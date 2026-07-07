@@ -301,15 +301,27 @@ atomic apply). `compact_context` **deleted**.
 
 ## Phase 5 — Fast-follow strategies (same seam)
 
-- [ ] **Tool-call-result compaction**: summarize/evict *old tool outputs* rather
-  than whole turns — but **only at a compaction boundary**, never per-turn (per-turn
-  = the cache bug we just deleted). WhippleScript edge: elide to a **re-expandable
-  content-addressed reference** the model can pull back via a tool call (lossless
-  where Codex/pi are lossy).
-- [ ] **Hard-reset (no-LLM)**: Codex's token-budget mode — discard history, rebuild
-  initial context only. Cheap fallback / cheap-agent strategy.
-- [ ] Strategy selection surface (per agent / profile / config) + a manual
-  `whip …`/`/compact`-equivalent entry point.
+**DONE 2026-07-07** (v0.3) — all three built against the Layer-B `Compactor` seam.
+
+- [x] **Tool-call-result compaction** (v0.3): `ToolResultCompactor` elides OLD
+  *captured* tool-result bodies (in the fold region) down to their content-addressed
+  recall ref at a compaction boundary, keeping conversation structure intact —
+  lossless via the `recall` tool where Codex/pi are lossy. Backed by **P5-2**:
+  `whipplescript-store::content::ContentStore` (sha-keyed, dedup) + capture at
+  `FileToolExecutor::execute` (dispatch now returns the FULL output; the single cap
+  moved here and stores the pre-truncation bytes) + a read-class `recall` tool
+  (paged by line offset/limit). This also made Layer A's "full output kept as
+  evidence" true — it was not stored before. The recall-footer format is kernel-owned
+  (`recall_footer`/`recall_id_in`) so executor and compactor share one contract.
+- [x] **Hard-reset (no-LLM)** (v0.3): `HardResetCompactor` — discard the middle,
+  keep anchors + recent tail, no model round. Codex's token-budget mode; the cheap
+  strategy. Shares `over_trigger`/`recent_tail_start` with summarize.
+- [x] **Strategy selection surface** (v0.3): `agent { compaction: summarize |
+  hard_reset | tool_results | none }` — parsed, lowered to `IrAgent.compaction`,
+  validated (unknown strategy = diagnostic), `.ir`-emitted only when set (no ripple).
+  `run_owned_agent_turn` resolves it from the program IR and constructs the selected
+  `Box<dyn Compactor>` (default = summarize). A manual `/compact`-equivalent entry
+  point remains a small follow-on.
 
 ---
 

@@ -357,6 +357,10 @@ pub enum AgentField {
     /// `tools [Foo, Bar]`: the workflows this agent may invoke as typed tools
     /// (DR-0025). Entries are workflow names resolved against the program/packages.
     Tools(Vec<Ident>, SourceSpan),
+    /// `compaction <strategy>`: the owned-harness conversation-compaction strategy
+    /// (context-assembly Phase 5). One of `summarize`, `hard_reset`, `tool_results`,
+    /// `none`.
+    Compaction(Ident),
     Unknown {
         name: Ident,
         span: SourceSpan,
@@ -1171,6 +1175,10 @@ pub struct IrAgent {
     pub capabilities: Vec<String>,
     /// Workflows this agent may invoke as typed tools (DR-0025 `tools [...]`).
     pub tools: Vec<String>,
+    /// Owned-harness conversation-compaction strategy (context-assembly Phase 5):
+    /// `summarize` (default), `hard_reset`, `tool_results`, or `none`. `None` uses
+    /// the harness default.
+    pub compaction: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2410,6 +2418,7 @@ fn agent_field_span(field: &AgentField) -> SourceSpan {
         | AgentField::Skills(_, span)
         | AgentField::Capabilities(_, span)
         | AgentField::Tools(_, span) => *span,
+        AgentField::Compaction(strategy) => strategy.span,
         AgentField::Unknown { span, .. } => *span,
     }
 }
@@ -2443,6 +2452,7 @@ fn agent_field_line(field: &AgentField) -> String {
                 .join(", ");
             format!("  tools [{tools}]")
         }
+        AgentField::Compaction(strategy) => format!("  compaction {}", strategy.name),
         AgentField::Unknown { name, .. } => format!("  {}", name.name),
     }
 }
@@ -3059,11 +3069,18 @@ impl IrProgram {
                 } else {
                     format!("[{}]", agent.tools.join(", "))
                 };
+                // Compaction strategy appends only when set, so agents that take the
+                // harness default keep an unchanged .ir snapshot (no ripple).
+                let compaction = agent
+                    .compaction
+                    .as_deref()
+                    .map(|strategy| format!(" compaction={strategy}"))
+                    .unwrap_or_default();
                 push_line(
                     &mut snapshot,
                     format!(
-                        "  agent {} harness={} provider={} profile={} capacity={} skills={} capabilities={} tools={}",
-                        agent.name, harness, provider, profile, capacity, skills, capabilities, tools
+                        "  agent {} harness={} provider={} profile={} capacity={} skills={} capabilities={} tools={}{}",
+                        agent.name, harness, provider, profile, capacity, skills, capabilities, tools, compaction
                     ),
                 );
             }
@@ -6169,6 +6186,7 @@ fn lower_agent(
         skills: Vec::new(),
         capabilities: Vec::new(),
         tools: Vec::new(),
+        compaction: None,
     };
 
     if let Some(harness) = &agent.harness {
@@ -6298,6 +6316,35 @@ fn lower_agent(
                     lowered.tools.push(tool.name);
                 }
             }
+            AgentField::Compaction(strategy) => {
+                const STRATEGIES: [&str; 4] = ["summarize", "hard_reset", "tool_results", "none"];
+                if lowered.compaction.is_some() {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: strategy.span,
+                        message: format!(
+                            "agent `{}` declares compaction more than once",
+                            agent.name.name
+                        ),
+                        suggestion: Some("keep exactly one `compaction` field".to_owned()),
+                    });
+                }
+                if !STRATEGIES.contains(&strategy.name.as_str()) {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: strategy.span,
+                        message: format!(
+                            "agent `{}` uses unknown compaction strategy `{}`",
+                            agent.name.name, strategy.name
+                        ),
+                        suggestion: Some(
+                            "supported strategies are `summarize`, `hard_reset`, `tool_results`, and `none`"
+                                .to_owned(),
+                        ),
+                    });
+                }
+                lowered.compaction = Some(strategy.name);
+            }
             AgentField::Unknown { name, .. } => {
                 diagnostics.push(Diagnostic { related: Vec::new(),
                     span: name.span,
@@ -6306,7 +6353,7 @@ fn lower_agent(
                         name.name, agent.name.name
                     ),
                     suggestion: Some(
-                        "supported agent fields are `provider`, `profile`, `capacity`, `skills`, `capabilities`, and `tools`".to_owned(),
+                        "supported agent fields are `provider`, `profile`, `capacity`, `skills`, `capabilities`, `tools`, and `compaction`".to_owned(),
                     ),
                 });
             }
@@ -16635,6 +16682,9 @@ fn format_agent(agent: AgentDecl, formatted: &mut String) {
                     .join(", ");
                 push_line(formatted, format!("  tools [{tools}]"));
             }
+            AgentField::Compaction(strategy) => {
+                push_line(formatted, format!("  compaction {}", strategy.name));
+            }
             AgentField::Unknown { name, .. } => {
                 push_line(formatted, format!("  {}", name.name));
             }
@@ -18677,6 +18727,13 @@ impl Parser<'_> {
                         self.synchronize_to_block_item();
                     }
                 }
+                "compaction" => {
+                    if let Some(strategy) = self.expect_ident("compaction strategy") {
+                        fields.push(AgentField::Compaction(strategy));
+                    } else {
+                        self.synchronize_to_block_item();
+                    }
+                }
                 _ => {
                     let span = field_name.span;
                     fields.push(AgentField::Unknown {
@@ -20472,6 +20529,7 @@ impl Parser<'_> {
                 || self.at_ident("skills")
                 || self.at_ident("capabilities")
                 || self.at_ident("tools")
+                || self.at_ident("compaction")
             {
                 return;
             }
@@ -22819,6 +22877,46 @@ agent worker {
             "diagnostics: {:?}",
             dup.diagnostics
         );
+    }
+
+    #[test]
+    fn agent_compaction_strategy_parses_lowers_formats_and_validates() {
+        let source = compile_program(
+            "workflow C\nagent w {\n  provider owned\n  profile \"p\"\n  capacity 1\n  compaction hard_reset\n}\n",
+        );
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let ir = source.ir.expect("ir");
+        let agent = ir.agents.iter().find(|a| a.name == "w").expect("agent");
+        assert_eq!(agent.compaction.as_deref(), Some("hard_reset"));
+
+        // Round-trips through the formatter and the .ir snapshot.
+        let formatted = format_program(
+            "workflow C\nagent w {\n  provider owned\n  profile \"p\"\n  capacity 1\n  compaction hard_reset\n}\n",
+        )
+        .formatted
+        .expect("formats");
+        assert!(formatted.contains("compaction hard_reset"), "{formatted}");
+        assert!(ir.to_snapshot().contains("compaction=hard_reset"));
+
+        // An unknown strategy is a diagnostic (not silently accepted).
+        let bad = compile_program(
+            "workflow C\nagent w {\n  provider owned\n  profile \"p\"\n  capacity 1\n  compaction squish\n}\n",
+        );
+        assert!(
+            bad.diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown compaction strategy `squish`")),
+            "diagnostics: {:?}",
+            bad.diagnostics
+        );
+
+        // An agent with no compaction field lowers to None and adds no .ir token.
+        let plain = compile_program(
+            "workflow C\nagent w {\n  provider owned\n  profile \"p\"\n  capacity 1\n}\n",
+        );
+        let plain_ir = plain.ir.expect("ir");
+        assert_eq!(plain_ir.agents[0].compaction, None);
+        assert!(!plain_ir.to_snapshot().contains("compaction="));
     }
 
     #[test]

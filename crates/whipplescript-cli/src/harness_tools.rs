@@ -20,9 +20,9 @@ use whipplescript_kernel::coerce_native::{
 };
 use whipplescript_kernel::context_assembly::{assemble, BundleKind, ContextBundle};
 use whipplescript_kernel::harness_loop::{
-    BrokeredTurnInput, ChatMessage, HarnessModelClient, HarnessModelError, HttpModelClient,
-    ModelReply, ToolCall, ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
-    TurnSummarizingCompactor,
+    BrokeredTurnInput, ChatMessage, Compactor, HardResetCompactor, HarnessModelClient,
+    HarnessModelError, HttpModelClient, ModelReply, NoopCompactor, ToolCall, ToolExecutor,
+    ToolOutcome, ToolResultCompactor, ToolSpec, ToolStatus, TurnSummarizingCompactor,
 };
 use whipplescript_kernel::harness_model::RealHarnessModelClient;
 use whipplescript_kernel::sansio::{HostDriver, IoRequest, IoResult};
@@ -2829,10 +2829,26 @@ pub fn run_owned_agent_turn(
     }
     drop(coordination);
 
-    // Conversation compaction (context-assembly Phase 4 Layer B): the turn-summarizing
-    // strategy. It fires only when real usage nears the window, so the fixture path
-    // (whose usage carries no input tokens) never compacts.
-    let compactor = TurnSummarizingCompactor::default();
+    // Conversation compaction (context-assembly Phase 4/5): the strategy is selected
+    // by the agent declaration (`compaction: summarize | hard_reset | tool_results |
+    // none`), resolved from the program IR; default = turn-summarization. It fires
+    // only when real usage nears the window, so the fixture path (whose usage carries
+    // no input tokens) never compacts.
+    let compaction_strategy: Option<String> = program_path
+        .and_then(|path| path.to_str())
+        .and_then(|path| crate::compile_source_path_with_root(path, root).ok())
+        .and_then(|(_, ir)| {
+            ir.agents
+                .iter()
+                .find(|declared| declared.name == agent)
+                .and_then(|declared| declared.compaction.clone())
+        });
+    let compactor: Box<dyn Compactor> = match compaction_strategy.as_deref() {
+        Some("hard_reset") => Box::new(HardResetCompactor::default()),
+        Some("tool_results") => Box::new(ToolResultCompactor::default()),
+        Some("none") => Box::new(NoopCompactor),
+        _ => Box::new(TurnSummarizingCompactor::default()),
+    };
     let result = match model_config {
         Some(config) => {
             let transport = UreqCoerceTransport::new(config.timeout);
@@ -2851,7 +2867,14 @@ pub fn run_owned_agent_turn(
             // transport is both the model client's transport and the machine's
             // `HostDriver` (blanket impl), so native and the durable object run the
             // one turn control-flow — the single seam Phase-4 compaction rides.
-            kernel.run_brokered_agent_turn(&ctx, &client, &executor, &transport, &compactor, &input)
+            kernel.run_brokered_agent_turn(
+                &ctx,
+                &client,
+                &executor,
+                &transport,
+                compactor.as_ref(),
+                &input,
+            )
         }
         None => {
             let client = FixtureModelClient::from_env();
@@ -2860,7 +2883,7 @@ pub fn run_owned_agent_turn(
                 &client,
                 &executor,
                 &FixtureHost,
-                &compactor,
+                compactor.as_ref(),
                 &input,
             )
         }
