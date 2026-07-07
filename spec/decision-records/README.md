@@ -172,7 +172,8 @@ others are active workshop material.
   tolerant run-id routing, two-clock liveness (inactivity wall clock + delivered-
   frame budget), ack-then-terminal cancellation wired into the driver, declared
   re-query before `uncertain` resolution, version exchange, kernel-owned
-  shape-only redaction. *Proposed; build items gated on ratification.*
+  shape-only redaction. *Accepted (obligations-over-dialects ratified); build
+  items B1–B6 un-gated.*
 
 ## Historical Decision Trackers
 

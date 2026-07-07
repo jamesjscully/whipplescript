@@ -1,6 +1,7 @@
 # DR-0035 — The delegated harness wire protocol
 
-Status: proposed (2026-07-07). The D8-6 follow-on under DR-0034 (managed vs.
+Status: accepted (2026-07-07; Decision 1 ratified as Option A — obligations
+over dialects). The D8-6 follow-on under DR-0034 (managed vs.
 delegated harnesses): the wire-level formalization of the delegated turn
 contract that DR-0034 absorbed "at the architecture level" from the original
 candidate scope flagged in `spec/compute-plane-design-note.md`. Cross-refs:
@@ -293,8 +294,6 @@ delegated-settings-authority lesson).
 
 ## Open questions
 
-- **Option A/B ratification** (Decision 1) — the one architectural fork; the
-  rest is enforcement of what already exists.
 - **`tool_requested`/`hook.event` on the Claude path**: the normalizer
   understands them; the shipped sidecar never emits them (tool_use is folded
   into stream shapes). Require the sidecar to emit them (richer attestation of
