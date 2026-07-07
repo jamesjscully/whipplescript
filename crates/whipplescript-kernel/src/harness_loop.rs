@@ -947,39 +947,18 @@ impl TurnSummarizingCompactor {
             tail_budget_bytes,
         }
     }
-
-    /// The suffix of `messages` (nearest the end) whose cumulative serialized size
-    /// stays within the tail budget — always at least the final message. Returns the
-    /// index at which the tail begins.
-    fn tail_start(&self, messages: &[ChatMessage]) -> usize {
-        let mut bytes = 0usize;
-        let mut start = messages.len();
-        for (index, message) in messages.iter().enumerate().rev() {
-            bytes = bytes.saturating_add(message_size_bytes(message));
-            if bytes > self.tail_budget_bytes && index + 1 < messages.len() {
-                break;
-            }
-            start = index;
-        }
-        start
-    }
 }
 
 impl Compactor for TurnSummarizingCompactor {
     fn should_compact(&self, stats: &CompactionStats) -> bool {
-        // Real usage has reached `trigger_tenths`/10 of the window, and there is a
-        // conversation worth folding. `last_input_tokens` is 0 until the first main
-        // reply and is reset to 0 after each compaction, so this fires rarely.
-        stats.message_count >= self.min_messages
-            && stats.last_input_tokens.saturating_mul(10)
-                >= stats.context_window.saturating_mul(self.trigger_tenths)
+        over_trigger(stats, self.trigger_tenths, self.min_messages)
     }
 
     fn plan(&self, transcript: &[ChatMessage], _stats: &CompactionStats) -> CompactionOutcome {
         // Anchors: the System message + the first User message (the seeded head, or
         // the held handoff after a prior compaction) — the stable cache prefix.
         let anchor_end = transcript.len().min(2);
-        let tail_start = self.tail_start(transcript).max(anchor_end);
+        let tail_start = recent_tail_start(transcript, self.tail_budget_bytes).max(anchor_end);
         // The fold region is everything between the anchors and the recent tail.
         // Nothing to fold → a no-op rewrite that disarms until the next reply.
         if tail_start <= anchor_end {
@@ -1007,6 +986,89 @@ impl Compactor for TurnSummarizingCompactor {
         out.push(ChatMessage::User(format!(
             "[Earlier conversation compacted to a handoff summary]\n{summary}"
         )));
+        out.extend(request.keep_tail.iter().cloned());
+        out
+    }
+}
+
+/// The shared compaction trigger (Decision 7): real usage has reached
+/// `trigger_tenths`/10 of the window and the conversation clears the message floor.
+fn over_trigger(stats: &CompactionStats, trigger_tenths: u64, min_messages: usize) -> bool {
+    stats.message_count >= min_messages
+        && stats.last_input_tokens.saturating_mul(10)
+            >= stats.context_window.saturating_mul(trigger_tenths)
+}
+
+/// The index at which the recent tail begins: the suffix (nearest the end) whose
+/// cumulative serialized size stays within `tail_budget_bytes`, always at least the
+/// final message. Shared by the summarizing and hard-reset strategies.
+fn recent_tail_start(messages: &[ChatMessage], tail_budget_bytes: usize) -> usize {
+    let mut bytes = 0usize;
+    let mut start = messages.len();
+    for (index, message) in messages.iter().enumerate().rev() {
+        bytes = bytes.saturating_add(message_size_bytes(message));
+        if bytes > tail_budget_bytes && index + 1 < messages.len() {
+            break;
+        }
+        start = index;
+    }
+    start
+}
+
+/// Strategy #2: hard-reset (no-LLM, Codex's token-budget mode). When the trigger
+/// fires, DISCARD the middle entirely — no summary, no model round — keeping only the
+/// System + first-User anchors and a byte-budgeted recent tail. The cheapest strategy:
+/// it loses the middle (unlike turn-summarization) but costs nothing and never stalls
+/// the turn on a summarization round. A `Deterministic` compactor.
+pub struct HardResetCompactor {
+    trigger_tenths: u64,
+    min_messages: usize,
+    tail_budget_bytes: usize,
+}
+
+impl Default for HardResetCompactor {
+    fn default() -> Self {
+        Self::new(
+            COMPACT_TRIGGER_TENTHS,
+            COMPACT_MIN_MESSAGES,
+            COMPACT_TAIL_BUDGET_BYTES,
+        )
+    }
+}
+
+impl HardResetCompactor {
+    /// Construct with explicit thresholds (for config and tests); [`Default`] uses
+    /// the shipped constants.
+    pub fn new(trigger_tenths: u64, min_messages: usize, tail_budget_bytes: usize) -> Self {
+        Self {
+            trigger_tenths,
+            min_messages,
+            tail_budget_bytes,
+        }
+    }
+}
+
+impl Compactor for HardResetCompactor {
+    fn should_compact(&self, stats: &CompactionStats) -> bool {
+        over_trigger(stats, self.trigger_tenths, self.min_messages)
+    }
+
+    fn plan(&self, transcript: &[ChatMessage], _stats: &CompactionStats) -> CompactionOutcome {
+        let anchor_end = transcript.len().min(2);
+        let tail_start = recent_tail_start(transcript, self.tail_budget_bytes).max(anchor_end);
+        // Nothing between anchors and tail → a no-op rewrite that disarms.
+        if tail_start <= anchor_end {
+            return CompactionOutcome::Deterministic(transcript.to_vec());
+        }
+        // Drop the middle: anchors + recent tail, no summary.
+        let mut out = transcript[..anchor_end].to_vec();
+        out.extend_from_slice(&transcript[tail_start..]);
+        CompactionOutcome::Deterministic(out)
+    }
+
+    fn assemble(&self, request: &SummarizationRequest, _summary: &str) -> Vec<ChatMessage> {
+        // Never called (hard-reset is always `Deterministic`); rebuild anchors + tail.
+        let mut out = request.anchors.clone();
         out.extend(request.keep_tail.iter().cloned());
         out
     }
@@ -2069,6 +2131,41 @@ mod tests {
                 .any(|o| matches!(o, LoopObservation::Compacted { .. })),
             "resume does not re-compact"
         );
+    }
+
+    #[test]
+    fn hard_reset_drops_the_middle_keeping_anchors_and_tail_with_no_model_round() {
+        let c = HardResetCompactor::new(9, 2, 10);
+        let transcript = vec![
+            ChatMessage::System("sys".into()),
+            ChatMessage::User("task".into()),
+            ChatMessage::Assistant {
+                text: "middle-1".into(),
+                tool_calls: Vec::new(),
+            },
+            ChatMessage::Assistant {
+                text: "middle-2".into(),
+                tool_calls: Vec::new(),
+            },
+            ChatMessage::User("recent".into()),
+        ];
+        assert!(c.should_compact(&stats(950, 1000, transcript.len())));
+        match c.plan(&transcript, &stats(950, 1000, transcript.len())) {
+            CompactionOutcome::Deterministic(out) => {
+                // Anchors + tail only; the middle is gone; no NeedsModel round.
+                assert_eq!(out[0], transcript[0]);
+                assert_eq!(out[1], transcript[1]);
+                assert_eq!(*out.last().expect("tail"), transcript[4]);
+                assert!(out.len() < transcript.len(), "middle dropped");
+                assert!(
+                    !out.iter().any(
+                        |m| matches!(m, ChatMessage::Assistant { text, .. } if text == "middle-1")
+                    ),
+                    "the folded middle is discarded, not summarized"
+                );
+            }
+            CompactionOutcome::NeedsModel(_) => panic!("hard-reset never needs a model"),
+        }
     }
 
     // --- Phase 4 Layer B: overflow fallback (Lb-5) -------------------------
