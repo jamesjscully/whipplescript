@@ -287,9 +287,13 @@ atomic apply). `compact_context` **deleted**.
 - [x] **Apply-once + hold stable**: the folded prefix is installed once, the
   `compaction_epoch` bumped, and `last_input_tokens` reset so subsequent turns only
   append; the middle is never edited again (v0.3).
-- [ ] **Overflow fallback**: on a provider context-window error mid-compaction,
-  trim from the front (keep the recent suffix byte-intact) — Codex's
-  cache-preserving fallback — rather than editing the middle. (Lb-5.)
+- [x] **Overflow fallback** (v0.3): on a provider context-window error, `front_trim`
+  drops the OLDEST middle messages (keeping the System + first-User anchors and a
+  pairing-safe recent suffix byte-intact — never a middle edit) and retries the same
+  step, bounded by `MAX_OVERFLOW_TRIMS`; a persistent overflow (or no droppable
+  middle) still fails cleanly. `is_context_overflow` matches the common provider
+  phrasings. Each trim records a `context.compaction` (summary_bytes 0). Unit tests:
+  detection, pairing-safe trim, retry-recovery, bounded-termination.
 
 ---
 

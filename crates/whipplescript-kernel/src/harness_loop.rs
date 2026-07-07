@@ -450,6 +450,10 @@ pub struct BrokeredTurnSnapshot {
     /// `awaiting == Summary`. Survives eviction so resume folds the same summary in.
     #[serde(default)]
     pub pending_compaction: Option<SummarizationRequest>,
+    /// How many times this turn has front-trimmed after a provider context-window
+    /// error (Lb-5 overflow fallback), bounded by `MAX_OVERFLOW_TRIMS`.
+    #[serde(default)]
+    pub overflow_trims: u32,
 }
 
 /// `serde(default)` seed for [`BrokeredTurnSnapshot::awaiting`] on pre-Phase-4
@@ -477,6 +481,7 @@ where
     last_input_tokens: u64,
     compaction_epoch: u32,
     pending_compaction: Option<SummarizationRequest>,
+    overflow_trims: u32,
 }
 
 impl<'a, M, E> BrokeredTurnMachine<'a, M, E>
@@ -506,6 +511,7 @@ where
             last_input_tokens: 0,
             compaction_epoch: 0,
             pending_compaction: None,
+            overflow_trims: 0,
         }
     }
 
@@ -539,6 +545,7 @@ where
             last_input_tokens: snapshot.last_input_tokens,
             compaction_epoch: snapshot.compaction_epoch,
             pending_compaction: snapshot.pending_compaction,
+            overflow_trims: snapshot.overflow_trims,
         }
     }
 
@@ -555,6 +562,7 @@ where
             last_input_tokens: self.last_input_tokens,
             compaction_epoch: self.compaction_epoch,
             pending_compaction: self.pending_compaction.clone(),
+            overflow_trims: self.overflow_trims,
         }
     }
 
@@ -690,6 +698,29 @@ where
         let reply = match self.model.parse_response(response) {
             Ok(reply) => reply,
             Err(error) => {
+                // Overflow fallback (Lb-5): a provider context-window error means the
+                // prompt is too large even to send. Rather than fail, trim from the
+                // FRONT — keep the anchors and a pairing-safe recent suffix byte-intact
+                // (Codex's cache-preserving fallback, never a middle edit) — and retry
+                // the same step. Bounded so a persistent overflow still terminates.
+                if is_context_overflow(&error) && self.overflow_trims < MAX_OVERFLOW_TRIMS {
+                    let trimmed = front_trim(&self.messages);
+                    // Only retry if the trim actually made progress (dropped messages);
+                    // otherwise fall through and fail rather than loop.
+                    if trimmed.len() < self.messages.len() {
+                        self.overflow_trims += 1;
+                        let folded_messages = self.messages.len() - trimmed.len();
+                        self.messages = trimmed;
+                        self.compaction_epoch += 1;
+                        self.observations.push(LoopObservation::Compacted {
+                            epoch: self.compaction_epoch,
+                            folded_messages,
+                            summary_bytes: 0,
+                        });
+                        (self.checkpoint)(&self.messages);
+                        return self.main_call();
+                    }
+                }
                 return Outcome::Settle(BrokeredTurnOutcome {
                     status: match error {
                         HarnessModelError::Timeout => TurnStatus::TimedOut,
@@ -994,6 +1025,75 @@ fn input_tokens_of(usage: &Value) -> u64 {
 /// The serialized size of one message, for the recent-tail byte budget.
 fn message_size_bytes(message: &ChatMessage) -> usize {
     chat_message_to_json(message).to_string().len()
+}
+
+/// How many times a single turn may front-trim on repeated context-window errors
+/// before giving up and failing (Lb-5 overflow fallback).
+const MAX_OVERFLOW_TRIMS: u32 = 3;
+
+/// Whether a model error is a provider context-window overflow (the prompt is too
+/// large to send) — the signal for the front-trim fallback. Matches the common
+/// provider phrasings; anything else fails the turn normally.
+fn is_context_overflow(error: &HarnessModelError) -> bool {
+    let HarnessModelError::Provider(message) = error else {
+        return false;
+    };
+    let message = message.to_lowercase();
+    [
+        "context length",
+        "context_length_exceeded",
+        "maximum context",
+        "context window",
+        "prompt is too long",
+        "too many tokens",
+        "input is too long",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+/// Front-trim the transcript for the overflow fallback: keep the System + first-User
+/// anchors and a byte-intact recent suffix, dropping the OLDEST middle messages
+/// (never editing the middle in place — Codex's cache-preserving shape). Drops in
+/// pairing-safe units: the kept suffix never begins with an orphan `ToolResults`
+/// whose assistant call was dropped, so the provider still accepts it. Aims to shed
+/// roughly half the middle; always keeps at least the final message.
+fn front_trim(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let anchor_end = messages.len().min(2);
+    if messages.len() <= anchor_end + 1 {
+        return messages.to_vec(); // anchors + one tail message: no progress possible
+    }
+    let last = messages.len() - 1;
+    // The furthest-back suffix start that still keeps the final message with its
+    // pairing intact: a trailing `ToolResults` needs its preceding assistant kept.
+    let last_safe = if matches!(messages[last], ChatMessage::ToolResults(_)) {
+        last.saturating_sub(1).max(anchor_end)
+    } else {
+        last
+    };
+    let middle_total: usize = messages[anchor_end..].iter().map(message_size_bytes).sum();
+    let target = middle_total / 2;
+    let mut dropped = 0usize;
+    let mut suffix_start = anchor_end;
+    while suffix_start < last_safe {
+        let safe_boundary = !matches!(messages[suffix_start], ChatMessage::ToolResults(_));
+        if dropped >= target && safe_boundary {
+            break;
+        }
+        dropped += message_size_bytes(&messages[suffix_start]);
+        suffix_start += 1;
+    }
+    // Never begin the kept suffix on an orphan `ToolResults` (its assistant was
+    // dropped) — advance past it.
+    if matches!(
+        messages.get(suffix_start),
+        Some(ChatMessage::ToolResults(_))
+    ) {
+        suffix_start += 1;
+    }
+    let mut out = messages[..anchor_end].to_vec();
+    out.extend_from_slice(&messages[suffix_start..]);
+    out
 }
 
 /// Serialize a transcript to JSON for durable persistence (no serde derive dep).
@@ -1969,5 +2069,159 @@ mod tests {
                 .any(|o| matches!(o, LoopObservation::Compacted { .. })),
             "resume does not re-compact"
         );
+    }
+
+    // --- Phase 4 Layer B: overflow fallback (Lb-5) -------------------------
+
+    fn assistant_tool_call(id: &str) -> ChatMessage {
+        ChatMessage::Assistant {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "read".into(),
+                arguments: json!({}),
+            }],
+        }
+    }
+
+    fn tool_results(id: &str) -> ChatMessage {
+        ChatMessage::ToolResults(vec![ToolResultMsg {
+            tool_call_id: id.into(),
+            tool_name: "read".into(),
+            content: "x".repeat(200),
+            is_error: false,
+        }])
+    }
+
+    #[test]
+    fn overflow_detection_matches_provider_phrasings() {
+        assert!(is_context_overflow(&HarnessModelError::Provider(
+            "This model's maximum context length is 200000 tokens".into()
+        )));
+        assert!(is_context_overflow(&HarnessModelError::Provider(
+            "prompt is too long: 250000 tokens".into()
+        )));
+        assert!(!is_context_overflow(&HarnessModelError::Provider(
+            "invalid api key".into()
+        )));
+        assert!(!is_context_overflow(&HarnessModelError::Timeout));
+    }
+
+    #[test]
+    fn front_trim_drops_oldest_pairs_keeping_anchors_and_a_paired_tail() {
+        let messages = vec![
+            ChatMessage::System("sys".into()),
+            ChatMessage::User("task".into()),
+            assistant_tool_call("a1"),
+            tool_results("a1"),
+            assistant_tool_call("a2"),
+            tool_results("a2"),
+        ];
+        let trimmed = front_trim(&messages);
+        // Progress was made, anchors survive, and the kept suffix does not begin
+        // with an orphan ToolResults (its assistant would have been dropped).
+        assert!(trimmed.len() < messages.len(), "made progress");
+        assert_eq!(trimmed[0], messages[0]);
+        assert_eq!(trimmed[1], messages[1]);
+        assert!(
+            !matches!(trimmed.get(2), Some(ChatMessage::ToolResults(_))),
+            "suffix never starts with an orphan tool result"
+        );
+        // The final message is preserved with its pairing.
+        assert_eq!(
+            *trimmed.last().expect("tail"),
+            *messages.last().expect("tail")
+        );
+    }
+
+    #[test]
+    fn a_context_overflow_front_trims_and_retries_instead_of_failing() {
+        // Two tool rounds build up a transcript, then the third main call overflows;
+        // the machine front-trims and retries, completing on the fourth call.
+        let replies = vec![
+            Ok(tool_reply("c1", "read")),
+            Ok(tool_reply("c2", "read")),
+            Err(HarnessModelError::Provider(
+                "This model's maximum context length is 200000 tokens".into(),
+            )),
+            Ok(final_reply("done after trim")),
+        ];
+        let client = CompactingHttpClient::new(replies, 200_000);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "x".repeat(500),
+        });
+        let outcome = {
+            let mut record = |_: &[ChatMessage]| {};
+            run_brokered_turn_http(
+                &client,
+                &exec,
+                &input(8),
+                &mut record,
+                &DummyHost,
+                &NoopCompactor,
+            )
+        };
+        // The turn recovered rather than failing on the overflow.
+        assert_eq!(outcome.status, TurnStatus::Completed);
+        assert_eq!(outcome.summary, "done after trim");
+        // Exactly one front-trim was recorded as a compaction event.
+        let trims: Vec<_> = outcome
+            .observations
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o,
+                    LoopObservation::Compacted {
+                        summary_bytes: 0,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(trims.len(), 1, "one overflow front-trim recorded");
+    }
+
+    #[test]
+    fn persistent_overflow_eventually_fails_after_bounded_trims() {
+        // Every main call overflows; after MAX_OVERFLOW_TRIMS the turn fails rather
+        // than looping forever. Enough tool rounds first so each trim makes progress.
+        let mut replies = vec![
+            Ok(tool_reply("c1", "read")),
+            Ok(tool_reply("c2", "read")),
+            Ok(tool_reply("c3", "read")),
+            Ok(tool_reply("c4", "read")),
+        ];
+        for _ in 0..(MAX_OVERFLOW_TRIMS + 2) {
+            replies.push(Err(HarnessModelError::Provider(
+                "context window exceeded".into(),
+            )));
+        }
+        let client = CompactingHttpClient::new(replies, 200_000);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "y".repeat(300),
+        });
+        let outcome = {
+            let mut record = |_: &[ChatMessage]| {};
+            run_brokered_turn_http(
+                &client,
+                &exec,
+                &input(8),
+                &mut record,
+                &DummyHost,
+                &NoopCompactor,
+            )
+        };
+        assert_eq!(outcome.status, TurnStatus::Failed);
+        // The turn terminated (no infinite retry loop) and never front-trimmed more
+        // than the bound, whether it hit the cap or ran out of droppable middle first.
+        let trims = outcome
+            .observations
+            .iter()
+            .filter(|o| matches!(o, LoopObservation::Compacted { .. }))
+            .count() as u32;
+        assert!(trims >= 1, "at least one recovery attempt");
+        assert!(trims <= MAX_OVERFLOW_TRIMS, "trims are bounded");
     }
 }
