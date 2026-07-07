@@ -1,0 +1,517 @@
+mod WHIPPLESCRIPT-CONSTRUCT-GRAPH is
+  protecting WHIPPLESCRIPT-CONSTRUCT-GRAMMAR .
+
+  sorts GraphNode GraphNodeList PortId PortIdList PortKind PortPhase PortCardinality LoweredKind .
+
+  ops
+    projectionNode
+    memoryNode
+    agentNode
+    scheduleNode
+    badNode
+    unrelatedNode
+    : -> GraphNode .
+
+  ops
+    reqIssue
+    reqMemory
+    reqRepo
+    reqRuntime
+    reqV2Issue
+    reqGithubIssue
+    provIssue
+    provMemory
+    provRepo
+    provRuntimeIssue
+    provV1Issue
+    provLinearIssue
+    provUnrelated
+    : -> PortId .
+
+  ops
+    valueKind
+    projectionKind
+    eventKind
+    eventSourceKind
+    capabilityKind
+    effectHandleKind
+    terminalOutputKind
+    resourceKind
+    operationKind
+    : -> PortKind .
+
+  ops compilePhase runtimePhase bothPhase : -> PortPhase .
+  ops exactlyOne optionalOne many namedMany : -> PortCardinality .
+  ops coreEffectOut coreEventOut coreFactOut directRuleFireOut hiddenRuntimeOut : -> LoweredKind .
+  op noGraphNodes : -> GraphNodeList .
+  op graphNodeCons : GraphNode GraphNodeList -> GraphNodeList .
+  op noPorts : -> PortIdList .
+  op portCons : PortId PortIdList -> PortIdList .
+
+  --- Graph and node shape.
+  op candidateGraph : GraphId -> Cfg .
+  op graphNodes : GraphId GraphNodeList -> Cfg .
+  op graphNodes0 : GraphId -> Cfg .
+  op graphNodes1 : GraphId GraphNode -> Cfg .
+  op graphNodes2 : GraphId GraphNode GraphNode -> Cfg .
+  op graphNodes3 : GraphId GraphNode GraphNode GraphNode -> Cfg .
+  op graphContainsNode : GraphId GraphNode -> Cfg .
+  op graphAccepted : GraphId -> Cfg .
+  op acceptedProgram : GraphId -> Cfg .
+
+  --- These are normalized checker facts, not package declarations. The
+  --- lowering-class lifecycle model refines nodeLoweringAccepted into concrete
+  --- platform-owned class profiles before lowering can be preserved.
+  op nodeFamilyAccepted : GraphNode -> Cfg .
+  op nodeLoweringAccepted : GraphNode -> Cfg .
+  op nodeShapeUnique : GraphNode -> Cfg .
+  op noHiddenNodeBehavior : GraphNode -> Cfg .
+  op nodeFactsConsistent : GraphNode -> Cfg .
+  op nodeStaticContractOk : GraphNode -> Cfg .
+  op nodeAccepted : GraphId GraphNode -> Cfg .
+
+  --- Finite required-port arities used by the model.
+  op nodeNeeds0 : GraphNode -> Cfg .
+  op nodeNeeds1 : GraphNode PortId -> Cfg .
+  op nodeNeeds2 : GraphNode PortId PortId -> Cfg .
+  op nodeNeeds3 : GraphNode PortId PortId PortId -> Cfg .
+  op nodeNeeds : GraphNode PortIdList -> Cfg .
+  op requiredPortsSatisfied : GraphNode -> Cfg .
+
+  --- Finite produced-port arities used by the model.
+  op nodeProduces0 : GraphNode -> Cfg .
+  op nodeProduces1 : GraphNode PortId -> Cfg .
+  op nodeProduces2 : GraphNode PortId PortId -> Cfg .
+  op nodeProduces : GraphNode PortIdList -> Cfg .
+  op producedPortAllowed : GraphNode PortId -> Cfg .
+  op providedPortOk : GraphNode PortId -> Cfg .
+  op producedPortsOk : GraphNode -> Cfg .
+
+  --- Port metadata and explicit resolution edges.
+  op port : PortId PortKind TypeId PortPhase ContractVersion PortCardinality -> Cfg .
+  op portResource : PortId ResourceId -> Cfg .
+  op portUnscoped : PortId -> Cfg .
+  op providesPort : GraphNode PortId -> Cfg .
+  op resolvesPort : GraphNode PortId GraphNode PortId -> Cfg .
+  op uniqueResolution : GraphNode PortId -> Cfg .
+  op uniqueResolvedPort : GraphNode PortId GraphNode PortId -> Cfg .
+  op resolutionAbsent : GraphNode PortId -> Cfg .
+  op resolutionFactsConsistent : GraphNode PortId -> Cfg .
+  op manyResolutionOrderClosed : GraphNode PortId -> Cfg .
+  op resolutionOrder : GraphNode PortId GraphNode PortId -> Cfg .
+  op namedResolutionKeyed : GraphNode PortId GraphNode PortId ResourceId -> Cfg .
+  op kindCompatible : PortKind PortKind -> Cfg .
+  op typeAssignable : TypeId TypeId -> Cfg .
+  op phaseCompatible : PortPhase PortPhase -> Cfg .
+  op versionCompatible : ContractVersion ContractVersion -> Cfg .
+  op resourceCompatible : PortId PortId -> Cfg .
+  op edgeAccepted : GraphNode PortId GraphNode PortId -> Cfg .
+  op portSatisfied : GraphNode PortId -> Cfg .
+  op inconsistentNodeFacts : GraphNode -> Cfg .
+  op inconsistentResolutionFacts : GraphNode PortId -> Cfg .
+
+  --- Capability and lowering obligations.
+  op noCapabilityRequirements : GraphNode -> Cfg .
+  op nodeRequiresCapability : GraphNode CapabilityId -> Cfg .
+  op declaredCapability : CapabilityId -> Cfg .
+  op loweredEffectRequiresCapability : GraphNode EffectId CapabilityId -> Cfg .
+  op capabilityClosureOk : GraphNode -> Cfg .
+
+  op loweringOutput : GraphNode LoweredKind -> Cfg .
+  op allowedLoweringOutput : LoweredKind -> Cfg .
+  op singleLoweringOutput : GraphNode -> Cfg .
+  op loweringOutputOk : GraphNode -> Cfg .
+
+  --- Adequacy obligations connecting implementation artifacts to the model.
+  op sourceAndLockDeterministic : GraphId -> Cfg .
+  op registryClosed : GraphId -> Cfg .
+  op checkerFactsAccounted : GraphId -> Cfg .
+  op checkerFactsConsistent : GraphId -> Cfg .
+  op namespaceStable : GraphId -> Cfg .
+  op constructIdentityStable : GraphId -> Cfg .
+  op authorityScoped : GraphId -> Cfg .
+  op phaseSeparated : GraphId -> Cfg .
+  op cardinalityChecked : GraphId -> Cfg .
+  op versionReplayPinned : GraphId -> Cfg .
+  op diagnosticsComplete : GraphId -> Cfg .
+  op loweringBoundaryDeclared : GraphId -> Cfg .
+  op lifecycleBoundaryDeclared : GraphId -> Cfg .
+  op adequacyContractOk : GraphId -> Cfg .
+
+  vars G : GraphId .
+  var Nodes : GraphNodeList .
+  vars N N2 N3 Provider Provider2 : GraphNode .
+  vars Reqs Provs : PortIdList .
+  vars Req Req2 Req3 Prov Prov2 : PortId .
+  vars ReqKind ProvKind ProvKind2 : PortKind .
+  vars ReqT ProvT ProvT2 : TypeId .
+  vars ReqPhase ProvPhase ProvPhase2 : PortPhase .
+  vars ReqV ProvV ProvV2 : ContractVersion .
+  vars ReqCard ProvCard ProvCard2 : PortCardinality .
+  vars Resource Resource2 : ResourceId .
+  var Cap : CapabilityId .
+  var E : EffectId .
+  var Out : LoweredKind .
+
+  --- Explicit accepted edge derivation. The provider type is checked as
+  --- assignable to the required type, and the required-port cardinality chooses
+  --- the resolution discipline.
+  rl [accept-exactly-one-construct-graph-edge] :
+    resolvesPort(N, Req, Provider, Prov)
+    uniqueResolution(N, Req)
+    uniqueResolvedPort(N, Req, Provider, Prov)
+    resolutionFactsConsistent(N, Req)
+    providedPortOk(Provider, Prov)
+    port(Req, ReqKind, ReqT, ReqPhase, ReqV, exactlyOne)
+    port(Prov, ProvKind, ProvT, ProvPhase, ProvV, ProvCard)
+    kindCompatible(ReqKind, ProvKind)
+    typeAssignable(ProvT, ReqT)
+    phaseCompatible(ProvPhase, ReqPhase)
+    versionCompatible(ProvV, ReqV)
+    resourceCompatible(Req, Prov)
+    =>
+    edgeAccepted(N, Req, Provider, Prov)
+    portSatisfied(N, Req) .
+
+  rl [accept-optional-one-construct-graph-edge] :
+    resolvesPort(N, Req, Provider, Prov)
+    uniqueResolution(N, Req)
+    uniqueResolvedPort(N, Req, Provider, Prov)
+    resolutionFactsConsistent(N, Req)
+    providedPortOk(Provider, Prov)
+    port(Req, ReqKind, ReqT, ReqPhase, ReqV, optionalOne)
+    port(Prov, ProvKind, ProvT, ProvPhase, ProvV, ProvCard)
+    kindCompatible(ReqKind, ProvKind)
+    typeAssignable(ProvT, ReqT)
+    phaseCompatible(ProvPhase, ReqPhase)
+    versionCompatible(ProvV, ReqV)
+    resourceCompatible(Req, Prov)
+    =>
+    edgeAccepted(N, Req, Provider, Prov)
+    portSatisfied(N, Req) .
+
+  rl [accept-optional-zero-port] :
+    resolutionAbsent(N, Req)
+    resolutionFactsConsistent(N, Req)
+    port(Req, ReqKind, ReqT, ReqPhase, ReqV, optionalOne)
+    =>
+    portSatisfied(N, Req) .
+
+  rl [accept-many-construct-graph-edge] :
+    resolvesPort(N, Req, Provider, Prov)
+    manyResolutionOrderClosed(N, Req)
+    resolutionOrder(N, Req, Provider, Prov)
+    resolutionFactsConsistent(N, Req)
+    providedPortOk(Provider, Prov)
+    port(Req, ReqKind, ReqT, ReqPhase, ReqV, many)
+    port(Prov, ProvKind, ProvT, ProvPhase, ProvV, ProvCard)
+    kindCompatible(ReqKind, ProvKind)
+    typeAssignable(ProvT, ReqT)
+    phaseCompatible(ProvPhase, ReqPhase)
+    versionCompatible(ProvV, ReqV)
+    resourceCompatible(Req, Prov)
+    =>
+    edgeAccepted(N, Req, Provider, Prov)
+    portSatisfied(N, Req) .
+
+  rl [accept-many-two-construct-graph-edges] :
+    resolvesPort(N, Req, Provider, Prov)
+    resolvesPort(N, Req, Provider2, Prov2)
+    manyResolutionOrderClosed(N, Req)
+    resolutionOrder(N, Req, Provider, Prov)
+    resolutionOrder(N, Req, Provider2, Prov2)
+    resolutionFactsConsistent(N, Req)
+    providedPortOk(Provider, Prov)
+    providedPortOk(Provider2, Prov2)
+    port(Req, ReqKind, ReqT, ReqPhase, ReqV, many)
+    port(Prov, ProvKind, ProvT, ProvPhase, ProvV, ProvCard)
+    port(Prov2, ProvKind2, ProvT2, ProvPhase2, ProvV2, ProvCard2)
+    kindCompatible(ReqKind, ProvKind)
+    kindCompatible(ReqKind, ProvKind2)
+    typeAssignable(ProvT, ReqT)
+    typeAssignable(ProvT2, ReqT)
+    phaseCompatible(ProvPhase, ReqPhase)
+    phaseCompatible(ProvPhase2, ReqPhase)
+    versionCompatible(ProvV, ReqV)
+    versionCompatible(ProvV2, ReqV)
+    resourceCompatible(Req, Prov)
+    resourceCompatible(Req, Prov2)
+    =>
+    edgeAccepted(N, Req, Provider, Prov)
+    edgeAccepted(N, Req, Provider2, Prov2)
+    portSatisfied(N, Req) .
+
+  rl [accept-many-zero-port] :
+    resolutionAbsent(N, Req)
+    manyResolutionOrderClosed(N, Req)
+    resolutionFactsConsistent(N, Req)
+    port(Req, ReqKind, ReqT, ReqPhase, ReqV, many)
+    =>
+    portSatisfied(N, Req) .
+
+  rl [accept-named-many-construct-graph-edge] :
+    resolvesPort(N, Req, Provider, Prov)
+    manyResolutionOrderClosed(N, Req)
+    resolutionOrder(N, Req, Provider, Prov)
+    namedResolutionKeyed(N, Req, Provider, Prov, Resource)
+    resolutionFactsConsistent(N, Req)
+    providedPortOk(Provider, Prov)
+    port(Req, ReqKind, ReqT, ReqPhase, ReqV, namedMany)
+    port(Prov, ProvKind, ProvT, ProvPhase, ProvV, ProvCard)
+    portResource(Prov, Resource)
+    kindCompatible(ReqKind, ProvKind)
+    typeAssignable(ProvT, ReqT)
+    phaseCompatible(ProvPhase, ReqPhase)
+    versionCompatible(ProvV, ReqV)
+    resourceCompatible(Req, Prov)
+    =>
+    edgeAccepted(N, Req, Provider, Prov)
+    portSatisfied(N, Req) .
+
+  rl [accept-named-many-two-construct-graph-edges] :
+    resolvesPort(N, Req, Provider, Prov)
+    resolvesPort(N, Req, Provider2, Prov2)
+    manyResolutionOrderClosed(N, Req)
+    resolutionOrder(N, Req, Provider, Prov)
+    resolutionOrder(N, Req, Provider2, Prov2)
+    namedResolutionKeyed(N, Req, Provider, Prov, Resource)
+    namedResolutionKeyed(N, Req, Provider2, Prov2, Resource2)
+    resolutionFactsConsistent(N, Req)
+    providedPortOk(Provider, Prov)
+    providedPortOk(Provider2, Prov2)
+    port(Req, ReqKind, ReqT, ReqPhase, ReqV, namedMany)
+    port(Prov, ProvKind, ProvT, ProvPhase, ProvV, ProvCard)
+    port(Prov2, ProvKind2, ProvT2, ProvPhase2, ProvV2, ProvCard2)
+    portResource(Prov, Resource)
+    portResource(Prov2, Resource2)
+    kindCompatible(ReqKind, ProvKind)
+    kindCompatible(ReqKind, ProvKind2)
+    typeAssignable(ProvT, ReqT)
+    typeAssignable(ProvT2, ReqT)
+    phaseCompatible(ProvPhase, ReqPhase)
+    phaseCompatible(ProvPhase2, ReqPhase)
+    versionCompatible(ProvV, ReqV)
+    versionCompatible(ProvV2, ReqV)
+    resourceCompatible(Req, Prov)
+    resourceCompatible(Req, Prov2)
+    =>
+    edgeAccepted(N, Req, Provider, Prov)
+    edgeAccepted(N, Req, Provider2, Prov2)
+    portSatisfied(N, Req) .
+
+  rl [accept-named-many-zero-port] :
+    resolutionAbsent(N, Req)
+    manyResolutionOrderClosed(N, Req)
+    resolutionFactsConsistent(N, Req)
+    port(Req, ReqKind, ReqT, ReqPhase, ReqV, namedMany)
+    =>
+    portSatisfied(N, Req) .
+
+  rl [detect-capability-fact-conflict] :
+    noCapabilityRequirements(N)
+    nodeRequiresCapability(N, Cap)
+    =>
+    inconsistentNodeFacts(N) .
+
+  rl [detect-produced-port-fact-conflict] :
+    nodeProduces0(N)
+    providesPort(N, Prov)
+    =>
+    inconsistentNodeFacts(N) .
+
+  rl [detect-resolution-fact-conflict] :
+    uniqueResolution(N, Req)
+    resolutionAbsent(N, Req)
+    =>
+    inconsistentResolutionFacts(N, Req) .
+
+  rl [detect-multi-resolution-fact-conflict] :
+    uniqueResolution(N, Req)
+    resolvesPort(N, Req, Provider, Prov)
+    resolvesPort(N, Req, Provider2, Prov2)
+    =>
+    inconsistentResolutionFacts(N, Req) .
+
+  rl [capability-closure-none] :
+    noCapabilityRequirements(N)
+    =>
+    capabilityClosureOk(N) .
+
+  rl [capability-closure-one] :
+    nodeRequiresCapability(N, Cap)
+    declaredCapability(Cap)
+    loweredEffectRequiresCapability(N, E, Cap)
+    =>
+    capabilityClosureOk(N) .
+
+  rl [allowed-unique-lowering-output] :
+    loweringOutput(N, Out)
+    allowedLoweringOutput(Out)
+    singleLoweringOutput(N)
+    =>
+    loweringOutputOk(N) .
+
+  rl [produced-ports-none] :
+    nodeProduces0(N)
+    =>
+    producedPortsOk(N) .
+
+  rl [produced-ports-one] :
+    nodeProduces1(N, Prov)
+    providesPort(N, Prov)
+    producedPortAllowed(N, Prov)
+    =>
+    providedPortOk(N, Prov)
+    producedPortsOk(N) .
+
+  rl [produced-ports-two] :
+    nodeProduces2(N, Prov, Prov2)
+    providesPort(N, Prov)
+    providesPort(N, Prov2)
+    producedPortAllowed(N, Prov)
+    producedPortAllowed(N, Prov2)
+    =>
+    providedPortOk(N, Prov)
+    providedPortOk(N, Prov2)
+    producedPortsOk(N) .
+
+  --- Generic generated-artifact port lists. The fixed arity rules above remain
+  --- as small hand-written model examples; generated checks use these list
+  --- forms so real emitted graphs do not need a new Maude rule for each arity.
+  rl [generated-produced-ports-empty] :
+    nodeProduces(N, noPorts)
+    =>
+    producedPortsOk(N) .
+
+  rl [generated-produced-ports-cons] :
+    nodeProduces(N, portCons(Prov, Provs))
+    providesPort(N, Prov)
+    producedPortAllowed(N, Prov)
+    =>
+    providedPortOk(N, Prov)
+    nodeProduces(N, Provs) .
+
+  rl [generated-required-ports-empty] :
+    nodeNeeds(N, noPorts)
+    =>
+    requiredPortsSatisfied(N) .
+
+  rl [generated-required-ports-cons] :
+    nodeNeeds(N, portCons(Req, Reqs))
+    portSatisfied(N, Req)
+    =>
+    nodeNeeds(N, Reqs) .
+
+  rl [accept-adequacy-contract] :
+    sourceAndLockDeterministic(G)
+    registryClosed(G)
+    checkerFactsAccounted(G)
+    checkerFactsConsistent(G)
+    namespaceStable(G)
+    constructIdentityStable(G)
+    authorityScoped(G)
+    phaseSeparated(G)
+    cardinalityChecked(G)
+    versionReplayPinned(G)
+    diagnosticsComplete(G)
+    loweringBoundaryDeclared(G)
+    lifecycleBoundaryDeclared(G)
+    =>
+    adequacyContractOk(G) .
+
+  rl [accept-node-static-contract] :
+    nodeFamilyAccepted(N)
+    nodeLoweringAccepted(N)
+    nodeShapeUnique(N)
+    noHiddenNodeBehavior(N)
+    nodeFactsConsistent(N)
+    producedPortsOk(N)
+    capabilityClosureOk(N)
+    loweringOutputOk(N)
+    =>
+    nodeStaticContractOk(N) .
+
+  rl [accept-node-0] :
+    graphContainsNode(G, N)
+    nodeStaticContractOk(N)
+    nodeNeeds0(N)
+    =>
+    nodeAccepted(G, N) .
+
+  rl [accept-node-1] :
+    graphContainsNode(G, N)
+    nodeStaticContractOk(N)
+    nodeNeeds1(N, Req)
+    portSatisfied(N, Req)
+    =>
+    nodeAccepted(G, N) .
+
+  rl [accept-node-2] :
+    graphContainsNode(G, N)
+    nodeStaticContractOk(N)
+    nodeNeeds2(N, Req, Req2)
+    portSatisfied(N, Req)
+    portSatisfied(N, Req2)
+    =>
+    nodeAccepted(G, N) .
+
+  rl [accept-node-3] :
+    graphContainsNode(G, N)
+    nodeStaticContractOk(N)
+    nodeNeeds3(N, Req, Req2, Req3)
+    portSatisfied(N, Req)
+    portSatisfied(N, Req2)
+    portSatisfied(N, Req3)
+    =>
+    nodeAccepted(G, N) .
+
+  rl [accept-generated-node] :
+    graphContainsNode(G, N)
+    nodeStaticContractOk(N)
+    requiredPortsSatisfied(N)
+    =>
+    nodeAccepted(G, N) .
+
+  rl [accept-generated-graph-empty] :
+    graphNodes(G, noGraphNodes)
+    =>
+    graphAccepted(G) .
+
+  rl [accept-generated-graph-cons] :
+    graphNodes(G, graphNodeCons(N, Nodes))
+    nodeAccepted(G, N)
+    =>
+    graphNodes(G, Nodes) .
+
+  rl [accept-graph-0] :
+    graphNodes0(G)
+    =>
+    graphAccepted(G) .
+
+  rl [accept-graph-1] :
+    graphNodes1(G, N)
+    nodeAccepted(G, N)
+    =>
+    graphAccepted(G) .
+
+  rl [accept-graph-2] :
+    graphNodes2(G, N, N2)
+    nodeAccepted(G, N)
+    nodeAccepted(G, N2)
+    =>
+    graphAccepted(G) .
+
+  rl [accept-graph-3] :
+    graphNodes3(G, N, N2, N3)
+    nodeAccepted(G, N)
+    nodeAccepted(G, N2)
+    nodeAccepted(G, N3)
+    =>
+    graphAccepted(G) .
+
+  rl [accept-program] :
+    graphAccepted(G)
+    adequacyContractOk(G)
+    =>
+    acceptedProgram(G) .
+endm

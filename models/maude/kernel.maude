@@ -1,0 +1,904 @@
+mod WHIPPLESCRIPT-KERNEL is
+  sorts
+    EffectId FactId RunId EventId RuleId GraphId
+    WorkflowId InstanceId PatternId ApplicationId OutputId FailureId InstanceStatus
+    ProgramVersion RevisionEpoch CancellationPolicy
+    Predicate EffectStatus TerminalStatus ProjectionStatus LeaseStatus GuardResult
+    AssertionId AssertionResult AgentTarget Path Presence Value Domain
+    Scalar QueryId QueryCardinality Expr ExprList Entry EntryList TerminalTag
+    ActionId CallId LocalBinding HBinding Cfg .
+
+  --- Sample identifiers used by hand-written model tests.
+  ops e1 e2 e3 : -> EffectId .
+  ops claimEff tellEff askEff coerceEff recordEff : -> EffectId .
+  ops issueFact workerFact claimFact turnFact : -> FactId .
+  ops coerceOkFact coerceBadFact : -> FactId .
+  ops run1 : -> RunId .
+  ops event1 initEvt turnCompletedEvt coerceCompletedEvt coerceFailedEvt : -> EventId .
+  ops ruleCommitEvt leaseExpiredEvt : -> EventId .
+  ops workflowCompletedEvt workflowFailedEvt : -> EventId .
+  op revisionActivatedEvt : -> EventId .
+  ops externalEventRule coerceRule : -> RuleId .
+  ops guardedRule agentRule : -> RuleId .
+  ops rootWorkflow reviewWorkflow : -> WorkflowId .
+  ops version1 version2 : -> ProgramVersion .
+  ops epoch0 epoch1 epoch2 : -> RevisionEpoch .
+  ops keep cancelQueued requestRunning : -> CancellationPolicy .
+  ops rootInstance childInstance : -> InstanceId .
+  op reviewPattern : -> PatternId .
+  op phaseReviewApplication : -> ApplicationId .
+  ops runTask loopAct : -> ActionId .
+  ops callOne callTwo callRec : -> CallId .
+  op routeRule : -> RuleId .
+  op turnLocal : -> LocalBinding .
+  op hbind : CallId LocalBinding -> HBinding .
+  ops reviewOutput reviewFailure : -> OutputId .
+  op blockedFailure : -> FailureId .
+  ops g1 g2 g3 : -> GraphId .
+  ops assertion1 : -> AssertionId .
+  ops codexAgent claudeAgent piAgent missingAgent : -> AgentTarget .
+  ops assigneePath providerPath : -> Path .
+  ops codexValue claudeValue invalidProviderValue : -> Value .
+  ops scalar1 scalar2 : -> Scalar .
+  ops query1 : -> QueryId .
+  op providerDomain : -> Domain .
+
+  --- Effect lifecycle states.
+  ops
+    queued
+    blocked
+    blockedByPolicy
+    blockedByCapacity
+    claimed
+    running
+    : -> EffectStatus .
+  subsort TerminalStatus < EffectStatus .
+  ops completed failed timedOut cancelled : -> TerminalStatus .
+
+  --- Projection and lease states.
+  ops pending projected : -> ProjectionStatus .
+  ops leaseActive leaseExpired : -> LeaseStatus .
+  ops instRunning instCompleted instFailed instCancelled : -> InstanceStatus .
+
+  --- Dependency predicates. These correspond to source-level
+  --- `after effect succeeds|fails|completes` edges.
+  ops succeeds fails completes : -> Predicate .
+
+  --- Expression-kernel abstraction.
+  ops gTrue gFalse gError : -> GuardResult .
+  ops aPass aFail aError : -> AssertionResult .
+  ops present missing : -> Presence .
+  ops qZero qOne qTwo qThree qMany qError : -> QueryCardinality .
+  ops boolTrue boolFalse exprError countZero countOne countTwo countThree countMany : -> Expr .
+  ops orderLow orderEqual orderHigh arrayEmpty objectEmpty mapEmpty : -> Expr .
+  ops terminalCompleted terminalFailed terminalTimedOut terminalCancelled : -> TerminalTag .
+
+  --- Runtime configuration as a multiset.
+  op none : -> Cfg .
+  op __ : Cfg Cfg -> Cfg [assoc comm id: none] .
+
+  --- Kernel projections.
+  op effect : EffectId EffectStatus -> Cfg .
+  op instance : InstanceId WorkflowId InstanceStatus -> Cfg .
+  op activeRevision : InstanceId ProgramVersion RevisionEpoch -> Cfg .
+  op nextEpoch : RevisionEpoch RevisionEpoch -> Cfg .
+  op activateRevision : InstanceId ProgramVersion ProgramVersion RevisionEpoch RevisionEpoch CancellationPolicy -> Cfg .
+  op revisionActivated : InstanceId ProgramVersion ProgramVersion RevisionEpoch CancellationPolicy -> Cfg .
+  op revisionCancellationPolicy : InstanceId ProgramVersion RevisionEpoch CancellationPolicy -> Cfg .
+  op dep : EffectId Predicate EffectId -> Cfg .
+  op fact : FactId -> Cfg .
+  op event : EventId -> Cfg .
+  op run : RunId EffectId -> Cfg .
+  op providerRun : EffectId -> Cfg .
+  op effectVersion : EffectId ProgramVersion RevisionEpoch -> Cfg .
+  op requestable : EffectId -> Cfg .
+  op cancellationRequested : EffectId -> Cfg .
+  op cancellationAcknowledged : EffectId -> Cfg .
+  op providerEvidence : EffectId TerminalStatus -> Cfg .
+  op requiredArtifactCaptureFailure : EffectId -> Cfg .
+  op correlates : EffectId FactId -> Cfg .
+  op projection : EventId FactId ProjectionStatus -> Cfg .
+  op completionProjection : EffectId TerminalStatus FactId ProjectionStatus -> Cfg .
+  op rule : RuleId FactId GraphId -> Cfg .
+  op scopedRule : InstanceId RuleId FactId GraphId -> Cfg .
+  op scopedRuleV : InstanceId ProgramVersion RevisionEpoch RuleId FactId GraphId -> Cfg .
+  op guard : RuleId FactId GuardResult -> Cfg .
+  op domainGuard : RuleId FactId Value Domain -> Cfg .
+  op domainMember : Value Domain -> Cfg .
+  op domainNonMember : Value Domain -> Cfg .
+  op patternBranch : RuleId FactId Value Domain GraphId -> Cfg .
+  op exhaustivePattern : RuleId FactId Value Domain -> Cfg .
+  op optionalSomeBranch : RuleId FactId Path GraphId -> Cfg .
+  op optionalNoneBranch : RuleId FactId Path GraphId -> Cfg .
+  op boundPresent : Path -> Cfg .
+  op ruleReady : RuleId FactId GraphId -> Cfg .
+  op ruleFired : RuleId FactId GraphId -> Cfg .
+  op scopedRuleFired : InstanceId RuleId FactId GraphId -> Cfg .
+  op graph : GraphId EffectId -> Cfg .
+  op graphV : GraphId ProgramVersion RevisionEpoch EffectId -> Cfg .
+  op graph2 : GraphId EffectId Predicate EffectId -> Cfg .
+  op graphAgent : GraphId EffectId AgentTarget -> Cfg .
+  op graphReady : GraphId -> Cfg .
+  op graphCommitted : GraphId -> Cfg .
+  op assertion : AssertionId AssertionResult -> Cfg .
+  op guardExpr : RuleId FactId Expr -> Cfg .
+  op assertionExpr : AssertionId Expr -> Cfg .
+  op scalar : Scalar -> Expr .
+  op query : QueryId QueryCardinality -> Expr .
+  op notExpr : Expr -> Expr .
+  op andExpr : Expr Expr -> Expr .
+  op orExpr : Expr Expr -> Expr .
+  op eqExpr : Expr Expr -> Expr .
+  op neExpr : Expr Expr -> Expr .
+  op countExpr : Expr -> Expr .
+  op existsExpr : Expr -> Expr .
+  op emptyExpr : Expr -> Expr .
+  op ltExpr : Expr Expr -> Expr .
+  op leExpr : Expr Expr -> Expr .
+  op gtExpr : Expr Expr -> Expr .
+  op geExpr : Expr Expr -> Expr .
+  op inExpr : Expr Expr -> Expr .
+  op arrayHas : Expr -> Expr .
+  op arrayMissing : Expr -> Expr .
+  op exprNil : -> ExprList .
+  op exprCons : Expr ExprList -> ExprList .
+  op entry : Expr Expr -> Entry .
+  op entryNil : -> EntryList .
+  op entryCons : Entry EntryList -> EntryList .
+  op arrayOf : ExprList -> Expr .
+  op mapOf : EntryList -> Expr .
+  op objectOf : EntryList -> Expr .
+  op countList : ExprList -> Expr .
+  op countEntries : EntryList -> Expr .
+  op inList : Expr ExprList -> Expr .
+  op inEntryKeys : Expr EntryList -> Expr .
+  op indexEntries : Expr EntryList -> Expr .
+  op mapHas : Expr Expr -> Expr .
+  op mapMissing : Expr -> Expr .
+  op objectHas : Expr Expr -> Expr .
+  op objectMissing : Expr -> Expr .
+  op indexExpr : Expr Expr -> Expr .
+  op queryFilter : QueryId Expr QueryCardinality -> Expr .
+  op terminalBranch : RuleId FactId TerminalTag TerminalTag GraphId -> Cfg .
+  op terminalBranchGuard : RuleId FactId TerminalTag TerminalTag Expr GraphId -> Cfg .
+  op exhaustiveTerminal : RuleId FactId TerminalTag TerminalTag -> Cfg .
+  op evalGuard : Expr -> GuardResult .
+  op evalAssertion : Expr -> AssertionResult .
+  op declaredAgent : AgentTarget -> Cfg .
+  op tellTarget : EffectId AgentTarget -> Cfg .
+  op path : Path Presence -> Cfg .
+  op readPath : Path -> Cfg .
+  op readOk : Path -> Cfg .
+  op diagnostic : RuleId -> Cfg .
+  op assertionDiagnostic : AssertionId -> Cfg .
+  op policyAllows : EffectId -> Cfg .
+  op capacityAvailable : EffectId -> Cfg .
+  op lease : EffectId LeaseStatus -> Cfg .
+  op retryAllowed : EffectId -> Cfg .
+  op retryUsed : EffectId -> Cfg .
+  op patternApp : PatternId ApplicationId RuleId FactId GraphId -> Cfg .
+  op patternElaborated : PatternId ApplicationId RuleId FactId GraphId -> Cfg .
+  op ruleProvenance : RuleId PatternId ApplicationId -> Cfg .
+  --- DR-0023 action-block expansion. An action call inlines its effect chain
+  --- into the calling rule body at compile time, the sibling of pattern
+  --- elaboration. acyclic marks an action the compiler proved non-recursive;
+  --- recursive marks one it rejected. boundEffect carries the inlined effect's
+  --- hygienic binding, keyed by call site so two calls never collide.
+  op actionCall : ActionId CallId RuleId -> Cfg .
+  op actionInlined : ActionId CallId RuleId -> Cfg .
+  op boundEffect : CallId HBinding -> Cfg .
+  op actionProvenance : RuleId ActionId CallId -> Cfg .
+  op acyclic : ActionId -> Cfg .
+  op recursive : ActionId -> Cfg .
+  op workflowOutput : WorkflowId OutputId -> Cfg .
+  op workflowFailure : WorkflowId FailureId -> Cfg .
+  op completeWorkflow : InstanceId OutputId FactId -> Cfg .
+  op failWorkflow : InstanceId FailureId FactId -> Cfg .
+  op terminalPayload : InstanceId FactId -> Cfg .
+  op invokeWorkflow : EffectId InstanceId WorkflowId InstanceId -> Cfg .
+  op childOf : InstanceId EffectId -> Cfg .
+  op invocationOutput : EffectId FactId -> Cfg .
+  op invocationFailure : EffectId FactId -> Cfg .
+  op invocationCancellation : EffectId -> Cfg .
+
+  vars U D E : EffectId .
+  vars F : FactId .
+  vars I CI : InstanceId .
+  vars W : WorkflowId .
+  vars PV PV2 : ProgramVersion .
+  vars Ep Ep2 : RevisionEpoch .
+  vars CP : CancellationPolicy .
+  vars Pat : PatternId .
+  vars App : ApplicationId .
+  vars O : OutputId .
+  vars Fail : FailureId .
+  vars Ev : EventId .
+  vars R : RuleId .
+  vars G : GraphId .
+  vars Act : ActionId .
+  vars Call : CallId .
+  vars LB : LocalBinding .
+  vars A : AssertionId .
+  vars T : AgentTarget .
+  vars X : Path .
+  vars V : Value .
+  vars Dm : Domain .
+  vars P : Predicate .
+  var TS : TerminalStatus .
+  vars Sc : Scalar .
+  vars Q : QueryId .
+  var C : QueryCardinality .
+  vars Ex Ex1 Ex2 Ex3 : Expr .
+  var EL : ExprList .
+  vars EN EN2 EN3 EN4 : Entry .
+  var KL : EntryList .
+  vars Tag Tag2 : TerminalTag .
+  vars Rest Rest2 : Cfg .
+
+  --- Deterministic expression-kernel subset used by generated per-program
+  --- checks. Generated models lower guards/assertions into these terms instead
+  --- of asserting symbolic true/false/error outcomes directly.
+  eq countExpr(query(Q, qZero)) = countZero .
+  eq countExpr(query(Q, qOne)) = countOne .
+  eq countExpr(query(Q, qTwo)) = countTwo .
+  eq countExpr(query(Q, qThree)) = countThree .
+  eq countExpr(query(Q, qMany)) = countMany .
+  eq countExpr(query(Q, qError)) = exprError .
+  eq countExpr(queryFilter(Q, boolTrue, qZero)) = countZero .
+  eq countExpr(queryFilter(Q, boolTrue, qOne)) = countOne .
+  eq countExpr(queryFilter(Q, boolTrue, qTwo)) = countTwo .
+  eq countExpr(queryFilter(Q, boolTrue, qThree)) = countThree .
+  eq countExpr(queryFilter(Q, boolTrue, qMany)) = countMany .
+  eq countExpr(queryFilter(Q, boolTrue, qError)) = exprError .
+  eq countExpr(queryFilter(Q, boolFalse, C)) = countZero .
+  eq countExpr(queryFilter(Q, exprError, C)) = exprError .
+  eq countExpr(arrayEmpty) = countZero .
+  eq countExpr(arrayHas(Ex)) = countOne .
+  eq countExpr(arrayMissing(Ex)) = countZero .
+  eq countExpr(arrayOf(EL)) = countList(EL) .
+  eq countExpr(mapEmpty) = countZero .
+  eq countExpr(mapHas(Ex1, Ex2)) = countOne .
+  eq countExpr(mapMissing(Ex)) = countZero .
+  eq countExpr(mapOf(KL)) = countEntries(KL) .
+  eq countExpr(objectEmpty) = countZero .
+  eq countExpr(objectHas(Ex1, Ex2)) = countOne .
+  eq countExpr(objectMissing(Ex)) = countZero .
+  eq countExpr(objectOf(KL)) = countEntries(KL) .
+  eq countList(exprNil) = countZero .
+  eq countList(exprCons(Ex, exprNil)) = countOne .
+  eq countList(exprCons(Ex, exprCons(Ex1, exprNil))) = countTwo .
+  eq countList(exprCons(Ex, exprCons(Ex1, exprCons(Ex2, exprNil)))) = countThree .
+  eq countList(exprCons(Ex, exprCons(Ex1, exprCons(Ex2, exprCons(Ex3, EL))))) = countMany .
+  eq countEntries(entryNil) = countZero .
+  eq countEntries(entryCons(EN, entryNil)) = countOne .
+  eq countEntries(entryCons(EN, entryCons(EN2, entryNil))) = countTwo .
+  eq countEntries(entryCons(EN, entryCons(EN2, entryCons(EN3, entryNil)))) = countThree .
+  eq countEntries(entryCons(EN, entryCons(EN2, entryCons(EN3, entryCons(EN4, KL))))) = countMany .
+  eq existsExpr(query(Q, qZero)) = boolFalse .
+  eq existsExpr(query(Q, qOne)) = boolTrue .
+  eq existsExpr(query(Q, qTwo)) = boolTrue .
+  eq existsExpr(query(Q, qThree)) = boolTrue .
+  eq existsExpr(query(Q, qMany)) = boolTrue .
+  eq existsExpr(query(Q, qError)) = exprError .
+  eq existsExpr(queryFilter(Q, boolTrue, qZero)) = boolFalse .
+  eq existsExpr(queryFilter(Q, boolTrue, qOne)) = boolTrue .
+  eq existsExpr(queryFilter(Q, boolTrue, qTwo)) = boolTrue .
+  eq existsExpr(queryFilter(Q, boolTrue, qThree)) = boolTrue .
+  eq existsExpr(queryFilter(Q, boolTrue, qMany)) = boolTrue .
+  eq existsExpr(queryFilter(Q, boolTrue, qError)) = exprError .
+  eq existsExpr(queryFilter(Q, boolFalse, C)) = boolFalse .
+  eq existsExpr(queryFilter(Q, exprError, C)) = exprError .
+  eq existsExpr(arrayEmpty) = boolFalse .
+  eq existsExpr(arrayHas(Ex)) = boolTrue .
+  eq existsExpr(arrayMissing(Ex)) = boolFalse .
+  eq existsExpr(arrayOf(EL)) = notExpr(eqExpr(countList(EL), countZero)) .
+  eq existsExpr(mapEmpty) = boolFalse .
+  eq existsExpr(mapHas(Ex1, Ex2)) = boolTrue .
+  eq existsExpr(mapMissing(Ex)) = boolFalse .
+  eq existsExpr(mapOf(KL)) = notExpr(eqExpr(countEntries(KL), countZero)) .
+  eq existsExpr(objectEmpty) = boolFalse .
+  eq existsExpr(objectHas(Ex1, Ex2)) = boolTrue .
+  eq existsExpr(objectMissing(Ex)) = boolFalse .
+  eq existsExpr(objectOf(KL)) = notExpr(eqExpr(countEntries(KL), countZero)) .
+  eq emptyExpr(query(Q, qZero)) = boolTrue .
+  eq emptyExpr(query(Q, qOne)) = boolFalse .
+  eq emptyExpr(query(Q, qTwo)) = boolFalse .
+  eq emptyExpr(query(Q, qThree)) = boolFalse .
+  eq emptyExpr(query(Q, qMany)) = boolFalse .
+  eq emptyExpr(query(Q, qError)) = exprError .
+  eq emptyExpr(queryFilter(Q, boolTrue, qZero)) = boolTrue .
+  eq emptyExpr(queryFilter(Q, boolTrue, qOne)) = boolFalse .
+  eq emptyExpr(queryFilter(Q, boolTrue, qTwo)) = boolFalse .
+  eq emptyExpr(queryFilter(Q, boolTrue, qThree)) = boolFalse .
+  eq emptyExpr(queryFilter(Q, boolTrue, qMany)) = boolFalse .
+  eq emptyExpr(queryFilter(Q, boolTrue, qError)) = exprError .
+  eq emptyExpr(queryFilter(Q, boolFalse, C)) = boolTrue .
+  eq emptyExpr(queryFilter(Q, exprError, C)) = exprError .
+  eq emptyExpr(arrayEmpty) = boolTrue .
+  eq emptyExpr(arrayHas(Ex)) = boolFalse .
+  eq emptyExpr(arrayMissing(Ex)) = boolTrue .
+  eq emptyExpr(arrayOf(EL)) = eqExpr(countList(EL), countZero) .
+  eq emptyExpr(mapEmpty) = boolTrue .
+  eq emptyExpr(mapHas(Ex1, Ex2)) = boolFalse .
+  eq emptyExpr(mapMissing(Ex)) = boolTrue .
+  eq emptyExpr(mapOf(KL)) = eqExpr(countEntries(KL), countZero) .
+  eq emptyExpr(objectEmpty) = boolTrue .
+  eq emptyExpr(objectHas(Ex1, Ex2)) = boolFalse .
+  eq emptyExpr(objectMissing(Ex)) = boolTrue .
+  eq emptyExpr(objectOf(KL)) = eqExpr(countEntries(KL), countZero) .
+  eq notExpr(boolTrue) = boolFalse .
+  eq notExpr(boolFalse) = boolTrue .
+  eq notExpr(exprError) = exprError .
+  eq andExpr(boolFalse, Ex) = boolFalse .
+  eq andExpr(boolTrue, Ex) = Ex .
+  eq andExpr(exprError, Ex) = exprError .
+  eq orExpr(boolTrue, Ex) = boolTrue .
+  eq orExpr(boolFalse, Ex) = Ex .
+  eq orExpr(exprError, Ex) = exprError .
+  eq eqExpr(scalar(Sc), scalar(Sc)) = boolTrue .
+  eq eqExpr(scalar(scalar1), scalar(scalar2)) = boolFalse .
+  eq eqExpr(scalar(scalar2), scalar(scalar1)) = boolFalse .
+  eq neExpr(scalar(Sc), scalar(Sc)) = boolFalse .
+  eq neExpr(scalar(scalar1), scalar(scalar2)) = boolTrue .
+  eq neExpr(scalar(scalar2), scalar(scalar1)) = boolTrue .
+  eq eqExpr(boolTrue, boolTrue) = boolTrue .
+  eq eqExpr(boolTrue, boolFalse) = boolFalse .
+  eq eqExpr(boolFalse, boolTrue) = boolFalse .
+  eq eqExpr(boolFalse, boolFalse) = boolTrue .
+  eq neExpr(boolTrue, boolTrue) = boolFalse .
+  eq neExpr(boolTrue, boolFalse) = boolTrue .
+  eq neExpr(boolFalse, boolTrue) = boolTrue .
+  eq neExpr(boolFalse, boolFalse) = boolFalse .
+  eq eqExpr(countZero, countZero) = boolTrue .
+  eq eqExpr(countZero, countOne) = boolFalse .
+  eq eqExpr(countZero, countTwo) = boolFalse .
+  eq eqExpr(countZero, countThree) = boolFalse .
+  eq eqExpr(countZero, countMany) = boolFalse .
+  eq eqExpr(countOne, countZero) = boolFalse .
+  eq eqExpr(countOne, countOne) = boolTrue .
+  eq eqExpr(countOne, countTwo) = boolFalse .
+  eq eqExpr(countOne, countThree) = boolFalse .
+  eq eqExpr(countTwo, countZero) = boolFalse .
+  eq eqExpr(countTwo, countOne) = boolFalse .
+  eq eqExpr(countTwo, countTwo) = boolTrue .
+  eq eqExpr(countTwo, countThree) = boolFalse .
+  eq eqExpr(countTwo, countMany) = boolFalse .
+  eq eqExpr(countThree, countZero) = boolFalse .
+  eq eqExpr(countThree, countOne) = boolFalse .
+  eq eqExpr(countThree, countTwo) = boolFalse .
+  eq eqExpr(countThree, countThree) = boolTrue .
+  eq eqExpr(countThree, countMany) = boolFalse .
+  eq eqExpr(countMany, countMany) = boolTrue .
+  eq eqExpr(countOne, countMany) = boolFalse .
+  eq eqExpr(countMany, countOne) = boolFalse .
+  eq eqExpr(countMany, countZero) = boolFalse .
+  eq eqExpr(countMany, countTwo) = boolFalse .
+  eq eqExpr(countMany, countThree) = boolFalse .
+  eq neExpr(countZero, countZero) = boolFalse .
+  eq neExpr(countZero, countOne) = boolTrue .
+  eq neExpr(countZero, countTwo) = boolTrue .
+  eq neExpr(countZero, countThree) = boolTrue .
+  eq neExpr(countZero, countMany) = boolTrue .
+  eq neExpr(countOne, countZero) = boolTrue .
+  eq neExpr(countOne, countOne) = boolFalse .
+  eq neExpr(countOne, countTwo) = boolTrue .
+  eq neExpr(countOne, countThree) = boolTrue .
+  eq neExpr(countTwo, countZero) = boolTrue .
+  eq neExpr(countTwo, countOne) = boolTrue .
+  eq neExpr(countTwo, countTwo) = boolFalse .
+  eq neExpr(countTwo, countThree) = boolTrue .
+  eq neExpr(countTwo, countMany) = boolTrue .
+  eq neExpr(countThree, countZero) = boolTrue .
+  eq neExpr(countThree, countOne) = boolTrue .
+  eq neExpr(countThree, countTwo) = boolTrue .
+  eq neExpr(countThree, countThree) = boolFalse .
+  eq neExpr(countThree, countMany) = boolTrue .
+  eq neExpr(countMany, countMany) = boolFalse .
+  eq neExpr(countOne, countMany) = boolTrue .
+  eq neExpr(countMany, countOne) = boolTrue .
+  eq neExpr(countMany, countZero) = boolTrue .
+  eq neExpr(countMany, countTwo) = boolTrue .
+  eq neExpr(countMany, countThree) = boolTrue .
+  eq ltExpr(orderLow, orderHigh) = boolTrue .
+  eq ltExpr(orderLow, orderEqual) = boolTrue .
+  eq ltExpr(orderEqual, orderHigh) = boolTrue .
+  eq ltExpr(orderLow, orderLow) = boolFalse .
+  eq ltExpr(orderEqual, orderEqual) = boolFalse .
+  eq ltExpr(orderHigh, orderLow) = boolFalse .
+  eq ltExpr(countZero, countOne) = boolTrue .
+  eq ltExpr(countZero, countTwo) = boolTrue .
+  eq ltExpr(countZero, countThree) = boolTrue .
+  eq ltExpr(countZero, countMany) = boolTrue .
+  eq ltExpr(countOne, countMany) = boolTrue .
+  eq ltExpr(countOne, countTwo) = boolTrue .
+  eq ltExpr(countOne, countThree) = boolTrue .
+  eq ltExpr(countTwo, countThree) = boolTrue .
+  eq ltExpr(countTwo, countMany) = boolTrue .
+  eq ltExpr(countThree, countMany) = boolTrue .
+  eq ltExpr(countZero, countZero) = boolFalse .
+  eq ltExpr(countOne, countOne) = boolFalse .
+  eq ltExpr(countTwo, countTwo) = boolFalse .
+  eq ltExpr(countThree, countThree) = boolFalse .
+  eq ltExpr(countMany, countMany) = boolFalse .
+  eq ltExpr(countOne, countZero) = boolFalse .
+  eq ltExpr(countTwo, countZero) = boolFalse .
+  eq ltExpr(countTwo, countOne) = boolFalse .
+  eq ltExpr(countThree, countZero) = boolFalse .
+  eq ltExpr(countThree, countOne) = boolFalse .
+  eq ltExpr(countThree, countTwo) = boolFalse .
+  eq ltExpr(countMany, countZero) = boolFalse .
+  eq ltExpr(countMany, countOne) = boolFalse .
+  eq ltExpr(countMany, countTwo) = boolFalse .
+  eq ltExpr(countMany, countThree) = boolFalse .
+  eq ltExpr(exprError, Ex) = exprError .
+  eq ltExpr(Ex, exprError) = exprError .
+  eq leExpr(orderLow, orderHigh) = boolTrue .
+  eq leExpr(orderLow, orderEqual) = boolTrue .
+  eq leExpr(orderEqual, orderHigh) = boolTrue .
+  eq leExpr(orderLow, orderLow) = boolTrue .
+  eq leExpr(orderEqual, orderEqual) = boolTrue .
+  eq leExpr(orderHigh, orderLow) = boolFalse .
+  eq leExpr(countZero, countZero) = boolTrue .
+  eq leExpr(countZero, countOne) = boolTrue .
+  eq leExpr(countZero, countTwo) = boolTrue .
+  eq leExpr(countZero, countThree) = boolTrue .
+  eq leExpr(countZero, countMany) = boolTrue .
+  eq leExpr(countOne, countOne) = boolTrue .
+  eq leExpr(countOne, countTwo) = boolTrue .
+  eq leExpr(countOne, countThree) = boolTrue .
+  eq leExpr(countOne, countMany) = boolTrue .
+  eq leExpr(countTwo, countTwo) = boolTrue .
+  eq leExpr(countTwo, countThree) = boolTrue .
+  eq leExpr(countTwo, countMany) = boolTrue .
+  eq leExpr(countThree, countThree) = boolTrue .
+  eq leExpr(countThree, countMany) = boolTrue .
+  eq leExpr(countMany, countMany) = boolTrue .
+  eq leExpr(countOne, countZero) = boolFalse .
+  eq leExpr(countTwo, countZero) = boolFalse .
+  eq leExpr(countTwo, countOne) = boolFalse .
+  eq leExpr(countThree, countZero) = boolFalse .
+  eq leExpr(countThree, countOne) = boolFalse .
+  eq leExpr(countThree, countTwo) = boolFalse .
+  eq leExpr(countMany, countZero) = boolFalse .
+  eq leExpr(countMany, countOne) = boolFalse .
+  eq leExpr(countMany, countTwo) = boolFalse .
+  eq leExpr(countMany, countThree) = boolFalse .
+  eq leExpr(exprError, Ex) = exprError .
+  eq leExpr(Ex, exprError) = exprError .
+  eq gtExpr(orderHigh, orderLow) = boolTrue .
+  eq gtExpr(orderHigh, orderEqual) = boolTrue .
+  eq gtExpr(orderEqual, orderLow) = boolTrue .
+  eq gtExpr(orderHigh, orderHigh) = boolFalse .
+  eq gtExpr(orderEqual, orderEqual) = boolFalse .
+  eq gtExpr(orderLow, orderHigh) = boolFalse .
+  eq gtExpr(countOne, countZero) = boolTrue .
+  eq gtExpr(countTwo, countZero) = boolTrue .
+  eq gtExpr(countTwo, countOne) = boolTrue .
+  eq gtExpr(countThree, countZero) = boolTrue .
+  eq gtExpr(countThree, countOne) = boolTrue .
+  eq gtExpr(countThree, countTwo) = boolTrue .
+  eq gtExpr(countMany, countZero) = boolTrue .
+  eq gtExpr(countMany, countOne) = boolTrue .
+  eq gtExpr(countMany, countTwo) = boolTrue .
+  eq gtExpr(countMany, countThree) = boolTrue .
+  eq gtExpr(countZero, countZero) = boolFalse .
+  eq gtExpr(countOne, countOne) = boolFalse .
+  eq gtExpr(countTwo, countTwo) = boolFalse .
+  eq gtExpr(countThree, countThree) = boolFalse .
+  eq gtExpr(countMany, countMany) = boolFalse .
+  eq gtExpr(countZero, countOne) = boolFalse .
+  eq gtExpr(countZero, countTwo) = boolFalse .
+  eq gtExpr(countZero, countThree) = boolFalse .
+  eq gtExpr(countZero, countMany) = boolFalse .
+  eq gtExpr(countOne, countTwo) = boolFalse .
+  eq gtExpr(countOne, countThree) = boolFalse .
+  eq gtExpr(countOne, countMany) = boolFalse .
+  eq gtExpr(countTwo, countThree) = boolFalse .
+  eq gtExpr(countTwo, countMany) = boolFalse .
+  eq gtExpr(countThree, countMany) = boolFalse .
+  eq gtExpr(exprError, Ex) = exprError .
+  eq gtExpr(Ex, exprError) = exprError .
+  eq geExpr(orderHigh, orderLow) = boolTrue .
+  eq geExpr(orderHigh, orderEqual) = boolTrue .
+  eq geExpr(orderEqual, orderLow) = boolTrue .
+  eq geExpr(orderHigh, orderHigh) = boolTrue .
+  eq geExpr(orderEqual, orderEqual) = boolTrue .
+  eq geExpr(orderLow, orderHigh) = boolFalse .
+  eq geExpr(countZero, countZero) = boolTrue .
+  eq geExpr(countOne, countZero) = boolTrue .
+  eq geExpr(countOne, countOne) = boolTrue .
+  eq geExpr(countTwo, countZero) = boolTrue .
+  eq geExpr(countTwo, countOne) = boolTrue .
+  eq geExpr(countTwo, countTwo) = boolTrue .
+  eq geExpr(countThree, countZero) = boolTrue .
+  eq geExpr(countThree, countOne) = boolTrue .
+  eq geExpr(countThree, countTwo) = boolTrue .
+  eq geExpr(countThree, countThree) = boolTrue .
+  eq geExpr(countMany, countZero) = boolTrue .
+  eq geExpr(countMany, countOne) = boolTrue .
+  eq geExpr(countMany, countTwo) = boolTrue .
+  eq geExpr(countMany, countThree) = boolTrue .
+  eq geExpr(countMany, countMany) = boolTrue .
+  eq geExpr(countZero, countOne) = boolFalse .
+  eq geExpr(countZero, countTwo) = boolFalse .
+  eq geExpr(countZero, countThree) = boolFalse .
+  eq geExpr(countZero, countMany) = boolFalse .
+  eq geExpr(countOne, countTwo) = boolFalse .
+  eq geExpr(countOne, countThree) = boolFalse .
+  eq geExpr(countOne, countMany) = boolFalse .
+  eq geExpr(countTwo, countThree) = boolFalse .
+  eq geExpr(countTwo, countMany) = boolFalse .
+  eq geExpr(countThree, countMany) = boolFalse .
+  eq geExpr(exprError, Ex) = exprError .
+  eq geExpr(Ex, exprError) = exprError .
+  eq inExpr(Ex, arrayHas(Ex)) = boolTrue .
+  eq inExpr(Ex, arrayMissing(Ex)) = boolFalse .
+  eq inExpr(Ex, arrayOf(EL)) = inList(Ex, EL) .
+  eq inList(Ex, exprNil) = boolFalse .
+  eq inList(Ex, exprCons(Ex, EL)) = boolTrue .
+  eq inList(Ex, exprCons(Ex1, EL)) = inList(Ex, EL) [owise] .
+  eq inExpr(Ex, mapHas(Ex, Ex1)) = boolTrue .
+  eq inExpr(Ex, mapMissing(Ex)) = boolFalse .
+  eq inExpr(Ex, mapOf(KL)) = inEntryKeys(Ex, KL) .
+  eq inExpr(Ex, objectHas(Ex, Ex1)) = boolTrue .
+  eq inExpr(Ex, objectMissing(Ex)) = boolFalse .
+  eq inExpr(Ex, objectOf(KL)) = inEntryKeys(Ex, KL) .
+  eq inEntryKeys(Ex, entryNil) = boolFalse .
+  eq inEntryKeys(Ex, entryCons(entry(Ex, Ex1), KL)) = boolTrue .
+  eq inEntryKeys(Ex, entryCons(entry(Ex1, Ex2), KL)) = inEntryKeys(Ex, KL) [owise] .
+  eq inExpr(Ex, arrayEmpty) = boolFalse .
+  eq inExpr(Ex, mapEmpty) = boolFalse .
+  eq inExpr(Ex, objectEmpty) = boolFalse .
+  eq inExpr(exprError, Ex) = exprError .
+  eq inExpr(Ex, exprError) = exprError .
+  eq indexExpr(mapHas(Ex1, Ex2), Ex1) = Ex2 .
+  eq indexExpr(mapMissing(Ex1), Ex1) = exprError .
+  eq indexExpr(mapOf(KL), Ex) = indexEntries(Ex, KL) .
+  eq indexExpr(objectHas(Ex1, Ex2), Ex1) = Ex2 .
+  eq indexExpr(objectMissing(Ex1), Ex1) = exprError .
+  eq indexExpr(objectOf(KL), Ex) = indexEntries(Ex, KL) .
+  eq indexEntries(Ex, entryNil) = exprError .
+  eq indexEntries(Ex, entryCons(entry(Ex, Ex1), KL)) = Ex1 .
+  eq indexEntries(Ex, entryCons(entry(Ex1, Ex2), KL)) = indexEntries(Ex, KL) [owise] .
+  eq indexExpr(exprError, Ex) = exprError .
+  eq indexExpr(Ex, exprError) = exprError .
+  eq evalGuard(boolTrue) = gTrue .
+  eq evalGuard(boolFalse) = gFalse .
+  eq evalGuard(exprError) = gError .
+  eq evalAssertion(boolTrue) = aPass .
+  eq evalAssertion(boolFalse) = aFail .
+  eq evalAssertion(exprError) = aError .
+
+  --- Event-log projection into typed facts.
+  rl [derive-fact] :
+    event(Ev) projection(Ev, F, pending)
+    => event(Ev) projection(Ev, F, projected) fact(F) .
+
+  --- Effect completion projection into typed lifecycle/domain facts.
+  rl [derive-completion-fact] :
+    effect(E, TS) completionProjection(E, TS, F, pending)
+    => effect(E, TS) completionProjection(E, TS, F, projected) fact(F) .
+
+  --- Pattern applications are compile-time source elaboration. The runtime
+  --- kernel only sees the generated first-order rule plus provenance; no
+  --- instance, event, or effect is created by applying a pattern.
+  rl [elaborate-pattern] :
+    patternApp(Pat, App, R, F, G)
+    => patternElaborated(Pat, App, R, F, G) rule(R, F, G) ruleProvenance(R, Pat, App) .
+
+  --- Action calls are compile-time inlining, the sibling of pattern
+  --- elaboration. A call inlines only for an action the compiler proved
+  --- acyclic; the inlined effect gets a hygienic binding keyed by its call
+  --- site, so two calls in one rule body cannot collide. The acyclic marker
+  --- is preserved so every call of the same action inlines. No instance,
+  --- event, or provider run happens during inlining.
+  rl [inline-action-call] :
+    acyclic(Act) actionCall(Act, Call, R)
+    => acyclic(Act)
+       actionInlined(Act, Call, R)
+       boundEffect(Call, hbind(Call, turnLocal))
+       actionProvenance(R, Act, Call) .
+
+  --- Rules are one-shot rewrites over facts. The graph is committed later by
+  --- the kernel; provider execution never happens during rule firing.
+  rl [guard-true-ready] :
+    fact(F) rule(R, F, G) guard(R, F, gTrue)
+    => fact(F) rule(R, F, G) ruleReady(R, F, G) .
+
+  rl [guard-error-diagnostic] :
+    fact(F) rule(R, F, G) guard(R, F, gError)
+    => fact(F) rule(R, F, G) diagnostic(R) .
+
+  crl [guard-expr-true-ready] :
+    fact(F) rule(R, F, G) guardExpr(R, F, Ex)
+    => fact(F) rule(R, F, G) ruleReady(R, F, G)
+    if evalGuard(Ex) == gTrue .
+
+  crl [guard-expr-error-diagnostic] :
+    fact(F) rule(R, F, G) guardExpr(R, F, Ex)
+    => fact(F) rule(R, F, G) diagnostic(R)
+    if evalGuard(Ex) == gError .
+
+  rl [domain-guard-true] :
+    fact(F) domainGuard(R, F, V, Dm) domainMember(V, Dm)
+    => fact(F) guard(R, F, gTrue) domainMember(V, Dm) .
+
+  --- Typed finite-domain pattern branches are rule-readiness gates. A branch
+  --- can fire only when the matched value belongs to the branch's enum/literal
+  --- domain. Non-matching branches do not produce diagnostics by themselves.
+  rl [pattern-branch-match] :
+    fact(F) patternBranch(R, F, V, Dm, G) domainMember(V, Dm)
+    => fact(F) ruleReady(R, F, G) domainMember(V, Dm) .
+
+  --- Exhaustive matches over finite domains may produce a diagnostic when the
+  --- value is outside every covered branch. This models compiler/runtime
+  --- evidence for missing enum/literal cases without committing a graph.
+  rl [exhaustive-pattern-miss] :
+    fact(F) exhaustivePattern(R, F, V, Dm) domainNonMember(V, Dm)
+    => fact(F) diagnostic(R) domainNonMember(V, Dm) .
+
+  --- Optional/non-null pattern branches bind a proven-present value. The bound
+  --- path can then be read without treating Missing as Null.
+  rl [optional-some-branch] :
+    fact(F) optionalSomeBranch(R, F, X, G) path(X, present)
+    => fact(F) ruleReady(R, F, G) path(X, present) boundPresent(X) .
+
+  rl [optional-none-branch] :
+    fact(F) optionalNoneBranch(R, F, X, G) path(X, missing)
+    => fact(F) ruleReady(R, F, G) path(X, missing) .
+
+  --- Terminal-output union branches are finite-domain gates over effect
+  --- terminal tags. The tag must match before the branch graph can commit; an
+  --- optional branch guard is evaluated after tag refinement.
+  rl [terminal-branch-match] :
+    fact(F) terminalBranch(R, F, Tag, Tag, G)
+    => fact(F) ruleReady(R, F, G) .
+
+  crl [terminal-branch-guard-match] :
+    fact(F) terminalBranchGuard(R, F, Tag, Tag, Ex, G)
+    => fact(F) ruleReady(R, F, G)
+    if evalGuard(Ex) == gTrue .
+
+  crl [terminal-branch-guard-error] :
+    fact(F) terminalBranchGuard(R, F, Tag, Tag, Ex, G)
+    => fact(F) diagnostic(R)
+    if evalGuard(Ex) == gError .
+
+  rl [exhaustive-terminal-miss] :
+    fact(F) exhaustiveTerminal(R, F, Tag, Tag2)
+    => fact(F) diagnostic(R) .
+
+  rl [fire-rule] :
+    fact(F) rule(R, F, G) ruleReady(R, F, G)
+    => fact(F) rule(R, F, G) ruleFired(R, F, G) graphReady(G) event(ruleCommitEvt) .
+
+  --- Instance-scoped rules can fire only while their workflow instance is
+  --- running. Terminal workflow instances do not commit additional effectful
+  --- rewrites.
+  rl [fire-scoped-rule] :
+    instance(I, W, instRunning) fact(F) scopedRule(I, R, F, G) ruleReady(R, F, G)
+    => instance(I, W, instRunning) fact(F) scopedRule(I, R, F, G)
+       scopedRuleFired(I, R, F, G) graphReady(G) event(ruleCommitEvt) .
+
+  --- Version-scoped rules can fire only when the instance is still on the
+  --- active program version and revision epoch used during rule evaluation.
+  --- After a revision activates, stale old-version rules have no matching
+  --- activeRevision term and therefore cannot create new effects.
+  rl [fire-versioned-scoped-rule] :
+    instance(I, W, instRunning) activeRevision(I, PV, Ep)
+    fact(F) scopedRuleV(I, PV, Ep, R, F, G) ruleReady(R, F, G)
+    => instance(I, W, instRunning) activeRevision(I, PV, Ep)
+       fact(F) scopedRuleV(I, PV, Ep, R, F, G)
+       scopedRuleFired(I, R, F, G) graphReady(G) event(ruleCommitEvt) .
+
+  --- Workflow completion is explicit and terminal. A `complete` or `fail`
+  --- action must name a declared output/failure contract for the current
+  --- workflow. The terminal payload is projected for parent invocation
+  --- resolution without exposing child-local facts.
+  rl [complete-workflow] :
+    instance(I, W, instRunning) workflowOutput(W, O) completeWorkflow(I, O, F) fact(F)
+    => instance(I, W, instCompleted) workflowOutput(W, O) terminalPayload(I, F)
+       fact(F) event(workflowCompletedEvt) .
+
+  rl [fail-workflow] :
+    instance(I, W, instRunning) workflowFailure(W, Fail) failWorkflow(I, Fail, F) fact(F)
+    => instance(I, W, instFailed) workflowFailure(W, Fail) terminalPayload(I, F)
+       fact(F) event(workflowFailedEvt) .
+
+  --- Assertions are read-only checks over projected state.
+  rl [assertion-fail-diagnostic] :
+    assertion(A, aFail)
+    => assertionDiagnostic(A) .
+
+  rl [assertion-error-diagnostic] :
+    assertion(A, aError)
+    => assertionDiagnostic(A) .
+
+  crl [assertion-expr-fail-diagnostic] :
+    assertionExpr(A, Ex)
+    => assertionDiagnostic(A)
+    if evalAssertion(Ex) == aFail .
+
+  crl [assertion-expr-error-diagnostic] :
+    assertionExpr(A, Ex)
+    => assertionDiagnostic(A)
+    if evalAssertion(Ex) == aError .
+
+  --- Optional path reads are allowed only when presence is known.
+  rl [read-present-path] :
+    path(X, present) readPath(X)
+    => path(X, present) readOk(X) .
+
+  rl [read-bound-present-path] :
+    boundPresent(X) readPath(X)
+    => boundPresent(X) readOk(X) .
+
+  --- Effect graph commits create durable outbox nodes and dependency edges.
+  rl [commit-single-effect-graph] :
+    graph(G, U) graphReady(G)
+    => graphCommitted(G) effect(U, queued) .
+
+  rl [commit-versioned-effect-graph] :
+    graphV(G, PV, Ep, U) graphReady(G)
+    => graphCommitted(G) effect(U, queued) effectVersion(U, PV, Ep) .
+
+  rl [commit-dependent-effect-graph] :
+    graph2(G, U, P, D) graphReady(G)
+    => graphCommitted(G) effect(U, queued) dep(U, P, D) effect(D, blocked) .
+
+  rl [commit-agent-effect-graph] :
+    graphAgent(G, U, T) graphReady(G) declaredAgent(T)
+    => graphCommitted(G) effect(U, queued) tellTarget(U, T) declaredAgent(T) .
+
+  --- Invoking a workflow is runtime composition. It creates a child instance
+  --- behind an invocation effect; it does not inline the child rules into the
+  --- parent. The invocation effect resolves only when the child reaches an
+  --- explicit terminal workflow event.
+  rl [start-workflow-invocation] :
+    effect(E, running) invokeWorkflow(E, I, W, CI)
+    => effect(E, running) instance(CI, W, instRunning) childOf(CI, E) .
+
+  rl [complete-workflow-invocation] :
+    effect(E, running) childOf(CI, E) instance(CI, W, instCompleted) terminalPayload(CI, F)
+    => effect(E, completed) childOf(CI, E) instance(CI, W, instCompleted)
+       terminalPayload(CI, F) invocationOutput(E, F) .
+
+  rl [fail-workflow-invocation] :
+    effect(E, running) childOf(CI, E) instance(CI, W, instFailed) terminalPayload(CI, F)
+    => effect(E, failed) childOf(CI, E) instance(CI, W, instFailed)
+       terminalPayload(CI, F) invocationFailure(E, F) .
+
+  rl [cancel-workflow-invocation] :
+    effect(E, running) childOf(CI, E) instance(CI, W, instCancelled)
+    => effect(E, cancelled) childOf(CI, E) instance(CI, W, instCancelled)
+       invocationCancellation(E) .
+
+  --- A queued effect can be claimed and then started by an external worker.
+  rl [claim-effect] : effect(E, queued) => effect(E, claimed) .
+  rl [start-run] : effect(E, claimed) => effect(E, running) .
+
+  --- Terminal provider outcomes are recorded by the kernel from worker
+  --- completion events. Invocation effects do not receive providerRun markers;
+  --- they resolve only from child workflow terminal state above.
+  rl [complete-run] : effect(E, running) providerRun(E) => effect(E, completed) providerRun(E) .
+  rl [fail-run] : effect(E, running) providerRun(E) => effect(E, failed) providerRun(E) .
+  rl [timeout-run] : effect(E, running) providerRun(E) => effect(E, timedOut) providerRun(E) .
+  rl [recover-provider-terminal] :
+    effect(E, running) providerRun(E) providerEvidence(E, TS)
+    => effect(E, TS) providerRun(E) providerEvidence(E, TS) .
+  rl [required-artifact-capture-failure] :
+    effect(E, running) providerRun(E) requiredArtifactCaptureFailure(E)
+    => effect(E, failed) providerRun(E) requiredArtifactCaptureFailure(E) .
+
+  --- Cancellation is available before an effect starts running.
+  rl [cancel-queued] : effect(E, queued) => effect(E, cancelled) .
+  rl [cancel-blocked] : effect(E, blocked) => effect(E, cancelled) .
+  rl [cancel-claimed] : effect(E, claimed) => effect(E, cancelled) .
+
+  --- Revision activation is an explicit control-plane transition, not a source
+  --- rule. It advances the active revision for a running instance and records
+  --- the policy that will later be applied to old-version effects.
+  rl [activate-revision] :
+    instance(I, W, instRunning) activeRevision(I, PV, Ep)
+    nextEpoch(Ep, Ep2) activateRevision(I, PV, PV2, Ep, Ep2, CP)
+    => instance(I, W, instRunning) activeRevision(I, PV2, Ep2)
+       nextEpoch(Ep, Ep2)
+       revisionActivated(I, PV, PV2, Ep2, CP)
+       revisionCancellationPolicy(I, PV, Ep, CP)
+       event(revisionActivatedEvt) .
+
+  rl [revision-cancel-queued] :
+    effect(E, queued) effectVersion(E, PV, Ep)
+    revisionCancellationPolicy(I, PV, Ep, cancelQueued)
+    => effect(E, cancelled) effectVersion(E, PV, Ep)
+       revisionCancellationPolicy(I, PV, Ep, cancelQueued) .
+
+  rl [revision-cancel-blocked] :
+    effect(E, blocked) effectVersion(E, PV, Ep)
+    revisionCancellationPolicy(I, PV, Ep, cancelQueued)
+    => effect(E, cancelled) effectVersion(E, PV, Ep)
+       revisionCancellationPolicy(I, PV, Ep, cancelQueued) .
+
+  rl [revision-request-cancel-queued] :
+    effect(E, queued) effectVersion(E, PV, Ep)
+    revisionCancellationPolicy(I, PV, Ep, requestRunning)
+    => effect(E, cancelled) effectVersion(E, PV, Ep)
+       revisionCancellationPolicy(I, PV, Ep, requestRunning) .
+
+  rl [revision-request-cancel-blocked] :
+    effect(E, blocked) effectVersion(E, PV, Ep)
+    revisionCancellationPolicy(I, PV, Ep, requestRunning)
+    => effect(E, cancelled) effectVersion(E, PV, Ep)
+       revisionCancellationPolicy(I, PV, Ep, requestRunning) .
+
+  rl [revision-request-cancel-claimed] :
+    effect(E, claimed) effectVersion(E, PV, Ep) requestable(E)
+    revisionCancellationPolicy(I, PV, Ep, requestRunning)
+    => effect(E, claimed) effectVersion(E, PV, Ep)
+       revisionCancellationPolicy(I, PV, Ep, requestRunning)
+       cancellationRequested(E) .
+
+  rl [revision-request-cancel-running] :
+    effect(E, running) effectVersion(E, PV, Ep) requestable(E)
+    revisionCancellationPolicy(I, PV, Ep, requestRunning)
+    => effect(E, running) effectVersion(E, PV, Ep)
+       revisionCancellationPolicy(I, PV, Ep, requestRunning)
+       cancellationRequested(E) .
+
+  rl [acknowledge-running-cancellation] :
+    effect(E, running) cancellationRequested(E)
+    => effect(E, running) cancellationAcknowledged(E) .
+
+  --- Policy and capacity are modeled separately from dependency blocking so
+  --- status and diagnostics can explain why work did not start.
+  rl [policy-release] :
+    effect(E, blockedByPolicy) policyAllows(E)
+    => effect(E, queued) policyAllows(E) .
+
+  rl [capacity-release] :
+    effect(E, blockedByCapacity) capacityAvailable(E)
+    => effect(E, queued) capacityAvailable(E) .
+
+  --- Lease expiry and retry reuse effect identity in this abstract model.
+  rl [expire-lease] :
+    effect(E, running) lease(E, leaseActive)
+    => effect(E, queued) lease(E, leaseExpired) event(leaseExpiredEvt) .
+
+  rl [retry-failed] :
+    effect(E, failed) retryAllowed(E)
+    => effect(E, queued) retryUsed(E) .
+
+  rl [retry-timeout] :
+    effect(E, timedOut) retryAllowed(E)
+    => effect(E, queued) retryUsed(E) .
+
+  --- Dependency release rules. Source order never releases an effect; only
+  --- terminal upstream outcomes do.
+  rl [unblock-success] :
+    effect(U, completed) dep(U, succeeds, D) effect(D, blocked)
+    => effect(U, completed) dep(U, succeeds, D) effect(D, queued) .
+
+  rl [unblock-failure] :
+    effect(U, failed) dep(U, fails, D) effect(D, blocked)
+    => effect(U, failed) dep(U, fails, D) effect(D, queued) .
+
+  rl [unblock-timeout-as-failure] :
+    effect(U, timedOut) dep(U, fails, D) effect(D, blocked)
+    => effect(U, timedOut) dep(U, fails, D) effect(D, queued) .
+
+  rl [unblock-completes-ok] :
+    effect(U, completed) dep(U, completes, D) effect(D, blocked)
+    => effect(U, completed) dep(U, completes, D) effect(D, queued) .
+
+  rl [unblock-completes-fail] :
+    effect(U, failed) dep(U, completes, D) effect(D, blocked)
+    => effect(U, failed) dep(U, completes, D) effect(D, queued) .
+
+  rl [unblock-completes-timeout] :
+    effect(U, timedOut) dep(U, completes, D) effect(D, blocked)
+    => effect(U, timedOut) dep(U, completes, D) effect(D, queued) .
+
+  rl [unblock-completes-cancelled] :
+    effect(U, cancelled) dep(U, completes, D) effect(D, blocked)
+    => effect(U, cancelled) dep(U, completes, D) effect(D, queued) .
+endm
