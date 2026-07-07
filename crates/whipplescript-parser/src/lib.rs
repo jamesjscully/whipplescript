@@ -343,6 +343,10 @@ pub struct ActionDecl {
 pub struct AgentDecl {
     pub name: Ident,
     pub harness: Option<Ident>,
+    /// `agent Foo delegated to <provider>` (DR-0034 Decision 2): the surface
+    /// spelling of a Delegated agent. Names the foreign provider kind directly;
+    /// `agent Foo { … }` without it is Managed by default.
+    pub delegated_to: Option<Ident>,
     pub fields: Vec<AgentField>,
     pub span: SourceSpan,
 }
@@ -2497,6 +2501,12 @@ fn try_format_agent_with_comments(
         .harness
         .as_ref()
         .map(|harness| format!(" using {}", harness.name))
+        .or_else(|| {
+            agent
+                .delegated_to
+                .as_ref()
+                .map(|delegate| format!(" delegated to {}", delegate.name))
+        })
         .unwrap_or_default();
     push_line(
         formatted,
@@ -6285,6 +6295,39 @@ fn lower_agent(
         }
     }
 
+    // `delegated to <provider>` (DR-0034 Decision 2): the surface spelling of a
+    // Delegated agent. It names the provider kind directly, so it must be a kind
+    // that actually classifies Delegated — `delegated to owned` is a contradiction.
+    if let Some(delegate) = &agent.delegated_to {
+        if !is_supported_harness_kind(&delegate.name) {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: delegate.span,
+                message: format!(
+                    "agent `{}` delegates to unsupported provider `{}`",
+                    agent.name.name, delegate.name
+                ),
+                suggestion: Some(
+                    "supported delegate providers are `codex`, `claude`, `pi`, `native-fixture`, and `command`"
+                        .to_owned(),
+                ),
+            });
+        } else if harness_class(&delegate.name) != HarnessClass::Delegated {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: delegate.span,
+                message: format!(
+                    "agent `{}` delegates to `{}`, which is a managed kind",
+                    agent.name.name, delegate.name
+                ),
+                suggestion: Some(
+                    "a plain `agent name { ... }` is managed by default; `delegated to` names a foreign runtime"
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+
     // Knob spans held for the class-partition check below (DR-0034 Decision 3) —
     // the class is only resolved after the field loop.
     let mut compaction_span: Option<SourceSpan> = None;
@@ -6315,6 +6358,19 @@ fn lower_agent(
                         ),
                         suggestion: Some(
                             "use either `agent name using harness { ... }` or `provider codex`, not both"
+                                .to_owned(),
+                        ),
+                    });
+                }
+                if agent.delegated_to.is_some() {
+                    diagnostics.push(Diagnostic { related: Vec::new(),
+                        span: provider.span,
+                        message: format!(
+                            "agent `{}` declares both `delegated to` and direct provider `{}`",
+                            agent.name.name, provider.name
+                        ),
+                        suggestion: Some(
+                            "use either `agent name delegated to <provider> { ... }` or a `provider` field, not both"
                                 .to_owned(),
                         ),
                     });
@@ -6475,10 +6531,23 @@ fn lower_agent(
         }
     }
 
+    // `delegated to` resolves as the provider binding. Applied after the field
+    // loop so a duplicate `provider` field reports the `declares both` diagnostic
+    // above rather than a spurious more-than-once. With no binding at all the
+    // agent is Managed by default (DR-0034 Decision 2/6: managed is the
+    // substrate, not a harness one binds).
+    if lowered.provider.is_none() {
+        if let Some(delegate) = &agent.delegated_to {
+            lowered.provider = Some(delegate.name.clone());
+        } else if lowered.harness.is_none() {
+            lowered.provider = Some("owned".to_owned());
+        }
+    }
+
     // Classify the harness (DR-0034 Decision 1/6): the class is derived from the
-    // resolved kind — a direct `provider <kind>`, or the kind of the bound `using
-    // <harness>`. An agent with neither is already a diagnostic below; it defaults to
-    // Managed harmlessly.
+    // resolved kind — a direct `provider <kind>`, the `delegated to <provider>`
+    // sugar, or the kind of the bound `using <harness>`. An agent with none of
+    // these is Managed by default (Decision 6: managed is the substrate).
     let resolved_kind = lowered.provider.as_deref().or_else(|| {
         lowered
             .harness
@@ -6531,14 +6600,6 @@ fn lower_agent(
             span: agent.name.span,
             message: format!("agent `{}` is missing a profile", agent.name.name),
             suggestion: Some("add `profile \"profile-name\"` inside the agent block".to_owned()),
-        });
-    }
-
-    if lowered.harness.is_none() && lowered.provider.is_none() {
-        diagnostics.push(Diagnostic { related: Vec::new(),
-            span: agent.name.span,
-            message: format!("agent `{}` is missing provider binding", agent.name.name),
-            suggestion: Some("add `provider codex`, `provider claude`, `provider pi`, `provider fixture`, or use an explicit harness".to_owned()),
         });
     }
 
@@ -16818,6 +16879,12 @@ fn format_agent(agent: AgentDecl, formatted: &mut String) {
         .harness
         .as_ref()
         .map(|harness| format!(" using {}", harness.name))
+        .or_else(|| {
+            agent
+                .delegated_to
+                .as_ref()
+                .map(|delegate| format!(" delegated to {}", delegate.name))
+        })
         .unwrap_or_default();
     push_line(
         formatted,
@@ -18854,6 +18921,13 @@ impl Parser<'_> {
         } else {
             None
         };
+        let delegated_to = if harness.is_none() && self.at_ident("delegated") {
+            self.advance();
+            self.expect_keyword("to")?;
+            Some(self.expect_ident("delegate provider")?)
+        } else {
+            None
+        };
         let open = self.expect_symbol('{')?;
         let mut fields = Vec::new();
 
@@ -18939,6 +19013,7 @@ impl Parser<'_> {
         Some(AgentDecl {
             name,
             harness,
+            delegated_to,
             fields,
             span: SourceSpan { start, end },
         })
@@ -23279,8 +23354,8 @@ agent worker {
         );
         assert!(good.diagnostics.is_empty(), "{:?}", good.diagnostics);
 
-        // An agent with no provider binding gets its own diagnostic, not a
-        // class-partition error (the class never resolved).
+        // An agent with no provider binding is Managed by default (D8-5), so a
+        // managed-only knob is legal on it.
         let unbound = compile_program(
             "workflow C\nagent w {\n  profile \"p\"\n  capacity 1\n  compaction summarize\n}\n",
         );
@@ -23292,6 +23367,71 @@ agent worker {
             "diagnostics: {:?}",
             unbound.diagnostics
         );
+    }
+
+    #[test]
+    fn agent_delegated_to_sugar_and_managed_default() {
+        // `agent d delegated to <provider>` is the Delegated surface spelling
+        // (DR-0034 Decision 2); it names the provider kind directly.
+        let program = "workflow C\nagent d delegated to claude {\n  profile \"p\"\n  capacity 1\n  settings project\n}\n";
+        let source = compile_program(program);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let ir = source.ir.expect("ir");
+        let agent = ir.agents.iter().find(|a| a.name == "d").expect("agent");
+        assert_eq!(agent.provider.as_deref(), Some("claude"));
+        assert_eq!(agent.harness_class, HarnessClass::Delegated);
+        assert!(ir.to_snapshot().contains("class=delegated"));
+
+        // The formatter preserves the sugar.
+        let formatted = format_program(program).formatted.expect("formats");
+        assert!(
+            formatted.contains("agent d delegated to claude {"),
+            "{formatted}"
+        );
+
+        // `delegated to owned` is a contradiction — owned is the managed substrate.
+        let bad = compile_program(
+            "workflow C\nagent d delegated to owned {\n  profile \"p\"\n  capacity 1\n}\n",
+        );
+        assert!(
+            bad.diagnostics.iter().any(|d| d
+                .message
+                .contains("delegates to `owned`, which is a managed kind")),
+            "diagnostics: {:?}",
+            bad.diagnostics
+        );
+
+        // An unsupported delegate kind is a diagnostic.
+        let unknown = compile_program(
+            "workflow C\nagent d delegated to mystery {\n  profile \"p\"\n  capacity 1\n}\n",
+        );
+        assert!(
+            unknown.diagnostics.iter().any(|d| d
+                .message
+                .contains("delegates to unsupported provider `mystery`")),
+            "diagnostics: {:?}",
+            unknown.diagnostics
+        );
+
+        // `delegated to` plus a `provider` field is an error, not a silent pick.
+        let both = compile_program(
+            "workflow C\nagent d delegated to claude {\n  provider codex\n  profile \"p\"\n  capacity 1\n}\n",
+        );
+        assert!(
+            both.diagnostics.iter().any(|d| d
+                .message
+                .contains("declares both `delegated to` and direct provider")),
+            "diagnostics: {:?}",
+            both.diagnostics
+        );
+
+        // A bare `agent m { … }` is Managed by default (Decision 6: managed is
+        // the substrate) — it lowers to the owned provider with no diagnostic.
+        let plain = compile_program("workflow C\nagent m {\n  profile \"p\"\n  capacity 1\n}\n");
+        assert!(plain.diagnostics.is_empty(), "{:?}", plain.diagnostics);
+        let plain_ir = plain.ir.expect("ir");
+        assert_eq!(plain_ir.agents[0].provider.as_deref(), Some("owned"));
+        assert_eq!(plain_ir.agents[0].harness_class, HarnessClass::Managed);
     }
 
     #[test]

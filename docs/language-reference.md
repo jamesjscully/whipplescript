@@ -259,20 +259,30 @@ to model small state machines.
 An addressable target for agent turns:
 
 ```whip
-agent codex {
-  provider codex
+agent reviewer {
+  profile "repo-reader"
+  capacity 1
+}
+
+agent coder delegated to claude {
   profile "repo-writer"
   capacity 2
   capabilities ["agent.tell"]
-  skills ["whipplescript-author"]
+  settings project
 }
 ```
 
-`provider` (required) names the provider family: `codex`, `claude`, `pi`, or
-`fixture`. `profile` (required) names the authority profile. `capacity`
-bounds concurrent turns and backs `is available` readiness. `capabilities`
-limits what the agent may be asked to do; `skills` attaches context bundles
-to its turns.
+A plain `agent name { … }` is **managed** by default: WhippleScript's own
+harness runs the turn and assembles its context. `agent name delegated to
+<provider>` names a foreign runtime (`codex`, `claude`, `pi`,
+`native-fixture`, `command`) that assembles its own context (DR-0034). The
+legacy `provider <kind>` field and `using <harness>` bindings remain
+supported and classify onto the same managed/delegated axis.
+
+`profile` (required) names the authority profile. `capacity` bounds
+concurrent turns and backs `is available` readiness. `capabilities` limits
+what the agent may be asked to do; `skills` attaches context bundles to its
+turns.
 
 `settings` (delegated harnesses, DR-0034) selects which of the delegate's own
 ambient-config sources it may read when assembling its context: `project`,
