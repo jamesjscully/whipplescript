@@ -407,6 +407,9 @@ pub struct CodexAppServerAdapter<T> {
     capability: ProviderCapability,
     client: CodexAppServerClient<T>,
     initialized: bool,
+    // The consumed `initialize` reply (DR-0035 Decision 7), shape-only;
+    // attached to the first event's evidence then cleared.
+    initialize_result_shape: Option<Value>,
     thread_id: Option<String>,
     turn_id: Option<String>,
     sequence: u64,
@@ -428,6 +431,7 @@ impl<T: CodexAppServerTransport> CodexAppServerAdapter<T> {
             capability,
             client,
             initialized: false,
+            initialize_result_shape: None,
             thread_id: None,
             turn_id: None,
             sequence: 0,
@@ -631,7 +635,8 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
         })?;
 
         if !self.initialized {
-            self.client
+            let initialize_result = self
+                .client
                 .request(
                     "initialize",
                     json!({
@@ -643,6 +648,10 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
                     }),
                 )
                 .map_err(|error| self.map_error("codex_initialize_failed", error))?;
+            // DR-0035 Decision 7: consume the handshake reply instead of
+            // discarding it — the server's advertised info rides the started
+            // event as evidence (shape-only across the redaction boundary).
+            self.initialize_result_shape = Some(json_shape(&initialize_result));
             self.initialized = true;
         }
 
@@ -696,6 +705,9 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
             provider_turn_id: Some(turn_id),
             sequence: Some(self.next_sequence()),
             evidence: json!({
+                // The consumed initialize reply (DR-0035 Decision 7) rides the
+                // started event once, shape-only.
+                "initialize_result_shape": self.initialize_result_shape.take(),
                 "thread_start_response_shape": json_shape(&thread_start),
                 "turn_start_response_shape": json_shape(&turn_start),
                 "policy": {
@@ -1541,6 +1553,16 @@ mod tests {
         assert_eq!(event.event_kind, NativeProviderEventKind::Started);
         assert_eq!(event.provider_session_id.as_deref(), Some("thread-1"));
         assert_eq!(event.provider_turn_id.as_deref(), Some("turn-1"));
+        // The consumed initialize reply rides the started event as a shape
+        // (DR-0035 Decision 7) — advertised info recorded, content dropped.
+        assert_eq!(
+            event
+                .evidence
+                .pointer("/initialize_result_shape/type")
+                .and_then(Value::as_str),
+            Some("object")
+        );
+        assert!(!event.evidence.to_string().contains("codex-test"));
 
         let transport = adapter.into_client().into_transport();
         let initialize: Value =

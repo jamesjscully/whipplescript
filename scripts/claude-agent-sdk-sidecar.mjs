@@ -4,6 +4,10 @@ import { createInterface } from "node:readline";
 import { stdin, stdout, stderr, env, cwd } from "node:process";
 
 const fakeMode = env.WHIPPLESCRIPT_CLAUDE_AGENT_SDK_FAKE === "1";
+// DR-0035 Decision 7: the whip sidecar dialect version. Exchanged via the
+// `hello` handshake before any run starts; the client blocks the binding on a
+// mismatch instead of failing mid-turn.
+const PROTOCOL_VERSION = "whip-sidecar/1";
 const activeRuns = new Map();
 
 function emit(message) {
@@ -328,7 +332,13 @@ rl.on("line", (line) => {
     emitError(null, "invalid_json", error.message);
     return;
   }
-  if (message.type === "run/start") {
+  if (message.type === "hello") {
+    emit({
+      type: "hello",
+      run_id: null,
+      payload: { protocol: PROTOCOL_VERSION },
+    });
+  } else if (message.type === "run/start") {
     void handleStart(message);
   } else if (message.type === "run/cancel") {
     void handleCancel(message);

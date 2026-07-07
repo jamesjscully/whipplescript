@@ -21,6 +21,7 @@ use whipplescript_core::{
 #[cfg(feature = "claude")]
 use whipplescript_kernel::claude_agent_sdk::{
     ClaudeAgentSdkAdapter, ClaudeAgentSdkClient, StdioClaudeAgentSdkTransport,
+    WHIP_SIDECAR_PROTOCOL,
 };
 #[cfg(feature = "codex")]
 use whipplescript_kernel::codex_app_server::{
@@ -22919,10 +22920,23 @@ fn claude_agent_sdk_adapter(
                 && capability.surface == AdapterSurface::ClaudeAgentSdk
         })
         .ok_or_else(|| StoreError::Conflict("missing built-in Claude capability".to_owned()))?;
-    Ok(
-        ClaudeAgentSdkAdapter::new(provider, capability, ClaudeAgentSdkClient::new(transport))
-            .with_inactivity_budget(native_provider_inactivity_budget()),
-    )
+    let mut client = ClaudeAgentSdkClient::new(transport);
+    // Version exchange (DR-0035 Decision 7): a sidecar that ANSWERS with a
+    // mismatched protocol blocks the binding here (provider_health,
+    // recoverable), never mid-turn. A legacy sidecar answering
+    // `unknown_command` is tolerated as `/1` for one release, and a transport
+    // error is NOT a mismatch — a dead or unreachable sidecar keeps surfacing
+    // at start_turn exactly as before (policy checks there run without any
+    // sidecar I/O, so a policy denial never needs a live peer).
+    if let Ok(Some(protocol)) = client.hello() {
+        if protocol != WHIP_SIDECAR_PROTOCOL {
+            return Err(StoreError::Conflict(format!(
+                "Claude sidecar speaks `{protocol}`; this whip requires `{WHIP_SIDECAR_PROTOCOL}`"
+            )));
+        }
+    }
+    Ok(ClaudeAgentSdkAdapter::new(provider, capability, client)
+        .with_inactivity_budget(native_provider_inactivity_budget()))
 }
 
 #[cfg(feature = "claude")]

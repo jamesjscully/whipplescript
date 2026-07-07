@@ -292,6 +292,38 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkClient<T> {
         }
     }
 
+    /// The `hello` handshake (DR-0035 Decision 7): returns the sidecar's
+    /// protocol identifier, or `None` for a legacy sidecar that predates the
+    /// verb (it answers `run/error unknown_command`; tolerated as `/1` for one
+    /// release). Run before any turn so a mismatch blocks the binding rather
+    /// than failing mid-turn.
+    pub fn hello(&mut self) -> Result<Option<String>, ClaudeAgentSdkError> {
+        self.transport
+            .write_line(&json!({ "type": "hello" }).to_string())?;
+        loop {
+            let line = self.transport.read_line()?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let message: Value = serde_json::from_str(&line)?;
+            return match message.get("type").and_then(Value::as_str) {
+                Some("hello") => Ok(message
+                    .pointer("/payload/protocol")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)),
+                Some("run/error")
+                    if message.pointer("/payload/code").and_then(Value::as_str)
+                        == Some("unknown_command") =>
+                {
+                    Ok(None)
+                }
+                _ => Err(ClaudeAgentSdkError::Protocol(
+                    "unexpected reply to `hello` handshake".to_owned(),
+                )),
+            };
+        }
+    }
+
     pub fn start_run(
         &mut self,
         request: Value,
@@ -305,6 +337,7 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkClient<T> {
             &json!({
                 "type": "run/start",
                 "run_id": run_id,
+                "protocol": WHIP_SIDECAR_PROTOCOL,
                 "request": request,
             })
             .to_string(),
@@ -340,6 +373,7 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkClient<T> {
             &json!({
                 "type": "run/start",
                 "run_id": run_id,
+                "protocol": WHIP_SIDECAR_PROTOCOL,
                 "request": request,
             })
             .to_string(),
@@ -403,6 +437,11 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkClient<T> {
 /// T3). The kernel records `whip.protocol.*` events as protocol-violation
 /// diagnostics, never as lifecycle events.
 pub const MISROUTED_FRAME_EVENT_TYPE: &str = "whip.protocol.misrouted_frame";
+
+/// The whip sidecar dialect version (DR-0035 Decision 7). Sent in `run/start`
+/// and exchanged via the `hello` handshake; a mismatched sidecar blocks the
+/// binding pre-turn (`provider_health`), never mid-turn.
+pub const WHIP_SIDECAR_PROTOCOL: &str = "whip-sidecar/1";
 
 enum RoutedFrame {
     Event(ClaudeSidecarEvent),
@@ -1578,6 +1617,43 @@ mod tests {
             .expect("event reads")
             .expect("terminal event");
         assert_eq!(terminal.event_kind, NativeProviderEventKind::Completed);
+    }
+
+    #[test]
+    fn client_hello_exchanges_protocol_and_tolerates_legacy_sidecars() {
+        // DR-0035 Decision 7: the handshake returns the sidecar's protocol.
+        let transport = FakeTransport::with_reads(&[
+            r#"{"type":"hello","run_id":null,"payload":{"protocol":"whip-sidecar/1"}}"#,
+        ]);
+        let mut client = ClaudeAgentSdkClient::new(transport);
+        assert_eq!(
+            client.hello().expect("handshake"),
+            Some(WHIP_SIDECAR_PROTOCOL.to_owned())
+        );
+
+        // A legacy sidecar answers unknown_command — tolerated as `/1`.
+        let transport = FakeTransport::with_reads(&[
+            r#"{"type":"run/error","run_id":null,"payload":{"code":"unknown_command","message":"unknown command hello"}}"#,
+        ]);
+        let mut client = ClaudeAgentSdkClient::new(transport);
+        assert_eq!(client.hello().expect("legacy tolerated"), None);
+    }
+
+    #[test]
+    fn client_run_start_carries_the_protocol_version() {
+        let transport = FakeTransport::with_reads(&[
+            r#"{"type":"claude.turn.completed","run_id":"run-1","payload":{}}"#,
+        ]);
+        let mut client = ClaudeAgentSdkClient::new(transport);
+        client
+            .start_run(json!({"run_id":"run-1"}))
+            .expect("run completes");
+        let frame: Value =
+            serde_json::from_str(&client.into_transport().writes[0]).expect("frame parses");
+        assert_eq!(
+            frame.get("protocol").and_then(Value::as_str),
+            Some(WHIP_SIDECAR_PROTOCOL)
+        );
     }
 
     #[test]
