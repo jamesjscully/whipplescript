@@ -6285,6 +6285,11 @@ fn lower_agent(
         }
     }
 
+    // Knob spans held for the class-partition check below (DR-0034 Decision 3) —
+    // the class is only resolved after the field loop.
+    let mut compaction_span: Option<SourceSpan> = None;
+    let mut settings_span: Option<SourceSpan> = None;
+
     for field in agent.fields {
         match field {
             AgentField::Provider(provider) => {
@@ -6422,6 +6427,7 @@ fn lower_agent(
                         ),
                     });
                 }
+                compaction_span = Some(strategy.span);
                 lowered.compaction = Some(strategy.name);
             }
             AgentField::Settings(sources) => {
@@ -6451,6 +6457,7 @@ fn lower_agent(
                         ),
                     });
                 }
+                settings_span = Some(sources.span);
                 lowered.settings = Some(sources.name);
             }
             AgentField::Unknown { name, .. } => {
@@ -6481,6 +6488,42 @@ fn lower_agent(
     lowered.harness_class = resolved_kind
         .map(harness_class)
         .unwrap_or(HarnessClass::Managed);
+
+    // Partition the knobs (DR-0034 Decision 3): each class admits only its
+    // meaningful knobs; the other class rejects them with a diagnostic rather than
+    // silently ignoring them. Only enforced when the class actually resolved — an
+    // agent with no provider binding already gets its own diagnostic below.
+    if resolved_kind.is_some() {
+        if lowered.harness_class == HarnessClass::Delegated {
+            if let Some(span) = compaction_span {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span,
+                    message: format!(
+                        "agent `{}` is delegated; `compaction` is a managed-harness knob",
+                        agent.name.name
+                    ),
+                    suggestion: Some(
+                        "remove `compaction` — a delegated harness compacts its own context"
+                            .to_owned(),
+                    ),
+                });
+            }
+        } else if let Some(span) = settings_span {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span,
+                message: format!(
+                    "agent `{}` is managed; `settings` is a delegated-harness knob",
+                    agent.name.name
+                ),
+                suggestion: Some(
+                    "remove `settings` — WhippleScript assembles a managed agent's context"
+                        .to_owned(),
+                ),
+            });
+        }
+    }
 
     if lowered.profile.is_none() {
         diagnostics.push(Diagnostic {
@@ -23185,6 +23228,70 @@ agent worker {
         let plain_ir = plain.ir.expect("ir");
         assert_eq!(plain_ir.agents[0].settings, None);
         assert!(!plain_ir.to_snapshot().contains("settings="));
+    }
+
+    #[test]
+    fn agent_knobs_partition_by_harness_class() {
+        // DR-0034 Decision 3: each class admits only its meaningful knobs; the
+        // other class rejects them with a diagnostic, never a silent no-op.
+
+        // `compaction` on a Delegated agent is an error — you cannot tell Claude
+        // how to compact; it does its own.
+        let bad = compile_program(
+            "workflow C\nagent w {\n  provider claude\n  profile \"p\"\n  capacity 1\n  compaction summarize\n}\n",
+        );
+        assert!(
+            bad.diagnostics.iter().any(|d| d
+                .message
+                .contains("is delegated; `compaction` is a managed-harness knob")),
+            "diagnostics: {:?}",
+            bad.diagnostics
+        );
+
+        // `settings` on a Managed agent is an error — WhippleScript already
+        // assembles the context; there is nothing foreign to configure.
+        let bad = compile_program(
+            "workflow C\nagent w {\n  provider owned\n  profile \"p\"\n  capacity 1\n  settings project\n}\n",
+        );
+        assert!(
+            bad.diagnostics.iter().any(|d| d
+                .message
+                .contains("is managed; `settings` is a delegated-harness knob")),
+            "diagnostics: {:?}",
+            bad.diagnostics
+        );
+
+        // The class resolves through a `using <harness>` binding too.
+        let bad = compile_program(
+            "workflow C\nharness box: claude\nagent w using box {\n  profile \"p\"\n  capacity 1\n  compaction summarize\n}\n",
+        );
+        assert!(
+            bad.diagnostics.iter().any(|d| d
+                .message
+                .contains("is delegated; `compaction` is a managed-harness knob")),
+            "diagnostics: {:?}",
+            bad.diagnostics
+        );
+
+        // The right-class pairings stay legal.
+        let good = compile_program(
+            "workflow C\nagent m {\n  provider owned\n  profile \"p\"\n  capacity 1\n  compaction summarize\n}\nagent d {\n  provider claude\n  profile \"p\"\n  capacity 1\n  settings project\n}\n",
+        );
+        assert!(good.diagnostics.is_empty(), "{:?}", good.diagnostics);
+
+        // An agent with no provider binding gets its own diagnostic, not a
+        // class-partition error (the class never resolved).
+        let unbound = compile_program(
+            "workflow C\nagent w {\n  profile \"p\"\n  capacity 1\n  compaction summarize\n}\n",
+        );
+        assert!(
+            !unbound
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("managed-harness knob")),
+            "diagnostics: {:?}",
+            unbound.diagnostics
+        );
     }
 
     #[test]

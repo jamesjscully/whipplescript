@@ -281,6 +281,11 @@ steers behavior only — the profile/capabilities envelope alone grants
 authority, so a delegate reading its own project config can never gain a tool
 the program did not authorize.
 
+The context knobs partition by harness class: `compaction` is managed-only
+(a delegated harness compacts its own context) and `settings` is
+delegated-only (WhippleScript already assembles a managed agent's context).
+Declaring either on the wrong class is a compile error, never a silent no-op.
+
 ### `table`
 
 Static seed rows, typed against a class and recorded when the instance
