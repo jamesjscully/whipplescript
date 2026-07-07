@@ -1,0 +1,23 @@
+# Consumer 1 of the shared support library: routes a ticket to a queue.
+# `include` pulls `SupportTicket` in from the library file, resolved relative to
+# this file's directory.
+include "includes/support-lib.whip"
+
+workflow TriageTickets
+
+input ticket SupportTicket
+output result TriageResult
+
+class TriageResult {
+  id string
+  queue string
+}
+
+rule triage
+  when SupportTicket as t
+=> {
+  complete result {
+    id t.id
+    queue t.severity
+  }
+}

@@ -1,0 +1,57 @@
+@service
+description "Two agents with bounded capacity handing work to each other through a queue"
+workflow MultiAgentBoundedConcurrency
+
+# Agent capacity is part of matching, so dispatch naturally back-pressures.
+tracker backlog {
+  provider builtin
+}
+
+# Optional-provider exhibit: this example deliberately binds the Codex and Claude
+# delegating providers (opt-in Cargo features) to show two distinct agent families
+# with different capacities. Most examples use the built-in `owned` harness.
+agent implementer {
+  provider codex
+  profile "repo-writer"
+  capacity 2
+}
+
+agent reviewer {
+  provider claude
+  profile "repo-reader"
+  capacity 1
+}
+
+rule implement_ready_work
+  when backlog has ready issue as issue
+  when implementer is available
+=> {
+  claim issue as active_claim
+
+  after active_claim succeeds {
+    tell implementer as turn """markdown
+    Implement this work item:
+
+    {{ issue.title }}
+
+    {{ issue.body }}
+    """
+  }
+
+  after turn succeeds as outcome {
+    finish issue {
+      summary outcome.summary
+    }
+  }
+}
+
+rule review_completed_turn
+  when implementer completed turn as turn
+  when reviewer is available
+=> {
+  tell reviewer """markdown
+  Review this completed turn:
+
+  {{ turn.summary }}
+  """
+}

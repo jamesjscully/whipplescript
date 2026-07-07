@@ -1,0 +1,23 @@
+workflow MinimalNoop
+
+output result StartupSeen
+
+# Smallest complete workflow: observe start, record a fact, and finish.
+class StartupSeen {
+  source string
+  state "observed"
+}
+
+rule observe_start
+  when started
+=> {
+  record StartupSeen {
+    source "external.started"
+    state "observed"
+  }
+
+  complete result {
+    source "external.started"
+    state "observed"
+  }
+}

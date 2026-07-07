@@ -1,0 +1,106 @@
+# `coerce` returning a sum-type `enum` (discriminated family A): the model picks a
+# variant, and the result is consumed by an exhaustive `case` whose arms narrow to
+# each variant's payload. The provider sees an anyOf-of-objects schema (one object
+# per data variant, each carrying its `variant` discriminant), so it can construct a
+# payload — not just a bare variant name.
+workflow CoerceEnum
+
+input item WorkItem
+output result Decision
+failure error ReviewFailure
+
+class WorkItem {
+  title string
+  body string
+}
+
+class Decision {
+  score float
+}
+
+class ReviewFailure {
+  reason string
+}
+
+enum ReviewOutcome {
+  Approved {
+    score float
+  }
+  Rejected {
+    reason string
+  }
+  NeedsInfo {
+    questions string[]
+  }
+}
+
+coerce reviewWork(title string, body string) -> ReviewOutcome {
+  prompt """markdown
+  Review this work item.
+
+  {{ title }}
+  {{ body }}
+
+  {{ ctx.output_format }}
+  """
+}
+
+rule handle_review
+  when WorkItem as item
+=> {
+  coerce reviewWork(item.title, item.body) as review
+
+  after review succeeds as outcome {
+    case outcome {
+      Approved as a => {
+        complete result { score a.score }
+      }
+      Rejected as r => {
+        fail error { reason r.reason }
+      }
+      NeedsInfo as n => {
+        fail error { reason "needs info" }
+      }
+    }
+  }
+
+  after review fails {
+    fail error { reason "review failed" }
+  }
+}
+
+# `stub coerce <fn> returns { … }` constructs a specific variant value (the `variant`
+# field is the discriminant); the exhaustive `case` then dispatches to that arm.
+test "approved variant completes" {
+  workflow CoerceEnum
+
+  given input {
+    item { title "t" body "b" }
+  }
+
+  stub coerce reviewWork returns {
+    variant "Approved"
+    score 0.9
+  }
+
+  run until idle
+
+  expect workflow completed
+}
+
+test "rejected variant fails" {
+  workflow CoerceEnum
+
+  given input {
+    item { title "t" body "b" }
+  }
+
+  stub coerce reviewWork returns {
+    variant "Rejected"
+    reason "not good enough"
+  }
+
+  run until idle
+
+  expect workflow failed
+}

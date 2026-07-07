@@ -1,0 +1,77 @@
+use std.script
+workflow CircuitBreaker
+
+output result Done
+failure error Tripped
+
+class Done {
+  note string
+}
+
+class Tripped {
+  reason string
+}
+
+class Service {
+  name string
+}
+
+class CallRequested {
+  service string
+}
+
+class CallFailed {
+  service string
+}
+
+# The breaker is not a primitive (spec/coordination.md declined it): it is
+# facts + a counter + rules. The failure budget is a consumable count; when
+# the budget is gone the circuit is open and work downgrades instead of
+# hammering the dependency. The daily reset is the half-open probe window.
+counter failure_budget {
+  key Service
+  cap 3
+  reset daily
+}
+
+rule seed
+  when started
+=> {
+  record CallRequested {
+    service "payments"
+  }
+}
+
+rule call_dependency
+  when CallRequested as c
+=> {
+  exec "sh -c 'exit 1'" as attempt
+
+  after attempt succeeds {
+    complete result {
+      note "call succeeded"
+    }
+  }
+  after attempt fails {
+    record CallFailed {
+      service "payments"
+    }
+  }
+}
+
+rule strike_breaker
+  when CallFailed as f
+=> {
+  consume failure_budget for f.service amount 1 as strike
+
+  after strike ok {
+    complete result {
+      note "failure recorded; circuit still closed for {{ f.service }}"
+    }
+  }
+  after strike over {
+    fail error {
+      reason "circuit open for {{ f.service }}: failure budget exhausted"
+    }
+  }
+}

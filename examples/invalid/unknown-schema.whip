@@ -1,0 +1,9 @@
+workflow UnknownSchema
+
+class Review {
+  status MissingStatus
+}
+
+coerce classify(summary string) -> MissingOutput {
+  prompt "Classify {{ summary }}"
+}

@@ -1,0 +1,38 @@
+workflow MemoryPoolDemo
+
+use memory
+
+// MEM-1: a declared memory pool. `context limit` is the optional recall packing
+// budget; v1 pools are provider-less (provider selection is binding-owned).
+memory pool project_memory {
+  context limit 8
+}
+
+output result R
+class R { ok bool }
+
+class Note {
+  topic string
+}
+
+rule seed
+  when started
+=> {
+  record Note {
+    topic "alpha"
+  }
+}
+
+rule remember_then_recall
+  when Note as note
+=> {
+  learn from note into project_memory { note "remember alpha" } as saved
+
+  after saved succeeds {
+    recall project_memory for note as context
+  }
+
+  after context succeeds as recalled {
+    complete result { ok true }
+  }
+}

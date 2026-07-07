@@ -1,0 +1,11 @@
+workflow Broken
+
+agent worker {
+  provider fixture
+  profile 42
+  capacity nope
+}
+
+rule missing_body
+  when started
+=>

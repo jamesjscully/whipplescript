@@ -1,0 +1,18 @@
+[package]
+name = "whipplescript-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Parser and static checks for WhippleScript workflow source"
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+whipplescript-core = { version = "0.2.0", path = "../whipplescript-core" }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

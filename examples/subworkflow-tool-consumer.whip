@@ -1,0 +1,47 @@
+# A consumer of a packaged `@tool` workflow (DR-0025 cross-package tools). The
+# `toolkit` package exports the convergence-checked `@tool` workflow `EchoText`
+# (see examples/packages/toolkit.json); this program `use`s the package and an
+# owned-harness agent is **granted** it with `tools [EchoText]`. At runtime the
+# agent may invoke `EchoText` synchronously as a typed tool, driven through the
+# runtime with first-class parent<->child lineage — not shelled out. Run with the
+# package lock: `whip dev examples/subworkflow-tool-consumer.whip
+# --package-lock examples/subworkflow-tool-consumer.lock.json --root ConsumerFlow
+# --provider owned`.
+use toolkit
+
+workflow ConsumerFlow {
+  input request ConsumerRequest
+
+  output result ConsumerResult
+
+  class ConsumerRequest {
+    task string
+  }
+
+  class ConsumerResult {
+    summary string
+  }
+
+  agent worker {
+    provider owned
+    profile "repo-writer"
+    capacity 1
+    tools [EchoText]
+  }
+
+  rule dispatch
+    when ConsumerRequest as request
+    when worker is available
+  => {
+    tell worker as turn """markdown
+    Do the task: {{ request.task }}
+    """
+
+    after turn succeeds {
+      done request
+      complete result {
+        summary turn.summary
+      }
+    }
+  }
+}

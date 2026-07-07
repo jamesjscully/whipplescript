@@ -1,0 +1,15 @@
+workflow MinimalNoop
+workflow_contracts
+  output result ref<StartupSeen>
+schemas
+  class StartupSeen
+    source string
+    state literal<"observed">
+rules
+  rule observe_start
+    when started
+    reads
+      pattern:started
+    writes
+      schema:StartupSeen
+    body_hash 4c6d15b392e98296

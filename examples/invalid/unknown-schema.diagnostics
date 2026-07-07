@@ -1,0 +1,12 @@
+error: unknown schema reference `MissingStatus`
+  --> examples/invalid/unknown-schema.whip:4:10
+  |
+4 |   status MissingStatus
+  |          ^^^^^^^^^^^^^
+  = help: declare `class MissingStatus` or `enum MissingStatus` before using it
+error: unknown schema reference `MissingOutput`
+  --> examples/invalid/unknown-schema.whip:7:36
+  |
+7 | coerce classify(summary string) -> MissingOutput {
+  |                                    ^^^^^^^^^^^^^
+  = help: declare `class MissingOutput` or `enum MissingOutput` before using it

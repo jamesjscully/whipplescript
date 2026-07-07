@@ -1,0 +1,21 @@
+workflow EffectfulSelfLoop
+
+class WorkItem {
+  title string
+}
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule loop
+  when WorkItem as item
+=> {
+  record WorkItem {
+    title item.title
+  }
+
+  tell worker "{{ item.title }}"
+}

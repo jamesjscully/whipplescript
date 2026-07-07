@@ -1,0 +1,6 @@
+error: recursive workflow invocation is not allowed (graph.unbounded_workflow_invocation_recursion): invocation cycle Ping -> Pong -> Ping
+   --> examples/invalid/recursive-workflow-invocation.whip:12:6
+   |
+12 |   => {
+   |      ^
+   = help: break the cycle: a runtime `invoke` cycle has no compile-time convergence proof; route the recurrence through an external event, clock, or durable boundary instead

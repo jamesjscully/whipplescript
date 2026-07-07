@@ -1,0 +1,15 @@
+{
+  "packages": [
+    {
+      "manifest_sha256": "95c62b2e45419a8af02c14ddd3b746364681305afa3c571583c4ea20699e44fc",
+      "name": "toolkit",
+      "package_id": "package-toolkit",
+      "source": {
+        "path": "packages/toolkit.json",
+        "type": "path"
+      },
+      "version": "0.1.0"
+    }
+  ],
+  "schema": "whipplescript.package_lock.v0"
+}

@@ -1,0 +1,60 @@
+error: rule `bad_coerce` uses an object literal without an expected object or map type
+   --> examples/invalid/bad-effect-payload.whip:29:4
+   |
+29 | => {
+   |    ^
+   = help: use object literals only in typed record fields or typed effect arguments
+error: rule `bad_coerce` compares incompatible expression types
+   --> examples/invalid/bad-effect-payload.whip:29:4
+   |
+29 | => {
+   |    ^
+   = help: compare values with compatible scalar or finite-domain types
+error: class `Owner` has no field `handle`
+   --> examples/invalid/bad-effect-payload.whip:29:4
+   |
+29 | => {
+   |    ^
+   = help: add `handle` to `class Owner` or use an existing field
+error: field `Payload.owner` is missing required object field `Owner.name`
+   --> examples/invalid/bad-effect-payload.whip:29:4
+   |
+29 | => {
+   |    ^
+   = help: add `name` to the `owner` object literal
+error: field `Payload.phase` expects `string`
+   --> examples/invalid/bad-effect-payload.whip:29:4
+   |
+29 | => {
+   |    ^
+   = help: record a value compatible with `string`
+error: field `Payload.tags` expects `string`
+   --> examples/invalid/bad-effect-payload.whip:29:4
+   |
+29 | => {
+   |    ^
+   = help: record a value compatible with `string`
+error: class `Payload` has no field `extra`
+   --> examples/invalid/bad-effect-payload.whip:29:4
+   |
+29 | => {
+   |    ^
+   = help: add `extra` to `class Payload` or use an existing field
+error: field `coerce `reviewPayload`.metadata` expects `string`
+   --> examples/invalid/bad-effect-payload.whip:29:4
+   |
+29 | => {
+   |    ^
+   = help: record a value compatible with `string`
+error: field `coerce `reviewPayload`.score` expects `int`
+   --> examples/invalid/bad-effect-payload.whip:29:4
+   |
+29 | => {
+   |    ^
+   = help: record a value compatible with `int`
+error: field `loft claim.issue` receives incompatible expression type
+   --> examples/invalid/bad-effect-payload.whip:45:4
+   |
+45 | => {
+   |    ^
+   = help: record a value compatible with `LoftIssue`

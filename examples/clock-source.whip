@@ -1,0 +1,42 @@
+@service
+workflow ClockSource
+
+# A clock source (std.time) admits a durable signal fact on a calendar
+# schedule. The source never fires a rule directly; rules react to the
+# admitted `triage.tick` signal. See spec/std-time.md.
+
+agent triager {
+  provider owned
+  profile "repo-writer"
+  capacity 1
+}
+
+signal triage.tick {
+  scheduled_at time
+  observed_at time
+  occurrence_id string
+  missed_count int
+}
+
+source clock as daily_triage {
+  every weekday at 09:00
+  timezone "America/New_York"
+  missed coalesce
+
+  observe as tick
+  emit triage.tick {
+    scheduled_at tick.scheduled_at
+    observed_at tick.observed_at
+    occurrence_id tick.occurrence_id
+    missed_count tick.missed_count
+  }
+}
+
+rule file_daily_triage
+  when triage.tick as tick
+  when triager is available
+=> {
+  tell triager """
+  Run the daily triage scheduled at {{ tick.scheduled_at }}.
+  """
+}

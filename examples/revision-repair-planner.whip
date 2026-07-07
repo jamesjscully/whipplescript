@@ -1,0 +1,60 @@
+workflow RevisionRepairPlanner {
+  input issue RepairIssue
+  output proposal PatchProposal
+  failure error RepairFailure
+
+  class RepairIssue {
+    instanceId string
+    sourcePath string
+    requestedChange string
+  }
+
+  class PatchProposal {
+    proposedPath string
+    summary string
+    dryRunCommand string
+  }
+
+  class RepairFailure {
+    reason string
+  }
+
+  agent planner {
+  provider owned
+    profile "repo-writer"
+    capacity 1
+    skills ["whipplescript-author"]
+  }
+
+  rule propose_patch_artifact
+    when RepairIssue as issue
+    when planner is available
+  => {
+    tell planner as turn """markdown
+    Prepare a patch proposal for this running workflow instance.
+
+    Instance:
+    {{ issue.instanceId }}
+
+    Current source:
+    {{ issue.sourcePath }}
+
+    Requested change:
+    {{ issue.requestedChange }}
+
+    Write the revised source as a separate artifact. Do not activate it. The
+    operator must review the artifact and run whip revise from the control
+    plane.
+    """
+
+    after turn succeeds {
+      done issue
+
+      complete proposal {
+        proposedPath issue.sourcePath
+        summary turn.summary
+        dryRunCommand "whip revise <instance_id> <candidate.whip> --root RevisionTicket --dry-run"
+      }
+    }
+  }
+}

@@ -1,0 +1,19 @@
+workflow EffectOutputScope
+
+tracker backlog {
+  provider builtin
+}
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule bad_scope
+  when backlog has ready issue as item
+=> {
+  claim item as claim
+
+  tell worker "{{ claim.value.id }}"
+}

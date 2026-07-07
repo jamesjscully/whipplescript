@@ -1,0 +1,76 @@
+workflow OpenClawLite
+source_tags
+@service workflow OpenClawLite
+uses
+  package memory
+schemas
+  class Heartbeat
+    job string
+    status literal<"observed">
+  class Plan
+    title string
+    summary string
+    status literal<"ready">
+  class ReviewDecision
+    decision string
+    decidedBy string
+trackers
+  tracker backlog provider=builtin
+agents
+  agent planner harness=<fallback> provider=codex profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[]
+  agent reviewer harness=<fallback> provider=claude profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[]
+assertions
+  assert count(Heartbeat where status == "observed") == 1
+    reads
+      fact:Heartbeat where status == "observed"
+  assert count(Plan where status == "ready") == 1
+    reads
+      fact:Plan where status == "ready"
+  assert count(effect kind tracker.file where status == completed) == 1
+    reads
+      effect:kind tracker.file where status == completed
+rules
+  rule observe_heartbeat
+    when started
+    reads
+      pattern:started
+    writes
+      schema:Heartbeat
+    body_hash 66ebf556cd43442b
+  rule plan_recurring_work
+    when Heartbeat as beat where beat.status == "observed"
+    when planner is available
+    reads
+      pattern:planner is available
+      schema:Heartbeat
+    writes
+      schema:Plan
+    effects
+      context kind=capability.call binding=context key=7e81e084dae5eb13
+      planTurn kind=agent.tell binding=planTurn key=97a3c1a4726b15f5
+      effect3 kind=tracker.file binding=- key=2c88ace5c002bad0
+      effect4 kind=capability.call binding=- key=557da7ba98895333
+    dependencies
+      context --succeeds--> planTurn
+      planTurn --succeeds--> effect3
+      planTurn --succeeds--> effect4
+    body_hash 39f20e5078b2b4e7
+  rule escalate_plan_for_review
+    when Plan as plan where plan.status == "ready"
+    when reviewer is available
+    reads
+      pattern:reviewer is available
+      schema:Plan
+    effects
+      review kind=human.ask binding=review key=b4ff8387f129deaf
+    body_hash 422a9ac206c4cee2
+  rule record_review_decision
+    when human answered review as answer
+    reads
+      pattern:human answered review as answer
+    writes
+      schema:ReviewDecision
+    body_hash 4ffab13c9ba7227f
+rule_dependencies
+  observe_heartbeat --schema:Heartbeat--> plan_recurring_work
+  plan_recurring_work --schema:Plan--> escalate_plan_for_review

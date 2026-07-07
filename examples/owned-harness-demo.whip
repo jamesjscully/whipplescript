@@ -1,0 +1,32 @@
+workflow OwnedHarnessDemo
+
+output done Summary
+
+# Owned brokered harness (DR-0024 slice 1): `provider owned` runs the agent turn
+# through whip's own tool-use loop -- the kernel executes each requested file tool
+# itself -- instead of delegating to an external provider harness. The turn settles
+# to the same `agent.turn.completed` fact the delegating harness emits, so
+# `when <agent> completed turn` works unchanged. Run with `--provider owned`.
+class Summary {
+  note string
+}
+
+agent helper {
+  provider owned
+  profile "repo-writer"
+  capacity 1
+}
+
+rule begin
+  when started
+=> {
+  tell helper "Summarize the project and stop."
+}
+
+rule finish
+  when helper completed turn
+=> {
+  complete done {
+    note "owned harness turn finished"
+  }
+}

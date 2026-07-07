@@ -1,0 +1,44 @@
+# `@private` is an invocation membrane marker. PublicAudit is the callable
+# workflow contract; InternalAuditHarness can be selected as a root for an
+# internal run, but sibling workflows cannot invoke it. Check either workflow
+# with `--root PublicAudit` or `--root InternalAuditHarness`.
+class AuditRequest {
+  id string
+}
+
+class AuditReport {
+  summary string
+}
+
+workflow PublicAudit {
+  input request AuditRequest
+  output result AuditReport
+
+  rule finish
+    when AuditRequest as request
+  => {
+    complete result {
+      summary "public audit {{ request.id }}"
+    }
+  }
+}
+
+@private
+workflow InternalAuditHarness {
+  input request AuditRequest
+  output result AuditReport
+
+  rule finish
+    when AuditRequest as request
+  => {
+    complete result {
+      summary "internal audit {{ request.id }}"
+    }
+  }
+}
+
+# This would be rejected:
+#
+# invoke InternalAuditHarness {
+#   request request
+# } as internal

@@ -1,0 +1,36 @@
+@service
+description "Inbound + outbound messaging: react to a channel message and reply on the same channel"
+workflow MessagingDemo
+
+# A `channel` is a named route through a messaging provider. Declaring one
+# auto-registers the built-in `std.messaging` contract (no `use`/lock needed);
+# `send via` and `when message from` name it. Under the fixture provider,
+# outbound `send` records a receipt and inbound messages are injected with
+# `whip message`.
+channel ops_room {
+  provider slack
+  destination "#ops"
+}
+
+output result Handled
+
+class Handled {
+  reply string
+}
+
+# Inbound: `when message from <channel> as msg` binds the generic `Message`
+# envelope (never a domain type). Outbound: `send via <channel> { ... }` posts
+# back through the same channel.
+rule acknowledge_message
+  when message from ops_room as msg
+=> {
+  send via ops_room {
+    text "ack: {{ msg.text }}"
+  } as reply
+
+  after reply succeeds {
+    complete result {
+      reply "ack: {{ msg.text }}"
+    }
+  }
+}

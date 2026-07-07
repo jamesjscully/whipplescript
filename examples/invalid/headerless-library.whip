@@ -1,0 +1,20 @@
+# Invalid: a source with no explicit `workflow` is a library fragment, not a
+# runnable program. The implicit compatibility root was removed (2026-07-01):
+# every program must declare at least one `workflow`. A file like this — only
+# shared types and a reusable pattern — is meant to be `include`d by a workflow,
+# not compiled on its own.
+class SharedTicket {
+  id string
+  title string
+}
+
+pattern TagReviewed<Input> {
+  rule tag
+    when Input as item
+  => {
+    record SharedTicket {
+      id item.id
+      title item.title
+    }
+  }
+}

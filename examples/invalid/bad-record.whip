@@ -1,0 +1,30 @@
+workflow BadRecord
+
+class ReviewRequest {
+  subject string
+}
+
+enum ReviewStatus {
+  Accept
+  Revise
+  Blocked
+}
+
+class HumanDecision {
+  subject string
+  status ReviewStatus
+  confidence float
+  mode "manual" | "auto"
+}
+
+rule bad_record
+  when ReviewRequest as request
+=> {
+  record HumanDecision {
+    subject request.missing
+    status Maybe
+    confidence "high"
+    mode "scripted"
+    extra "field"
+  }
+}

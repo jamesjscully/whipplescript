@@ -1,0 +1,39 @@
+workflow DeterministicValidation
+workflow_contracts
+  output result ref<ValidationReport>
+  failure error ref<ValidationFailed>
+uses
+  package std.script
+schemas
+  class Artifact
+    path string
+    expectedScript string
+  class ScriptCheck
+    isExpectedScript bool
+    detail string
+  class ValidationReport
+    path string
+    detail string
+  class ValidationFailed
+    reason string
+rules
+  rule table_artifacts
+    when started
+    reads
+      pattern:started
+    writes
+      schema:Artifact
+    record_sources
+      schema:Artifact construct=table_row span=1050..1119
+    body_hash 0c1ff08cdc581ffb
+  rule validate_artifact_script
+    when Artifact as artifact
+    reads
+      schema:Artifact
+    consumes
+      schema:Artifact
+    effects
+      check kind=exec.command binding=check key=9f679eb8f308ab6b
+    body_hash b04c86aba98f210d
+rule_dependencies
+  table_artifacts --schema:Artifact--> validate_artifact_script

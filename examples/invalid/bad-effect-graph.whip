@@ -1,0 +1,25 @@
+workflow BadEffectGraph
+
+tracker backlog {
+  provider builtin
+}
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule bad_after
+  when backlog has ready issue as item
+=> {
+  after ghost succeeds {
+    tell worker "missing claim"
+  }
+
+  claim item as claim
+
+  after claim retries {
+    tell worker "bad predicate"
+  }
+}

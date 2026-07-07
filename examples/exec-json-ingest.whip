@@ -1,0 +1,46 @@
+use std.script
+workflow ExecJsonIngest
+
+output result TestSummary
+failure error TestFailure
+
+# `exec -> Type` admits local command output only after typed JSON decoding.
+class TestSummary {
+  passed bool
+  failed int
+}
+
+class FailedTest {
+  name string
+  reason string
+}
+
+class TestFailure {
+  reason string
+}
+
+rule run_test_report
+  when started
+=> {
+  exec "printf '{\"passed\":true,\"failed\":0}\\n'" -> TestSummary as report
+
+  after report succeeds as summary {
+    complete result {
+      passed summary.passed
+      failed summary.failed
+    }
+  }
+
+  after report fails as failure {
+    fail error {
+      reason failure.reason
+    }
+  }
+}
+
+# The `each` form records one FailedTest fact per JSON object.
+rule ingest_failed_tests
+  when started
+=> {
+  exec "printf '{\"name\":\"checkout\",\"reason\":\"timeout\"}\\n'" -> each FailedTest
+}

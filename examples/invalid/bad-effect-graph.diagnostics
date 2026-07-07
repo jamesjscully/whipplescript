@@ -1,0 +1,12 @@
+error: rule `bad_after` has `after` block for unknown effect binding `claim`
+   --> examples/invalid/bad-effect-graph.whip:10:4
+   |
+10 | => {
+   |    ^
+   = help: create an effect with `as claim` before the `after` block
+error: rule `bad_after` has unsupported `after` dependency predicate
+   --> examples/invalid/bad-effect-graph.whip:10:4
+   |
+10 | => {
+   |    ^
+   = help: use `after name succeeds`, `after name fails`, or `after name completes`

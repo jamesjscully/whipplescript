@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/whipplescript-cli",
+    "crates/whipplescript-core",
+    "crates/whipplescript-host-do",
+    "crates/whipplescript-kernel",
+    "crates/whipplescript-parser",
+    "crates/whipplescript-store",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+homepage = "https://github.com/jamesjscully/whipplescript"
+repository = "https://github.com/jamesjscully/whipplescript"
+readme = "README.md"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

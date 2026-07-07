@@ -1,0 +1,15 @@
+workflow RecursivePattern
+
+class Item {
+  id string
+}
+
+# A pattern whose body applies itself can never elaborate into a finite
+# first-order program, so v0 rejects it (graph.unbounded_pattern_recursion).
+pattern Loop<T> {
+  apply Loop<T> as inner {
+  }
+}
+
+apply Loop<Item> as top {
+}

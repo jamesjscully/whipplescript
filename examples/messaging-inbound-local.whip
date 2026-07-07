@@ -1,0 +1,31 @@
+@service
+description "Autonomous inbound RECEIVE over the native local-inbox provider (the SOURCE side of the S5 local mailbox)"
+workflow MessagingInboundLocal
+
+use std.messaging
+
+# A `channel` declaring `provider local` selects the native, file-backed local
+# provider behind the S5 CapabilityProvider seam. On the RECEIVE side the worker
+# polls a per-channel inbox at `<store>.inbox.<channel>.jsonl` and admits each
+# JSON line as a `Message` on `message.<channel>` — byte-for-byte the same fact
+# `whip message` injects — so a `when message from <channel>` rule fires
+# autonomously, one firing per received message.
+channel inbox {
+  provider local
+}
+
+class Received {
+  text string
+}
+
+# Reacts to every received message. `record` (not `complete`) so each of the
+# admitted messages drives an observable firing — the inbound mirror of the file
+# source's per-line `record`. The `msg` binding resolving `msg.text` proves the
+# admitted fact matches the `when message from` reaction path.
+rule react
+  when message from inbox as msg
+=> {
+  record Received {
+    text msg.text
+  }
+}

@@ -1,0 +1,44 @@
+workflow CircuitBreaker
+workflow_contracts
+  output result ref<Done>
+  failure error ref<Tripped>
+uses
+  package std.script
+schemas
+  class Done
+    note string
+  class Tripped
+    reason string
+  class Service
+    name string
+  class CallRequested
+    service string
+  class CallFailed
+    service string
+rules
+  rule seed
+    when started
+    reads
+      pattern:started
+    writes
+      schema:CallRequested
+    body_hash 878ad577f963a784
+  rule call_dependency
+    when CallRequested as c
+    reads
+      schema:CallRequested
+    writes
+      schema:CallFailed
+    effects
+      attempt kind=exec.command binding=attempt key=f648634d3a590b18
+    body_hash 1f0a290aa22a7e40
+  rule strike_breaker
+    when CallFailed as f
+    reads
+      schema:CallFailed
+    effects
+      strike kind=counter.consume binding=strike key=dfba1b3628ecd68f
+    body_hash 525acda830301bab
+rule_dependencies
+  call_dependency --schema:CallFailed--> strike_breaker
+  seed --schema:CallRequested--> call_dependency

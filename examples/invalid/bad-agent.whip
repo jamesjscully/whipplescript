@@ -1,0 +1,8 @@
+workflow BadAgent
+
+agent worker {
+  provider fixture
+  capacity 0
+  skills ["loft-user", "loft-user"]
+  mystery "field"
+}

@@ -1,0 +1,60 @@
+use std.script
+workflow DeterministicValidation
+
+output result ValidationReport
+failure error ValidationFailed
+
+# Deterministic validation (no model judgment): a non-LLM checker runs via
+# `exec <cmd> -> Schema`, its typed JSON result is ingested, and the rule branches
+# on it. Unlike `coerce` (which asks a model), the same input always yields the
+# same result — so this path suits reproducible CI checks such as exact script or
+# format detection. The `exec` command here stands in for a project validator
+# binary; a real one would, e.g., run Unicode script detection over the artifact.
+class Artifact {
+  path string
+  expectedScript string
+}
+
+# The validator's typed output. `exec -> ScriptCheck` admits the command's stdout
+# only after it decodes against this schema, so a malformed validator is a typed
+# effect failure, not silent garbage.
+class ScriptCheck {
+  isExpectedScript bool
+  detail string
+}
+
+class ValidationReport {
+  path string
+  detail string
+}
+
+class ValidationFailed {
+  reason string
+}
+
+table artifacts as Artifact [
+  {
+    path "target/dogfood/sample.txt"
+    expectedScript "Latin"
+  }
+]
+
+rule validate_artifact_script
+  when Artifact as artifact
+=> {
+  exec "printf '{\"isExpectedScript\":true,\"detail\":\"Latin script confirmed\"}\\n'" -> ScriptCheck as check
+
+  after check succeeds as result {
+    done artifact
+    complete result {
+      path artifact.path
+      detail result.detail
+    }
+  }
+
+  after check fails as failure {
+    fail error {
+      reason failure.reason
+    }
+  }
+}

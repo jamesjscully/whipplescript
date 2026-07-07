@@ -1,0 +1,47 @@
+workflow BadEffectPayload
+
+class Owner {
+  name string
+}
+
+class Payload {
+  title string
+  owner Owner
+  metadata map<string>
+  tags string[]
+}
+
+class Task {
+  title string
+  owner string
+}
+
+class Review {
+  accepted bool
+}
+
+coerce reviewPayload(payload Payload, metadata map<string>, score int) -> Review {
+  prompt "review"
+}
+
+rule bad_coerce
+  when Task as task where { owner "Ada" } == task.owner
+=> {
+  coerce reviewPayload(
+    {
+      title task.title
+      owner { handle task.owner }
+      metadata { phase 3 }
+      tags ["object", 7]
+      extra "bad"
+    },
+    { phase task.owner, count 3 },
+    "high"
+  ) as review
+}
+
+rule bad_claim
+  when Task as task
+=> {
+  claim task.title with loft as claim
+}

@@ -1,0 +1,6 @@
+error: program declares no `workflow`
+  --> examples/invalid/headerless-library.whip:1:1
+  |
+1 | # Invalid: a source with no explicit `workflow` is a library fragment, not a
+  | ^
+  = help: add an explicit `workflow Name { ... }` declaration; a runnable program requires at least one workflow (files that only declare shared types or patterns are libraries, meant to be `include`d)

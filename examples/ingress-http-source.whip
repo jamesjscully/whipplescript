@@ -1,0 +1,39 @@
+@service
+workflow IngressHttpSource
+
+# An `http` ingress source GETs a URL returning a JSON array and admits one
+# durable signal fact per array element, mirroring how a `file` source admits a
+# fact per non-empty line (spec/std-time.md admission semantics). The source
+# never fires a rule directly: it materializes the `ingress.ingested` signal, and rules
+# react to the admitted signal. Admission is idempotent by (source, element
+# index) — re-polling the endpoint re-admits nothing already seen (append-only
+# feed semantics), so a growing feed only ever adds new elements.
+signal ingress.ingested {
+  text string
+}
+
+class IngestedItem {
+  text string
+}
+
+# `observe as obs` binds the http observation record `{ item, item_index, url }`,
+# where `item` is the JSON element re-stringified; the `emit` clause maps those
+# observation fields onto the `ingress.ingested` signal payload, exactly as a file source
+# maps `obs.line`.
+source http as feed {
+  url "http://127.0.0.1:8080/feed.json"
+  observe as obs
+  emit ingress.ingested {
+    text obs.item
+  }
+}
+
+# Rules react to the admitted signal, not the source. Each admitted element
+# drives one `record`, so a two-element array yields two `IngestedItem` facts.
+rule record_item
+  when ingress.ingested as f
+=> {
+  record IngestedItem {
+    text f.text
+  }
+}

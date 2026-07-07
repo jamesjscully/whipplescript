@@ -1,0 +1,33 @@
+# Transitive runtime workflow-invocation cycle: `Ping` invokes `Pong` and `Pong`
+# invokes `Ping`. A runtime `invoke` cycle has no compile-time convergence proof
+# (termination is data-dependent), so v0 rejects it, parallel to recursive pattern
+# application. Route a genuine recurrence through an external event/clock instead.
+workflow Ping {
+  input task PingTask
+  output result PingResult
+  class PingTask { id string }
+  class PingResult { id string }
+  rule go
+    when PingTask as t
+  => {
+    invoke Pong { task { id t.id } } as p
+    after p succeeds as r {
+      complete result { id r.id }
+    }
+  }
+}
+
+workflow Pong {
+  input task PongTask
+  output result PongResult
+  class PongTask { id string }
+  class PongResult { id string }
+  rule go
+    when PongTask as t
+  => {
+    invoke Ping { task { id t.id } } as p
+    after p succeeds as r {
+      complete result { id r.id }
+    }
+  }
+}

@@ -1,0 +1,36 @@
+workflow CoerceBranch
+source_tags
+@service workflow CoerceBranch
+schemas
+  enum Priority { Low, Normal, Urgent }
+  class MessageClassification
+    priority ref<Priority>
+    summary string
+    confidence float
+  class ClassifiedMessage
+    request ref<WorkItem>
+    classification ref<MessageClassification>
+coerces
+  coerce classifyMessage(title string, body string) -> ref<MessageClassification>
+rules
+  rule classify_request
+    when WorkItem as request
+    reads
+      schema:WorkItem
+    writes
+      schema:ClassifiedMessage
+    effects
+      classification kind=schema.coerce binding=classification key=7c8df348bec42460
+      effect2 kind=human.ask binding=- key=9cb792d395f3f9ce
+    dependencies
+      classification --fails--> effect2
+    body_hash e5b9747dd84b9c04
+  rule route_classified
+    when ClassifiedMessage as message
+    reads
+      schema:ClassifiedMessage
+    effects
+      effect1 kind=human.ask binding=- key=f81bef02f1cb4990
+    body_hash 4bbde6eaaf7ce5f0
+rule_dependencies
+  classify_request --schema:ClassifiedMessage--> route_classified

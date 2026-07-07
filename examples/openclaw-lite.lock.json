@@ -1,0 +1,15 @@
+{
+  "packages": [
+    {
+      "manifest_sha256": "98f929f5b6c47e51971b0faea71a9e70c82564eb57c768fdbdd225603fe66348",
+      "name": "memory",
+      "package_id": "package-memory",
+      "source": {
+        "path": "packages/memory.json",
+        "type": "path"
+      },
+      "version": "0.1.0"
+    }
+  ],
+  "schema": "whipplescript.package_lock.v0"
+}

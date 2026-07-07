@@ -1,0 +1,34 @@
+[package]
+name = "whipplescript-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Runtime kernel and provider integrations for WhippleScript workflows"
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+whipplescript-core = { version = "0.2.0", path = "../whipplescript-core" }
+whipplescript-parser = { version = "0.2.0", path = "../whipplescript-parser" }
+whipplescript-store = { version = "0.2.0", path = "../whipplescript-store", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# `native` pulls in the rusqlite-backed store (whipplescript-store/native); the
+# kernel itself is store-backend-agnostic (RuntimeKernel<S: RuntimeStore>), so a
+# wasm consumer builds with `--no-default-features` to drop rusqlite (DR-0033
+# Phase 5). The delegating provider adapters are optional (DR-0024): the owned
+# brokered harness is the built-in path; Codex/Claude stdio sidecars are opt-in
+# and native-only. Default-on preserves current behavior.
+default = ["native", "codex", "claude"]
+native = ["whipplescript-store/native"]
+codex = []
+claude = []
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

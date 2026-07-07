@@ -1,0 +1,56 @@
+workflow AutoResearchLite
+workflow_contracts
+  output result ref<ResearchResult>
+  failure error ref<ResearchStopped>
+uses
+  package std.script
+schemas
+  class ResearchProject
+    id string
+  class Hypothesis
+    id string
+    project ref<ResearchProject>
+    idea string
+    status literal<"queued">
+  class ExperimentMetric
+    score float
+    notes string
+  class ResearchResult
+    hypothesisId string
+    score float
+    decision literal<"keep">
+  class ResearchStopped
+    reason string
+rules
+  rule table_projects
+    when started
+    reads
+      pattern:started
+    writes
+      schema:ResearchProject
+    record_sources
+      schema:ResearchProject construct=table_row span=677..709
+    body_hash 5aff8984f3a70a7b
+  rule table_hypotheses
+    when started
+    reads
+      pattern:started
+    writes
+      schema:Hypothesis
+    record_sources
+      schema:Hypothesis construct=table_row span=748..880
+    body_hash d72cc951a42a0e91
+  rule run_budgeted_experiment
+    when Hypothesis as hypothesis where hypothesis.status == "queued"
+    reads
+      schema:Hypothesis
+    consumes
+      schema:Hypothesis
+    effects
+      budget kind=counter.consume binding=budget key=e8558d7a02f1000a
+      metric kind=exec.command binding=metric key=5a9942dfd9bd2b72
+    dependencies
+      budget --completes--> metric
+    body_hash 7b190d3b04f76f83
+rule_dependencies
+  table_hypotheses --schema:Hypothesis--> run_budgeted_experiment

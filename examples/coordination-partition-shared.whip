@@ -1,0 +1,123 @@
+# Coordination resources are partitioned by workflow owner unless the resource
+# explicitly opts into `shared`. Check with any root below; the compiler validates
+# all workflows in the bundle.
+class CoordKey {
+  id string
+}
+
+class CoordDone {
+  note string
+}
+
+class CoordBlocked {
+  reason string
+}
+
+lease partitioned_slot {
+  key CoordKey
+  slots 1
+  ttl 10m
+}
+
+lease shared_slot {
+  shared
+  key CoordKey
+  slots 1
+  ttl 10m
+}
+
+workflow PartitionedAlpha {
+  input key CoordKey
+  output result CoordDone
+  failure error CoordBlocked
+
+  rule grab
+    when CoordKey as key
+  => {
+    acquire partitioned_slot for key.id until ttl as slot
+
+    after slot held {
+      complete result {
+        note "alpha held its partition"
+      }
+    }
+
+    after slot contended {
+      fail error {
+        reason "unexpected contention"
+      }
+    }
+  }
+}
+
+workflow PartitionedBeta {
+  input key CoordKey
+  output result CoordDone
+  failure error CoordBlocked
+
+  rule grab
+    when CoordKey as key
+  => {
+    acquire partitioned_slot for key.id until ttl as slot
+
+    after slot held {
+      complete result {
+        note "beta held its partition"
+      }
+    }
+
+    after slot contended {
+      fail error {
+        reason "unexpected contention"
+      }
+    }
+  }
+}
+
+workflow SharedAlpha {
+  input key CoordKey
+  output result CoordDone
+  failure error CoordBlocked
+
+  rule grab
+    when CoordKey as key
+  => {
+    acquire shared_slot for key.id until ttl as slot
+
+    after slot held {
+      complete result {
+        note "alpha held the shared slot"
+      }
+    }
+
+    after slot contended {
+      fail error {
+        reason "shared slot busy"
+      }
+    }
+  }
+}
+
+workflow SharedBeta {
+  input key CoordKey
+  output result CoordDone
+  failure error CoordBlocked
+
+  rule grab
+    when CoordKey as key
+  => {
+    acquire shared_slot for key.id until ttl as slot
+
+    after slot held {
+      complete result {
+        note "beta held the shared slot"
+      }
+    }
+
+    after slot contended {
+      fail error {
+        reason "shared slot busy"
+      }
+    }
+  }
+}

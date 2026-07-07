@@ -1,0 +1,90 @@
+@service
+description "Claim ready work items, implement them, review each turn, and escalate failed reviews to a human"
+workflow QueueWorkerWithReview
+
+# Queues make work ownership explicit: claim before turn, finish or release after review.
+tracker backlog {
+  provider builtin
+}
+
+enum ReviewStatus {
+  Accept
+  Revise
+  Blocked
+}
+
+class WorkReview {
+  status ReviewStatus
+  reason string
+  followups string[]
+  confidence float
+}
+
+class ReviewedWork {
+  itemId string
+  review WorkReview
+}
+
+coerce reviewWork(itemTitle string, agentSummary string) -> WorkReview {
+  prompt """markdown
+  Review this completed agent turn for the work issue.
+
+  Item:
+  {{ itemTitle }}
+
+  Agent summary:
+  {{ agentSummary }}
+
+  Return a structured review.
+
+  {{ ctx.output_format }}
+  """
+}
+
+agent worker {
+  provider owned
+  profile "repo-writer"
+  capacity 1
+}
+
+rule work_ready_item
+  when backlog has ready issue as issue
+  when worker is available
+=> {
+  claim issue as active_claim
+
+  after active_claim succeeds {
+    tell worker as turn """markdown
+    Implement this work item:
+
+    {{ issue.title }}
+
+    {{ issue.body }}
+
+    Finish with a concise summary.
+    """
+  }
+
+  after turn succeeds as outcome {
+    coerce reviewWork(issue.title, outcome.summary) as review
+  }
+
+  after review succeeds as verdict {
+    finish issue {
+      summary outcome.summary
+    }
+    record ReviewedWork {
+      itemId issue.id
+      review verdict
+    }
+  }
+
+  after review fails {
+    release issue
+    askHuman """markdown
+    Review failed for work item {{ issue.id }}: {{ issue.title }}
+
+    Please inspect the turn and decide whether to accept, revise, or block the issue.
+    """
+  }
+}

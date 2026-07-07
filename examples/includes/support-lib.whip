@@ -1,0 +1,10 @@
+# Shared library file, `include`d by more than one workflow (see
+# `include-triage.whip` and `include-audit.whip`). It declares the common
+# `SupportTicket` envelope so the consuming workflows agree on one schema
+# instead of each redeclaring it. Library files hold declarations only — no
+# `workflow` of their own — and are pulled in by an `include` in the consumer.
+class SupportTicket {
+  id string
+  summary string
+  severity string
+}

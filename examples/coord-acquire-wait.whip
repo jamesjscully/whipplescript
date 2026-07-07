@@ -1,0 +1,74 @@
+# Bounded-wait lease acquisition (spec/coordination.md).
+#
+# Two instances contend for a single shared slot. `Holder` grabs the slot, does
+# its work, and releases it. `Waiter` asks for the same slot with `wait 30s`:
+# instead of reporting `contended` on the first attempt, the acquire retries on
+# every worker pass until the slot frees (then `held`) or 30 seconds elapse
+# (then `contended`). Without `wait`, a busy slot routes straight to `contended`.
+
+class Ticket {
+  id string
+}
+
+class Done {
+  note string
+}
+
+class Busy {
+  reason string
+}
+
+lease deploy_slot {
+  shared
+  key Ticket
+  slots 1
+  ttl 10m
+}
+
+workflow Holder {
+  input ticket Ticket
+  output result Done
+  failure error Busy
+
+  rule grab
+    when Ticket as t
+  => {
+    acquire deploy_slot for t.id as slot
+
+    after slot held {
+      release slot
+      complete result {
+        note "holder took and released the slot"
+      }
+    }
+    after slot contended {
+      fail error {
+        reason "holder could not take the slot"
+      }
+    }
+  }
+}
+
+workflow Waiter {
+  input ticket Ticket
+  output result Done
+  failure error Busy
+
+  rule grab
+    when Ticket as t
+  => {
+    acquire deploy_slot for t.id wait 30s as slot
+
+    after slot held {
+      release slot
+      complete result {
+        note "waiter acquired the slot after waiting"
+      }
+    }
+    after slot contended {
+      fail error {
+        reason "waiter gave up after waiting 30s"
+      }
+    }
+  }
+}

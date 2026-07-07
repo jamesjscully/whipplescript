@@ -1,0 +1,24 @@
+# Consumer 2 of the SAME shared support library: records an audit outcome. Two
+# separate workflows (`TriageTickets` and `AuditTickets`) each `include` the
+# one `support-lib.whip`, demonstrating cross-workflow source reuse: the library
+# is written once and shared by both.
+include "includes/support-lib.whip"
+
+workflow AuditTickets
+
+input ticket SupportTicket
+output result AuditResult
+
+class AuditResult {
+  id string
+  logged bool
+}
+
+rule audit
+  when SupportTicket as t
+=> {
+  complete result {
+    id t.id
+    logged true
+  }
+}

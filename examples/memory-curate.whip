@@ -1,0 +1,82 @@
+@service
+workflow MemoryCurate
+
+use memory
+
+class Seed {
+  topic string
+}
+
+class S2 {
+  topic string
+}
+
+class S3 {
+  topic string
+}
+
+class S4 {
+  topic string
+}
+
+class S5 {
+  topic string
+}
+
+rule seed
+  when started
+=> {
+  record Seed {
+    topic "go"
+  }
+}
+
+rule learn_dup_one
+  when Seed as s
+=> {
+  learn from s.topic into project_memory { note "dup" } as a
+  after a succeeds {
+    record S2 {
+      topic s.topic
+    }
+  }
+}
+
+rule learn_dup_two
+  when S2 as s
+=> {
+  learn from s.topic into project_memory { note "dup" } as a
+  after a succeeds {
+    record S3 {
+      topic s.topic
+    }
+  }
+}
+
+rule learn_distinct
+  when S3 as s
+=> {
+  learn from s.topic into project_memory { note "distinct" } as a
+  after a succeeds {
+    record S4 {
+      topic s.topic
+    }
+  }
+}
+
+rule curate_pool
+  when S4 as s
+=> {
+  curate project_memory { reason "compact" } as pruned
+  after pruned succeeds {
+    record S5 {
+      topic s.topic
+    }
+  }
+}
+
+rule recall_pool
+  when S5 as s
+=> {
+  recall project_memory for s.topic as context
+}

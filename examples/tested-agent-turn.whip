@@ -1,0 +1,90 @@
+workflow ReviewTurn
+
+input ticket Ticket
+output result ReviewSeen
+
+class Ticket {
+  title string
+}
+
+class ReviewSeen {
+  agent string
+  summary string
+}
+
+agent reviewer {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule begin
+  when started
+  when reviewer is available
+=> {
+  tell reviewer "Review the ticket."
+}
+
+rule observe
+  when reviewer completed turn as turn
+=> {
+  record ReviewSeen {
+    agent turn.agent
+    summary turn.summary
+  }
+
+  complete result {
+    agent turn.agent
+    summary turn.summary
+  }
+}
+
+test "a successful review turn completes the workflow" {
+  workflow ReviewTurn
+
+  given input {
+    ticket { title "Crash on startup" }
+  }
+
+  stub agent reviewer succeeds
+
+  run until idle
+
+  expect rule begin fired
+  expect effect agent.tell completed
+  expect rule observe fired
+  expect workflow completed
+  expect ReviewSeen exists
+  expect agent.turn.completed where agent == "reviewer"
+}
+
+test "a failed review turn blocks completion and records a diagnostic" {
+  workflow ReviewTurn
+
+  given input {
+    ticket { title "Crash on startup" }
+  }
+
+  stub agent reviewer fails
+
+  run until idle
+
+  expect effect agent.tell failed
+  expect rule observe did not fire
+  expect diagnostic nonzero_exit
+}
+
+test "one step settles the turn before the observing rule fires" {
+  workflow ReviewTurn
+
+  given input {
+    ticket { title "Crash on startup" }
+  }
+
+  stub agent reviewer succeeds
+
+  run for 1 steps
+
+  expect rule begin fired
+  expect rule observe did not fire
+}

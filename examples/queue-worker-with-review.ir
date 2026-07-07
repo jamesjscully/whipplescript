@@ -1,0 +1,44 @@
+workflow QueueWorkerWithReview
+source_tags
+@service workflow QueueWorkerWithReview
+source_descriptions
+"Claim ready work items, implement them, review each turn, and escalate failed reviews to a human" workflow QueueWorkerWithReview
+schemas
+  enum ReviewStatus { Accept, Revise, Blocked }
+  class WorkReview
+    status ref<ReviewStatus>
+    reason string
+    followups array<string>
+    confidence float
+  class ReviewedWork
+    itemId string
+    review ref<WorkReview>
+trackers
+  tracker backlog provider=builtin
+agents
+  agent worker harness=<fallback> provider=owned profile=repo-writer capacity=1 skills=[] capabilities=[] tools=[]
+coerces
+  coerce reviewWork(itemTitle string, agentSummary string) -> ref<WorkReview>
+rules
+  rule work_ready_item
+    when backlog has ready issue as issue
+    when worker is available
+    reads
+      pattern:backlog has ready issue as issue
+      pattern:worker is available
+    writes
+      schema:ReviewedWork
+    effects
+      active_claim kind=tracker.claim binding=active_claim key=4f1eba1192865a81
+      turn kind=agent.tell binding=turn key=1d124f49240816a7
+      review kind=schema.coerce binding=review key=d8e8ca8d5f1369f1
+      effect4 kind=tracker.finish binding=- key=8707324facb2e308
+      effect5 kind=tracker.release binding=- key=0e796dff366d7f0d
+      effect6 kind=human.ask binding=- key=631378576107ef4f
+    dependencies
+      active_claim --succeeds--> turn
+      turn --succeeds--> review
+      review --succeeds--> effect4
+      review --fails--> effect5
+      review --fails--> effect6
+    body_hash 7cb189b7fa690d35

@@ -1,0 +1,46 @@
+# Typed invoke results: when a child workflow's `output` contract is a shared
+# top-level class, a parent that invokes it can access the result's fields with
+# static checking. `after scored succeeds as r` binds `r` to the child's output
+# contract (here `Report`), so `r.summary` is type-checked — a typo like
+# `r.sumary` would be a compile error, not a silent runtime null.
+#
+# (The output class must be shared at the top level: a class declared privately
+# inside the child workflow is not visible to the parent, per workflow-local
+# scoping, so the binding stays opaque in that case.) Check with `--root Router`.
+class ScoreRequest {
+  id string
+}
+
+class Report {
+  id string
+  summary string
+}
+
+workflow Router(request: ScoreRequest) -> Report {
+  rule dispatch
+    when ScoreRequest as request
+  => {
+    invoke Scorer { request { id request.id } } as scored
+
+    after scored succeeds as r {
+      complete result {
+        id r.id
+        summary r.summary
+      }
+    }
+  }
+}
+
+workflow Scorer {
+  input request ScoreRequest
+  output result Report
+
+  rule score
+    when ScoreRequest as request
+  => {
+    complete result {
+      id request.id
+      summary "scored"
+    }
+  }
+}

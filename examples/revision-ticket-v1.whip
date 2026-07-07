@@ -1,0 +1,66 @@
+workflow RevisionTicket {
+  input ticket TicketRequest
+  output result TicketResult
+  failure error TicketFailure
+
+  class TicketRequest {
+    title string
+    body string
+  }
+
+  class TicketResult {
+    summary string
+  }
+
+  class TicketFailure {
+    reason string
+  }
+
+  class TicketWork {
+    title string
+    body string
+    status "queued"
+  }
+
+  agent worker {
+  provider owned
+    profile "repo-writer"
+    capacity 1
+    skills ["whipplescript-author"]
+  }
+
+  rule seed_ticket
+    when TicketRequest as ticket
+  => {
+    done ticket -> record TicketWork {
+      title ticket.title
+      body ticket.body
+      status "queued"
+    }
+  }
+
+  rule dispatch_ticket
+    when TicketWork as work where work.status == "queued"
+    when worker is available
+  => {
+    tell worker as turn """markdown
+    Implement this ticket.
+
+    Title:
+    {{ work.title }}
+
+    Body:
+    {{ work.body }}
+
+    Finish with a concise summary and changed file list.
+    """
+
+    after turn succeeds {
+      done work
+
+      complete result {
+        summary turn.summary
+      }
+    }
+  }
+}

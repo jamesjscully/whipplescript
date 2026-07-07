@@ -1,0 +1,61 @@
+workflow RevisionRunningCancel {
+  input task RunningCancelTask
+  output result RunningCancelResult
+  failure error RunningCancelFailure
+
+  class RunningCancelTask {
+    title string
+    artifactPath string
+  }
+
+  class RunningCancelResult {
+    summary string
+  }
+
+  class RunningCancelFailure {
+    reason string
+  }
+
+  class RunningCancelObserved {
+    title string
+    status "completed"
+  }
+
+  agent worker {
+  provider owned
+    profile "repo-writer"
+    capacity 1
+    skills ["whipplescript-author"]
+  }
+
+  rule start_long_turn
+    when RunningCancelTask as task
+    when worker is available
+  => {
+    tell worker as turn """markdown
+    Work on this task until the provider finishes or acknowledges cancellation.
+
+    Title:
+    {{ task.title }}
+
+    Artifact path:
+    {{ task.artifactPath }}
+
+    A revision with --cancel running should request cancellation if this turn is
+    already running. It must not fabricate a terminal result.
+    """
+
+    after turn succeeds {
+      done task
+
+      record RunningCancelObserved {
+        title task.title
+        status "completed"
+      }
+
+      complete result {
+        summary turn.summary
+      }
+    }
+  }
+}

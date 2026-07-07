@@ -1,0 +1,9 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "package-toolkit",
+  "name": "toolkit",
+  "version": "0.1.0",
+  "workflow_tools": [
+    { "name": "EchoText", "source": "../echo-text-tool.whip" }
+  ]
+}

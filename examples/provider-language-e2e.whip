@@ -1,0 +1,191 @@
+@fixture
+@acceptance
+description "Fixture-backed provider x language acceptance workflow"
+@service
+workflow ProviderLanguageE2E
+
+
+class LanguageTask {
+  provider AgentRef<codex | claude | pi>
+  language string
+  expectedScript string
+  prompt string
+  artifactPath string
+  status "queued"
+}
+
+class LanguageQualityReview {
+  isTargetLanguage bool
+  usesExpectedScript bool
+  isWellFormed bool
+  reason string
+  confidence float
+}
+
+class LanguageE2EResult {
+  provider string
+  language string
+  artifactPath string
+  turn AgentTurn
+  review LanguageQualityReview
+  status "reviewed"
+}
+
+coerce reviewLanguageArtifact(language string, expectedScript string, artifactPath string, turnSummary string) -> LanguageQualityReview {
+  prompt """markdown
+  Review the completed language artifact.
+
+  Language:
+  {{ language }}
+
+  Expected script:
+  {{ expectedScript }}
+
+  Artifact path:
+  {{ artifactPath }}
+
+  Turn summary:
+  {{ turnSummary }}
+
+  Decide whether the artifact is in the target language, uses the expected script,
+  and is a well-formed short text for the requested task.
+
+  {{ ctx.output_format }}
+  """
+}
+
+agent codex {
+  provider codex
+  profile "repo-writer"
+  capacity 2
+}
+
+agent claude {
+  provider claude
+  profile "repo-writer"
+  capacity 2
+}
+
+agent pi {
+  provider pi
+  profile "repo-writer"
+  capacity 2
+}
+
+@acceptance
+description "Codex completes both assigned language tasks"
+assert count(LanguageE2EResult where provider == "codex") == 2
+@acceptance
+description "Claude completes both assigned language tasks"
+assert count(LanguageE2EResult where provider == "claude") == 2
+@acceptance
+description "Pi completes both assigned language tasks"
+assert count(LanguageE2EResult where provider == "pi") == 2
+@acceptance
+description "All seeded language tasks are consumed"
+assert count(LanguageTask where status == "queued") == 0
+@acceptance
+description "All agent turns complete"
+assert count(effect kind agent.tell where status == completed) == 6
+@acceptance
+description "All language reviews complete"
+assert count(effect kind schema.coerce where status == completed) == 6
+
+@fixture
+description "Static provider x language task rows"
+table language_tasks as LanguageTask [
+  {
+    provider codex
+    language "French"
+    expectedScript "Latin"
+    prompt "Write a four-line original poem about rain over a city at night."
+    artifactPath "target/dogfood/language/codex-french.txt"
+    status "queued"
+  }
+
+  {
+    provider codex
+    language "Arabic"
+    expectedScript "Arabic"
+    prompt "Write a four-line original poem about a desert sunrise."
+    artifactPath "target/dogfood/language/codex-arabic.txt"
+    status "queued"
+  }
+
+  {
+    provider claude
+    language "Spanish"
+    expectedScript "Latin"
+    prompt "Write a four-line original poem about a harbor at dawn."
+    artifactPath "target/dogfood/language/claude-spanish.txt"
+    status "queued"
+  }
+
+  {
+    provider claude
+    language "Hindi"
+    expectedScript "Devanagari"
+    prompt "Write a four-line original poem about monsoon clouds."
+    artifactPath "target/dogfood/language/claude-hindi.txt"
+    status "queued"
+  }
+
+  {
+    provider pi
+    language "Japanese"
+    expectedScript "Kana and kanji"
+    prompt "Write a four-line original poem about a quiet train station."
+    artifactPath "target/dogfood/language/pi-japanese.txt"
+    status "queued"
+  }
+
+  {
+    provider pi
+    language "German"
+    expectedScript "Latin"
+    prompt "Write a four-line original poem about snow on rooftops."
+    artifactPath "target/dogfood/language/pi-german.txt"
+    status "queued"
+  }
+]
+
+description "Route one queued language task to its selected provider"
+rule run_language_task
+  when LanguageTask as task where task.status == "queued"
+  when task.provider is available
+=> {
+  tell task.provider as turn """markdown
+  Complete this language e2e task.
+
+  Target language:
+  {{ task.language }}
+
+  Expected script:
+  {{ task.expectedScript }}
+
+  Task:
+  {{ task.prompt }}
+
+  Write only the requested text to {{ task.artifactPath }}.
+  Do not edit files outside target/dogfood/language.
+
+  Finish your turn with a concise summary that includes the artifact path.
+  """
+
+  after turn succeeds {
+    coerce reviewLanguageArtifact(task.language, task.expectedScript, task.artifactPath, turn.summary) as review
+  }
+
+  after review succeeds {
+    done task
+
+    record LanguageE2EResult {
+      provider task.provider
+      language task.language
+      artifactPath task.artifactPath
+      turn turn
+      review review
+      status "reviewed"
+    }
+  }
+}

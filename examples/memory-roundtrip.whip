@@ -1,0 +1,26 @@
+@service
+workflow MemoryRoundtrip
+
+use memory
+
+class Note {
+  topic string
+}
+
+rule seed
+  when started
+=> {
+  record Note {
+    topic "alpha"
+  }
+}
+
+rule remember_then_recall
+  when Note as note
+=> {
+  learn from note into project_memory { note "remember alpha" } as saved
+
+  after saved succeeds {
+    recall project_memory for note as context
+  }
+}

@@ -1,0 +1,39 @@
+@service
+description "Outbound messaging over the native stdio provider (writes a marker line to stdout)"
+workflow MessagingStdioDemo
+
+# A `channel` declaring `provider stdio` selects the native stdio provider
+# behind the S5 CapabilityProvider seam: outbound `send` writes one
+# `[messaging.stdio] channel=… text=…` line to the process stdout. Every other
+# provider (e.g. `local`, `slack`) keeps its own provider.
+channel console {
+  provider stdio
+}
+
+output result Done
+
+class Trigger {
+  id string
+}
+
+class Done {
+  ok string
+}
+
+table seed as Trigger [
+  { id "t" }
+]
+
+rule notify
+  when Trigger as t
+=> {
+  send via console {
+    text "hello-stdio"
+  } as sent
+
+  after sent succeeds {
+    complete result {
+      ok "sent"
+    }
+  }
+}

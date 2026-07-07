@@ -1,0 +1,28 @@
+# Consumer A of the shared `TagReviewed` pattern (from review-pattern-lib.whip).
+# Applies the pattern to its own `TicketA` input, then completes from the shared
+# `ReviewLog` fact the generated rule records.
+include "includes/review-pattern-lib.whip"
+
+workflow ReviewTicketsA
+
+input ticket TicketA
+output result DoneA
+
+class TicketA {
+  id string
+}
+
+class DoneA {
+  id string
+}
+
+apply TagReviewed<TicketA> as ticketTag {
+}
+
+rule finish
+  when ReviewLog as log
+=> {
+  complete result {
+    id log.id
+  }
+}

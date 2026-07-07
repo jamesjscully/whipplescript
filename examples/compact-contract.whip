@@ -1,0 +1,28 @@
+# The compact workflow-contract signature: `workflow Name(in: Type) -> Output !
+# Failure` desugars to the same `input`/`output`/`failure` contracts as the
+# keyword form, with the output bound as `result` and the failure as `error`.
+# Both forms are legal to write; `whip fmt` re-emits the keyword lines.
+workflow CompactTriage(ticket: Ticket) -> Resolution ! TriageFailed
+
+class Ticket {
+  id string
+  title string
+}
+
+class Resolution {
+  id string
+  summary string
+}
+
+class TriageFailed {
+  reason string
+}
+
+rule triage
+  when Ticket as ticket
+=> {
+  complete result {
+    id ticket.id
+    summary ticket.title
+  }
+}

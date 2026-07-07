@@ -1,0 +1,25 @@
+# Cloudflare Worker + Durable Object deployment for the WhippleScript runtime
+# (DR-0033 chunk 5d). Aligns with Cloudflare's DO-with-SQLite docs.
+name = "whipplescript-runtime"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+# The Durable Object holding one workflow instance. `new_sqlite_classes` gives it
+# the SQLite-backed storage the runtime store is ported to (do_store.rs / DoSql).
+[[durable_objects.bindings]]
+name = "WORKFLOW_INSTANCE"
+class_name = "WorkflowInstance"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkflowInstance"]
+
+# The wasm module built from the #[wasm_bindgen] surface (crate whipplescript-host-do).
+# `wasm-pack build --target bundler` emits worker/pkg/*; the bundler inlines the .wasm.
+[build]
+command = "npm run build:wasm"
+
+# Provider credentials are DO secrets, set out-of-band:
+#   wrangler secret put ANTHROPIC_API_KEY
+#   wrangler secret put OPENAI_API_KEY
+# They flow into DurableEffectPorts (coerce/agent) once create() accepts them.

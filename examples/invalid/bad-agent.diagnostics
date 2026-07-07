@@ -1,0 +1,24 @@
+error: agent `worker` capacity must be greater than zero
+  --> examples/invalid/bad-agent.whip:4:12
+  |
+4 |   capacity 0
+  |            ^
+  = help: use `capacity 1` or a larger integer
+error: agent `worker` attaches skill `loft-user` more than once
+  --> examples/invalid/bad-agent.whip:5:26
+  |
+5 |   skills ["loft-user", "loft-user"]
+  |                          ^^^^^^^^^^^^^
+  = help: remove the duplicate skill entry
+error: unknown agent field `mystery` on agent `worker`
+  --> examples/invalid/bad-agent.whip:6:3
+  |
+6 |   mystery "field"
+  |   ^^^^^^^
+  = help: supported agent fields are `profile`, `capacity`, and `skills`
+error: agent `worker` is missing a profile
+  --> examples/invalid/bad-agent.whip:3:7
+  |
+3 | agent worker {
+  |       ^^^^^^
+  = help: add `profile "profile-name"` inside the agent block
