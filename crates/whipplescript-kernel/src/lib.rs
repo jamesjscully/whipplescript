@@ -2183,6 +2183,27 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         event: &NativeProviderEvent,
         occurrence_key: &str,
     ) -> StoreResult<ProviderEvidence> {
+        // DR-0035 Decision 3 (T1/T3): protocol violations are recorded as
+        // diagnostics, never as lifecycle events. Explicit violations are
+        // adapter-surfaced `whip.protocol.*` frames (e.g. misrouted run ids);
+        // implicit ones are frames arriving after this run's terminal was
+        // admitted — exactly-one-terminal means they must never reopen the run
+        // or add lifecycle observations.
+        let violation_reason = if event.provider_event_type.starts_with("whip.protocol.") {
+            Some("adapter_surfaced")
+        } else if self
+            .store
+            .list_runs(execution.instance_id)?
+            .iter()
+            .any(|run| run.run_id == execution.run_id && run.status != "running")
+        {
+            Some("post_terminal")
+        } else {
+            None
+        };
+        if let Some(reason) = violation_reason {
+            return self.record_protocol_violation(execution, event, occurrence_key, reason);
+        }
         let artifact_ids = event
             .artifacts
             .iter()
@@ -2233,6 +2254,49 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         Ok(ProviderEvidence {
             evidence_id: Some(evidence_id),
             artifact_ids,
+        })
+    }
+
+    /// DR-0035 Decision 3: a protocol-violating frame lands as evidence only —
+    /// no lifecycle observation, no artifacts, and the run's terminal state is
+    /// untouched, so a violating peer can never reopen or double-terminate a
+    /// run.
+    fn record_protocol_violation(
+        &mut self,
+        execution: AgentTurnExecution<'_>,
+        event: &NativeProviderEvent,
+        occurrence_key: &str,
+        reason: &str,
+    ) -> StoreResult<ProviderEvidence> {
+        let metadata = json!({
+            "effect_id": execution.effect_id,
+            "agent": execution.agent,
+            "provider": execution.provider,
+            "reason": reason,
+            "native_event": event.to_json_redacted(),
+            // The adapter-constructed violation detail (frame type + run id) is
+            // identifiers-only by construction, so it may cross verbatim where
+            // the generic evidence shape would erase it.
+            "violation": event.evidence.get("violation").cloned().unwrap_or(Value::Null),
+        })
+        .to_string();
+        let evidence_id = self.store.record_evidence(EvidenceRecord {
+            instance_id: execution.instance_id,
+            kind: "agent.turn.protocol_violation",
+            subject_type: "run",
+            subject_id: execution.run_id,
+            causation_id: Some(execution.effect_id),
+            correlation_id: Some(occurrence_key),
+            summary: Some(&format!(
+                "protocol violation ({reason}): {} frame from {}",
+                event.event_kind.as_str(),
+                event.provider_event_type
+            )),
+            metadata_json: &metadata,
+        })?;
+        Ok(ProviderEvidence {
+            evidence_id: Some(evidence_id),
+            artifact_ids: Vec::new(),
         })
     }
 
@@ -6379,6 +6443,125 @@ rule wait
             })
             .expect("run starts");
         (kernel, instance_id)
+    }
+
+    #[test]
+    fn protocol_violations_record_as_evidence_not_lifecycle_events() {
+        // DR-0035 Decision 3 (T1/T3): adapter-surfaced `whip.protocol.*` frames
+        // and frames arriving after the run's terminal both land as
+        // `agent.turn.protocol_violation` evidence — never as lifecycle events,
+        // and they never reopen the run.
+        let (mut kernel, instance_id) = start_running_agent_turn_without_evidence();
+        let execution = AgentTurnExecution {
+            instance_id: &instance_id,
+            effect_id: "tell",
+            run_id: "run-tell",
+            provider: "codex",
+            worker_id: "worker-1",
+            lease_id: "lease-tell",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            agent: "worker",
+            profile: Some("repo-writer"),
+            input_json: r#"{"prompt":"go"}"#,
+            skill_names: &[],
+        };
+        let frame = |event_type: &str, kind: NativeProviderEventKind| NativeProviderEvent {
+            provider_id: "codex".to_owned(),
+            run_id: "run-tell".to_owned(),
+            event_kind: kind,
+            provider_event_type: event_type.to_owned(),
+            provider_session_id: None,
+            provider_turn_id: None,
+            sequence: None,
+            evidence: json!({"violation": {"frame_type": "item/started", "frame_run_id": "run-other"}}),
+            artifacts: Vec::new(),
+        };
+
+        // While running: an adapter-surfaced misrouted frame is a violation.
+        kernel
+            .record_native_provider_event(
+                execution,
+                &frame(
+                    "whip.protocol.misrouted_frame",
+                    NativeProviderEventKind::Diagnostic,
+                ),
+                "violation-0",
+            )
+            .expect("adapter-surfaced violation records");
+
+        // Terminate the run (recovery resolves it to the uncertain terminal).
+        kernel
+            .recover_running_provider_runs(&instance_id)
+            .expect("recovery resolves the run");
+        let events_at_terminal = kernel
+            .store()
+            .list_events(&instance_id)
+            .expect("events list")
+            .len();
+
+        // Post-terminal: even an ordinary stream frame is a violation now.
+        kernel
+            .record_native_provider_event(
+                execution,
+                &frame("item/started", NativeProviderEventKind::Streamed),
+                "violation-1",
+            )
+            .expect("post-terminal violation records");
+
+        let evidence = kernel
+            .store()
+            .list_evidence(&instance_id)
+            .expect("evidence lists");
+        let violations = evidence
+            .iter()
+            .filter(|row| row.kind == "agent.turn.protocol_violation")
+            .collect::<Vec<_>>();
+        assert_eq!(violations.len(), 2, "both frames land as violations");
+        let reasons = violations
+            .iter()
+            .map(|row| {
+                serde_json::from_str::<Value>(&row.metadata_json)
+                    .expect("violation metadata")
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .expect("reason present")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            reasons.contains(&"adapter_surfaced".to_owned()),
+            "{reasons:?}"
+        );
+        assert!(reasons.contains(&"post_terminal".to_owned()), "{reasons:?}");
+        // The adapter-constructed identifiers survive into the evidence.
+        assert!(
+            violations
+                .iter()
+                .any(|row| row.metadata_json.contains("run-other")),
+            "violation detail carries the stray frame's run id"
+        );
+        // Violations add no lifecycle events and the run stays terminal.
+        assert!(
+            !evidence
+                .iter()
+                .any(|row| row.kind == "agent.turn.native_event"),
+            "no lifecycle observation was appended for a violation"
+        );
+        let events_after = kernel
+            .store()
+            .list_events(&instance_id)
+            .expect("events list")
+            .len();
+        assert_eq!(
+            events_after, events_at_terminal,
+            "a post-terminal frame appends no events"
+        );
+        let runs = kernel.store().list_runs(&instance_id).expect("runs list");
+        let run = runs.iter().find(|r| r.run_id == "run-tell").expect("run");
+        assert_eq!(
+            run.status, "uncertain",
+            "the violation never reopens the run"
+        );
     }
 
     #[test]

@@ -304,22 +304,17 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkClient<T> {
                 continue;
             }
             let message: Value = serde_json::from_str(&line)?;
-            if message.get("run_id").and_then(Value::as_str) != Some(&run_id) {
-                return Err(ClaudeAgentSdkError::Protocol(
-                    "received event for unexpected run id".to_owned(),
-                ));
-            }
-            if message.get("type").and_then(Value::as_str) == Some("run/error") {
-                return Err(ClaudeAgentSdkError::Remote(message));
-            }
-            let event = parse_event(message)?;
-            let terminal = matches!(
-                event.event_type.as_str(),
-                "claude.turn.completed" | "claude.turn.failed" | "claude.turn.cancelled"
-            );
-            self.events.push(event);
-            if terminal {
-                return Ok(self.events.clone());
+            match route_frame(message, &run_id)? {
+                RoutedFrame::Event(event) | RoutedFrame::Misrouted(event) => {
+                    let terminal = matches!(
+                        event.event_type.as_str(),
+                        "claude.turn.completed" | "claude.turn.failed" | "claude.turn.cancelled"
+                    );
+                    self.events.push(event);
+                    if terminal {
+                        return Ok(self.events.clone());
+                    }
+                }
             }
         }
     }
@@ -351,15 +346,9 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkClient<T> {
                 continue;
             }
             let message: Value = serde_json::from_str(&line)?;
-            if message.get("run_id").and_then(Value::as_str) != Some(expected_run_id) {
-                return Err(ClaudeAgentSdkError::Protocol(
-                    "received event for unexpected run id".to_owned(),
-                ));
-            }
-            if message.get("type").and_then(Value::as_str) == Some("run/error") {
-                return Err(ClaudeAgentSdkError::Remote(message));
-            }
-            return parse_event(message);
+            return match route_frame(message, expected_run_id)? {
+                RoutedFrame::Event(event) | RoutedFrame::Misrouted(event) => Ok(event),
+            };
         }
     }
 
@@ -376,6 +365,42 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkClient<T> {
     pub fn into_transport(self) -> T {
         self.transport
     }
+}
+
+/// The synthetic event type a misrouted frame surfaces as (DR-0035 Decision 3
+/// T3). The kernel records `whip.protocol.*` events as protocol-violation
+/// diagnostics, never as lifecycle events.
+pub const MISROUTED_FRAME_EVENT_TYPE: &str = "whip.protocol.misrouted_frame";
+
+enum RoutedFrame {
+    Event(ClaudeSidecarEvent),
+    Misrouted(ClaudeSidecarEvent),
+}
+
+/// DR-0035 Decision 3 T3 routing. A `run/error` with a null run id is a
+/// channel-level sidecar failure and one with our run id is this run's error —
+/// both surface as `Remote`. Any other frame whose run id does not match is
+/// misrouted: it becomes a synthetic protocol-violation event (identifiers
+/// only, no payload content) instead of aborting the turn.
+fn route_frame(message: Value, expected_run_id: &str) -> Result<RoutedFrame, ClaudeAgentSdkError> {
+    let frame_run_id = message.get("run_id").and_then(Value::as_str);
+    let frame_type = message.get("type").and_then(Value::as_str);
+    if frame_type == Some("run/error")
+        && (frame_run_id.is_none() || frame_run_id == Some(expected_run_id))
+    {
+        return Err(ClaudeAgentSdkError::Remote(message));
+    }
+    if frame_run_id != Some(expected_run_id) {
+        return Ok(RoutedFrame::Misrouted(ClaudeSidecarEvent {
+            event_type: MISROUTED_FRAME_EVENT_TYPE.to_owned(),
+            run_id: expected_run_id.to_owned(),
+            payload: json!({
+                "frame_type": frame_type,
+                "frame_run_id": frame_run_id,
+            }),
+        }));
+    }
+    parse_event(message).map(RoutedFrame::Event)
 }
 
 fn parse_event(message: Value) -> Result<ClaudeSidecarEvent, ClaudeAgentSdkError> {
@@ -501,6 +526,22 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkAdapter<T> {
     }
 
     fn event_from_sidecar(&mut self, event: ClaudeSidecarEvent) -> Option<NativeProviderEvent> {
+        if event.event_type == MISROUTED_FRAME_EVENT_TYPE {
+            // A misrouted frame surfaces as a non-terminal diagnostic; the
+            // kernel records it as a protocol violation (DR-0035 Decision 3).
+            let run_id = event.run_id.clone();
+            return Some(NativeProviderEvent {
+                provider_id: self.provider_id.clone(),
+                run_id,
+                event_kind: NativeProviderEventKind::Diagnostic,
+                provider_event_type: event.event_type.clone(),
+                provider_session_id: None,
+                provider_turn_id: None,
+                sequence: Some(self.next_sequence()),
+                evidence: json!({ "violation": event.payload }),
+                artifacts: Vec::new(),
+            });
+        }
         let observation = normalize_claude_agent_sdk_event(&event)?;
         let run_id = event.run_id.clone();
         if let Some(session_id) = observation.provider_session_id.as_ref() {
@@ -926,7 +967,10 @@ mod tests {
     }
 
     #[test]
-    fn client_rejects_unexpected_run_id() {
+    fn client_misrouted_terminal_never_completes_the_run() {
+        // DR-0035 Decision 3: a terminal frame for ANOTHER run id is misrouted
+        // — it must not terminate this run (it rides as a violation event and
+        // the run keeps waiting for its own terminal).
         let transport = FakeTransport::with_reads(&[
             r#"{"type":"claude.turn.completed","run_id":"run-2","payload":{}}"#,
         ]);
@@ -934,9 +978,9 @@ mod tests {
 
         let error = client
             .start_run(json!({"run_id":"run-1"}))
-            .expect_err("unexpected run id fails");
+            .expect_err("no own terminal ever arrives");
 
-        assert!(matches!(error, ClaudeAgentSdkError::Protocol(_)));
+        assert!(matches!(error, ClaudeAgentSdkError::Timeout(_)));
     }
 
     #[test]
@@ -1274,6 +1318,90 @@ mod tests {
             .expect("terminal event");
         assert_eq!(terminal.event_kind, NativeProviderEventKind::Completed);
         assert!(terminal.event_kind.is_terminal());
+    }
+
+    #[test]
+    fn native_adapter_misrouted_frame_is_violation_diagnostic_not_abort() {
+        // DR-0035 Decision 3 T3: a frame for another run id surfaces as a
+        // non-terminal protocol-violation diagnostic; the turn keeps going and
+        // the stray frame's payload never crosses (identifiers only).
+        let transport = FakeTransport::with_reads(&[
+            r#"{"type":"claude.session.started","run_id":"run-1","payload":{"session_id":"session-1"}}"#,
+            r#"{"type":"claude.stream.message","run_id":"run-2","payload":{"content":"stray secret text"}}"#,
+            r#"{"type":"claude.turn.completed","run_id":"run-1","payload":{"session_id":"session-1","subtype":"success"}}"#,
+        ]);
+        let client = ClaudeAgentSdkClient::new(transport);
+        let mut adapter = ClaudeAgentSdkAdapter::new("claude-main", claude_capability(), client);
+        adapter
+            .start_turn(native_claude_request())
+            .expect("turn starts");
+
+        let violation = adapter
+            .next_event("run-1")
+            .expect("event reads")
+            .expect("violation event");
+        assert_eq!(violation.event_kind, NativeProviderEventKind::Diagnostic);
+        assert!(!violation.event_kind.is_terminal());
+        assert_eq!(violation.provider_event_type, MISROUTED_FRAME_EVENT_TYPE);
+        assert_eq!(violation.run_id, "run-1");
+        // The violation payload is whip-constructed from identifiers only —
+        // the stray frame's content never crosses into it.
+        assert_eq!(
+            violation
+                .evidence
+                .pointer("/violation/frame_run_id")
+                .and_then(Value::as_str),
+            Some("run-2")
+        );
+        let raw = violation.evidence.to_string();
+        assert!(!raw.contains("stray secret text"), "{raw}");
+        let rendered = violation.to_json_redacted().to_string();
+        assert!(!rendered.contains("stray secret text"), "{rendered}");
+
+        let terminal = adapter
+            .next_event("run-1")
+            .expect("event reads")
+            .expect("terminal event");
+        assert_eq!(terminal.event_kind, NativeProviderEventKind::Completed);
+    }
+
+    #[test]
+    fn client_routes_null_run_id_error_as_remote_not_protocol_abort() {
+        // DR-0035 Decision 3 T3: the sidecar's pre-run failures carry
+        // `run_id: null`; they must surface as the remote error they are, not
+        // as an unexpected-run-id protocol abort.
+        let transport = FakeTransport::with_reads(&[
+            r#"{"type":"run/error","run_id":null,"payload":{"code":"invalid_json","message":"bad frame"}}"#,
+        ]);
+        let mut client = ClaudeAgentSdkClient::new(transport);
+        let run_id = client
+            .begin_run(json!({"run_id":"run-1"}))
+            .expect("run begins");
+
+        let error = client.read_event(&run_id).expect_err("remote error");
+        assert!(
+            matches!(error, ClaudeAgentSdkError::Remote(message) if message.pointer("/payload/code").and_then(Value::as_str) == Some("invalid_json"))
+        );
+    }
+
+    #[test]
+    fn client_start_run_carries_misrouted_frame_as_violation_event() {
+        // The batch path applies the same tolerant routing: the stray frame
+        // rides along as a violation event and the terminal still lands.
+        let transport = FakeTransport::with_reads(&[
+            r#"{"type":"claude.session.started","run_id":"run-1","payload":{"session_id":"session-1"}}"#,
+            r#"{"type":"claude.stream.message","run_id":"run-9","payload":{"content":"stray"}}"#,
+            r#"{"type":"claude.turn.completed","run_id":"run-1","payload":{"session_id":"session-1","subtype":"success"}}"#,
+        ]);
+        let mut client = ClaudeAgentSdkClient::new(transport);
+
+        let events = client
+            .start_run(json!({"run_id":"run-1"}))
+            .expect("run completes");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1].event_type, MISROUTED_FRAME_EVENT_TYPE);
+        assert_eq!(events[1].run_id, "run-1");
+        assert_eq!(events[2].event_type, "claude.turn.completed");
     }
 
     #[test]
