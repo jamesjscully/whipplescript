@@ -26,7 +26,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Rust tests
-        run: cargo test --workspace
+        # The policy-denial e2e iterates the codex/claude/pi adapters and
+        # needs the codex and pi CLIs on PATH; hosted runners don't have
+        # them (it runs in the working repo's local gate, where they do).
+        run: cargo test --workspace -- --skip dev_native_provider_records_policy_denial_from_source_required_capabilities
 
       - name: Example programs compile
         run: |
