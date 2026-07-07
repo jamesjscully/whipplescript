@@ -101,10 +101,9 @@ if [[ "$FULL" == "1" ]]; then
   run_check required "e2e suite" "cd '$ROOT' && scripts/check-e2e.sh"
 fi
 
-run_check external "strict Loft submodule fixtures" \
-  "cd '$ROOT' && WHIPPLESCRIPT_REQUIRE_LOFT_SUBMODULE_FIXTURES=1 scripts/check-loft-fixtures.sh"
-run_check external "Loft submodule readiness" \
-  "cd '$ROOT' && scripts/check-loft-submodule-readiness.sh"
+# The strict Loft submodule checks were retired with the dead vendor/loft
+# submodule (ced3ae3, 2026-07-06); Loft compatibility stays covered by the
+# required `Loft compatibility fixtures` check over the vendored copies.
 run_check external "native provider surface probe" \
   "cd '$ROOT' && scripts/check-native-provider-surfaces.sh"
 run_check external "Codex app-server schema pin" \
