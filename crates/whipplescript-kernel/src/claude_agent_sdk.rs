@@ -266,6 +266,17 @@ pub fn summarize_claude_agent_sdk_events(events: &[ClaudeSidecarEvent]) -> Value
 pub trait ClaudeAgentSdkTransport {
     fn write_line(&mut self, line: &str) -> Result<(), ClaudeAgentSdkError>;
     fn read_line(&mut self) -> Result<String, ClaudeAgentSdkError>;
+    /// Wait up to `wait` for the next line; `Ok(None)` means the window
+    /// elapsed with the peer still alive (DR-0035 Decision 4 inactivity
+    /// clock). The default keeps blocking semantics for transports without a
+    /// clock (test fakes).
+    fn read_line_timeout(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> Result<Option<String>, ClaudeAgentSdkError> {
+        let _ = wait;
+        self.read_line().map(Some)
+    }
 }
 
 pub struct ClaudeAgentSdkClient<T> {
@@ -352,6 +363,27 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkClient<T> {
         }
     }
 
+    /// `read_event` bounded by the inactivity clock: `Ok(None)` means the
+    /// window elapsed without a frame (the peer is alive but silent).
+    pub fn read_event_timeout(
+        &mut self,
+        expected_run_id: &str,
+        wait: std::time::Duration,
+    ) -> Result<Option<ClaudeSidecarEvent>, ClaudeAgentSdkError> {
+        loop {
+            let Some(line) = self.transport.read_line_timeout(wait)? else {
+                return Ok(None);
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let message: Value = serde_json::from_str(&line)?;
+            return match route_frame(message, expected_run_id)? {
+                RoutedFrame::Event(event) | RoutedFrame::Misrouted(event) => Ok(Some(event)),
+            };
+        }
+    }
+
     pub fn cancel_run(&mut self, run_id: &str) -> Result<(), ClaudeAgentSdkError> {
         self.transport.write_line(
             &json!({
@@ -429,6 +461,9 @@ pub struct ClaudeAgentSdkAdapter<T> {
     active_run_id: Option<String>,
     provider_session_id: Option<String>,
     sequence: u64,
+    // DR-0035 Decision 4: the inactivity wall clock. When no frame arrives
+    // within this window, the adapter synthesizes the TimedOut terminal.
+    inactivity_budget: std::time::Duration,
 }
 
 impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkAdapter<T> {
@@ -444,7 +479,13 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkAdapter<T> {
             active_run_id: None,
             provider_session_id: None,
             sequence: 0,
+            inactivity_budget: std::time::Duration::from_secs(300),
         }
+    }
+
+    pub fn with_inactivity_budget(mut self, budget: std::time::Duration) -> Self {
+        self.inactivity_budget = budget;
+        self
     }
 
     pub fn into_client(self) -> ClaudeAgentSdkClient<T> {
@@ -454,6 +495,25 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkAdapter<T> {
     fn next_sequence(&mut self) -> u64 {
         self.sequence += 1;
         self.sequence
+    }
+
+    /// The synthesized inactivity terminal (DR-0035 Decision 4 T2): a silent
+    /// or closed peer still yields exactly one terminal.
+    fn inactivity_timeout_event(&mut self, run_id: &str, reason: &str) -> NativeProviderEvent {
+        NativeProviderEvent {
+            provider_id: self.provider_id.clone(),
+            run_id: run_id.to_owned(),
+            event_kind: NativeProviderEventKind::TimedOut,
+            provider_event_type: "whip.native.inactivity_timeout".to_owned(),
+            provider_session_id: self.provider_session_id.clone(),
+            provider_turn_id: None,
+            sequence: Some(self.next_sequence()),
+            evidence: json!({
+                "reason": reason,
+                "inactivity_budget_seconds": self.inactivity_budget.as_secs(),
+            }),
+            artifacts: Vec::new(),
+        }
     }
 
     fn boundary_error(
@@ -607,11 +667,19 @@ impl<T: ClaudeAgentSdkTransport> NativeProviderAdapter for ClaudeAgentSdkAdapter
             .begin_run(sidecar_request)
             .map_err(|error| self.map_error("claude_run_start_failed", error))?;
         self.active_run_id = Some(run_id.clone());
+        let budget = self.inactivity_budget;
         loop {
-            let event = self
-                .client
-                .read_event(&run_id)
-                .map_err(|error| self.map_error("claude_event_read_failed", error))?;
+            let event = match self.client.read_event_timeout(&run_id, budget) {
+                Ok(Some(event)) => event,
+                // A peer silent through the whole start window still yields
+                // exactly one terminal (DR-0035 Decision 4 T2).
+                Ok(None) => {
+                    return Ok(self.inactivity_timeout_event(&run_id, "inactivity_budget_exhausted"))
+                }
+                Err(error) => {
+                    return Err(self.map_error("claude_event_read_failed", error));
+                }
+            };
             if let Some(native) = self.event_from_sidecar(event) {
                 return Ok(native);
             }
@@ -626,9 +694,18 @@ impl<T: ClaudeAgentSdkTransport> NativeProviderAdapter for ClaudeAgentSdkAdapter
             .active_run_id
             .clone()
             .unwrap_or_else(|| run_id.to_owned());
-        match self.client.read_event(&active_run_id) {
-            Ok(event) => Ok(self.event_from_sidecar(event)),
-            Err(ClaudeAgentSdkError::Timeout(_)) => Ok(None),
+        let budget = self.inactivity_budget;
+        match self.client.read_event_timeout(&active_run_id, budget) {
+            Ok(Some(event)) => Ok(self.event_from_sidecar(event)),
+            // Window elapsed with no frame: the inactivity clock fires.
+            Ok(None) => Ok(Some(self.inactivity_timeout_event(
+                &active_run_id,
+                "inactivity_budget_exhausted",
+            ))),
+            // The stream closed with no terminal: same backstop, distinct reason.
+            Err(ClaudeAgentSdkError::Timeout(_)) => Ok(Some(
+                self.inactivity_timeout_event(&active_run_id, "stream_closed"),
+            )),
             Err(error) => Err(self.map_error("claude_event_read_failed", error)),
         }
     }
@@ -798,7 +875,9 @@ fn json_shape(value: &Value) -> Value {
 pub struct StdioClaudeAgentSdkTransport {
     _child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    // Lines arrive via a reader thread so reads can carry a timeout
+    // (DR-0035 Decision 4): a blocked pipe no longer pins the worker thread.
+    lines: std::sync::mpsc::Receiver<std::io::Result<String>>,
 }
 
 impl StdioClaudeAgentSdkTransport {
@@ -818,9 +897,38 @@ impl StdioClaudeAgentSdkTransport {
         Ok(Self {
             _child: child,
             stdin,
-            stdout: BufReader::new(stdout),
+            lines: spawn_line_reader(stdout),
         })
     }
+
+    fn closed_error() -> ClaudeAgentSdkError {
+        ClaudeAgentSdkError::Timeout(
+            "Claude sidecar stdout closed before terminal event".to_owned(),
+        )
+    }
+}
+
+fn spawn_line_reader(stdout: ChildStdout) -> std::sync::mpsc::Receiver<std::io::Result<String>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if sender.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+    receiver
 }
 
 impl ClaudeAgentSdkTransport for StdioClaudeAgentSdkTransport {
@@ -832,14 +940,23 @@ impl ClaudeAgentSdkTransport for StdioClaudeAgentSdkTransport {
     }
 
     fn read_line(&mut self) -> Result<String, ClaudeAgentSdkError> {
-        let mut line = String::new();
-        let bytes = self.stdout.read_line(&mut line)?;
-        if bytes == 0 {
-            return Err(ClaudeAgentSdkError::Timeout(
-                "Claude sidecar stdout closed before terminal event".to_owned(),
-            ));
+        match self.lines.recv() {
+            Ok(Ok(line)) => Ok(line),
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => Err(Self::closed_error()),
         }
-        Ok(line)
+    }
+
+    fn read_line_timeout(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> Result<Option<String>, ClaudeAgentSdkError> {
+        match self.lines.recv_timeout(wait) {
+            Ok(Ok(line)) => Ok(Some(line)),
+            Ok(Err(error)) => Err(error.into()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Self::closed_error()),
+        }
     }
 }
 
@@ -1318,6 +1435,85 @@ mod tests {
             .expect("terminal event");
         assert_eq!(terminal.event_kind, NativeProviderEventKind::Completed);
         assert!(terminal.event_kind.is_terminal());
+    }
+
+    /// A transport whose peer stays alive but silent once the scripted reads
+    /// are exhausted: `read_line_timeout` reports an empty window instead of a
+    /// closed stream.
+    struct SilentAfterReadsTransport(FakeTransport);
+
+    impl ClaudeAgentSdkTransport for SilentAfterReadsTransport {
+        fn write_line(&mut self, line: &str) -> Result<(), ClaudeAgentSdkError> {
+            self.0.write_line(line)
+        }
+
+        fn read_line(&mut self) -> Result<String, ClaudeAgentSdkError> {
+            self.0.read_line()
+        }
+
+        fn read_line_timeout(
+            &mut self,
+            _wait: std::time::Duration,
+        ) -> Result<Option<String>, ClaudeAgentSdkError> {
+            match self.0.read_line() {
+                Ok(line) => Ok(Some(line)),
+                Err(_) => Ok(None),
+            }
+        }
+    }
+
+    #[test]
+    fn native_adapter_inactivity_synthesizes_timed_out_terminal() {
+        // DR-0035 Decision 4: a peer that stays silent past the inactivity
+        // window yields exactly one synthesized TimedOut terminal.
+        let transport = SilentAfterReadsTransport(FakeTransport::with_reads(&[
+            r#"{"type":"claude.session.started","run_id":"run-1","payload":{"session_id":"session-1"}}"#,
+        ]));
+        let client = ClaudeAgentSdkClient::new(transport);
+        let mut adapter = ClaudeAgentSdkAdapter::new("claude-main", claude_capability(), client)
+            .with_inactivity_budget(std::time::Duration::from_millis(1));
+        adapter
+            .start_turn(native_claude_request())
+            .expect("turn starts");
+
+        let timed_out = adapter
+            .next_event("run-1")
+            .expect("event reads")
+            .expect("inactivity terminal");
+        assert_eq!(timed_out.event_kind, NativeProviderEventKind::TimedOut);
+        assert!(timed_out.event_kind.is_terminal());
+        assert_eq!(
+            timed_out.provider_event_type,
+            "whip.native.inactivity_timeout"
+        );
+        assert_eq!(
+            timed_out.evidence.get("reason").and_then(Value::as_str),
+            Some("inactivity_budget_exhausted")
+        );
+    }
+
+    #[test]
+    fn native_adapter_closed_stream_synthesizes_timed_out_terminal() {
+        // A stream that closes with no terminal gets the same backstop with a
+        // distinct reason.
+        let transport = FakeTransport::with_reads(&[
+            r#"{"type":"claude.session.started","run_id":"run-1","payload":{"session_id":"session-1"}}"#,
+        ]);
+        let client = ClaudeAgentSdkClient::new(transport);
+        let mut adapter = ClaudeAgentSdkAdapter::new("claude-main", claude_capability(), client);
+        adapter
+            .start_turn(native_claude_request())
+            .expect("turn starts");
+
+        let timed_out = adapter
+            .next_event("run-1")
+            .expect("event reads")
+            .expect("stream-closed terminal");
+        assert_eq!(timed_out.event_kind, NativeProviderEventKind::TimedOut);
+        assert_eq!(
+            timed_out.evidence.get("reason").and_then(Value::as_str),
+            Some("stream_closed")
+        );
     }
 
     #[test]

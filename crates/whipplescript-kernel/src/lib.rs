@@ -1297,16 +1297,35 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             );
         }
 
-        for index in 0..max_events {
+        // Two-clock liveness (DR-0035 Decision 4): `max_events` bounds
+        // DELIVERED frames only — an empty poll no longer consumes budget. The
+        // wall-clock inactivity bound lives in the adapters (which synthesize
+        // their own TimedOut terminal); the idle-poll ceiling here is only a
+        // backstop against an adapter that spins on `Ok(None)` without ever
+        // blocking, and it resets on every delivered frame.
+        // The idle ceiling is deliberately generous: real adapters block on
+        // their wall clock and synthesize their own TimedOut instead of
+        // returning empty polls, so this only stops a non-blocking adapter
+        // from spinning forever.
+        let idle_poll_ceiling = max_events.max(1024);
+        let mut delivered = 0usize;
+        let mut idle_polls = 0usize;
+        while delivered < max_events && idle_polls < idle_poll_ceiling {
             let event = match adapter.next_event(execution.run_id) {
-                Ok(Some(event)) => event,
-                Ok(None) => continue,
+                Ok(Some(event)) => {
+                    idle_polls = 0;
+                    event
+                }
+                Ok(None) => {
+                    idle_polls += 1;
+                    continue;
+                }
                 Err(error) => {
                     let failed = native_boundary_error_event(execution, error);
                     latest_evidence = self.record_native_provider_event(
                         execution,
                         &failed,
-                        &format!("native-provider-boundary-event-{index}"),
+                        &format!("native-provider-boundary-event-{delivered}"),
                     )?;
                     return self.complete_native_agent_turn(
                         execution,
@@ -1319,8 +1338,9 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             latest_evidence = self.record_native_provider_event(
                 execution,
                 &event,
-                &format!("native-provider-event-{index}"),
+                &format!("native-provider-event-{delivered}"),
             )?;
+            delivered += 1;
             if event.event_kind.is_terminal() {
                 return self.complete_native_agent_turn(
                     execution,
@@ -1339,7 +1359,11 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             provider_session_id: None,
             provider_turn_id: None,
             sequence: None,
-            evidence: json!({"max_events": max_events}),
+            evidence: json!({
+                "max_events": max_events,
+                "delivered": delivered,
+                "idle_polls": idle_polls,
+            }),
             artifacts: Vec::new(),
         };
         latest_evidence =
@@ -4011,6 +4035,10 @@ mod tests {
     };
     use loft::{FakeLoftClient, LoftAction, LoftEffectRequest};
     use native_lifecycle::{normalize_pi_rpc_event, AgentTurnLifecycleKind};
+    use provider::{
+        builtin_provider_capabilities, AdapterSurface, CancellationDepth,
+        NativeProviderBoundaryError, NativeProviderCancellation, ProviderCapability, ProviderKind,
+    };
     use std::{fs, path::PathBuf, process::Command};
     use trace::check_trace;
     use whipplescript_parser::compile_program;
@@ -6391,7 +6419,7 @@ rule wait
         );
     }
 
-    fn start_running_agent_turn_without_evidence() -> (RuntimeKernel, String) {
+    fn kernel_with_queued_agent_tell() -> (RuntimeKernel, String) {
         let store = SqliteStore::open_in_memory().expect("store opens");
         let mut kernel = RuntimeKernel::new(store);
         let version = kernel
@@ -6430,6 +6458,11 @@ rule wait
                 idempotency_key: Some("commit-start-uncertain"),
             })
             .expect("rule commits");
+        (kernel, instance_id)
+    }
+
+    fn start_running_agent_turn_without_evidence() -> (RuntimeKernel, String) {
+        let (mut kernel, instance_id) = kernel_with_queued_agent_tell();
         kernel
             .start_run(RunStart {
                 instance_id: &instance_id,
@@ -6443,6 +6476,135 @@ rule wait
             })
             .expect("run starts");
         (kernel, instance_id)
+    }
+
+    /// A scripted native adapter for driver-loop tests: `None` entries are
+    /// empty polls, `Some` entries are delivered frames.
+    struct ScriptedAdapter {
+        capability: ProviderCapability,
+        script: std::collections::VecDeque<Option<NativeProviderEvent>>,
+    }
+
+    impl ScriptedAdapter {
+        fn new(script: Vec<Option<NativeProviderEvent>>) -> Self {
+            Self {
+                capability: builtin_provider_capabilities()
+                    .into_iter()
+                    .find(|capability| capability.provider_kind == ProviderKind::Fixture)
+                    .expect("fixture capability"),
+                script: script.into(),
+            }
+        }
+    }
+
+    impl NativeProviderAdapter for ScriptedAdapter {
+        fn provider_id(&self) -> &str {
+            "scripted"
+        }
+
+        fn capability(&self) -> &ProviderCapability {
+            &self.capability
+        }
+
+        fn start_turn(
+            &mut self,
+            _request: NativeProviderTurnRequest,
+        ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
+            Ok(self
+                .script
+                .pop_front()
+                .flatten()
+                .expect("scripted start event"))
+        }
+
+        fn next_event(
+            &mut self,
+            _run_id: &str,
+        ) -> Result<Option<NativeProviderEvent>, NativeProviderBoundaryError> {
+            Ok(self.script.pop_front().unwrap_or(None))
+        }
+
+        fn cancel_turn(
+            &mut self,
+            _cancellation: NativeProviderCancellation,
+        ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
+            unreachable!("scripted adapter does not cancel")
+        }
+    }
+
+    fn scripted_event(kind: NativeProviderEventKind, event_type: &str) -> NativeProviderEvent {
+        NativeProviderEvent {
+            provider_id: "scripted".to_owned(),
+            run_id: "run-tell".to_owned(),
+            event_kind: kind,
+            provider_event_type: event_type.to_owned(),
+            provider_session_id: None,
+            provider_turn_id: None,
+            sequence: None,
+            evidence: json!({}),
+            artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_polls_do_not_consume_the_event_budget() {
+        // DR-0035 Decision 4: `max_events` bounds DELIVERED frames only. With a
+        // budget of 2, three empty polls before the terminal must not push the
+        // turn into the synthetic timeout (pre-B2 they consumed the budget).
+        let (mut kernel, instance_id) = kernel_with_queued_agent_tell();
+        let execution = AgentTurnExecution {
+            instance_id: &instance_id,
+            effect_id: "tell",
+            run_id: "run-tell",
+            provider: "scripted",
+            worker_id: "worker-1",
+            lease_id: "lease-tell",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            agent: "worker",
+            profile: Some("repo-writer"),
+            input_json: r#"{"prompt":"go"}"#,
+            skill_names: &[],
+        };
+        let mut adapter = ScriptedAdapter::new(vec![
+            Some(scripted_event(
+                NativeProviderEventKind::Started,
+                "scripted.started",
+            )),
+            None,
+            None,
+            None,
+            Some(scripted_event(
+                NativeProviderEventKind::Completed,
+                "scripted.completed",
+            )),
+        ]);
+        let request = NativeProviderTurnRequest {
+            provider_id: "scripted".to_owned(),
+            provider_kind: ProviderKind::Fixture,
+            surface: AdapterSurface::Fixture,
+            run_id: "run-tell".to_owned(),
+            effect_id: "tell".to_owned(),
+            agent: "worker".to_owned(),
+            profile: Some("repo-writer".to_owned()),
+            prompt_json: json!("go"),
+            workspace_policy: "read_only".to_owned(),
+            required_capabilities: Vec::new(),
+            cancellation_depth: CancellationDepth::None,
+            artifact_policy: "metadata".to_owned(),
+            credential_ref: None,
+            provider_options: std::collections::BTreeMap::new(),
+        };
+
+        kernel
+            .run_native_agent_turn(execution, request, &mut adapter, 2)
+            .expect("turn completes");
+
+        let runs = kernel.store().list_runs(&instance_id).expect("runs list");
+        let run = runs.iter().find(|r| r.run_id == "run-tell").expect("run");
+        assert_eq!(
+            run.status, "completed",
+            "the turn completed instead of timing out on empty polls"
+        );
     }
 
     #[test]

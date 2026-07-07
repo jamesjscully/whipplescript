@@ -22854,11 +22854,10 @@ fn codex_app_server_adapter(
                 && capability.surface == AdapterSurface::CodexAppServer
         })
         .ok_or_else(|| StoreError::Conflict("missing built-in Codex capability".to_owned()))?;
-    Ok(CodexAppServerAdapter::new(
-        provider,
-        capability,
-        CodexAppServerClient::new(transport),
-    ))
+    Ok(
+        CodexAppServerAdapter::new(provider, capability, CodexAppServerClient::new(transport))
+            .with_inactivity_budget(native_provider_inactivity_budget()),
+    )
 }
 
 #[cfg(feature = "codex")]
@@ -22920,11 +22919,10 @@ fn claude_agent_sdk_adapter(
                 && capability.surface == AdapterSurface::ClaudeAgentSdk
         })
         .ok_or_else(|| StoreError::Conflict("missing built-in Claude capability".to_owned()))?;
-    Ok(ClaudeAgentSdkAdapter::new(
-        provider,
-        capability,
-        ClaudeAgentSdkClient::new(transport),
-    ))
+    Ok(
+        ClaudeAgentSdkAdapter::new(provider, capability, ClaudeAgentSdkClient::new(transport))
+            .with_inactivity_budget(native_provider_inactivity_budget()),
+    )
 }
 
 #[cfg(feature = "claude")]
@@ -22994,11 +22992,10 @@ fn pi_rpc_adapter(provider: &str) -> Result<PiRpcAdapter<StdioPiRpcTransport>, S
                 && capability.surface == AdapterSurface::PiRpc
         })
         .ok_or_else(|| StoreError::Conflict("missing built-in Pi capability".to_owned()))?;
-    Ok(PiRpcAdapter::new(
-        provider,
-        capability,
-        PiRpcClient::new(transport),
-    ))
+    Ok(
+        PiRpcAdapter::new(provider, capability, PiRpcClient::new(transport))
+            .with_inactivity_budget(native_provider_inactivity_budget()),
+    )
 }
 
 fn pi_native_turn_request(
@@ -23166,6 +23163,17 @@ fn native_provider_max_events() -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(256)
+}
+
+/// DR-0035 Decision 4: the inactivity wall clock for delegated event streams.
+/// When no frame arrives within this window the adapter synthesizes the
+/// TimedOut terminal instead of blocking the worker thread forever.
+fn native_provider_inactivity_budget() -> std::time::Duration {
+    let seconds = env::var("WHIPPLESCRIPT_NATIVE_PROVIDER_INACTIVITY_TIMEOUT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(300);
+    std::time::Duration::from_secs(seconds)
 }
 
 struct NativeFixtureAdapter {

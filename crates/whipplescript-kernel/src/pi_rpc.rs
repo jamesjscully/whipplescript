@@ -246,6 +246,17 @@ fn pi_insert_unique(values: &mut Vec<String>, value: &str) {
 pub trait PiRpcTransport {
     fn write_line(&mut self, line: &str) -> Result<(), PiRpcError>;
     fn read_line(&mut self) -> Result<String, PiRpcError>;
+    /// Wait up to `wait` for the next line; `Ok(None)` means the window
+    /// elapsed with the peer still alive (DR-0035 Decision 4 inactivity
+    /// clock). The default keeps blocking semantics for transports without a
+    /// clock (test fakes).
+    fn read_line_timeout(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> Result<Option<String>, PiRpcError> {
+        let _ = wait;
+        self.read_line().map(Some)
+    }
 }
 
 pub struct PiRpcClient<T> {
@@ -329,6 +340,29 @@ impl<T: PiRpcTransport> PiRpcClient<T> {
                 ));
             }
             return Ok(message);
+        }
+    }
+
+    /// `read_event` bounded by the inactivity clock: `Ok(None)` means the
+    /// window elapsed without a frame (the peer is alive but silent).
+    pub fn read_event_timeout(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> Result<Option<Value>, PiRpcError> {
+        loop {
+            let Some(line) = self.transport.read_line_timeout(wait)? else {
+                return Ok(None);
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let message: Value = serde_json::from_str(&line)?;
+            if message.get("type").and_then(Value::as_str) == Some("response") {
+                return Err(PiRpcError::Protocol(
+                    "received Pi RPC response while waiting for event".to_owned(),
+                ));
+            }
+            return Ok(Some(message));
         }
     }
 
@@ -423,6 +457,9 @@ pub struct PiRpcAdapter<T> {
     client: PiRpcClient<T>,
     state: Option<PiRpcState>,
     sequence: u64,
+    // DR-0035 Decision 4: the inactivity wall clock. When no frame arrives
+    // within this window, the adapter synthesizes the TimedOut terminal.
+    inactivity_budget: std::time::Duration,
 }
 
 impl<T: PiRpcTransport> PiRpcAdapter<T> {
@@ -437,7 +474,13 @@ impl<T: PiRpcTransport> PiRpcAdapter<T> {
             client,
             state: None,
             sequence: 0,
+            inactivity_budget: std::time::Duration::from_secs(300),
         }
+    }
+
+    pub fn with_inactivity_budget(mut self, budget: std::time::Duration) -> Self {
+        self.inactivity_budget = budget;
+        self
     }
 
     pub fn into_client(self) -> PiRpcClient<T> {
@@ -447,6 +490,28 @@ impl<T: PiRpcTransport> PiRpcAdapter<T> {
     fn next_sequence(&mut self) -> u64 {
         self.sequence += 1;
         self.sequence
+    }
+
+    /// The synthesized inactivity terminal (DR-0035 Decision 4 T2): a silent
+    /// or closed peer still yields exactly one terminal.
+    fn inactivity_timeout_event(&mut self, run_id: &str, reason: &str) -> NativeProviderEvent {
+        NativeProviderEvent {
+            provider_id: self.provider_id.clone(),
+            run_id: run_id.to_owned(),
+            event_kind: NativeProviderEventKind::TimedOut,
+            provider_event_type: "whip.native.inactivity_timeout".to_owned(),
+            provider_session_id: self
+                .state
+                .as_ref()
+                .and_then(|state| state.session_id.clone()),
+            provider_turn_id: None,
+            sequence: Some(self.next_sequence()),
+            evidence: json!({
+                "reason": reason,
+                "inactivity_budget_seconds": self.inactivity_budget.as_secs(),
+            }),
+            artifacts: Vec::new(),
+        }
     }
 
     fn boundary_error(
@@ -625,9 +690,17 @@ impl<T: PiRpcTransport> NativeProviderAdapter for PiRpcAdapter<T> {
         if let Some(event) = self.client.pop_event() {
             return Ok(self.event_from_message(run_id, event));
         }
-        match self.client.read_event() {
-            Ok(event) => Ok(self.event_from_message(run_id, event)),
-            Err(PiRpcError::Timeout(_)) => Ok(None),
+        let budget = self.inactivity_budget;
+        match self.client.read_event_timeout(budget) {
+            Ok(Some(event)) => Ok(self.event_from_message(run_id, event)),
+            // Window elapsed with no frame: the inactivity clock fires.
+            Ok(None) => Ok(Some(
+                self.inactivity_timeout_event(run_id, "inactivity_budget_exhausted"),
+            )),
+            // The stream closed with no terminal: same backstop, distinct reason.
+            Err(PiRpcError::Timeout(_)) => {
+                Ok(Some(self.inactivity_timeout_event(run_id, "stream_closed")))
+            }
             Err(error) => Err(self.map_error("pi_event_read_failed", error)),
         }
     }
@@ -772,7 +845,9 @@ fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
 pub struct StdioPiRpcTransport {
     _child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    // Lines arrive via a reader thread so reads can carry a timeout
+    // (DR-0035 Decision 4): a blocked pipe no longer pins the worker thread.
+    lines: std::sync::mpsc::Receiver<std::io::Result<String>>,
 }
 
 impl StdioPiRpcTransport {
@@ -792,9 +867,36 @@ impl StdioPiRpcTransport {
         Ok(Self {
             _child: child,
             stdin,
-            stdout: BufReader::new(stdout),
+            lines: spawn_line_reader(stdout),
         })
     }
+
+    fn closed_error() -> PiRpcError {
+        PiRpcError::Timeout("Pi RPC stdout closed before response".to_owned())
+    }
+}
+
+fn spawn_line_reader(stdout: ChildStdout) -> std::sync::mpsc::Receiver<std::io::Result<String>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if sender.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+    receiver
 }
 
 impl PiRpcTransport for StdioPiRpcTransport {
@@ -806,14 +908,23 @@ impl PiRpcTransport for StdioPiRpcTransport {
     }
 
     fn read_line(&mut self) -> Result<String, PiRpcError> {
-        let mut line = String::new();
-        let bytes = self.stdout.read_line(&mut line)?;
-        if bytes == 0 {
-            return Err(PiRpcError::Timeout(
-                "Pi RPC stdout closed before response".to_owned(),
-            ));
+        match self.lines.recv() {
+            Ok(Ok(line)) => Ok(line),
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => Err(Self::closed_error()),
         }
-        Ok(line)
+    }
+
+    fn read_line_timeout(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> Result<Option<String>, PiRpcError> {
+        match self.lines.recv_timeout(wait) {
+            Ok(Ok(line)) => Ok(Some(line)),
+            Ok(Err(error)) => Err(error.into()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Self::closed_error()),
+        }
     }
 }
 
