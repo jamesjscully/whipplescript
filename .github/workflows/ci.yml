@@ -35,5 +35,8 @@ jobs:
         run: |
           cargo build -p whipplescript
           for example in examples/*.whip; do
-            ./target/debug/whip check "$example"
+            # Multi-workflow examples need an explicit root; use the first
+            # declared workflow.
+            root=$(grep -m1 '^workflow ' "$example" | awk '{print $2}')
+            ./target/debug/whip check "$example" --root "$root"
           done
