@@ -17,8 +17,8 @@ schemas
 trackers
   tracker backlog provider=builtin
 agents
-  agent planner harness=<fallback> provider=codex profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[]
-  agent reviewer harness=<fallback> provider=claude profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[]
+  agent planner harness=<fallback> provider=codex profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[] class=delegated
+  agent reviewer harness=<fallback> provider=claude profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[] class=delegated
 assertions
   assert count(Heartbeat where status == "observed") == 1
     reads

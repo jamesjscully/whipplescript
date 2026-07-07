@@ -1179,6 +1179,10 @@ pub struct IrAgent {
     /// `summarize` (default), `hard_reset`, `tool_results`, or `none`. `None` uses
     /// the harness default.
     pub compaction: Option<String>,
+    /// The harness class (DR-0034): `Managed` (WhippleScript is the runtime) vs
+    /// `Delegated` (a foreign runtime that assembles its own context). Derived from
+    /// the resolved provider/harness kind at lowering.
+    pub harness_class: HarnessClass,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3080,11 +3084,17 @@ impl IrProgram {
                     .as_deref()
                     .map(|strategy| format!(" compaction={strategy}"))
                     .unwrap_or_default();
+                // Harness class (DR-0034): Managed is the default/substrate, so only
+                // Delegated agents emit a class token — Managed agents' .ir is unchanged.
+                let class = match agent.harness_class {
+                    HarnessClass::Delegated => " class=delegated",
+                    HarnessClass::Managed => "",
+                };
                 push_line(
                     &mut snapshot,
                     format!(
-                        "  agent {} harness={} provider={} profile={} capacity={} skills={} capabilities={} tools={}{}",
-                        agent.name, harness, provider, profile, capacity, skills, capabilities, tools, compaction
+                        "  agent {} harness={} provider={} profile={} capacity={} skills={} capabilities={} tools={}{}{}",
+                        agent.name, harness, provider, profile, capacity, skills, capabilities, tools, compaction, class
                     ),
                 );
             }
@@ -3805,7 +3815,7 @@ fn lower_program(
         program
     };
     let schema_names = collect_schema_names(&program, &mut diagnostics);
-    let harness_names = collect_harness_names(&program, &mut diagnostics);
+    let harness_kinds = collect_harness_kinds(&program, &mut diagnostics);
     let agent_names = collect_agent_names(&program, &mut diagnostics);
     let workflow_contract_names = collect_workflow_contract_names(&program, &mut diagnostics);
     let mut semantic = SemanticContext::from_program(&program, workflow_inputs);
@@ -3939,7 +3949,7 @@ fn lower_program(
                     context_limit: pool.context_limit,
                 });
             }
-            Item::Agent(agent) => lower_agent(agent, &mut ir, &harness_names, &mut diagnostics),
+            Item::Agent(agent) => lower_agent(agent, &mut ir, &harness_kinds, &mut diagnostics),
             Item::Enum(enum_decl) => lower_enum(enum_decl, &mut ir, &mut diagnostics),
             Item::Event(event) => lower_event(event, &mut ir, &mut diagnostics),
             Item::Source(source) => {
@@ -5170,13 +5180,19 @@ fn collect_schema_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) ->
     names
 }
 
-fn collect_harness_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
+fn collect_harness_kinds(
+    program: &Program,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> BTreeMap<String, String> {
+    let mut kinds: BTreeMap<String, String> = BTreeMap::new();
     for item in &program.items {
         let Item::Harness(harness) = item else {
             continue;
         };
-        if !names.insert(harness.name.name.clone()) {
+        if kinds
+            .insert(harness.name.name.clone(), harness.kind.name.clone())
+            .is_some()
+        {
             diagnostics.push(Diagnostic {
                 related: Vec::new(),
                 span: harness.name.span,
@@ -5187,7 +5203,7 @@ fn collect_harness_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) -
             });
         }
     }
-    names
+    kinds
 }
 
 fn collect_agent_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> BTreeSet<String> {
@@ -6183,10 +6199,42 @@ fn is_supported_harness_kind(kind: &str) -> bool {
     )
 }
 
+/// The harness class (DR-0034). `Managed` = WhippleScript is the agent runtime
+/// (owned; hermetic context, full provenance, reproducible). `Delegated` = a foreign
+/// runtime WhippleScript invokes, which assembles its own context. The guarantee is
+/// two-valued, so the class is too.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HarnessClass {
+    Managed,
+    Delegated,
+}
+
+impl HarnessClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HarnessClass::Managed => "managed",
+            HarnessClass::Delegated => "delegated",
+        }
+    }
+}
+
+/// Classify a harness kind (DR-0034 Decision 6). Total over the supported kinds:
+/// `owned` and the credential-free `fixture` model client are Managed; every other
+/// kind (codex/claude sidecars, the `native-fixture` delegated adapter, `command`)
+/// is Delegated. An unrecognized kind — already rejected by
+/// `is_supported_harness_kind` — defaults to Delegated, never granting the Managed
+/// guarantee to something unknown.
+pub fn harness_class(kind: &str) -> HarnessClass {
+    match kind {
+        "owned" | "fixture" => HarnessClass::Managed,
+        _ => HarnessClass::Delegated,
+    }
+}
+
 fn lower_agent(
     agent: AgentDecl,
     ir: &mut IrProgram,
-    harness_names: &BTreeSet<String>,
+    harness_kinds: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let mut lowered = IrAgent {
@@ -6199,10 +6247,12 @@ fn lower_agent(
         capabilities: Vec::new(),
         tools: Vec::new(),
         compaction: None,
+        // Filled after the field loop, once provider/harness are resolved.
+        harness_class: HarnessClass::Managed,
     };
 
     if let Some(harness) = &agent.harness {
-        if !harness_names.contains(&harness.name) {
+        if !harness_kinds.contains_key(&harness.name) {
             diagnostics.push(Diagnostic {
                 related: Vec::new(),
                 span: harness.span,
@@ -6371,6 +6421,20 @@ fn lower_agent(
             }
         }
     }
+
+    // Classify the harness (DR-0034 Decision 1/6): the class is derived from the
+    // resolved kind — a direct `provider <kind>`, or the kind of the bound `using
+    // <harness>`. An agent with neither is already a diagnostic below; it defaults to
+    // Managed harmlessly.
+    let resolved_kind = lowered.provider.as_deref().or_else(|| {
+        lowered
+            .harness
+            .as_deref()
+            .and_then(|name| harness_kinds.get(name).map(String::as_str))
+    });
+    lowered.harness_class = resolved_kind
+        .map(harness_class)
+        .unwrap_or(HarnessClass::Managed);
 
     if lowered.profile.is_none() {
         diagnostics.push(Diagnostic {
@@ -22900,6 +22964,43 @@ agent worker {
             "diagnostics: {:?}",
             dup.diagnostics
         );
+    }
+
+    #[test]
+    fn harness_class_classifies_managed_vs_delegated_and_emits_only_delegated() {
+        // Classifier is total: owned/fixture Managed, the rest Delegated.
+        assert_eq!(harness_class("owned"), HarnessClass::Managed);
+        assert_eq!(harness_class("fixture"), HarnessClass::Managed);
+        assert_eq!(harness_class("claude"), HarnessClass::Delegated);
+        assert_eq!(harness_class("codex"), HarnessClass::Delegated);
+        assert_eq!(harness_class("native-fixture"), HarnessClass::Delegated);
+        assert_eq!(harness_class("command"), HarnessClass::Delegated);
+
+        // A `provider owned` agent lowers Managed and emits NO class token (default).
+        let managed = compile_program(
+            "workflow W\nagent m {\n  provider owned\n  profile \"p\"\n  capacity 1\n}\n",
+        );
+        let managed_ir = managed.ir.expect("ir");
+        assert_eq!(managed_ir.agents[0].harness_class, HarnessClass::Managed);
+        assert!(!managed_ir.to_snapshot().contains("class="));
+
+        // A `provider claude` agent lowers Delegated and emits `class=delegated`.
+        let delegated = compile_program(
+            "workflow W\nagent d {\n  provider claude\n  profile \"repo-writer\"\n  capacity 1\n}\n",
+        );
+        let delegated_ir = delegated.ir.expect("ir");
+        assert_eq!(
+            delegated_ir.agents[0].harness_class,
+            HarnessClass::Delegated
+        );
+        assert!(delegated_ir.to_snapshot().contains("class=delegated"));
+
+        // `using <harness>` resolves the class through the harness's kind.
+        let via_harness = compile_program(
+            "workflow W\nharness box: claude\nagent d using box {\n  profile \"repo-writer\"\n  capacity 1\n}\n",
+        );
+        let via_ir = via_harness.ir.expect("ir");
+        assert_eq!(via_ir.agents[0].harness_class, HarnessClass::Delegated);
     }
 
     #[test]
