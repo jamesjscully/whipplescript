@@ -179,7 +179,10 @@ freedom.
 5. **Surface sugar + Managed default.** `agent Foo delegated to <provider>` and
    `agent Foo { … }`-is-Managed; migrate `provider …` / `using …` onto the axis.
 6. **(Follow-on)** Formalize the delegated sidecar wire protocol (the original
-   candidate-DR-0034 scope), now a sub-decision under this record.
+   candidate-DR-0034 scope), now a sub-decision under this record —
+   **written as DR-0035** (`0035-delegated-harness-wire-protocol.md`,
+   proposed). Note: DR-0035 corrects this record's "(pi retired)" aside — pi
+   remains a live, unconditionally-compiled Delegated dialect.
 
 Model-first per repo discipline: the class invariants (a Managed-only knob is
 unreachable on a Delegated agent; a Delegated turn emits no `context.bundle`; ambient

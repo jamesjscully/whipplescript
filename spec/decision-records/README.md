@@ -164,6 +164,15 @@ others are active workshop material.
   evidence model forks (full provenance vs a `context: provider-assembled`
   attestation); authority stays WhippleScript's for both. *Accepted; reframes/supersedes
   context-assembly Phase 6; absorbs the candidate sidecar-protocol DR; retrofits DR-0024.*
+- [0035-delegated-harness-wire-protocol.md](0035-delegated-harness-wire-protocol.md):
+  the D8-6 follow-on under DR-0034 — the delegated turn contract is formalized as
+  **obligations over the existing dialects** (Claude whip-sidecar JSONL, Codex
+  app-server JSON-RPC, Pi RPC), not one unified wire format: canonical turn
+  envelope with narrowing-only policy projections, exactly-one-terminal +
+  tolerant run-id routing, two-clock liveness (inactivity wall clock + delivered-
+  frame budget), ack-then-terminal cancellation wired into the driver, declared
+  re-query before `uncertain` resolution, version exchange, kernel-owned
+  shape-only redaction. *Proposed; build items gated on ratification.*
 
 ## Historical Decision Trackers
 
