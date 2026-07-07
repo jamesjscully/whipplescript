@@ -464,6 +464,8 @@ pub struct ClaudeAgentSdkAdapter<T> {
     // DR-0035 Decision 4: the inactivity wall clock. When no frame arrives
     // within this window, the adapter synthesizes the TimedOut terminal.
     inactivity_budget: std::time::Duration,
+    // Idle time accumulated across empty poll slices; reset on every frame.
+    idle_elapsed: std::time::Duration,
 }
 
 impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkAdapter<T> {
@@ -480,6 +482,7 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkAdapter<T> {
             provider_session_id: None,
             sequence: 0,
             inactivity_budget: std::time::Duration::from_secs(300),
+            idle_elapsed: std::time::Duration::ZERO,
         }
     }
 
@@ -694,14 +697,30 @@ impl<T: ClaudeAgentSdkTransport> NativeProviderAdapter for ClaudeAgentSdkAdapter
             .active_run_id
             .clone()
             .unwrap_or_else(|| run_id.to_owned());
-        let budget = self.inactivity_budget;
-        match self.client.read_event_timeout(&active_run_id, budget) {
-            Ok(Some(event)) => Ok(self.event_from_sidecar(event)),
-            // Window elapsed with no frame: the inactivity clock fires.
-            Ok(None) => Ok(Some(self.inactivity_timeout_event(
-                &active_run_id,
-                "inactivity_budget_exhausted",
-            ))),
+        // The wait is sliced (DR-0035 Decision 5) so the driver regains control
+        // between slices to act on cancellation requests; the inactivity clock
+        // accumulates across empty slices and fires at the full budget.
+        let slice = self
+            .inactivity_budget
+            .min(std::time::Duration::from_secs(1));
+        match self.client.read_event_timeout(&active_run_id, slice) {
+            Ok(Some(event)) => {
+                self.idle_elapsed = std::time::Duration::ZERO;
+                Ok(self.event_from_sidecar(event))
+            }
+            Ok(None) => {
+                self.idle_elapsed += slice;
+                if self.idle_elapsed >= self.inactivity_budget {
+                    self.idle_elapsed = std::time::Duration::ZERO;
+                    // Window elapsed with no frame: the inactivity clock fires.
+                    Ok(Some(self.inactivity_timeout_event(
+                        &active_run_id,
+                        "inactivity_budget_exhausted",
+                    )))
+                } else {
+                    Ok(None)
+                }
+            }
             // The stream closed with no terminal: same backstop, distinct reason.
             Err(ClaudeAgentSdkError::Timeout(_)) => Ok(Some(
                 self.inactivity_timeout_event(&active_run_id, "stream_closed"),

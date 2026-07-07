@@ -413,6 +413,8 @@ pub struct CodexAppServerAdapter<T> {
     // DR-0035 Decision 4: the inactivity wall clock. When no frame arrives
     // within this window, the adapter synthesizes the TimedOut terminal.
     inactivity_budget: std::time::Duration,
+    // Idle time accumulated across empty poll slices; reset on every frame.
+    idle_elapsed: std::time::Duration,
 }
 
 impl<T: CodexAppServerTransport> CodexAppServerAdapter<T> {
@@ -430,6 +432,7 @@ impl<T: CodexAppServerTransport> CodexAppServerAdapter<T> {
             turn_id: None,
             sequence: 0,
             inactivity_budget: std::time::Duration::from_secs(300),
+            idle_elapsed: std::time::Duration::ZERO,
         }
     }
 
@@ -717,9 +720,15 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
         if let Some(message) = self.client.pop_notification() {
             return Ok(self.maybe_event_from_message(run_id, message));
         }
-        let budget = self.inactivity_budget;
-        match self.client.read_message_timeout(budget) {
+        // The wait is sliced (DR-0035 Decision 5) so the driver regains control
+        // between slices to act on cancellation requests; the inactivity clock
+        // accumulates across empty slices and fires at the full budget.
+        let slice = self
+            .inactivity_budget
+            .min(std::time::Duration::from_secs(1));
+        match self.client.read_message_timeout(slice) {
             Ok(Some(message)) => {
+                self.idle_elapsed = std::time::Duration::ZERO;
                 if message.get("id").is_some()
                     && message.get("method").and_then(Value::as_str).is_some()
                 {
@@ -729,10 +738,19 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
                 }
                 Ok(self.maybe_event_from_message(run_id, message))
             }
-            // Window elapsed with no frame: the inactivity clock fires.
-            Ok(None) => Ok(Some(
-                self.inactivity_timeout_event(run_id, "inactivity_budget_exhausted"),
-            )),
+            Ok(None) => {
+                self.idle_elapsed += slice;
+                if self.idle_elapsed >= self.inactivity_budget {
+                    self.idle_elapsed = std::time::Duration::ZERO;
+                    // Window elapsed with no frame: the inactivity clock fires.
+                    Ok(Some(self.inactivity_timeout_event(
+                        run_id,
+                        "inactivity_budget_exhausted",
+                    )))
+                } else {
+                    Ok(None)
+                }
+            }
             // The stream closed with no terminal: same backstop, distinct reason.
             Err(CodexAppServerError::Timeout(_)) => {
                 Ok(Some(self.inactivity_timeout_event(run_id, "stream_closed")))

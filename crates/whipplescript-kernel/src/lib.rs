@@ -35,8 +35,8 @@ use harness::{
 use loft::{LoftAction, LoftClient, LoftEffectRequest, LoftEffectResult, LoftEffectStatus};
 use native_lifecycle::{AgentTurnLifecycleKind, NativeAgentTurnObservation};
 use provider::{
-    NativeProviderAdapter, NativeProviderArtifactRef, NativeProviderEvent, NativeProviderEventKind,
-    NativeProviderTurnRequest,
+    NativeProviderAdapter, NativeProviderArtifactRef, NativeProviderCancellation,
+    NativeProviderEvent, NativeProviderEventKind, NativeProviderTurnRequest,
 };
 use serde_json::{json, Value};
 use trace::{DependencyEdge, EffectStatus, TraceEvent, TraceRecord};
@@ -1269,6 +1269,10 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             ])),
         })?;
 
+        // Captured before the request moves into the adapter: the depth the
+        // program authorized for this turn, used for driver-initiated
+        // cancellation (DR-0035 Decision 5).
+        let cancellation_depth = request.cancellation_depth;
         let started = match adapter.start_turn(request) {
             Ok(event) => event,
             Err(error) => {
@@ -1310,7 +1314,63 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         let idle_poll_ceiling = max_events.max(1024);
         let mut delivered = 0usize;
         let mut idle_polls = 0usize;
+        let mut cancel_attempted = false;
         while delivered < max_events && idle_polls < idle_poll_ceiling {
+            // Cancellation plumb-through (DR-0035 Decision 5): an open durable
+            // cancellation request reaches the running delegate. The ack is a
+            // non-terminal Diagnostic; the run still ends with exactly one
+            // terminal (normally `cancelled`, else the inactivity backstop).
+            if !cancel_attempted
+                && self.store.effect_has_open_cancellation_request(
+                    execution.instance_id,
+                    execution.effect_id,
+                )?
+            {
+                cancel_attempted = true;
+                match adapter.cancel_turn(NativeProviderCancellation {
+                    run_id: execution.run_id.to_owned(),
+                    provider_session_id: None,
+                    provider_turn_id: None,
+                    requested_depth: cancellation_depth,
+                    reason: "effect_cancellation_requested".to_owned(),
+                }) {
+                    Ok(ack) => {
+                        latest_evidence = self.record_native_provider_event(
+                            execution,
+                            &ack,
+                            "native-provider-cancel-ack",
+                        )?;
+                        if ack.event_kind.is_terminal() {
+                            return self.complete_native_agent_turn(
+                                execution,
+                                &ack,
+                                &latest_evidence,
+                                run_metadata_json,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        // A refused cancel is evidence, not a turn failure —
+                        // the run keeps draining toward its own terminal.
+                        let refused = NativeProviderEvent {
+                            provider_id: execution.provider.to_owned(),
+                            run_id: execution.run_id.to_owned(),
+                            event_kind: NativeProviderEventKind::Diagnostic,
+                            provider_event_type: "whip.native.cancel_failed".to_owned(),
+                            provider_session_id: None,
+                            provider_turn_id: None,
+                            sequence: None,
+                            evidence: json!({ "boundary_error": error.to_json_redacted() }),
+                            artifacts: Vec::new(),
+                        };
+                        self.record_native_provider_event(
+                            execution,
+                            &refused,
+                            "native-provider-cancel-failed",
+                        )?;
+                    }
+                }
+            }
             let event = match adapter.next_event(execution.run_id) {
                 Ok(Some(event)) => {
                     idle_polls = 0;
@@ -6420,7 +6480,10 @@ rule wait
     }
 
     fn kernel_with_queued_agent_tell() -> (RuntimeKernel, String) {
-        let store = SqliteStore::open_in_memory().expect("store opens");
+        kernel_with_queued_agent_tell_on(SqliteStore::open_in_memory().expect("store opens"))
+    }
+
+    fn kernel_with_queued_agent_tell_on(store: SqliteStore) -> (RuntimeKernel, String) {
         let mut kernel = RuntimeKernel::new(store);
         let version = kernel
             .create_program_version(ProgramVersionInput {
@@ -6479,10 +6542,16 @@ rule wait
     }
 
     /// A scripted native adapter for driver-loop tests: `None` entries are
-    /// empty polls, `Some` entries are delivered frames.
+    /// empty polls, `Some` entries are delivered frames. `on_start` fires
+    /// inside `start_turn` (after the kernel's own run start); `with_cancel`
+    /// arms an ack event plus the terminal the delegate emits afterwards.
     struct ScriptedAdapter {
         capability: ProviderCapability,
         script: std::collections::VecDeque<Option<NativeProviderEvent>>,
+        on_start: Option<Box<dyn FnMut()>>,
+        cancel_ack: Option<NativeProviderEvent>,
+        cancel_follow_up: Option<NativeProviderEvent>,
+        cancellations: Vec<CancellationDepth>,
     }
 
     impl ScriptedAdapter {
@@ -6493,7 +6562,22 @@ rule wait
                     .find(|capability| capability.provider_kind == ProviderKind::Fixture)
                     .expect("fixture capability"),
                 script: script.into(),
+                on_start: None,
+                cancel_ack: None,
+                cancel_follow_up: None,
+                cancellations: Vec::new(),
             }
+        }
+
+        fn with_on_start(mut self, hook: Box<dyn FnMut()>) -> Self {
+            self.on_start = Some(hook);
+            self
+        }
+
+        fn with_cancel(mut self, ack: NativeProviderEvent, terminal: NativeProviderEvent) -> Self {
+            self.cancel_ack = Some(ack);
+            self.cancel_follow_up = Some(terminal);
+            self
         }
     }
 
@@ -6510,6 +6594,9 @@ rule wait
             &mut self,
             _request: NativeProviderTurnRequest,
         ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
+            if let Some(hook) = self.on_start.as_mut() {
+                hook();
+            }
             Ok(self
                 .script
                 .pop_front()
@@ -6526,9 +6613,14 @@ rule wait
 
         fn cancel_turn(
             &mut self,
-            _cancellation: NativeProviderCancellation,
+            cancellation: NativeProviderCancellation,
         ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
-            unreachable!("scripted adapter does not cancel")
+            self.cancellations.push(cancellation.requested_depth);
+            let ack = self.cancel_ack.take().expect("scripted cancel ack");
+            if let Some(terminal) = self.cancel_follow_up.take() {
+                self.script.push_front(Some(terminal));
+            }
+            Ok(ack)
         }
     }
 
@@ -6605,6 +6697,110 @@ rule wait
             run.status, "completed",
             "the turn completed instead of timing out on empty polls"
         );
+    }
+
+    #[test]
+    fn driver_cancels_running_delegate_on_open_cancellation_request() {
+        // DR-0035 Decision 5: an open durable cancellation request reaches the
+        // running delegate through the driver loop — cancel_turn is no longer
+        // dead code. The ack is a non-terminal Diagnostic; the delegate's own
+        // `cancelled` terminal ends the run (exactly one terminal).
+        let store_path = std::env::temp_dir().join(format!(
+            "whip-kernel-delegate-cancel-{}.sqlite",
+            idempotency_key(&["delegate-cancel", "store"])
+        ));
+        let _ = fs::remove_file(&store_path);
+        let store = SqliteStore::open(&store_path).expect("store opens");
+        let (mut kernel, instance_id) = kernel_with_queued_agent_tell_on(store);
+        let execution = AgentTurnExecution {
+            instance_id: &instance_id,
+            effect_id: "tell",
+            run_id: "run-tell",
+            provider: "scripted",
+            worker_id: "worker-1",
+            lease_id: "lease-tell",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            agent: "worker",
+            profile: Some("repo-writer"),
+            input_json: r#"{"prompt":"go"}"#,
+            skill_names: &[],
+        };
+        // The cancellation request lands from a second store connection while
+        // the turn is starting — the effect is `running` by then.
+        let request_path = store_path.clone();
+        let request_instance = instance_id.clone();
+        let mut adapter = ScriptedAdapter::new(vec![Some(scripted_event(
+            NativeProviderEventKind::Started,
+            "scripted.started",
+        ))])
+        .with_on_start(Box::new(move || {
+            let mut store = SqliteStore::open(&request_path).expect("store reopens");
+            store
+                .request_effect_cancellation(EffectCancellationRequest {
+                    instance_id: &request_instance,
+                    effect_id: "tell",
+                    revision_id: None,
+                    reason: Some("test delegate cancellation"),
+                    requested_by: "test",
+                    causation_event_id: None,
+                    idempotency_key: Some("test-delegate-cancel"),
+                })
+                .expect("cancellation request records");
+        }))
+        .with_cancel(
+            scripted_event(NativeProviderEventKind::Diagnostic, "scripted.cancel_ack"),
+            scripted_event(NativeProviderEventKind::Cancelled, "scripted.cancelled"),
+        );
+        let request = NativeProviderTurnRequest {
+            provider_id: "scripted".to_owned(),
+            provider_kind: ProviderKind::Fixture,
+            surface: AdapterSurface::Fixture,
+            run_id: "run-tell".to_owned(),
+            effect_id: "tell".to_owned(),
+            agent: "worker".to_owned(),
+            profile: Some("repo-writer".to_owned()),
+            prompt_json: json!("go"),
+            workspace_policy: "read_only".to_owned(),
+            required_capabilities: Vec::new(),
+            cancellation_depth: CancellationDepth::NativeStop,
+            artifact_policy: "metadata".to_owned(),
+            credential_ref: None,
+            provider_options: std::collections::BTreeMap::new(),
+        };
+
+        kernel
+            .run_native_agent_turn(execution, request, &mut adapter, 8)
+            .expect("turn cancels");
+
+        // The delegate saw exactly one cancel at the authorized depth.
+        assert_eq!(adapter.cancellations, vec![CancellationDepth::NativeStop]);
+        let runs = kernel.store().list_runs(&instance_id).expect("runs list");
+        let run = runs.iter().find(|r| r.run_id == "run-tell").expect("run");
+        assert_eq!(run.status, "cancelled");
+        // The ack was recorded as a non-terminal diagnostic before the terminal.
+        let evidence = kernel
+            .store()
+            .list_evidence(&instance_id)
+            .expect("evidence lists");
+        assert!(
+            evidence
+                .iter()
+                .any(|row| row.metadata_json.contains("scripted.cancel_ack")),
+            "cancel ack recorded"
+        );
+        // Exactly one terminal lifecycle fact for the run.
+        let events = kernel
+            .store()
+            .list_events(&instance_id)
+            .expect("events list");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "agent.turn.cancelled")
+                .count(),
+            1
+        );
+        let _ = fs::remove_file(&store_path);
     }
 
     #[test]

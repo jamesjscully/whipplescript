@@ -460,6 +460,8 @@ pub struct PiRpcAdapter<T> {
     // DR-0035 Decision 4: the inactivity wall clock. When no frame arrives
     // within this window, the adapter synthesizes the TimedOut terminal.
     inactivity_budget: std::time::Duration,
+    // Idle time accumulated across empty poll slices; reset on every frame.
+    idle_elapsed: std::time::Duration,
 }
 
 impl<T: PiRpcTransport> PiRpcAdapter<T> {
@@ -475,6 +477,7 @@ impl<T: PiRpcTransport> PiRpcAdapter<T> {
             state: None,
             sequence: 0,
             inactivity_budget: std::time::Duration::from_secs(300),
+            idle_elapsed: std::time::Duration::ZERO,
         }
     }
 
@@ -690,13 +693,30 @@ impl<T: PiRpcTransport> NativeProviderAdapter for PiRpcAdapter<T> {
         if let Some(event) = self.client.pop_event() {
             return Ok(self.event_from_message(run_id, event));
         }
-        let budget = self.inactivity_budget;
-        match self.client.read_event_timeout(budget) {
-            Ok(Some(event)) => Ok(self.event_from_message(run_id, event)),
-            // Window elapsed with no frame: the inactivity clock fires.
-            Ok(None) => Ok(Some(
-                self.inactivity_timeout_event(run_id, "inactivity_budget_exhausted"),
-            )),
+        // The wait is sliced (DR-0035 Decision 5) so the driver regains control
+        // between slices to act on cancellation requests; the inactivity clock
+        // accumulates across empty slices and fires at the full budget.
+        let slice = self
+            .inactivity_budget
+            .min(std::time::Duration::from_secs(1));
+        match self.client.read_event_timeout(slice) {
+            Ok(Some(event)) => {
+                self.idle_elapsed = std::time::Duration::ZERO;
+                Ok(self.event_from_message(run_id, event))
+            }
+            Ok(None) => {
+                self.idle_elapsed += slice;
+                if self.idle_elapsed >= self.inactivity_budget {
+                    self.idle_elapsed = std::time::Duration::ZERO;
+                    // Window elapsed with no frame: the inactivity clock fires.
+                    Ok(Some(self.inactivity_timeout_event(
+                        run_id,
+                        "inactivity_budget_exhausted",
+                    )))
+                } else {
+                    Ok(None)
+                }
+            }
             // The stream closed with no terminal: same backstop, distinct reason.
             Err(PiRpcError::Timeout(_)) => {
                 Ok(Some(self.inactivity_timeout_event(run_id, "stream_closed")))
