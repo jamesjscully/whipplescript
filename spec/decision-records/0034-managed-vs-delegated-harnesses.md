@@ -1,6 +1,6 @@
 # DR-0034 — Managed vs. delegated harnesses
 
-Status: proposed (2026-07-07). Splits the harness abstraction that DR-0024 (owned
+Status: accepted (2026-07-07). Splits the harness abstraction that DR-0024 (owned
 brokered harness) was retrofitted into. Reframes and supersedes
 `spec/context-assembly-tracker.md` **Phase 6** (delegated-path context), and
 absorbs the "formalize the sidecar protocol" candidate-DR-0034 flagged in

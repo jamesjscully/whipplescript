@@ -162,7 +162,7 @@ others are active workshop material.
   foreign runtime that assembles its own context). Context-assembly knobs are
   Managed-only, delegation knobs (un-crippled `setting_sources`) Delegated-only; the
   evidence model forks (full provenance vs a `context: provider-assembled`
-  attestation); authority stays WhippleScript's for both. *Proposed; reframes/supersedes
+  attestation); authority stays WhippleScript's for both. *Accepted; reframes/supersedes
   context-assembly Phase 6; absorbs the candidate sidecar-protocol DR; retrofits DR-0024.*
 
 ## Historical Decision Trackers
