@@ -234,16 +234,18 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
     /// EVIDENCE only (I2: no rule-matchable fact), then settles the single
     /// terminal and derives exactly one `agent.turn.<status>` fact (layer 3) so
     /// `after <turn> succeeds` matches it just like the delegating harness.
-    pub fn run_brokered_agent_turn<C, E>(
+    pub fn run_brokered_agent_turn<M, E, H>(
         &mut self,
         ctx: &BrokeredTurnContext<'_>,
-        client: &C,
+        client: &M,
         executor: &E,
+        host: &H,
         input: &crate::harness_loop::BrokeredTurnInput,
     ) -> StoreResult<StoredEvent>
     where
-        C: crate::harness_loop::HarnessModelClient + ?Sized,
+        M: crate::harness_loop::HttpModelClient + ?Sized,
         E: crate::harness_loop::ToolExecutor + ?Sized,
+        H: crate::sansio::HostDriver,
     {
         use crate::harness_loop::TurnStatus;
 
@@ -326,7 +328,13 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                     idempotency_key: Some(&key),
                 });
             };
-            crate::harness_loop::run_brokered_loop(client, executor, run_input, &mut checkpoint)
+            crate::harness_loop::run_brokered_turn_http(
+                client,
+                executor,
+                run_input,
+                &mut checkpoint,
+                host,
+            )
         };
 
         // In-turn observations are evidence, never facts (leaf-ness, I2).

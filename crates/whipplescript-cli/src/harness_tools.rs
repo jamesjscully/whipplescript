@@ -15,13 +15,16 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use whipplescript_kernel::coerce_native::{json_schema_for_type, CoerceProvider};
+use whipplescript_kernel::coerce_native::{
+    json_schema_for_type, CoerceProvider, CoerceTransportError, HttpRequest, HttpResponse,
+};
 use whipplescript_kernel::context_assembly::{assemble, BundleKind, ContextBundle};
 use whipplescript_kernel::harness_loop::{
-    BrokeredTurnInput, ChatMessage, HarnessModelClient, HarnessModelError, ModelReply, ToolCall,
-    ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
+    BrokeredTurnInput, ChatMessage, HarnessModelClient, HarnessModelError, HttpModelClient,
+    ModelReply, ToolCall, ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
 };
 use whipplescript_kernel::harness_model::RealHarnessModelClient;
+use whipplescript_kernel::sansio::{HostDriver, IoRequest, IoResult};
 use whipplescript_kernel::{BrokeredTurnContext, RuntimeKernel};
 use whipplescript_parser::IrWorkflowContractKind;
 use whipplescript_store::coordination::{AcquireOutcome, CoordinationStore};
@@ -2030,18 +2033,18 @@ impl FixtureModelClient {
     }
 }
 
-impl HarnessModelClient for FixtureModelClient {
-    fn next(
-        &self,
-        messages: &[ChatMessage],
-        _tools: &[ToolSpec],
-    ) -> Result<ModelReply, HarnessModelError> {
+impl FixtureModelClient {
+    /// The deterministic reply for the conversation so far: one scripted tool call
+    /// on the first turn (if `WHIPPLESCRIPT_OWNED_FIXTURE_TOOL` is set), else
+    /// completion. Shared by both the synchronous [`HarnessModelClient`] path and
+    /// the sans-IO [`HttpModelClient`] path so they stay identical.
+    fn reply_for(&self, messages: &[ChatMessage]) -> ModelReply {
         let already_acted = messages
             .iter()
             .any(|message| matches!(message, ChatMessage::Assistant { .. }));
         if let Some((id, name, args)) = &self.tool {
             if !already_acted {
-                return Ok(ModelReply {
+                return ModelReply {
                     text: String::new(),
                     tool_calls: vec![ToolCall {
                         id: id.clone(),
@@ -2049,14 +2052,107 @@ impl HarnessModelClient for FixtureModelClient {
                         arguments: args.clone(),
                     }],
                     usage: json!({ "output_tokens": 1 }),
-                });
+                };
             }
         }
-        Ok(ModelReply {
+        ModelReply {
             text: "owned-harness fixture turn complete".to_string(),
             tool_calls: Vec::new(),
             usage: json!({ "output_tokens": 1 }),
+        }
+    }
+}
+
+impl HarnessModelClient for FixtureModelClient {
+    fn next(
+        &self,
+        messages: &[ChatMessage],
+        _tools: &[ToolSpec],
+    ) -> Result<ModelReply, HarnessModelError> {
+        Ok(self.reply_for(messages))
+    }
+}
+
+/// The fixture as a sans-IO [`HttpModelClient`] (context-assembly Phase 4, Option
+/// α): the owned turn drives a single `BrokeredTurnMachine` on native and the DO,
+/// so the credential-free fixture must speak the same build/parse seam. The
+/// scripted reply is decided at `build_request` time (it has the messages) and
+/// encoded into the request body; [`FixtureHost`] echoes that body back so
+/// `parse_response` reconstructs the exact [`ModelReply`] — a faithful
+/// request→response round-trip with no live provider.
+impl HttpModelClient for FixtureModelClient {
+    fn build_request(&self, messages: &[ChatMessage], _tools: &[ToolSpec]) -> HttpRequest {
+        let reply = self.reply_for(messages);
+        let tool_calls: Vec<Value> = reply
+            .tool_calls
+            .iter()
+            .map(|call| json!({ "id": call.id, "name": call.name, "arguments": call.arguments }))
+            .collect();
+        HttpRequest {
+            url: "fixture://owned-harness".to_string(),
+            headers: Vec::new(),
+            body: json!({
+                "text": reply.text,
+                "tool_calls": tool_calls,
+                "usage": reply.usage,
+            }),
+        }
+    }
+
+    fn parse_response(
+        &self,
+        response: Result<HttpResponse, CoerceTransportError>,
+    ) -> Result<ModelReply, HarnessModelError> {
+        let body = response
+            .map_err(|error| HarnessModelError::Transport(format!("{error:?}")))?
+            .body;
+        let tool_calls = body
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .map(|calls| {
+                calls
+                    .iter()
+                    .map(|call| ToolCall {
+                        id: call
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: call
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        arguments: call.get("arguments").cloned().unwrap_or(Value::Null),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(ModelReply {
+            text: body
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            tool_calls,
+            usage: body.get("usage").cloned().unwrap_or(Value::Null),
         })
+    }
+}
+
+/// The host for the fixture model client: echoes each request body back as a 200
+/// response so the fixture's `build_request`-encoded reply reaches its
+/// `parse_response`. Stands in for the ureq/`fetch` transport on the credential-free
+/// path (mirrors the kernel test `DummyHost`, but echoing rather than dropping).
+pub struct FixtureHost;
+
+impl HostDriver for FixtureHost {
+    fn fulfill(&self, request: &IoRequest) -> IoResult {
+        let IoRequest::Http(http) = request;
+        IoResult::Http(Ok(HttpResponse {
+            status: 200,
+            body: http.body.clone(),
+        }))
     }
 }
 
@@ -2661,11 +2757,15 @@ pub fn run_owned_agent_turn(
                 // constant across the turn's model steps.
                 Some(effect_id.to_owned()),
             );
-            kernel.run_brokered_agent_turn(&ctx, &client, &executor, &input)
+            // Native drives the sans-IO `BrokeredTurnMachine` (Option α): the ureq
+            // transport is both the model client's transport and the machine's
+            // `HostDriver` (blanket impl), so native and the durable object run the
+            // one turn control-flow — the single seam Phase-4 compaction rides.
+            kernel.run_brokered_agent_turn(&ctx, &client, &executor, &transport, &input)
         }
         None => {
             let client = FixtureModelClient::from_env();
-            kernel.run_brokered_agent_turn(&ctx, &client, &executor, &input)
+            kernel.run_brokered_agent_turn(&ctx, &client, &executor, &FixtureHost, &input)
         }
     };
 
