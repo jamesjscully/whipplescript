@@ -991,6 +991,29 @@ impl Compactor for TurnSummarizingCompactor {
     }
 }
 
+/// The recall footer appended to a truncated tool output (context-assembly Phase 5).
+/// The format is owned here — the CLI executor appends it at capture time and the
+/// [`ToolResultCompactor`] parses it back — so the two sides agree on one contract.
+/// `id` is the content-addressed recall id the model passes to the `recall` tool.
+pub fn recall_footer(tool: &str, byte_len: usize, id: &str) -> String {
+    format!(
+        "\n[full `{tool}` output: {byte_len} bytes, id {id} — call `recall` with this id (and optional line offset/limit) to read the rest]"
+    )
+}
+
+/// Marker preceding the recall id in a [`recall_footer`], used to parse it back.
+const RECALL_ID_MARKER: &str = ", id ";
+
+/// Extract the recall id from a tool-result content that carries a [`recall_footer`],
+/// or `None` if it was not captured. The id is a single whitespace-delimited token.
+fn recall_id_in(content: &str) -> Option<String> {
+    let start = content.rfind(RECALL_ID_MARKER)? + RECALL_ID_MARKER.len();
+    let rest = &content[start..];
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let id = &rest[..end];
+    (!id.is_empty()).then(|| id.to_string())
+}
+
 /// The shared compaction trigger (Decision 7): real usage has reached
 /// `trigger_tenths`/10 of the window and the conversation clears the message floor.
 fn over_trigger(stats: &CompactionStats, trigger_tenths: u64, min_messages: usize) -> bool {
@@ -1068,6 +1091,86 @@ impl Compactor for HardResetCompactor {
 
     fn assemble(&self, request: &SummarizationRequest, _summary: &str) -> Vec<ChatMessage> {
         // Never called (hard-reset is always `Deterministic`); rebuild anchors + tail.
+        let mut out = request.anchors.clone();
+        out.extend(request.keep_tail.iter().cloned());
+        out
+    }
+}
+
+/// Strategy #3: tool-result compaction (the WhippleScript edge — lossless where
+/// Codex/pi are lossy). At a compaction boundary, rewrite the bodies of OLD captured
+/// tool results (in the fold region between the anchors and the recent tail) down to
+/// just their content-addressed recall ref, keeping the conversation STRUCTURE
+/// (assistant turns, small results) intact. The bulk — large tool outputs already
+/// truncated + captured — shrinks to ~100-byte refs the model can `recall` losslessly.
+/// A `Deterministic` compactor (no model round). Best for read/grep/bash-heavy turns.
+pub struct ToolResultCompactor {
+    trigger_tenths: u64,
+    min_messages: usize,
+    tail_budget_bytes: usize,
+}
+
+impl Default for ToolResultCompactor {
+    fn default() -> Self {
+        Self::new(
+            COMPACT_TRIGGER_TENTHS,
+            COMPACT_MIN_MESSAGES,
+            COMPACT_TAIL_BUDGET_BYTES,
+        )
+    }
+}
+
+impl ToolResultCompactor {
+    /// Construct with explicit thresholds (for config and tests); [`Default`] uses
+    /// the shipped constants.
+    pub fn new(trigger_tenths: u64, min_messages: usize, tail_budget_bytes: usize) -> Self {
+        Self {
+            trigger_tenths,
+            min_messages,
+            tail_budget_bytes,
+        }
+    }
+}
+
+impl Compactor for ToolResultCompactor {
+    fn should_compact(&self, stats: &CompactionStats) -> bool {
+        over_trigger(stats, self.trigger_tenths, self.min_messages)
+    }
+
+    fn plan(&self, transcript: &[ChatMessage], _stats: &CompactionStats) -> CompactionOutcome {
+        let anchor_end = transcript.len().min(2);
+        let tail_start = recent_tail_start(transcript, self.tail_budget_bytes).max(anchor_end);
+        if tail_start <= anchor_end {
+            return CompactionOutcome::Deterministic(transcript.to_vec());
+        }
+        let mut out = transcript[..anchor_end].to_vec();
+        // Elide old captured tool results to their recall ref; keep structure.
+        for message in &transcript[anchor_end..tail_start] {
+            match message {
+                ChatMessage::ToolResults(results) => {
+                    let elided = results
+                        .iter()
+                        .map(|result| match recall_id_in(&result.content) {
+                            Some(id) => ToolResultMsg {
+                                content: format!(
+                                    "[tool output elided at compaction — call `recall` with id {id} to read it]"
+                                ),
+                                ..result.clone()
+                            },
+                            None => result.clone(),
+                        })
+                        .collect();
+                    out.push(ChatMessage::ToolResults(elided));
+                }
+                other => out.push(other.clone()),
+            }
+        }
+        out.extend_from_slice(&transcript[tail_start..]);
+        CompactionOutcome::Deterministic(out)
+    }
+
+    fn assemble(&self, request: &SummarizationRequest, _summary: &str) -> Vec<ChatMessage> {
+        // Never called (always `Deterministic`); rebuild anchors + tail.
         let mut out = request.anchors.clone();
         out.extend(request.keep_tail.iter().cloned());
         out
@@ -2165,6 +2268,58 @@ mod tests {
                 );
             }
             CompactionOutcome::NeedsModel(_) => panic!("hard-reset never needs a model"),
+        }
+    }
+
+    #[test]
+    fn tool_result_compactor_elides_captured_results_to_refs_keeping_structure() {
+        let c = ToolResultCompactor::new(9, 2, 10);
+        // A captured tool result carries a recall footer; the compactor elides its
+        // body to a ref while keeping the assistant turn and a small result intact.
+        let captured = ChatMessage::ToolResults(vec![ToolResultMsg {
+            tool_call_id: "c1".into(),
+            tool_name: "read".into(),
+            content: format!("HEAD...TAIL{}", recall_footer("read", 90_000, "abc123")),
+            is_error: false,
+        }]);
+        let small = ChatMessage::ToolResults(vec![ToolResultMsg {
+            tool_call_id: "c2".into(),
+            tool_name: "ls".into(),
+            content: "a\nb\nc".into(),
+            is_error: false,
+        }]);
+        let transcript = vec![
+            ChatMessage::System("sys".into()),
+            ChatMessage::User("task".into()),
+            ChatMessage::Assistant {
+                text: "reading".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: json!({}),
+                }],
+            },
+            captured,
+            small,
+            ChatMessage::User("recent".into()),
+        ];
+        match c.plan(&transcript, &stats(950, 1000, transcript.len())) {
+            CompactionOutcome::Deterministic(out) => {
+                // Structure preserved: same message count, assistant turn intact.
+                assert_eq!(out.len(), transcript.len());
+                assert_eq!(out[2], transcript[2], "assistant turn kept");
+                // The captured result is now a compact recall ref (no HEAD/TAIL body).
+                if let ChatMessage::ToolResults(results) = &out[3] {
+                    assert!(results[0].content.contains("recall` with id abc123"));
+                    assert!(!results[0].content.contains("HEAD"));
+                    assert!(results[0].content.len() < 200, "shrunk to a ref");
+                } else {
+                    panic!("expected tool results at index 3");
+                }
+                // The small (uncaptured) result is untouched.
+                assert_eq!(out[4], transcript[4]);
+            }
+            CompactionOutcome::NeedsModel(_) => panic!("tool-result compaction needs no model"),
         }
     }
 

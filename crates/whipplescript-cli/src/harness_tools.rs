@@ -901,9 +901,11 @@ impl FileToolExecutor {
             return truncated;
         };
         match ContentStore::open(path).and_then(|store| store.put(full)) {
+            // The footer format is owned by the kernel so the `ToolResultCompactor`
+            // can parse the recall id back (context-assembly Phase 5).
             Ok(id) => format!(
-                "{truncated}\n[full `{tool}` output: {} bytes, id {id} — call `recall` with this id (and optional line offset/limit) to read the rest]",
-                full.len()
+                "{truncated}{}",
+                whipplescript_kernel::harness_loop::recall_footer(tool, full.len(), &id)
             ),
             // Capture failure degrades to plain truncation (never blocks the turn).
             Err(_) => truncated,
