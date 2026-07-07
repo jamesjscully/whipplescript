@@ -146,6 +146,14 @@ pub trait HttpModelClient {
         &self,
         response: Result<HttpResponse, TransportError>,
     ) -> Result<ModelReply, HarnessModelError>;
+
+    /// The model's context window in tokens, for the conversation-compaction
+    /// trigger (context-assembly Phase 4, Decision 7). The default suits the common
+    /// 200k-token frontier models; a client with a known window (or a fixture that
+    /// wants to force compaction cheaply) overrides it.
+    fn context_window(&self) -> u64 {
+        DEFAULT_CONTEXT_WINDOW
+    }
 }
 
 /// One model call as a sans-IO [`StepMachine`]: prepare the provider request,
@@ -297,6 +305,11 @@ pub struct BrokeredTurnInput {
 /// message then a tool-results message each round. The loop ends when the model
 /// replies with no tool calls (Completed), a model call errors (Failed), or the
 /// step bound is hit (TimedOut).
+///
+/// This is the imperative, no-compaction *reference* loop: production drives the
+/// sans-IO [`BrokeredTurnMachine`] (which carries the [`Compactor`]) on both native
+/// and the durable object. The loop is retained as the equivalence oracle the
+/// stepped machine is proven byte-identical against (with a [`NoopCompactor`]).
 pub fn run_brokered_loop<C, E>(
     client: &C,
     executor: &E,
@@ -325,10 +338,6 @@ where
     let mut usage = Value::Null;
 
     for step in 0..input.max_steps {
-        // Compact the projected context before each model call: the durable
-        // observation stream is untouched (the runner records every step); only
-        // what the model re-reads is bounded (DR-0024 boundary corollary).
-        messages = compact_context(messages, COMPACT_MAX_MESSAGES, COMPACT_KEEP_RECENT);
         observations.push(LoopObservation::ModelRequest { step });
         let reply = match client.next(&messages, &input.tools) {
             Ok(reply) => reply,
@@ -414,6 +423,28 @@ pub struct BrokeredTurnSnapshot {
     pub usage: Value,
     pub step: usize,
     pub started: bool,
+    /// Which round the next Http response answers (Phase 4 Layer B). `Main` unless
+    /// a summarization round is in flight.
+    #[serde(default = "awaiting_main")]
+    pub awaiting: Awaiting,
+    /// The last MAIN reply's `input_tokens` — the compaction trigger signal. Reset
+    /// to 0 after each compaction (hysteresis).
+    #[serde(default)]
+    pub last_input_tokens: u64,
+    /// How many compactions have been applied this turn (apply-once bookkeeping /
+    /// evidence key).
+    #[serde(default)]
+    pub compaction_epoch: u32,
+    /// The summarization compaction awaiting its model reply; `Some` iff
+    /// `awaiting == Summary`. Survives eviction so resume folds the same summary in.
+    #[serde(default)]
+    pub pending_compaction: Option<SummarizationRequest>,
+}
+
+/// `serde(default)` seed for [`BrokeredTurnSnapshot::awaiting`] on pre-Phase-4
+/// snapshots (they were mid-main by construction).
+fn awaiting_main() -> Awaiting {
+    Awaiting::Main
 }
 
 pub struct BrokeredTurnMachine<'a, M, E>
@@ -425,11 +456,16 @@ where
     executor: &'a E,
     input: &'a BrokeredTurnInput,
     checkpoint: &'a mut dyn FnMut(&[ChatMessage]),
+    compactor: &'a dyn Compactor,
     messages: Vec<ChatMessage>,
     observations: Vec<LoopObservation>,
     usage: Value,
     step: usize,
     started: bool,
+    awaiting: Awaiting,
+    last_input_tokens: u64,
+    compaction_epoch: u32,
+    pending_compaction: Option<SummarizationRequest>,
 }
 
 impl<'a, M, E> BrokeredTurnMachine<'a, M, E>
@@ -442,17 +478,23 @@ where
         executor: &'a E,
         input: &'a BrokeredTurnInput,
         checkpoint: &'a mut dyn FnMut(&[ChatMessage]),
+        compactor: &'a dyn Compactor,
     ) -> Self {
         Self {
             model,
             executor,
             input,
             checkpoint,
+            compactor,
             messages: Vec::new(),
             observations: Vec::new(),
             usage: Value::Null,
             step: 0,
             started: false,
+            awaiting: Awaiting::Main,
+            last_input_tokens: 0,
+            compaction_epoch: 0,
+            pending_compaction: None,
         }
     }
 
@@ -468,6 +510,7 @@ where
         executor: &'a E,
         input: &'a BrokeredTurnInput,
         checkpoint: &'a mut dyn FnMut(&[ChatMessage]),
+        compactor: &'a dyn Compactor,
         snapshot: BrokeredTurnSnapshot,
     ) -> Self {
         Self {
@@ -475,11 +518,16 @@ where
             executor,
             input,
             checkpoint,
+            compactor,
             messages: snapshot.messages,
             observations: snapshot.observations,
             usage: snapshot.usage,
             step: snapshot.step,
             started: snapshot.started,
+            awaiting: snapshot.awaiting,
+            last_input_tokens: snapshot.last_input_tokens,
+            compaction_epoch: snapshot.compaction_epoch,
+            pending_compaction: snapshot.pending_compaction,
         }
     }
 
@@ -492,36 +540,73 @@ where
             usage: self.usage.clone(),
             step: self.step,
             started: self.started,
+            awaiting: self.awaiting,
+            last_input_tokens: self.last_input_tokens,
+            compaction_epoch: self.compaction_epoch,
+            pending_compaction: self.pending_compaction.clone(),
         }
     }
 
-    /// Prepare the model call for the current step, or settle if the step bound
-    /// is reached. Mirrors the top of each `run_brokered_loop` iteration (compact
-    /// → observe → build request), and the after-loop `TimedOut` when the bound
-    /// is hit.
-    fn prepare_model_call(&mut self) -> Outcome<BrokeredTurnOutcome> {
+    /// Decide the next round: settle if the step bound is reached, else consult the
+    /// compactor (Phase 4 Layer B) and either interleave a summarization round, apply
+    /// a deterministic rewrite, or proceed straight to the main call. Replaces the old
+    /// `prepare_model_call` (whose per-turn `compact_context` was cache-hostile).
+    fn decide_next_call(&mut self) -> Outcome<BrokeredTurnOutcome> {
         if self.step >= self.input.max_steps {
-            return Outcome::Settle(BrokeredTurnOutcome {
-                status: TurnStatus::TimedOut,
-                summary: format!(
-                    "brokered turn exceeded {} model steps",
-                    self.input.max_steps
-                ),
-                steps: self.input.max_steps,
-                observations: std::mem::take(&mut self.observations),
-                usage: std::mem::take(&mut self.usage),
-            });
+            return Outcome::Settle(self.timed_out());
         }
-        self.messages = compact_context(
-            std::mem::take(&mut self.messages),
-            COMPACT_MAX_MESSAGES,
-            COMPACT_KEEP_RECENT,
-        );
+        let stats = CompactionStats {
+            last_input_tokens: self.last_input_tokens,
+            context_window: self.model.context_window(),
+            message_count: self.messages.len(),
+        };
+        if self.compactor.should_compact(&stats) {
+            match self.compactor.plan(&self.messages, &stats) {
+                CompactionOutcome::Deterministic(rewritten) => {
+                    // A pure rewrite (front-trim / hard-reset): install it, disarm,
+                    // and persist the new prefix once (apply-once).
+                    self.messages = rewritten;
+                    self.compaction_epoch += 1;
+                    self.last_input_tokens = 0;
+                    (self.checkpoint)(&self.messages);
+                }
+                CompactionOutcome::NeedsModel(request) => {
+                    // Interleave one summarization round (Decision 8): yield its
+                    // request as `NeedsIo(Http)`, remembering it so the reply folds
+                    // in on re-entry. This is what makes the summarizer eviction-safe
+                    // on the durable object.
+                    self.awaiting = Awaiting::Summary;
+                    let http = self.model.build_request(&request.request_messages, &[]);
+                    self.pending_compaction = Some(request);
+                    return Outcome::NeedsIo(IoRequest::Http(http));
+                }
+            }
+        }
+        self.main_call()
+    }
+
+    /// Prepare the main agent model call for the current step (observe + build).
+    fn main_call(&mut self) -> Outcome<BrokeredTurnOutcome> {
+        self.awaiting = Awaiting::Main;
         self.observations
             .push(LoopObservation::ModelRequest { step: self.step });
         Outcome::NeedsIo(IoRequest::Http(
             self.model.build_request(&self.messages, &self.input.tools),
         ))
+    }
+
+    /// The `TimedOut` terminal when the step bound is hit.
+    fn timed_out(&mut self) -> BrokeredTurnOutcome {
+        BrokeredTurnOutcome {
+            status: TurnStatus::TimedOut,
+            summary: format!(
+                "brokered turn exceeded {} model steps",
+                self.input.max_steps
+            ),
+            steps: self.input.max_steps,
+            observations: std::mem::take(&mut self.observations),
+            usage: std::mem::take(&mut self.usage),
+        }
     }
 }
 
@@ -546,13 +631,35 @@ where
                 sanitize_resume_messages(self.input.resume_from.clone())
             };
             (self.checkpoint)(&self.messages);
-            return self.prepare_model_call();
+            return self.decide_next_call();
         }
 
         let response = match incoming {
             Some(IoResult::Http(response)) => response,
             None => unreachable!("BrokeredTurnMachine re-entered without a model response"),
         };
+
+        // A summarization round (Phase 4 Layer B): fold the summary into a fresh
+        // stable prefix (apply-once), disarm, and issue the deferred main call. The
+        // summarizer round is infrastructure — it does not advance `step`, and its
+        // usage is not the trigger signal. On a summarizer failure, disarm and
+        // proceed uncompacted (the Lb-5 overflow fallback covers the hard case).
+        if self.awaiting == Awaiting::Summary {
+            let folded = match (
+                self.model.parse_response(response),
+                self.pending_compaction.take(),
+            ) {
+                (Ok(reply), Some(request)) => Some(self.compactor.assemble(&request, &reply.text)),
+                _ => None,
+            };
+            if let Some(messages) = folded {
+                self.messages = messages;
+                self.compaction_epoch += 1;
+                (self.checkpoint)(&self.messages);
+            }
+            self.last_input_tokens = 0;
+            return self.main_call();
+        }
 
         let reply = match self.model.parse_response(response) {
             Ok(reply) => reply,
@@ -570,6 +677,8 @@ where
             }
         };
         self.usage = merge_usage(std::mem::take(&mut self.usage), reply.usage.clone());
+        // The real-usage compaction signal is the MAIN reply's input token count.
+        self.last_input_tokens = input_tokens_of(&reply.usage);
 
         if reply.is_final() {
             return Outcome::Settle(BrokeredTurnOutcome {
@@ -610,7 +719,7 @@ where
         self.messages.push(ChatMessage::ToolResults(results));
         (self.checkpoint)(&self.messages);
         self.step += 1;
-        self.prepare_model_call()
+        self.decide_next_call()
     }
 }
 
@@ -626,58 +735,239 @@ pub fn run_brokered_turn_http<M, E>(
     input: &BrokeredTurnInput,
     checkpoint: &mut dyn FnMut(&[ChatMessage]),
     host: &impl HostDriver,
+    compactor: &dyn Compactor,
 ) -> BrokeredTurnOutcome
 where
     M: HttpModelClient + ?Sized,
     E: ToolExecutor + ?Sized,
 {
-    let mut machine = BrokeredTurnMachine::new(model, executor, input, checkpoint);
+    let mut machine = BrokeredTurnMachine::new(model, executor, input, checkpoint, compactor);
     run_to_completion(&mut machine, host)
 }
 
-/// Compact when the projected context exceeds this many messages.
-const COMPACT_MAX_MESSAGES: usize = 40;
-/// Messages at the tail kept verbatim through compaction (the recent window).
-const COMPACT_KEEP_RECENT: usize = 12;
+// ---------------------------------------------------------------------------
+// Conversation compaction (context-assembly Phase 4, Layer B).
+//
+// The cache-hostile per-turn `compact_context` (which rewrote the middle of the
+// prefix on every request) is gone. Compaction is now a pluggable, cache-aware
+// strategy consulted ONCE per step before the main model call: it fires rarely
+// and decisively (Decision 7), and when it needs a model — a turn-summarizing
+// strategy — that summarization is an interleaved `NeedsHttp` round on the same
+// step machine (Decision 8), so it suspends/resumes on the durable object like
+// any other model call. The `owned-harness-compaction` /
+// `compaction-epoch-lifecycle` Maude models lock the invariants.
+// ---------------------------------------------------------------------------
 
-/// Compact the projected context (DR-0024 boundary corollary, slice 5).
-///
-/// Two-tier eviction: when the context exceeds `max_messages`, older
-/// `ToolResults` are elided to a short reference while the System message, the
-/// first User message, and the last `keep_recent` messages are kept verbatim.
-/// Tool *call* records (the assistant turns) are preserved so the model retains
-/// what it did, only the bulky results are dropped. Idempotent: re-compacting an
-/// already-elided context changes nothing (anti-thrashing). This transforms only
-/// the model's working context; the durable observation stream is unaffected.
-pub fn compact_context(
-    messages: Vec<ChatMessage>,
-    max_messages: usize,
-    keep_recent: usize,
-) -> Vec<ChatMessage> {
-    let len = messages.len();
-    if len <= max_messages {
-        return messages;
+/// The model's default context window (tokens) when a client does not report one.
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
+
+/// Real-usage statistics the compactor's trigger reads (Decision 7). Populated
+/// from the last MAIN model reply's `input_tokens` — the provider's own count of
+/// the whole prompt it just processed, a faithful `BodyAfterPrefix` proxy — and
+/// the model's context window.
+#[derive(Clone, Copy, Debug)]
+pub struct CompactionStats {
+    pub last_input_tokens: u64,
+    pub context_window: u64,
+    pub message_count: usize,
+}
+
+/// Which model round the machine's next Http response answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Awaiting {
+    /// A normal agent model call.
+    Main,
+    /// The interleaved summarization round of a `NeedsModel` compaction.
+    Summary,
+}
+
+/// What a [`Compactor`] decides when the trigger fires.
+pub enum CompactionOutcome {
+    /// Rewrite the transcript with no model call (front-trim, hard-reset).
+    Deterministic(Vec<ChatMessage>),
+    /// Run one summarization round, then rebuild via [`Compactor::assemble`].
+    NeedsModel(SummarizationRequest),
+}
+
+/// A pending summarization compaction: the synthetic no-tools request that yields
+/// the handoff summary, plus the verbatim anchors/tail to rebuild the transcript
+/// around it. Serializable so it survives a durable-object eviction mid-round
+/// (the machine snapshots it while `awaiting == Summary`).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SummarizationRequest {
+    /// The synthetic conversation sent to the model to produce the summary: a
+    /// System instruction plus a User message carrying the folded transcript. No
+    /// tools are offered.
+    pub request_messages: Vec<ChatMessage>,
+    /// Messages re-injected verbatim ahead of the summary (System + first User),
+    /// preserving the stable cache prefix.
+    pub anchors: Vec<ChatMessage>,
+    /// The recent tail kept verbatim after the summary.
+    pub keep_tail: Vec<ChatMessage>,
+}
+
+/// A conversation-compaction strategy (Decision 6), consulted once per step before
+/// the main model call. Selected per agent/profile/config; v1 ships
+/// [`TurnSummarizingCompactor`] and [`NoopCompactor`].
+pub trait Compactor {
+    /// Should a compaction fire before the next main call? Reads real usage vs the
+    /// window (Decision 7); must be false until a fresh main reply re-measures, so
+    /// the machine resets `last_input_tokens` to 0 after each compaction.
+    fn should_compact(&self, stats: &CompactionStats) -> bool;
+
+    /// Plan the compaction: a pure rewrite, or a summarization round.
+    fn plan(&self, transcript: &[ChatMessage], stats: &CompactionStats) -> CompactionOutcome;
+
+    /// Rebuild the transcript from a completed summary (the model's reply to a
+    /// `NeedsModel` request) and the request's verbatim anchors/tail.
+    fn assemble(&self, request: &SummarizationRequest, summary: &str) -> Vec<ChatMessage>;
+}
+
+/// A compactor that never compacts: the native default before a strategy is chosen,
+/// and the reference the loop-equivalence tests drive so the stepped machine stays
+/// byte-identical to the no-compaction reference loop.
+pub struct NoopCompactor;
+
+impl Compactor for NoopCompactor {
+    fn should_compact(&self, _stats: &CompactionStats) -> bool {
+        false
     }
-    let keep_from = len.saturating_sub(keep_recent);
-    messages
-        .into_iter()
-        .enumerate()
-        .map(|(index, message)| {
-            // Anchors: the System message and the first User message (indices 0
-            // and 1 in the loop's construction) and the recent tail survive.
-            let is_anchor = index < 2;
-            let in_recent_window = index >= keep_from;
-            if is_anchor || in_recent_window {
-                return message;
+
+    fn plan(&self, transcript: &[ChatMessage], _stats: &CompactionStats) -> CompactionOutcome {
+        CompactionOutcome::Deterministic(transcript.to_vec())
+    }
+
+    fn assemble(&self, request: &SummarizationRequest, _summary: &str) -> Vec<ChatMessage> {
+        let mut out = request.anchors.clone();
+        out.extend(request.keep_tail.iter().cloned());
+        out
+    }
+}
+
+/// Trigger threshold in context-window tenths: compact when real input usage reaches
+/// this fraction of the window (Decision 7: ~90%).
+const COMPACT_TRIGGER_TENTHS: u64 = 9;
+/// Never compact a conversation shorter than this — there is nothing worth folding.
+const COMPACT_MIN_MESSAGES: usize = 6;
+/// Verbatim recent-tail budget in bytes (~20k tokens of recent turns kept intact).
+const COMPACT_TAIL_BUDGET_BYTES: usize = 80_000;
+
+/// The summarization instruction (Codex-shape structured handoff). Sent as the
+/// System message of the interleaved summarization round.
+const SUMMARIZE_INSTRUCTION: &str = "You are compacting an agent conversation that is approaching its context limit. \
+Produce a dense, structured handoff summary a fresh agent could resume from with no other history: the task and goals, \
+the decisions made and why, the current state, the concrete next steps, and every file path, identifier, and value \
+referenced — verbatim. Do not omit specifics. Output only the summary.";
+
+/// Strategy #1: turn-summarization (Decision 6, Codex-local shape). When real usage
+/// crosses the trigger, fold the middle of the transcript into a recorded handoff
+/// summary via one interleaved model round, keeping the System + first-User anchors
+/// (the stable cache prefix) and a verbatim recent tail. The post-compaction prefix
+/// is installed once and held stable (apply-once); subsequent turns only append.
+pub struct TurnSummarizingCompactor {
+    trigger_tenths: u64,
+    min_messages: usize,
+    tail_budget_bytes: usize,
+}
+
+impl Default for TurnSummarizingCompactor {
+    fn default() -> Self {
+        Self::new(
+            COMPACT_TRIGGER_TENTHS,
+            COMPACT_MIN_MESSAGES,
+            COMPACT_TAIL_BUDGET_BYTES,
+        )
+    }
+}
+
+impl TurnSummarizingCompactor {
+    /// Construct with explicit thresholds (for per-profile config and tests);
+    /// [`Default`] uses the shipped constants.
+    pub fn new(trigger_tenths: u64, min_messages: usize, tail_budget_bytes: usize) -> Self {
+        Self {
+            trigger_tenths,
+            min_messages,
+            tail_budget_bytes,
+        }
+    }
+
+    /// The suffix of `messages` (nearest the end) whose cumulative serialized size
+    /// stays within the tail budget — always at least the final message. Returns the
+    /// index at which the tail begins.
+    fn tail_start(&self, messages: &[ChatMessage]) -> usize {
+        let mut bytes = 0usize;
+        let mut start = messages.len();
+        for (index, message) in messages.iter().enumerate().rev() {
+            bytes = bytes.saturating_add(message_size_bytes(message));
+            if bytes > self.tail_budget_bytes && index + 1 < messages.len() {
+                break;
             }
-            match message {
-                ChatMessage::ToolResults(results) => {
-                    ChatMessage::ToolResults(results.into_iter().map(elide_tool_result).collect())
-                }
-                other => other,
-            }
+            start = index;
+        }
+        start
+    }
+}
+
+impl Compactor for TurnSummarizingCompactor {
+    fn should_compact(&self, stats: &CompactionStats) -> bool {
+        // Real usage has reached `trigger_tenths`/10 of the window, and there is a
+        // conversation worth folding. `last_input_tokens` is 0 until the first main
+        // reply and is reset to 0 after each compaction, so this fires rarely.
+        stats.message_count >= self.min_messages
+            && stats.last_input_tokens.saturating_mul(10)
+                >= stats.context_window.saturating_mul(self.trigger_tenths)
+    }
+
+    fn plan(&self, transcript: &[ChatMessage], _stats: &CompactionStats) -> CompactionOutcome {
+        // Anchors: the System message + the first User message (the seeded head, or
+        // the held handoff after a prior compaction) — the stable cache prefix.
+        let anchor_end = transcript.len().min(2);
+        let tail_start = self.tail_start(transcript).max(anchor_end);
+        // The fold region is everything between the anchors and the recent tail.
+        // Nothing to fold → a no-op rewrite that disarms until the next reply.
+        if tail_start <= anchor_end {
+            return CompactionOutcome::Deterministic(transcript.to_vec());
+        }
+        let anchors = transcript[..anchor_end].to_vec();
+        let fold = &transcript[anchor_end..tail_start];
+        let keep_tail = transcript[tail_start..].to_vec();
+        let folded_json = chat_messages_to_json(fold);
+        let request_messages = vec![
+            ChatMessage::System(SUMMARIZE_INSTRUCTION.to_string()),
+            ChatMessage::User(format!(
+                "Summarize this earlier portion of the conversation:\n{folded_json}"
+            )),
+        ];
+        CompactionOutcome::NeedsModel(SummarizationRequest {
+            request_messages,
+            anchors,
+            keep_tail,
         })
-        .collect()
+    }
+
+    fn assemble(&self, request: &SummarizationRequest, summary: &str) -> Vec<ChatMessage> {
+        let mut out = request.anchors.clone();
+        out.push(ChatMessage::User(format!(
+            "[Earlier conversation compacted to a handoff summary]\n{summary}"
+        )));
+        out.extend(request.keep_tail.iter().cloned());
+        out
+    }
+}
+
+/// The input-token count from a model reply's usage (`input_tokens`, or the OpenAI
+/// `prompt_tokens` alias), 0 when absent — the real-usage signal for the trigger.
+fn input_tokens_of(usage: &Value) -> u64 {
+    usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+/// The serialized size of one message, for the recent-tail byte budget.
+fn message_size_bytes(message: &ChatMessage) -> usize {
+    chat_message_to_json(message).to_string().len()
 }
 
 /// Serialize a transcript to JSON for durable persistence (no serde derive dep).
@@ -807,19 +1097,6 @@ fn sanitize_resume_messages(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> 
         }
     }
     messages
-}
-
-/// Replace a tool result's content with a short reference. Idempotent.
-fn elide_tool_result(result: ToolResultMsg) -> ToolResultMsg {
-    if result.content.starts_with("[elided") {
-        return result;
-    }
-    let content = format!(
-        "[elided: {} result, {} bytes — recoverable from the durable log]",
-        result.tool_name,
-        result.content.len()
-    );
-    ToolResultMsg { content, ..result }
 }
 
 fn model_error_summary(error: &HarnessModelError) -> String {
@@ -1026,7 +1303,14 @@ mod tests {
         let mut cp2: Vec<Value> = Vec::new();
         let out2 = {
             let mut record = |messages: &[ChatMessage]| cp2.push(chat_messages_to_json(messages));
-            run_brokered_turn_http(&http, &exec2, &input(max_steps), &mut record, &DummyHost)
+            run_brokered_turn_http(
+                &http,
+                &exec2,
+                &input(max_steps),
+                &mut record,
+                &DummyHost,
+                &NoopCompactor,
+            )
         };
 
         assert_eq!(out1.status, out2.status, "status");
@@ -1061,7 +1345,14 @@ mod tests {
         let exec = RecordingExecutor::new(outcome_of.clone());
         let reference = {
             let mut record = |_: &[ChatMessage]| {};
-            run_brokered_turn_http(&http, &exec, &input(8), &mut record, &DummyHost)
+            run_brokered_turn_http(
+                &http,
+                &exec,
+                &input(8),
+                &mut record,
+                &DummyHost,
+                &NoopCompactor,
+            )
         };
 
         // Eviction-simulated: rebuild the machine from a serialized snapshot each
@@ -1077,13 +1368,22 @@ mod tests {
         let outcome = loop {
             let mut discard = |_: &[ChatMessage]| {};
             let mut machine = match snapshot.take() {
-                None => BrokeredTurnMachine::new(&http2, &exec2, &input2, &mut discard),
+                None => {
+                    BrokeredTurnMachine::new(&http2, &exec2, &input2, &mut discard, &NoopCompactor)
+                }
                 Some(snap) => {
                     let json = serde_json::to_string(&snap).expect("snapshot serializes");
                     let restored: BrokeredTurnSnapshot =
                         serde_json::from_str(&json).expect("snapshot deserializes");
                     rebuilds += 1;
-                    BrokeredTurnMachine::restore(&http2, &exec2, &input2, &mut discard, restored)
+                    BrokeredTurnMachine::restore(
+                        &http2,
+                        &exec2,
+                        &input2,
+                        &mut discard,
+                        &NoopCompactor,
+                        restored,
+                    )
                 }
             };
             match machine.step(incoming.take()) {
@@ -1292,72 +1592,6 @@ mod tests {
         assert_eq!(outcome.steps, 2);
     }
 
-    fn tool_result(tag: &str) -> ChatMessage {
-        ChatMessage::ToolResults(vec![ToolResultMsg {
-            tool_call_id: tag.to_string(),
-            tool_name: "read".to_string(),
-            content: format!("big content for {tag}"),
-            is_error: false,
-        }])
-    }
-
-    #[test]
-    fn compaction_is_a_noop_under_threshold() {
-        let messages = vec![
-            ChatMessage::System("s".into()),
-            ChatMessage::User("u".into()),
-            tool_result("a"),
-        ];
-        let out = compact_context(messages.clone(), 40, 12);
-        assert_eq!(out, messages);
-    }
-
-    #[test]
-    fn compaction_elides_old_tool_results_but_keeps_anchors_and_recent() {
-        let mut messages = vec![
-            ChatMessage::System("s".into()),
-            ChatMessage::User("u".into()),
-        ];
-        for i in 0..30 {
-            messages.push(tool_result(&format!("r{i}")));
-        }
-        let len = messages.len();
-        let out = compact_context(messages, 10, 5);
-        assert_eq!(out.len(), len, "compaction elides content, not messages");
-
-        // System + first User anchors are verbatim.
-        assert_eq!(out[0], ChatMessage::System("s".into()));
-        assert_eq!(out[1], ChatMessage::User("u".into()));
-
-        // A middle (old) tool result is elided to a reference.
-        if let ChatMessage::ToolResults(results) = &out[4] {
-            assert!(results[0].content.starts_with("[elided"));
-        } else {
-            panic!("expected tool results at index 4");
-        }
-
-        // The most recent entry is kept verbatim.
-        if let ChatMessage::ToolResults(results) = out.last().expect("last") {
-            assert!(results[0].content.starts_with("big content"));
-        } else {
-            panic!("expected tool results at the tail");
-        }
-    }
-
-    #[test]
-    fn compaction_is_idempotent_anti_thrashing() {
-        let mut messages = vec![
-            ChatMessage::System("s".into()),
-            ChatMessage::User("u".into()),
-        ];
-        for i in 0..30 {
-            messages.push(tool_result(&format!("r{i}")));
-        }
-        let once = compact_context(messages, 10, 5);
-        let twice = compact_context(once.clone(), 10, 5);
-        assert_eq!(once, twice, "re-compacting an elided context is a no-op");
-    }
-
     #[test]
     fn resume_continues_from_persisted_transcript_without_rerunning_tools() {
         let client = ScriptedClient::new(vec![Ok(final_reply("resumed and done"))]);
@@ -1456,5 +1690,165 @@ mod tests {
             json!({ "input_tokens": 3, "output_tokens": 7 }),
         );
         assert_eq!(merged, json!({ "input_tokens": 13, "output_tokens": 12 }));
+    }
+
+    // --- Phase 4 Layer B: conversation compaction --------------------------
+
+    fn stats(last_input_tokens: u64, window: u64, message_count: usize) -> CompactionStats {
+        CompactionStats {
+            last_input_tokens,
+            context_window: window,
+            message_count,
+        }
+    }
+
+    #[test]
+    fn trigger_fires_only_near_the_window_and_above_the_message_floor() {
+        let c = TurnSummarizingCompactor::default(); // 90%, floor 6
+                                                     // Below 90% real usage: no compaction.
+        assert!(!c.should_compact(&stats(179_000, 200_000, 40)));
+        // At/above 90% with enough messages: compaction.
+        assert!(c.should_compact(&stats(181_000, 200_000, 40)));
+        // At the threshold but too few messages: no compaction (nothing to fold).
+        assert!(!c.should_compact(&stats(181_000, 200_000, 3)));
+        // The 0-token starting/just-compacted signal never fires.
+        assert!(!c.should_compact(&stats(0, 200_000, 40)));
+    }
+
+    #[test]
+    fn plan_folds_the_middle_keeping_anchors_and_a_verbatim_tail() {
+        // A tiny tail budget forces a real fold region (only the last message fits
+        // in the tail); the System + first User are anchors.
+        let c = TurnSummarizingCompactor::new(9, 2, 10);
+        let transcript = vec![
+            ChatMessage::System("sys".into()),
+            ChatMessage::User("task".into()),
+            ChatMessage::Assistant {
+                text: "middle-1".into(),
+                tool_calls: Vec::new(),
+            },
+            ChatMessage::Assistant {
+                text: "middle-2".into(),
+                tool_calls: Vec::new(),
+            },
+            ChatMessage::User("recent".into()),
+        ];
+        match c.plan(&transcript, &stats(950, 1000, transcript.len())) {
+            CompactionOutcome::NeedsModel(req) => {
+                assert_eq!(req.anchors, transcript[..2].to_vec(), "System + first User");
+                assert_eq!(req.keep_tail, vec![transcript[4].clone()], "verbatim tail");
+                // The summarization request offers no tools and carries the fold region.
+                assert_eq!(req.request_messages.len(), 2);
+                assert!(matches!(req.request_messages[0], ChatMessage::System(_)));
+                // assemble rebuilds anchors + handoff + tail.
+                let rebuilt = c.assemble(&req, "HANDOFF");
+                assert_eq!(rebuilt[0], transcript[0]);
+                assert_eq!(rebuilt[1], transcript[1]);
+                assert!(matches!(&rebuilt[2], ChatMessage::User(t) if t.contains("HANDOFF")));
+                assert_eq!(*rebuilt.last().expect("rebuilt tail"), transcript[4]);
+            }
+            CompactionOutcome::Deterministic(_) => panic!("expected a summarization round"),
+        }
+    }
+
+    /// A scripted `HttpModelClient` with a small context window and a per-round
+    /// record of whether tools were offered — so a test can force compaction and
+    /// observe that the interleaved summarization round is a no-tools model call.
+    struct CompactingHttpClient {
+        replies: RefCell<std::collections::VecDeque<Result<ModelReply, HarnessModelError>>>,
+        tools_seen: RefCell<Vec<bool>>,
+        window: u64,
+    }
+
+    impl CompactingHttpClient {
+        fn new(replies: Vec<Result<ModelReply, HarnessModelError>>, window: u64) -> Self {
+            Self {
+                replies: RefCell::new(replies.into_iter().collect()),
+                tools_seen: RefCell::new(Vec::new()),
+                window,
+            }
+        }
+    }
+
+    impl HttpModelClient for CompactingHttpClient {
+        fn build_request(&self, _messages: &[ChatMessage], tools: &[ToolSpec]) -> HttpRequest {
+            self.tools_seen.borrow_mut().push(!tools.is_empty());
+            HttpRequest {
+                url: "https://fake/model".to_string(),
+                headers: Vec::new(),
+                body: json!({}),
+            }
+        }
+        fn parse_response(
+            &self,
+            _response: Result<HttpResponse, TransportError>,
+        ) -> Result<ModelReply, HarnessModelError> {
+            self.replies
+                .borrow_mut()
+                .pop_front()
+                .expect("compacting client ran out of replies")
+        }
+        fn context_window(&self) -> u64 {
+            self.window
+        }
+    }
+
+    #[test]
+    fn a_triggered_turn_interleaves_a_no_tools_summarization_round() {
+        // Round 1 (main): a tool call whose input usage crosses 90% of the tiny
+        // window → arms compaction. Round 2 (summary): the handoff text. Round 3
+        // (main): the final answer.
+        let replies = || {
+            vec![
+                Ok(ModelReply {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        arguments: json!({ "path": "README.md" }),
+                    }],
+                    usage: json!({ "input_tokens": 950, "output_tokens": 1 }),
+                }),
+                Ok(final_reply("STRUCTURED HANDOFF")),
+                Ok(final_reply("the answer")),
+            ]
+        };
+        let client = CompactingHttpClient::new(replies(), 1000);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "file body".to_string(),
+        });
+        // Small message floor + tiny tail budget so the single tool round both
+        // clears the floor and leaves a fold region.
+        let compactor = TurnSummarizingCompactor::new(9, 2, 10);
+        let mut folded_seen = false;
+        let outcome = {
+            let mut record = |messages: &[ChatMessage]| {
+                if messages.iter().any(
+                    |m| matches!(m, ChatMessage::User(t) if t.contains("compacted to a handoff")),
+                ) {
+                    folded_seen = true;
+                }
+            };
+            run_brokered_turn_http(
+                &client,
+                &exec,
+                &input(8),
+                &mut record,
+                &DummyHost,
+                &compactor,
+            )
+        };
+
+        assert_eq!(outcome.status, TurnStatus::Completed);
+        assert_eq!(outcome.summary, "the answer");
+        // The tool ran once (the main round), and the folded transcript was persisted.
+        assert_eq!(exec.calls.borrow().len(), 1);
+        assert!(
+            folded_seen,
+            "a checkpoint captured the folded handoff prefix"
+        );
+        // Three model rounds were built: main, summarization (no tools), main.
+        assert_eq!(*client.tools_seen.borrow(), vec![true, false, true]);
     }
 }

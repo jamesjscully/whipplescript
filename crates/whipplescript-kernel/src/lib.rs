@@ -240,6 +240,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         client: &M,
         executor: &E,
         host: &H,
+        compactor: &dyn crate::harness_loop::Compactor,
         input: &crate::harness_loop::BrokeredTurnInput,
     ) -> StoreResult<StoredEvent>
     where
@@ -334,6 +335,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 run_input,
                 &mut checkpoint,
                 host,
+                compactor,
             )
         };
 

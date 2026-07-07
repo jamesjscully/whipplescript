@@ -30,7 +30,7 @@ use whipplescript_kernel::effect_handlers::{
 };
 use whipplescript_kernel::harness_loop::{
     provider_result_from_brokered_turn, BrokeredTurnInput, BrokeredTurnMachine,
-    BrokeredTurnSnapshot, ChatMessage, HttpModelClient, ToolExecutor,
+    BrokeredTurnSnapshot, ChatMessage, HttpModelClient, NoopCompactor, ToolExecutor,
 };
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::rule_lowering::json_from_str;
@@ -209,10 +209,18 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     })?;
                 }
                 let mut discard = |_: &[ChatMessage]| {};
+                // The DO agent turn is still a no-tools stub; conversation compaction
+                // (context-assembly Phase 4 Layer B) lands with the DO agent-tool
+                // executor, so drive the machine with the no-op compactor for now.
+                let compactor = NoopCompactor;
                 let mut machine = match loaded {
-                    None => {
-                        BrokeredTurnMachine::new(model, self.agent_tools, &turn_input, &mut discard)
-                    }
+                    None => BrokeredTurnMachine::new(
+                        model,
+                        self.agent_tools,
+                        &turn_input,
+                        &mut discard,
+                        &compactor,
+                    ),
                     Some(json) => {
                         let snapshot: BrokeredTurnSnapshot = serde_json::from_str(&json)
                             .map_err(|error| StoreError::Conflict(error.to_string()))?;
@@ -221,6 +229,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             self.agent_tools,
                             &turn_input,
                             &mut discard,
+                            &compactor,
                             snapshot,
                         )
                     }

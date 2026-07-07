@@ -257,24 +257,38 @@ distinct layers replace it:
   `run_bounded_command`. Full output stays addressable as evidence. Unit test.
 
 **Layer B — the `Compactor` trait (conversation compaction, cache-aware).**
-- [ ] `trait Compactor { should_compact(stats, window) -> bool; plan(transcript)
-  -> CompactionOutcome }` where `CompactionOutcome = Deterministic(Plan) |
-  NeedsModel(Request)`. `NeedsModel` runs as a `NeedsHttp` round on the DR-0033
-  step machine (Decision 8).
-- [ ] **Trigger** = real-usage (from `ModelReply` usage) ≈ 90% of the model
-  context window, **`BodyAfterPrefix`** scope (count only growth after the
-  server-observed cached prefix), hysteresis so it fires rarely and drops well
-  below the line (Decision 7).
-- [ ] **Strategy #1 — turn-summarization** (Codex-local shape): one recorded
-  summarization effect produces a structured handoff summary; rewrite history to
-  `[recent user messages ≤ ~20k tokens] + [summary]`, re-inject canonical initial
-  context at the model-expected boundary. Summary recorded as an evidence
-  artifact and **reused on replay** (Decision 7).
-- [ ] **Apply-once + hold stable**: install the post-compaction prefix once and
-  reuse it as the new stable prefix; never edit the middle on subsequent turns.
+
+**Prep (v0.3):** native owned turn now drives the sans-IO `BrokeredTurnMachine`
+(Option α — `FixtureModelClient: HttpModelClient` + `FixtureHost`), so native and
+the DO share one compacting control-flow. Epoch lifecycle modeled in
+`compaction-epoch-lifecycle.maude` (coverage 3 / bite 2: at-most-once-per-epoch +
+atomic apply). `compact_context` **deleted**.
+
+- [x] `trait Compactor { should_compact(stats) -> bool; plan(transcript, stats)
+  -> CompactionOutcome; assemble(request, summary) }` where `CompactionOutcome =
+  Deterministic(Vec<ChatMessage>) | NeedsModel(SummarizationRequest)` (v0.3,
+  `harness_loop.rs`). `NeedsModel` runs as a real `NeedsHttp` round on the
+  `BrokeredTurnMachine` — a no-tools model call over the folded transcript
+  (Decision 8); `awaiting`/`pending_compaction` snapshot fields make it
+  eviction-safe. `NoopCompactor` is the equivalence oracle.
+- [x] **Trigger** = real-usage (last MAIN reply's `input_tokens`) ≥ 90% of the
+  model context window (`HttpModelClient::context_window`, default 200k); a message
+  floor + resetting `last_input_tokens` to 0 after each compaction gives hysteresis
+  so it fires rarely (Decision 7). (`BodyAfterPrefix` refinement: `input_tokens` is
+  the provider's own whole-prompt count, a faithful proxy; a tighter post-prefix
+  delta can follow.)
+- [~] **Strategy #1 — turn-summarization** (Codex-local shape): `TurnSummarizingCompactor`
+  folds the middle into a handoff summary via one interleaved model round, keeping
+  the System + first-User anchors and a byte-budgeted recent tail, re-injecting the
+  anchors ahead of the summary (v0.3). **Follow-on (Lb-4):** record the summary as a
+  `context.compaction` evidence artifact + a crash-mid-compaction resume proof
+  (reuse-on-replay is already load-bearing via the checkpointed folded transcript).
+- [x] **Apply-once + hold stable**: the folded prefix is installed once, the
+  `compaction_epoch` bumped, and `last_input_tokens` reset so subsequent turns only
+  append; the middle is never edited again (v0.3).
 - [ ] **Overflow fallback**: on a provider context-window error mid-compaction,
   trim from the front (keep the recent suffix byte-intact) — Codex's
-  cache-preserving fallback — rather than editing the middle.
+  cache-preserving fallback — rather than editing the middle. (Lb-5.)
 
 ---
 

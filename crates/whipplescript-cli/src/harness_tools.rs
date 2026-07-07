@@ -22,6 +22,7 @@ use whipplescript_kernel::context_assembly::{assemble, BundleKind, ContextBundle
 use whipplescript_kernel::harness_loop::{
     BrokeredTurnInput, ChatMessage, HarnessModelClient, HarnessModelError, HttpModelClient,
     ModelReply, ToolCall, ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
+    TurnSummarizingCompactor,
 };
 use whipplescript_kernel::harness_model::RealHarnessModelClient;
 use whipplescript_kernel::sansio::{HostDriver, IoRequest, IoResult};
@@ -2743,6 +2744,10 @@ pub fn run_owned_agent_turn(
     }
     drop(coordination);
 
+    // Conversation compaction (context-assembly Phase 4 Layer B): the turn-summarizing
+    // strategy. It fires only when real usage nears the window, so the fixture path
+    // (whose usage carries no input tokens) never compacts.
+    let compactor = TurnSummarizingCompactor::default();
     let result = match model_config {
         Some(config) => {
             let transport = UreqCoerceTransport::new(config.timeout);
@@ -2761,11 +2766,18 @@ pub fn run_owned_agent_turn(
             // transport is both the model client's transport and the machine's
             // `HostDriver` (blanket impl), so native and the durable object run the
             // one turn control-flow — the single seam Phase-4 compaction rides.
-            kernel.run_brokered_agent_turn(&ctx, &client, &executor, &transport, &input)
+            kernel.run_brokered_agent_turn(&ctx, &client, &executor, &transport, &compactor, &input)
         }
         None => {
             let client = FixtureModelClient::from_env();
-            kernel.run_brokered_agent_turn(&ctx, &client, &executor, &FixtureHost, &input)
+            kernel.run_brokered_agent_turn(
+                &ctx,
+                &client,
+                &executor,
+                &FixtureHost,
+                &compactor,
+                &input,
+            )
         }
     };
 
