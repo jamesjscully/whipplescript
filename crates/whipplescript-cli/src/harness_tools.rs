@@ -28,6 +28,7 @@ use whipplescript_kernel::harness_model::RealHarnessModelClient;
 use whipplescript_kernel::sansio::{HostDriver, IoRequest, IoResult};
 use whipplescript_kernel::{BrokeredTurnContext, RuntimeKernel};
 use whipplescript_parser::IrWorkflowContractKind;
+use whipplescript_store::content::ContentStore;
 use whipplescript_store::coordination::{AcquireOutcome, CoordinationStore};
 use whipplescript_store::items::WorkItemStore;
 use whipplescript_store::{
@@ -43,6 +44,7 @@ pub const TOOL_GREP: &str = "grep";
 pub const TOOL_FIND: &str = "find";
 pub const TOOL_LS: &str = "ls";
 pub const TOOL_BASH: &str = "bash";
+pub const TOOL_RECALL: &str = "recall";
 pub const TOOL_LIST_TODOS: &str = "list_todos";
 pub const TOOL_ADD_TODO: &str = "add_todo";
 pub const TOOL_UPDATE_TODO: &str = "update_todo";
@@ -222,6 +224,23 @@ fn file_tool_specs_for_policy(policy: &HarnessProfilePolicy) -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
         },
+        ToolSpec {
+            name: TOOL_RECALL.into(),
+            description: "Read the full text of an earlier tool output that was truncated. \
+                          Pass the id from a truncation footer; optional 1-based line offset \
+                          and limit to page through a large output."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "content id from a truncation footer" },
+                    "offset": { "type": "integer", "description": "1-based first line" },
+                    "limit": { "type": "integer", "description": "max lines to return" }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+        },
     ]
     .into_iter()
     .filter(|spec| policy.allows_tool(&spec.name))
@@ -237,7 +256,7 @@ fn file_tool_specs_for_turn(
     file_tool_specs_for_policy(policy)
         .into_iter()
         .filter(|spec| match spec.name.as_str() {
-            TOOL_READ | TOOL_GREP | TOOL_FIND | TOOL_LS => read_files,
+            TOOL_READ | TOOL_GREP | TOOL_FIND | TOOL_LS | TOOL_RECALL => read_files,
             TOOL_WRITE => write_files,
             TOOL_EDIT => read_files && write_files,
             TOOL_BASH => access.command_run,
@@ -317,6 +336,11 @@ pub struct FileToolExecutor {
     /// location resolves here (the registry) rather than the filesystem, so the
     /// model reads the exact registered bytes — identical on native and the DO.
     skill_bodies: std::collections::HashMap<String, String>,
+    /// Content-addressed store path for large-tool-output capture + `recall`
+    /// (context-assembly Phase 5). When set, a truncated tool output stores its full
+    /// bytes here and hands the model a recall id; `recall` reads them back. `None`
+    /// on direct/test executors (no capture, no recall).
+    content_store_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -615,7 +639,7 @@ impl HarnessProfilePolicy {
 
     fn allows_tool(&self, tool: &str) -> bool {
         match tool {
-            TOOL_READ | TOOL_GREP | TOOL_FIND | TOOL_LS => self.read_files,
+            TOOL_READ | TOOL_GREP | TOOL_FIND | TOOL_LS | TOOL_RECALL => self.read_files,
             TOOL_WRITE | TOOL_EDIT => self.write_files,
             TOOL_BASH => self.bash,
             TOOL_ADD_TODO => self.tracker_file,
@@ -660,6 +684,7 @@ impl FileToolExecutor {
             work_unit: String::new(),
             provider_ctx: None,
             skill_bodies: std::collections::HashMap::new(),
+            content_store_path: None,
         }
     }
 
@@ -671,6 +696,14 @@ impl FileToolExecutor {
         skill_bodies: std::collections::HashMap<String, String>,
     ) -> Self {
         self.skill_bodies = skill_bodies;
+        self
+    }
+
+    /// Enable large-tool-output capture + `recall` (context-assembly Phase 5): a
+    /// truncated tool output stores its full bytes in the content-addressed store at
+    /// `path` and hands the model a recall id; the `recall` tool reads them back.
+    pub fn with_content_store(mut self, path: impl Into<PathBuf>) -> Self {
+        self.content_store_path = Some(path.into());
         self
     }
 
@@ -804,6 +837,7 @@ impl FileToolExecutor {
             TOOL_GREP => self.grep(args),
             TOOL_FIND => self.find(args),
             TOOL_LS => self.ls(args),
+            TOOL_RECALL => self.recall(args),
             other => match self.workflow_tools.iter().find(|tool| tool.name == other) {
                 Some(tool) => self.invoke_workflow_tool(tool, args),
                 None => Err(format!("unknown tool `{other}`")),
@@ -854,6 +888,48 @@ impl FileToolExecutor {
         }
     }
 
+    /// Cap a full tool output to the byte budget (Phase 4 Layer A) and, when it
+    /// overflows and a content store is configured, capture the full bytes
+    /// content-addressed and append a `recall` footer so the model can read the rest
+    /// losslessly (Phase 5). Without a content store, this is just the truncation.
+    fn cap_and_capture(&self, tool: &str, full: &str) -> String {
+        if full.len() <= self.max_bytes {
+            return full.to_string();
+        }
+        let truncated = middle_truncate(full, self.max_bytes);
+        let Some(path) = &self.content_store_path else {
+            return truncated;
+        };
+        match ContentStore::open(path).and_then(|store| store.put(full)) {
+            Ok(id) => format!(
+                "{truncated}\n[full `{tool}` output: {} bytes, id {id} — call `recall` with this id (and optional line offset/limit) to read the rest]",
+                full.len()
+            ),
+            // Capture failure degrades to plain truncation (never blocks the turn).
+            Err(_) => truncated,
+        }
+    }
+
+    /// Read the full text of an earlier truncated tool output by its content id
+    /// (Phase 5 `recall`). Optional 1-based line offset/limit page through a large
+    /// output; the returned slice is itself capped by `execute`.
+    fn recall(&self, args: &Value) -> Result<String, String> {
+        let id = str_arg(args, "id")?;
+        let path = self
+            .content_store_path
+            .as_ref()
+            .ok_or_else(|| "recall is not available for this turn".to_string())?;
+        let store =
+            ContentStore::open(path).map_err(|e| format!("recall failed to open store: {e:?}"))?;
+        let body = store
+            .get(id)
+            .map_err(|e| format!("recall failed: {e:?}"))?
+            .ok_or_else(|| format!("no stored output with id `{id}`"))?;
+        let offset = usize_arg(args, "offset");
+        let limit = usize_arg(args, "limit");
+        Ok(slice_lines(&body, offset, limit))
+    }
+
     fn read(&self, args: &Value) -> Result<String, String> {
         let path = str_arg(args, "path")?;
         // Skill activation (Decision 3): a read of a catalogue location resolves to
@@ -864,8 +940,8 @@ impl FileToolExecutor {
         if let Some(body) = self.skill_bodies.get(path) {
             let offset = usize_arg(args, "offset");
             let limit = usize_arg(args, "limit");
-            let sliced = slice_lines(body, offset, limit);
-            return Ok(middle_truncate(&sliced, self.max_bytes));
+            // Full content; `execute` applies the single capture-time cap.
+            return Ok(slice_lines(body, offset, limit));
         }
         if let Some(reason) = self.policy(path, "read") {
             return Err(reason);
@@ -874,8 +950,7 @@ impl FileToolExecutor {
             .map_err(|e| format!("read of `{path}` failed: {e}"))?;
         let offset = usize_arg(args, "offset");
         let limit = usize_arg(args, "limit");
-        let sliced = slice_lines(&content, offset, limit);
-        Ok(middle_truncate(&sliced, self.max_bytes))
+        Ok(slice_lines(&content, offset, limit))
     }
 
     fn write(&self, args: &Value) -> Result<String, String> {
@@ -971,7 +1046,7 @@ impl FileToolExecutor {
         if hits.is_empty() {
             Ok("No files found".to_string())
         } else {
-            Ok(middle_truncate(&hits.join("\n"), self.max_bytes))
+            Ok(hits.join("\n"))
         }
     }
 
@@ -1018,7 +1093,7 @@ impl FileToolExecutor {
         if hits.is_empty() {
             Ok("No matches".to_string())
         } else {
-            Ok(middle_truncate(&hits.join("\n"), self.max_bytes))
+            Ok(hits.join("\n"))
         }
     }
 
@@ -1056,7 +1131,9 @@ impl FileToolExecutor {
                 .unwrap_or(BASH_DEFAULT_TIMEOUT_SECS),
         );
         let output = run_bounded_command(command, &self.root, timeout)?;
-        let combined = middle_truncate(&output.combined, self.max_bytes);
+        // Full (source-bounded) output; `execute` applies the single capture-time cap
+        // on success so the pre-truncation bytes can be captured for `recall`.
+        let combined = output.combined;
         match output.exit_code {
             Some(0) => Ok(combined),
             Some(code) => Err(format!("command exited with status {code}\n{combined}")),
@@ -1737,13 +1814,15 @@ fn run_bounded_command(
 impl ToolExecutor for FileToolExecutor {
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
         match self.dispatch(call) {
-            // Deterministic capture-time cap (Phase 4 Layer A): every tool output
-            // is middle-truncated to the byte budget as a uniform safety net, on top
-            // of the per-tool caps, so no tool can bloat the model context.
+            // The single capture-time cap (Phase 4 Layer A + Phase 5): dispatch
+            // returns the FULL output; here it is capped once, and when it overflows
+            // the full bytes are captured (content-addressed) so the model can
+            // `recall` them — truncation is lossless, not lossy.
             Ok(content) => ToolOutcome {
                 status: ToolStatus::Ok,
-                content: middle_truncate(&content, self.max_bytes),
+                content: self.cap_and_capture(&call.name, &content),
             },
+            // Errors are operational (small); cap without capture.
             Err(reason) => ToolOutcome {
                 status: ToolStatus::Error,
                 content: middle_truncate(&reason, self.max_bytes),
@@ -2681,7 +2760,11 @@ pub fn run_owned_agent_turn(
                 .map(|body| (entry.location.clone(), body))
         })
         .collect();
-    executor = executor.with_skill_bodies(skill_bodies);
+    executor = executor
+        .with_skill_bodies(skill_bodies)
+        // Large-tool-output capture + `recall` (context-assembly Phase 5): full
+        // outputs are stored content-addressed in the workspace-scoped store.
+        .with_content_store(crate::content_store_path());
     // Project instructions (AGENTS.md / CLAUDE.md) rooted at the workspace, plus an
     // optional env-configured global directory (context-assembly Phase 3).
     let global_context_dir =
@@ -2935,6 +3018,66 @@ mod tests {
         assert_eq!(r.status, ToolStatus::Ok);
         assert_eq!(r.content, "hello");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_truncated_tool_output_is_captured_and_recallable() {
+        let root = temp_root();
+        let content_path = root.join("content.sqlite");
+        let exec = FileToolExecutor::new(&root).with_content_store(&content_path);
+
+        // A file larger than the byte budget so read is truncated + captured.
+        let big: String = (0..9000).map(|i| format!("line {i}\n")).collect();
+        assert!(big.len() > DEFAULT_MAX_BYTES);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "big.txt", "content": big.clone() }),
+        ));
+
+        let r = exec.execute(&call(TOOL_READ, json!({ "path": "big.txt" })));
+        assert_eq!(r.status, ToolStatus::Ok);
+        assert!(
+            r.content.len() <= DEFAULT_MAX_BYTES + 512,
+            "model view is capped"
+        );
+        assert!(
+            r.content.contains("call `recall`"),
+            "truncation footer offers recall"
+        );
+
+        // Extract the recall id from the footer and pull the full output back.
+        let id = r
+            .content
+            .split("id ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("recall id in footer")
+            .to_string();
+        let recalled = exec.execute(&call(TOOL_RECALL, json!({ "id": id })));
+        assert_eq!(recalled.status, ToolStatus::Ok);
+        // The recalled slice reconstructs the full output (its own capping aside, the
+        // first lines match and nothing was lost — recall of a paged window returns it).
+        let paged = exec.execute(&call(
+            TOOL_RECALL,
+            json!({ "id": id, "offset": 1, "limit": 3 }),
+        ));
+        assert_eq!(paged.content, "line 0\nline 1\nline 2");
+
+        // An unknown id is a clean tool error, not a crash.
+        let missing = exec.execute(&call(TOOL_RECALL, json!({ "id": "deadbeef" })));
+        assert_eq!(missing.status, ToolStatus::Error);
+        assert!(missing.content.contains("no stored output"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn recall_is_a_read_class_tool_in_the_spec_set() {
+        // recall is offered under the read-class policy (same gating as read/grep).
+        let specs = file_tool_specs_for_policy(&HarnessProfilePolicy::permissive());
+        assert!(specs.iter().any(|s| s.name == TOOL_RECALL));
+        // And a turn with no file-read access does not offer it.
+        assert!(HarnessProfilePolicy::permissive().allows_tool(TOOL_RECALL));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Durable SQLite store for event logs, facts, effects, and evidence.
 
+pub mod content;
 pub mod coordination;
 pub mod files;
 pub mod items;

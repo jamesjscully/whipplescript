@@ -21059,6 +21059,15 @@ fn coordination_store_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".whipplescript/coordination.sqlite"))
 }
 
+/// Workspace-scoped content-addressed store for large tool-output capture + `recall`
+/// (context-assembly Phase 5). Durable and shared across turns like the coordination
+/// store, so a recall id from an earlier turn still resolves.
+pub(crate) fn content_store_path() -> PathBuf {
+    env::var("WHIPPLESCRIPT_CONTENT_STORE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".whipplescript/harness-content.sqlite"))
+}
+
 /// Native path-based release for callers that hold only a runtime-store kernel
 /// (the `pause`/`cancel` control paths): open the workspace coordination and
 /// work-items stores directly and release this holder's leases/claims.
