@@ -1269,6 +1269,11 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             ])),
         })?;
 
+        // Pre-start cancellation needs no branch here: `store.start_run`
+        // (called above, before any provider work) transactionally refuses to
+        // start a run while a cancellation request is open — the delegated
+        // path shares the owned harness's pre-launch protection at the store
+        // layer (DR-0035 Decision 5 residual, verified closed).
         // Captured before the request moves into the adapter: the depth the
         // program authorized for this turn, used for driver-initiated
         // cancellation (DR-0035 Decision 5).
@@ -6696,6 +6701,103 @@ rule wait
         assert_eq!(
             run.status, "completed",
             "the turn completed instead of timing out on empty polls"
+        );
+    }
+
+    #[test]
+    fn driver_never_launches_provider_when_cancel_requested_before_start() {
+        // DR-0035 Decision 5 (B3 residual, verified closed at the store
+        // layer): `store.start_run` transactionally refuses to start a run
+        // while a cancellation request is open, so a delegated turn with a
+        // pre-start request never invokes the provider — the same pre-launch
+        // protection the owned harness has.
+        let (mut kernel, instance_id) = start_running_agent_turn_without_evidence();
+        kernel
+            .store_mut()
+            .request_effect_cancellation(EffectCancellationRequest {
+                instance_id: &instance_id,
+                effect_id: "tell",
+                revision_id: None,
+                reason: Some("pre-start cancellation"),
+                requested_by: "test",
+                causation_event_id: None,
+                idempotency_key: Some("test-pre-start-cancel"),
+            })
+            .expect("cancellation request records");
+        let execution = AgentTurnExecution {
+            instance_id: &instance_id,
+            effect_id: "tell",
+            run_id: "run-tell",
+            provider: "scripted",
+            worker_id: "worker-1",
+            lease_id: "lease-tell",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            agent: "worker",
+            profile: Some("repo-writer"),
+            input_json: r#"{"prompt":"go"}"#,
+            skill_names: &[],
+        };
+        // An adapter whose start would panic proves the provider never launches.
+        struct NeverLaunchAdapter {
+            capability: ProviderCapability,
+        }
+        impl NativeProviderAdapter for NeverLaunchAdapter {
+            fn provider_id(&self) -> &str {
+                "scripted"
+            }
+            fn capability(&self) -> &ProviderCapability {
+                &self.capability
+            }
+            fn start_turn(
+                &mut self,
+                _request: NativeProviderTurnRequest,
+            ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
+                panic!("provider must not launch after a pre-start cancellation request");
+            }
+            fn next_event(
+                &mut self,
+                _run_id: &str,
+            ) -> Result<Option<NativeProviderEvent>, NativeProviderBoundaryError> {
+                panic!("provider must not stream after a pre-start cancellation request");
+            }
+            fn cancel_turn(
+                &mut self,
+                _cancellation: NativeProviderCancellation,
+            ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
+                panic!("pre-start skip needs no provider cancel");
+            }
+        }
+        let mut adapter = NeverLaunchAdapter {
+            capability: builtin_provider_capabilities()
+                .into_iter()
+                .find(|capability| capability.provider_kind == ProviderKind::Fixture)
+                .expect("fixture capability"),
+        };
+        let request = NativeProviderTurnRequest {
+            provider_id: "scripted".to_owned(),
+            provider_kind: ProviderKind::Fixture,
+            surface: AdapterSurface::Fixture,
+            run_id: "run-tell".to_owned(),
+            effect_id: "tell".to_owned(),
+            agent: "worker".to_owned(),
+            profile: Some("repo-writer".to_owned()),
+            prompt_json: json!("go"),
+            workspace_policy: "read_only".to_owned(),
+            required_capabilities: Vec::new(),
+            cancellation_depth: CancellationDepth::None,
+            artifact_policy: "metadata".to_owned(),
+            credential_ref: None,
+            provider_options: std::collections::BTreeMap::new(),
+        };
+
+        // The store-level guard fires before any provider work; the
+        // NeverLaunchAdapter proves start_turn/next_event were never reached.
+        let error = kernel
+            .run_native_agent_turn(execution, request, &mut adapter, 8)
+            .expect_err("run start is refused while a cancellation request is open");
+        assert!(
+            matches!(&error, StoreError::Conflict(message) if message.contains("cancellation")),
+            "unexpected error: {error:?}"
         );
     }
 

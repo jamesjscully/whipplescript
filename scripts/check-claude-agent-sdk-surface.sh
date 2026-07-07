@@ -119,6 +119,29 @@ const pythonPackageVersion = pythonPackage.ok
   ? (pythonPackage.stdout.match(/claude-agent-sdk \(([^)]+)\)/) || [])[1] || null
   : null;
 
+// Live sidecar handshake (DR-0035 Decision 7): the sidecar is whip-owned and
+// credential-free, so its protocol version is probed for real here — the
+// offline doctor keeps skipping live provider checks. Writing `hello` and
+// closing stdin makes the sidecar reply and exit.
+const sidecarProtocolExpected = "whip-sidecar/1";
+const sidecarProbe = (() => {
+  const result = command(process.execPath, [path.join(root, "scripts/claude-agent-sdk-sidecar.mjs")], {
+    input: '{"type":"hello"}\n',
+    stdio: ["pipe", "pipe", "pipe"],
+    timeout: 10000,
+  });
+  if (!result.ok) {
+    return { ok: false, protocol: null, error: result.stderr || "sidecar did not answer" };
+  }
+  try {
+    const reply = JSON.parse(result.stdout.split("\n")[0]);
+    const protocol = reply?.payload?.protocol ?? null;
+    return { ok: protocol === sidecarProtocolExpected, protocol };
+  } catch (error) {
+    return { ok: false, protocol: null, error: String(error) };
+  }
+})();
+
 const warnings = [];
 if (!probeRegistry) {
   warnings.push("registry probe disabled");
@@ -137,6 +160,7 @@ const report = {
     nodeVersion.ok &&
     npmVersion.ok &&
     tsSdkConfigured &&
+    sidecarProbe.ok &&
     (!strictRegistry || tsPackage.ok),
   checkedAt: new Date().toISOString(),
   decision: {
@@ -171,6 +195,12 @@ const report = {
     pipIndexAvailable: pythonPackage.ok,
     latestVersion: pythonPackageVersion,
     pythonVersion: pythonVersion.stdout || null,
+  },
+  sidecarProtocol: {
+    expected: sidecarProtocolExpected,
+    observed: sidecarProbe.protocol,
+    ok: sidecarProbe.ok,
+    error: sidecarProbe.error ?? null,
   },
 };
 

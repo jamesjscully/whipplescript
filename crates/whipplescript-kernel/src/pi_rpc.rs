@@ -275,12 +275,40 @@ impl<T: PiRpcTransport> PiRpcClient<T> {
     }
 
     pub fn request(&mut self, command_type: &str, params: Value) -> Result<Value, PiRpcError> {
+        self.request_inner(command_type, params, None)
+    }
+
+    /// `request` bounded by a wait budget (DR-0035 Decision 4): a peer that
+    /// never answers the RPC yields a Timeout error instead of blocking the
+    /// worker thread through turn start.
+    pub fn request_timeout(
+        &mut self,
+        command_type: &str,
+        params: Value,
+        wait: std::time::Duration,
+    ) -> Result<Value, PiRpcError> {
+        self.request_inner(command_type, params, Some(wait))
+    }
+
+    fn request_inner(
+        &mut self,
+        command_type: &str,
+        params: Value,
+        wait: Option<std::time::Duration>,
+    ) -> Result<Value, PiRpcError> {
         let id = format!("ws-{}", self.next_id);
         self.next_id += 1;
         let request = build_request(&id, command_type, params);
         self.transport.write_line(&request.to_string())?;
         loop {
-            let line = self.transport.read_line()?;
+            let line = match wait {
+                Some(window) => self.transport.read_line_timeout(window)?.ok_or_else(|| {
+                    PiRpcError::Timeout(format!(
+                        "no response to `{command_type}` within the start budget"
+                    ))
+                })?,
+                None => self.transport.read_line()?,
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -302,6 +330,19 @@ impl<T: PiRpcTransport> PiRpcClient<T> {
 
     pub fn get_state(&mut self) -> Result<PiRpcState, PiRpcError> {
         let data = self.request("get_state", Value::Null)?;
+        Self::parse_state(data)
+    }
+
+    /// `get_state` bounded by the start budget (DR-0035 Decision 4).
+    pub fn get_state_timeout(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> Result<PiRpcState, PiRpcError> {
+        let data = self.request_timeout("get_state", Value::Null, wait)?;
+        Self::parse_state(data)
+    }
+
+    fn parse_state(data: Value) -> Result<PiRpcState, PiRpcError> {
         Ok(PiRpcState {
             session_id: data
                 .get("sessionId")
@@ -647,13 +688,21 @@ impl<T: PiRpcTransport> NativeProviderAdapter for PiRpcAdapter<T> {
         .map_err(|error| {
             self.boundary_error(error.code, error.message, false, request.to_json_redacted())
         })?;
+        // Turn-start RPCs are bounded by the inactivity budget (DR-0035
+        // Decision 4): a hung peer fails the start instead of pinning the
+        // worker thread.
+        let budget = self.inactivity_budget;
         let state = self
             .client
-            .get_state()
+            .get_state_timeout(budget)
             .map_err(|error| self.map_error("pi_get_state_failed", error))?;
         self.state = Some(state);
         self.client
-            .request("prompt", pi_prompt_request(&request.prompt_json, &policy))
+            .request_timeout(
+                "prompt",
+                pi_prompt_request(&request.prompt_json, &policy),
+                budget,
+            )
             .map_err(|error| self.map_error("pi_prompt_failed", error))?;
         while let Some(event) = self.client.pop_event() {
             if let Some(native) = self.event_from_message(&request.run_id, event) {

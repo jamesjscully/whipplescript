@@ -301,7 +301,15 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkClient<T> {
         self.transport
             .write_line(&json!({ "type": "hello" }).to_string())?;
         loop {
-            let line = self.transport.read_line()?;
+            // Bounded read: a sidecar that never answers the handshake is
+            // treated as no-answer (liveness stays a start_turn concern), not
+            // a construction hang.
+            let Some(line) = self
+                .transport
+                .read_line_timeout(std::time::Duration::from_secs(10))?
+            else {
+                return Ok(None);
+            };
             if line.trim().is_empty() {
                 continue;
             }

@@ -72,6 +72,27 @@ impl<T: CodexAppServerTransport> CodexAppServerClient<T> {
     }
 
     pub fn request(&mut self, method: &str, params: Value) -> Result<Value, CodexAppServerError> {
+        self.request_inner(method, params, None)
+    }
+
+    /// `request` bounded by a wait budget (DR-0035 Decision 4): a peer that
+    /// never answers the JSON-RPC call yields a Timeout error instead of
+    /// blocking the worker thread through turn start.
+    pub fn request_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        wait: std::time::Duration,
+    ) -> Result<Value, CodexAppServerError> {
+        self.request_inner(method, params, Some(wait))
+    }
+
+    fn request_inner(
+        &mut self,
+        method: &str,
+        params: Value,
+        wait: Option<std::time::Duration>,
+    ) -> Result<Value, CodexAppServerError> {
         let id = self.next_id;
         self.next_id += 1;
         let request = json!({
@@ -83,7 +104,14 @@ impl<T: CodexAppServerTransport> CodexAppServerClient<T> {
         .to_string();
         self.transport.write_line(&request)?;
         loop {
-            let line = self.transport.read_line()?;
+            let line = match wait {
+                Some(window) => self.transport.read_line_timeout(window)?.ok_or_else(|| {
+                    CodexAppServerError::Timeout(format!(
+                        "no response to `{method}` within the start budget"
+                    ))
+                })?,
+                None => self.transport.read_line()?,
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -634,10 +662,14 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
             self.boundary_error(error.code, error.message, false, request.to_json_redacted())
         })?;
 
+        // Turn-start RPCs are bounded by the inactivity budget (DR-0035
+        // Decision 4): a hung app-server fails the start instead of pinning
+        // the worker thread.
+        let budget = self.inactivity_budget;
         if !self.initialized {
             let initialize_result = self
                 .client
-                .request(
+                .request_timeout(
                     "initialize",
                     json!({
                         "clientInfo": {
@@ -646,6 +678,7 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
                         },
                         "capabilities": {},
                     }),
+                    budget,
                 )
                 .map_err(|error| self.map_error("codex_initialize_failed", error))?;
             // DR-0035 Decision 7: consume the handshake reply instead of
@@ -657,7 +690,11 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
 
         let thread_start = self
             .client
-            .request("thread/start", codex_thread_start_params(&request, &policy))
+            .request_timeout(
+                "thread/start",
+                codex_thread_start_params(&request, &policy),
+                budget,
+            )
             .map_err(|error| self.map_error("codex_thread_start_failed", error))?;
         let thread_id = thread_start
             .pointer("/thread/id")
@@ -676,9 +713,10 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
 
         let turn_start = self
             .client
-            .request(
+            .request_timeout(
                 "turn/start",
                 codex_turn_start_params(&request, &policy, &thread_id),
+                budget,
             )
             .map_err(|error| self.map_error("codex_turn_start_failed", error))?;
         let turn_id = turn_start

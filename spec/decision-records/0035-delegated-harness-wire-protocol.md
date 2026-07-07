@@ -293,14 +293,17 @@ delegated-settings-authority lesson).
 - [x] B2 — Two-clock liveness: reader-thread transports with read timeouts +
       adapter inactivity clock (`WHIPPLESCRIPT_NATIVE_PROVIDER_INACTIVITY_TIMEOUT`,
       default 300s) synthesizing the TimedOut terminal; `max_events` counts
-      delivered frames only. Residual: codex/pi turn-start JSON-RPC requests
-      remain blocking (fast path). (551bb09)
+      delivered frames only. (551bb09) Residual closed in the follow-up: the
+      codex/pi turn-start RPCs and the claude `hello` read are budget-bounded
+      too (a hung peer fails the start instead of pinning the worker thread).
 - [x] B3 — Cancel plumb-through: the driver consults the durable
       `effect_cancellation_requests` surface each iteration and calls
       `cancel_turn` at the authorized depth; adapters poll in ≤1s slices so
-      the check is responsive; refused cancels are diagnostics. Residual:
-      pre-start cancellation short-circuit (owned harness has it; delegated
-      does not yet). (95bb399)
+      the check is responsive; refused cancels are diagnostics. (95bb399)
+      Residual verified already closed: `store.start_run` transactionally
+      refuses to start a run while a cancellation request is open, so the
+      delegated path shares the owned harness's pre-launch protection at the
+      store layer (regression test added).
 - [ ] B4 — Re-query: capability declaration + `run/query` in the sidecar
       dialect + recovery integration (admission spec's re-query branch).
       **DEFERRED with cause** (see Decision 6 build finding): impossible for
@@ -310,7 +313,10 @@ delegated-settings-authority lesson).
       sidecar dialect (answered-mismatch → binding block; legacy and dead
       sidecars tolerated — liveness stays a start_turn concern); Codex
       `initialize` reply consumed as started-event evidence; pi declares no
-      version surface yet. Residual: doctor live version probe. (c96d966)
+      version surface yet. (c96d966) Residual resolved in the follow-up: the
+      live protocol probe lands in `check-claude-agent-sdk-surface.sh` (the
+      sidecar is whip-owned and credential-free), not the doctor — the doctor
+      deliberately skips live provider checks, and that stance holds.
 - [x] B6 — Maude `delegated-wire-lifecycle.maude`, 3 coverage + 3 bites,
       landed before B1–B3. (a5a8618)
 
