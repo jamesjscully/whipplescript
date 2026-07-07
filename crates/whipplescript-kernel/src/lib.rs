@@ -2386,6 +2386,45 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         })
     }
 
+    /// Record the delegated-harness context attestation (DR-0034 Decision 5, D8-2).
+    /// The evidence path forks on the harness class. A **Delegated** turn's context is
+    /// assembled by the foreign runtime (codex/claude/command sidecar), so
+    /// WhippleScript does NOT fabricate `context.bundle` provenance rows for a context
+    /// it did not build. Instead it records ONE `context.attestation` row explicitly
+    /// tagged `context: provider-assembled` — provider identity + kind, the prompt
+    /// hash, and a hash of the tool/permission policy the envelope imposed — so an
+    /// auditor can tell from the record alone which guarantee the turn carries. The
+    /// shared `agent.turn.<status>` terminal is still emitted by the dispatched
+    /// executor (only the provenance depth differs). **Managed** turns never call this;
+    /// they emit their full hermetic `context.bundle` provenance instead.
+    pub fn record_delegated_context_attestation(
+        &self,
+        execution: AgentTurnExecution<'_>,
+        kind: &str,
+        policy_json: &str,
+    ) -> StoreResult<()> {
+        let metadata = json!({
+            "context": "provider-assembled",
+            "provider": execution.provider,
+            "kind": kind,
+            "prompt_hash": stable_hash_hex(execution.input_json),
+            "profile": execution.profile,
+            "policy_hash": stable_hash_hex(policy_json),
+        })
+        .to_string();
+        self.store.record_evidence(EvidenceRecord {
+            instance_id: execution.instance_id,
+            kind: "context.attestation",
+            subject_type: "run",
+            subject_id: execution.run_id,
+            causation_id: None,
+            correlation_id: Some(execution.effect_id),
+            summary: Some("provider-assembled context"),
+            metadata_json: &metadata,
+        })?;
+        Ok(())
+    }
+
     fn append_agent_turn_event_and_fact(
         &mut self,
         execution: AgentTurnExecution<'_>,
@@ -4133,6 +4172,103 @@ rule noop
             .count();
         assert_eq!(activation_records, 1);
         check_trace(kernel.trace()).expect("revision trace remains conformant");
+    }
+
+    #[test]
+    fn delegated_context_attestation_is_tagged_provider_assembled() {
+        // DR-0034 Decision 5 (D8-2): the kernel-owned attestation contract. A
+        // Delegated turn records ONE `context.attestation` row tagged
+        // `context: provider-assembled`, carrying provider identity/kind plus the
+        // prompt and policy hashes — never the hermetic `context.bundle` provenance.
+        let compiled = compile_program(
+            r#"
+workflow AttestationContract
+
+agent worker {
+  provider native-fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule noop
+  when started
+=> {
+}
+"#,
+        );
+        let program = compiled.ir.expect("program compiles");
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &program.workflow,
+                    source_hash: "source-1",
+                    ir_hash: "ir-1",
+                    compiler_version: "test",
+                },
+                &program,
+            )
+            .expect("version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+
+        let execution = AgentTurnExecution {
+            instance_id: &instance_id,
+            effect_id: "eff-1",
+            run_id: "run-1",
+            provider: "native-fixture",
+            worker_id: "whip-worker",
+            lease_id: "lease-1",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            agent: "worker",
+            profile: Some("repo-writer"),
+            input_json: r#"{"message":"delegated context is provider-assembled"}"#,
+            skill_names: &[],
+        };
+        kernel
+            .record_delegated_context_attestation(execution, "native-fixture", r#"["agent.tell"]"#)
+            .expect("attestation records");
+
+        let evidence = kernel
+            .store()
+            .list_evidence(&instance_id)
+            .expect("evidence lists");
+        let attestations = evidence
+            .iter()
+            .filter(|row| row.kind == "context.attestation")
+            .collect::<Vec<_>>();
+        assert_eq!(attestations.len(), 1, "exactly one attestation row");
+        assert!(
+            !evidence.iter().any(|row| row.kind == "context.bundle"),
+            "a delegated turn fabricates no context.bundle provenance"
+        );
+        let metadata: Value =
+            serde_json::from_str(&attestations[0].metadata_json).expect("attestation metadata");
+        assert_eq!(
+            metadata.get("context").and_then(Value::as_str),
+            Some("provider-assembled")
+        );
+        assert_eq!(
+            metadata.get("kind").and_then(Value::as_str),
+            Some("native-fixture")
+        );
+        assert_eq!(
+            metadata.get("profile").and_then(Value::as_str),
+            Some("repo-writer")
+        );
+        // The prompt and policy hashes are present, non-empty, and distinct.
+        let prompt_hash = metadata
+            .get("prompt_hash")
+            .and_then(Value::as_str)
+            .expect("prompt hash");
+        let policy_hash = metadata
+            .get("policy_hash")
+            .and_then(Value::as_str)
+            .expect("policy hash");
+        assert!(!prompt_hash.is_empty() && !policy_hash.is_empty());
+        assert_ne!(prompt_hash, policy_hash);
     }
 
     #[test]

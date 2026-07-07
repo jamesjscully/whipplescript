@@ -4997,6 +4997,18 @@ fn dev_owned_harness_completes_turn_with_leaf_invariants() {
         "expected one context.bundle evidence row per assembled bundle (>=4), got {context_bundle_rows}"
     );
 
+    // DR-0034 Decision 5 (D8-2): the Managed side of the evidence fork. An owned turn
+    // is hermetic — it records full `context.bundle` provenance and NEVER a
+    // provider-assembled `context.attestation` (that tag is the Delegated path's).
+    let attestation_rows = evidence
+        .iter()
+        .filter(|item| item.get("kind").and_then(Value::as_str) == Some("context.attestation"))
+        .count();
+    assert_eq!(
+        attestation_rows, 0,
+        "a managed/owned turn must emit no context.attestation rows, got {attestation_rows}"
+    );
+
     let _ = fs::remove_file(store_path);
 }
 
@@ -5455,9 +5467,11 @@ rule start_native_work
         Some("text/plain")
     );
     assert_eq!(
+        // Native-fixture is a Delegated harness, so the evidence also carries the one
+        // `context.attestation` row the D8-2 fork records (DR-0034 Decision 5).
         dev.pointer("/provider_evidence/summary/total")
             .and_then(Value::as_u64),
-        Some(8)
+        Some(9)
     );
     assert_eq!(
         dev.pointer("/provider_evidence/groups/0/kind")
@@ -5598,6 +5612,125 @@ rule start_native_work
             })
             .count(),
         1
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn dev_delegated_turn_records_provider_assembled_attestation_not_context_bundles() {
+    // DR-0034 Decision 5 (D8-2): the evidence path forks on the harness class. A
+    // Delegated turn (here: native-fixture, a foreign runtime) does NOT emit the
+    // hermetic `context.bundle` provenance a Managed/owned turn records — WhippleScript
+    // did not assemble that context. It records exactly one `context.attestation` row
+    // tagged `context: provider-assembled` (provider identity, prompt hash, policy
+    // hash) so an auditor can tell from the record which guarantee the turn carries.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("delegated-attestation-fork");
+    fs::write(
+        &source_path,
+        r#"
+workflow DelegatedAttestationFork
+
+agent worker {
+  provider native-fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule start_delegated_work
+  when started
+  when worker is available
+=> {
+  tell worker "delegated context is provider-assembled"
+}
+"#,
+    )
+    .expect("write delegated attestation workflow");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "native-fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let evidence = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "evidence",
+            instance_id,
+        ],
+    );
+    let evidence = evidence
+        .get("evidence")
+        .and_then(Value::as_array)
+        .expect("evidence array");
+
+    // A Delegated turn fabricates no hermetic provenance.
+    let context_bundle_rows = evidence
+        .iter()
+        .filter(|item| item.get("kind").and_then(Value::as_str) == Some("context.bundle"))
+        .count();
+    assert_eq!(
+        context_bundle_rows, 0,
+        "a delegated turn must emit no context.bundle rows, got {context_bundle_rows}"
+    );
+
+    // It records exactly one attestation, explicitly tagged provider-assembled.
+    let attestations: Vec<&Value> = evidence
+        .iter()
+        .filter(|item| item.get("kind").and_then(Value::as_str) == Some("context.attestation"))
+        .collect();
+    assert_eq!(
+        attestations.len(),
+        1,
+        "a delegated turn must emit exactly one context.attestation row, got {}",
+        attestations.len()
+    );
+    let attestation = attestations[0];
+    let metadata = attestation
+        .get("metadata")
+        .expect("attestation metadata object");
+    assert_eq!(
+        metadata.get("context").and_then(Value::as_str),
+        Some("provider-assembled"),
+        "attestation must be tagged provider-assembled"
+    );
+    assert_eq!(
+        metadata.get("kind").and_then(Value::as_str),
+        Some("native-fixture")
+    );
+    assert!(
+        metadata
+            .get("prompt_hash")
+            .and_then(Value::as_str)
+            .is_some_and(|hash| !hash.is_empty()),
+        "attestation must carry a prompt hash"
+    );
+    assert!(
+        metadata
+            .get("policy_hash")
+            .and_then(Value::as_str)
+            .is_some_and(|hash| !hash.is_empty()),
+        "attestation must carry a tool/permission policy hash"
     );
 
     let _ = fs::remove_file(store_path);
@@ -17258,10 +17391,12 @@ rule startNativeWork
         Some("text/plain")
     );
     assert_eq!(
+        // Native-fixture is a Delegated harness, so the evidence also carries the one
+        // `context.attestation` row the D8-2 fork records (DR-0034 Decision 5).
         report
             .pointer("/observed/evidence/summary/total")
             .and_then(Value::as_u64),
-        Some(8)
+        Some(9)
     );
     assert_eq!(
         report

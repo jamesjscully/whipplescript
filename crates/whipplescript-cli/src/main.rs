@@ -60,14 +60,14 @@ use whipplescript_kernel::{
     RuntimeKernel,
 };
 use whipplescript_parser::{
-    format_program, format_program_preserving_comments, lex_comments, parse_expression, BinaryOp,
-    CalendarPattern, DependencyPredicate as IrDependencyPredicate, Diagnostic,
-    EffectStatus as TestEffectStatus, ExpectTarget, Expr, ExprLiteral, ExprObjectField,
-    FormatOutput, GivenClause, IrConstructUse, IrEffectDependency, IrEffectKind, IrEffectNode,
-    IrInclude, IrPrimitiveType, IrProgram, IrProjectionRead, IrRule, IrSchema, IrSource, IrTest,
-    IrType, IrWorkflowContract, IrWorkflowContractKind, Item, MissedPolicy, ProjQueryKind,
-    QueryKind, Recurrence, RuleStatus, RunKind, SourceSpan, SourceValue, StubPayload, TestClause,
-    TestField, TimeOfDay, UnaryOp, Weekday,
+    format_program, format_program_preserving_comments, harness_class, lex_comments,
+    parse_expression, BinaryOp, CalendarPattern, DependencyPredicate as IrDependencyPredicate,
+    Diagnostic, EffectStatus as TestEffectStatus, ExpectTarget, Expr, ExprLiteral, ExprObjectField,
+    FormatOutput, GivenClause, HarnessClass, IrConstructUse, IrEffectDependency, IrEffectKind,
+    IrEffectNode, IrInclude, IrPrimitiveType, IrProgram, IrProjectionRead, IrRule, IrSchema,
+    IrSource, IrTest, IrType, IrWorkflowContract, IrWorkflowContractKind, Item, MissedPolicy,
+    ProjQueryKind, QueryKind, Recurrence, RuleStatus, RunKind, SourceSpan, SourceValue,
+    StubPayload, TestClause, TestField, TimeOfDay, UnaryOp, Weekday,
 };
 use whipplescript_store::{
     ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, ClaimableEffect, DerivedFact,
@@ -22151,6 +22151,20 @@ fn run_agent_effect(
             "provider_config",
             &reason,
         );
+    }
+    // DR-0034 Decision 5 (D8-2): the evidence path forks on the harness class — this
+    // is the first place dispatch acts on it. A Delegated turn's context is assembled
+    // by the foreign runtime, so instead of the hermetic `context.bundle` provenance a
+    // Managed turn records, we record one `context.attestation` row tagged
+    // `context: provider-assembled` (provider identity, prompt hash, tool/permission
+    // policy) before the turn. Managed kinds (owned/fixture) skip this and emit their
+    // full provenance from within the brokered loop.
+    if harness_class(&provider_selection.kind) == HarnessClass::Delegated {
+        kernel.record_delegated_context_attestation(
+            execution,
+            &provider_selection.kind,
+            &effect.required_capabilities_json,
+        )?;
     }
     if provider_selection.kind == "owned" {
         // Owned brokered harness (DR-0024 slice 1): the kernel drives the model
