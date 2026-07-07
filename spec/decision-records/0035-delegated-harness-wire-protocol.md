@@ -205,15 +205,26 @@ Two consequences:
 
 `ProviderCapability` gains a **re-query declaration**: whether the surface can
 answer "what is the terminal state of run/thread/turn X" idempotently, and by
-which identity fields. Codex plausibly can (thread id + turn id survive the
-app-server); the whip sidecar dialect gains an optional `run/query` verb; Pi
-declares none until probed. `recover_running_provider_runs` consults the
+which identity fields. `recover_running_provider_runs` consults the
 declaration: re-query and admit the discovered terminal when supported,
 resolve `uncertain` otherwise — making the admission spec's re-query branch
 reachable for the first time. A dialect that declares re-query and answers it
 wrongly (two different terminals for one run) violates T1 and is a
 protocol-violation diagnostic, not a second admission (the idempotency-key
 unique index already absorbs the duplicate).
+
+**Build finding (2026-07-07, B4 deferred with cause):** every delegated
+surface today is a *subprocess of the worker* — the Claude sidecar, the codex
+app-server, and the pi RPC process all die with the worker whose crash
+recovery would want to re-query them. There is no peer left to answer
+`run/query`, so a re-query declaration would be machinery with zero possible
+implementations (the original "codex thread/turn ids survive" hunch is wrong
+for the same reason: the app-server is our child process). Re-query becomes
+real exactly when a delegate outlives the worker — the compute plane's
+remote Class-B containers (`spec/compute-plane-design-note.md`) — so B4 is
+deferred to that build, where the capability declaration, the `run/query`
+verb, and the recovery integration land together against a surface that can
+actually answer.
 
 ## Decision 7 — Version is exchanged and pinned, not assumed
 
@@ -273,24 +284,35 @@ produces a terminal (coverage: every non-terminated run reaches `timedOut`).
 Keep the state space finite: consume trigger tokens (the
 delegated-settings-authority lesson).
 
-## Build items (gated on ratification of this record)
+## Build items (ratified 2026-07-07; built same day except B4)
 
-- [ ] B1 — T1/T3 enforcement in the kernel driver: post-terminal and
+- [x] B1 — T1/T3 enforcement in the kernel driver: post-terminal and
       misrouted frames → `agent.turn.protocol_violation` diagnostics; Claude
       client stops aborting on unexpected run ids; null-run_id `run/error`
-      routed as channel error.
-- [ ] B2 — Two-clock liveness: read timeouts on the three stdio transports +
-      inactivity clock in the driver; `max_events` counts delivered frames
-      only.
-- [ ] B3 — Cancel plumb-through: external cancel signal into the driver loop;
-      `cancel_turn` becomes reachable; ack-without-terminal resolves via the
-      inactivity clock + Decision 5.
+      routed as channel error. (d88579e)
+- [x] B2 — Two-clock liveness: reader-thread transports with read timeouts +
+      adapter inactivity clock (`WHIPPLESCRIPT_NATIVE_PROVIDER_INACTIVITY_TIMEOUT`,
+      default 300s) synthesizing the TimedOut terminal; `max_events` counts
+      delivered frames only. Residual: codex/pi turn-start JSON-RPC requests
+      remain blocking (fast path). (551bb09)
+- [x] B3 — Cancel plumb-through: the driver consults the durable
+      `effect_cancellation_requests` surface each iteration and calls
+      `cancel_turn` at the authorized depth; adapters poll in ≤1s slices so
+      the check is responsive; refused cancels are diagnostics. Residual:
+      pre-start cancellation short-circuit (owned harness has it; delegated
+      does not yet). (95bb399)
 - [ ] B4 — Re-query: capability declaration + `run/query` in the sidecar
       dialect + recovery integration (admission spec's re-query branch).
-- [ ] B5 — Version exchange: `protocol` field in the sidecar dialect; consume
-      the Codex `initialize` reply; live version check in doctor +
-      pre-dispatch health.
-- [ ] B6 — Maude `delegated-wire-lifecycle.maude` (before B1–B3 land).
+      **DEFERRED with cause** (see Decision 6 build finding): impossible for
+      subprocess delegates; lands with the compute plane's remote Class-B
+      containers.
+- [x] B5 — Version exchange: `hello` handshake + `protocol` field in the
+      sidecar dialect (answered-mismatch → binding block; legacy and dead
+      sidecars tolerated — liveness stays a start_turn concern); Codex
+      `initialize` reply consumed as started-event evidence; pi declares no
+      version surface yet. Residual: doctor live version probe. (c96d966)
+- [x] B6 — Maude `delegated-wire-lifecycle.maude`, 3 coverage + 3 bites,
+      landed before B1–B3. (a5a8618)
 
 ## Open questions
 
