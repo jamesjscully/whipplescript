@@ -915,18 +915,11 @@ struct Migration {
 }
 
 #[cfg(feature = "native")]
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        name: "runtime-store-schema",
-        sql: include_str!("../migrations/0001_runtime_store.sql"),
-    },
-    Migration {
-        version: 2,
-        name: "skill-body",
-        sql: include_str!("../migrations/0002_skill_body.sql"),
-    },
-];
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "runtime-store-schema",
+    sql: include_str!("../migrations/0001_runtime_store.sql"),
+}];
 
 /// Stage marker retained for the CLI/kernel scaffold.
 pub fn store_stage() -> &'static str {
@@ -9326,7 +9319,33 @@ fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
     ensure_instance_authority_schema(connection)?;
     ensure_workspace_schema(connection)?;
     ensure_effect_time_columns(connection)?;
+    ensure_skill_body_column(connection)?;
     ensure_lookup_indexes(connection)?;
+    Ok(())
+}
+
+/// Idempotent patch (context-assembly Phase 2, Decision 3): give `skills` a `body`
+/// column carrying the content-addressed SKILL.md bytes. Applied on every open, so
+/// a store from before the column gains it; a no-op once present.
+#[cfg(feature = "native")]
+fn ensure_skill_body_column(connection: &Connection) -> StoreResult<()> {
+    let skills_table_exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'skills'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !skills_table_exists {
+        return Ok(());
+    }
+    if !column_exists(connection, "skills", "body")? {
+        connection.execute(
+            "ALTER TABLE skills ADD COLUMN body TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
     Ok(())
 }
 
