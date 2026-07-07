@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whipplescript.local/schemas/dev_stream_v0.schema.json",
+  "title": "WhippleScript dev NDJSON stream envelope v0",
+  "type": "object",
+  "required": ["schema", "sequence", "event", "data"],
+  "properties": {
+    "schema": {"const": "whipplescript.dev_stream.v0"},
+    "sequence": {"type": "integer", "minimum": 0},
+    "event": {
+      "enum": [
+        "dev.started",
+        "dev.events",
+        "dev.step",
+        "dev.worker",
+        "dev.idle",
+        "dev.assertions",
+        "dev.report"
+      ]
+    },
+    "data": {"type": "object"}
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whipplescript.dev/schemas/test_report_v0.schema.json",
+  "title": "WhippleScript Test Report v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "status", "summary", "scenarios"],
+  "properties": {
+    "schema": {
+      "const": "whipplescript.test_report.v0"
+    },
+    "status": {
+      "enum": ["passed", "failed", "invalid", "cancelled", "no_tests"]
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selected", "passed", "failed", "invalid", "skipped"],
+      "properties": {
+        "selected": {"type": "integer", "minimum": 0},
+        "passed": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0},
+        "invalid": {"type": "integer", "minimum": 0},
+        "skipped": {"type": "integer", "minimum": 0}
+      }
+    },
+    "scenarios": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/scenario"}
+    }
+  },
+  "$defs": {
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "workflow", "steps", "expectations", "diagnostics"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "status": {"enum": ["passed", "failed", "invalid", "skipped"]},
+        "workflow": {"type": "string", "minLength": 1},
+        "source_span": {
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/span"}]
+        },
+        "steps": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/step"}
+        },
+        "expectations": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/expectation"}
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/diagnostic"}
+        },
+        "dev_report_ref": {
+          "oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "description"],
+      "properties": {
+        "kind": {"enum": ["given", "stub", "run"]},
+        "description": {"type": "string", "minLength": 1}
+      }
+    },
+    "expectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["description", "status"],
+      "properties": {
+        "description": {"type": "string", "minLength": 1},
+        "status": {"enum": ["passed", "failed"]},
+        "diagnostic_code": {"type": "string", "minLength": 1}
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "message"],
+      "properties": {
+        "code": {"type": "string", "minLength": 1},
+        "severity": {"enum": ["error", "warning", "info", "hint"]},
+        "message": {"type": "string", "minLength": 1},
+        "source_span": {
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/span"}]
+        }
+      }
+    },
+    "span": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": {"type": "integer", "minimum": 0},
+        "end": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whipplescript.local/schemas/local_trace_v0.schema.json",
+  "title": "WhippleScript local trace report v0",
+  "type": "object",
+  "required": [
+    "schema",
+    "instance_id",
+    "events",
+    "facts",
+    "effects",
+    "runs",
+    "native_lifecycle",
+    "evidence",
+    "evidence_links"
+  ],
+  "properties": {
+    "schema": {"const": "whipplescript.local_trace.v0"},
+    "instance_id": {"type": "string"},
+    "events": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/store_event"}
+    },
+    "facts": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "effects": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "runs": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "native_lifecycle": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "evidence": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "evidence_links": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "abstract_trace": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/trace_record"}
+    },
+    "conformance": {
+      "type": "object",
+      "required": ["ok"],
+      "properties": {
+        "ok": {"type": "boolean"},
+        "sequence": {"type": "integer", "minimum": 0},
+        "message": {"type": "string"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "store_event": {
+      "type": "object",
+      "required": ["event_id", "sequence", "event_type", "payload", "source", "occurred_at"],
+      "properties": {
+        "event_id": {"type": "string"},
+        "sequence": {"type": "integer", "minimum": 0},
+        "event_type": {"type": "string"},
+        "payload": {},
+        "source": {"type": "string"},
+        "occurred_at": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "trace_record": {
+      "type": "object",
+      "required": ["sequence", "event"],
+      "properties": {
+        "sequence": {"type": "integer", "minimum": 0},
+        "event": {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": {
+              "enum": [
+                "effect_created",
+                "dependency_created",
+                "effect_claimed",
+                "run_started",
+                "lease_expired",
+                "effect_terminal",
+                "provider_diagnostic",
+                "effect_blocked",
+                "effect_cancelled",
+                "revision_activated",
+                "effect_cancellation_requested",
+                "instance_paused",
+                "instance_resumed",
+                "instance_cancelled"
+              ]
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

@@ -1,0 +1,413 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whipplescript.local/schemas/dev_report_v0.schema.json",
+  "title": "WhippleScript dev report v0",
+  "type": "object",
+  "required": [
+    "schema",
+    "instance_id",
+    "workflow",
+    "source_metadata",
+    "steps",
+    "workers",
+    "diagnostics",
+    "assertion_filter",
+    "executable_spec",
+    "assertions",
+    "provider_runs",
+    "provider_artifacts",
+    "provider_evidence"
+  ],
+  "properties": {
+    "schema": {"const": "whipplescript.dev_report.v0"},
+    "instance_id": {"type": "string"},
+    "workflow": {"type": "string"},
+    "source_metadata": {"$ref": "#/$defs/source_metadata"},
+    "steps": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "workers": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/diagnostic"}
+    },
+    "assertion_filter": {
+      "type": "object",
+      "required": ["include_tags", "exclude_tags", "total", "selected"],
+      "properties": {
+        "include_tags": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "exclude_tags": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "total": {"type": "integer", "minimum": 0},
+        "selected": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    },
+    "executable_spec": {"$ref": "#/$defs/executable_spec"},
+    "assertions": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/assertion"}
+    },
+    "provider_runs": {"$ref": "#/$defs/provider_runs"},
+    "provider_artifacts": {"$ref": "#/$defs/provider_artifacts"},
+    "provider_evidence": {"$ref": "#/$defs/provider_evidence"}
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "span": {
+      "type": "object",
+      "required": ["start", "end"],
+      "properties": {
+        "path": {"type": ["string", "null"]},
+        "start": {"type": "integer", "minimum": 0},
+        "end": {"type": "integer", "minimum": 0},
+        "construct": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "source_metadata": {
+      "type": "object",
+      "required": ["tags", "descriptions", "targets"],
+      "properties": {
+        "tags": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/source_tag"}
+        },
+        "descriptions": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/source_description"}
+        },
+        "targets": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/source_target"}
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_tag": {
+      "type": "object",
+      "required": ["name", "target_kind", "target", "source_span"],
+      "properties": {
+        "name": {"type": "string"},
+        "target_kind": {"type": "string"},
+        "target": {"type": "string"},
+        "source_span": {"$ref": "#/$defs/span"}
+      },
+      "additionalProperties": true
+    },
+    "source_description": {
+      "type": "object",
+      "required": ["value", "target_kind", "target", "source_span"],
+      "properties": {
+        "value": {"type": "string"},
+        "target_kind": {"type": "string"},
+        "target": {"type": "string"},
+        "source_span": {"$ref": "#/$defs/span"}
+      },
+      "additionalProperties": true
+    },
+    "source_target": {
+      "type": "object",
+      "required": ["target_kind", "target", "tags"],
+      "properties": {
+        "target_kind": {"type": "string"},
+        "target": {"type": "string"},
+        "tags": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "description": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "diagnostic": {
+      "type": "object",
+      "required": ["diagnostic_id", "severity", "message"],
+      "properties": {
+        "diagnostic_id": {"type": "string"},
+        "instance_id": {"type": ["string", "null"]},
+        "program_id": {"type": ["string", "null"]},
+        "program_version_id": {"type": ["string", "null"]},
+        "severity": {"enum": ["error", "warning", "info", "hint"]},
+        "code": {"type": ["string", "null"]},
+        "message": {"type": "string"},
+        "source_span": {"anyOf": [{"$ref": "#/$defs/span"}, {"type": "null"}]},
+        "subject_type": {"type": ["string", "null"]},
+        "subject_id": {"type": ["string", "null"]},
+        "event_id": {"type": ["string", "null"]},
+        "effect_id": {"type": ["string", "null"]},
+        "run_id": {"type": ["string", "null"]},
+        "assertion_id": {"type": ["string", "null"]},
+        "evidence_ids": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "artifact_ids": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "causation_id": {"type": ["string", "null"]},
+        "correlation_id": {"type": ["string", "null"]},
+        "idempotency_key": {"type": ["string", "null"]},
+        "created_at": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "executable_spec": {
+      "type": "object",
+      "required": ["status", "summary", "tags"],
+      "properties": {
+        "status": {"enum": ["passed", "failed", "error"]},
+        "summary": {"$ref": "#/$defs/assertion_summary"},
+        "tags": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/assertion_group"}
+        },
+        "untagged": {"$ref": "#/$defs/assertion_group"}
+      },
+      "additionalProperties": true
+    },
+    "assertion_group": {
+      "type": "object",
+      "required": ["status", "summary", "assertions"],
+      "properties": {
+        "tag": {"type": "string"},
+        "status": {"enum": ["passed", "failed", "error"]},
+        "summary": {"$ref": "#/$defs/assertion_summary"},
+        "assertions": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/assertion_summary_entry"}
+        }
+      },
+      "additionalProperties": true
+    },
+    "assertion_summary": {
+      "type": "object",
+      "required": ["total", "passed", "failed", "error"],
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "passed": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0},
+        "error": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    },
+    "assertion_summary_entry": {
+      "type": "object",
+      "required": ["target_id", "expr", "reads", "status", "passed"],
+      "properties": {
+        "target_id": {"type": "string"},
+        "event_id": {"type": "string"},
+        "diagnostic_ids": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "expr": {"type": "string"},
+        "description": {"type": "string"},
+        "reads": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/assertion_read"}
+        },
+        "status": {"enum": ["passed", "failed", "error"]},
+        "passed": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "assertion": {
+      "type": "object",
+      "required": [
+        "target_id",
+        "expr",
+        "reads",
+        "tags",
+        "status",
+        "passed",
+        "actual",
+        "actual_values",
+        "expected"
+      ],
+      "properties": {
+        "target_id": {"type": "string"},
+        "event_id": {"type": "string"},
+        "diagnostic_ids": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "expr": {"type": "string"},
+        "reads": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/assertion_read"}
+        },
+        "tags": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "description": {"type": "string"},
+        "status": {"enum": ["passed", "failed", "error"]},
+        "passed": {"type": "boolean"},
+        "failure_reason": {"type": "string"},
+        "error": {"type": "string"},
+        "source_span": {"$ref": "#/$defs/span"}
+      },
+      "additionalProperties": true
+    },
+    "assertion_read": {
+      "type": "object",
+      "required": ["kind", "head", "source", "match_count", "matches"],
+      "properties": {
+        "kind": {"enum": ["fact", "effect"]},
+        "head": {"type": "string"},
+        "guard": {"type": "string"},
+        "source": {"type": "string"},
+        "match_count": {"type": "integer", "minimum": 0},
+        "matches": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/assertion_read_match"}
+        },
+        "error": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "assertion_read_match": {
+      "type": "object",
+      "required": ["id", "name"],
+      "properties": {
+        "id": {"type": "string"},
+        "name": {"type": "string"},
+        "key": {"type": "string"},
+        "status": {"type": "string"},
+        "prompt_content_type": {"type": "string"},
+        "provenance_class": {"type": "string"},
+        "source_span": {"$ref": "#/$defs/span"}
+      },
+      "additionalProperties": true
+    },
+    "provider_runs": {
+      "type": "object",
+      "required": ["summary", "groups"],
+      "properties": {
+        "summary": {
+          "type": "object",
+          "required": ["total", "artifact_count"],
+          "properties": {
+            "total": {"type": "integer", "minimum": 0},
+            "artifact_count": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": true
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["provider", "status", "count", "artifact_count"],
+            "properties": {
+              "provider": {"type": "string"},
+              "status": {"type": "string"},
+              "count": {"type": "integer", "minimum": 0},
+              "artifact_count": {"type": "integer", "minimum": 0}
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "provider_artifacts": {
+      "type": "object",
+      "required": ["summary", "groups"],
+      "properties": {
+        "summary": {
+          "type": "object",
+          "required": ["total"],
+          "properties": {
+            "total": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": true
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["kind", "mime_type", "count"],
+            "properties": {
+              "kind": {"type": "string"},
+              "mime_type": {"type": ["string", "null"]},
+              "count": {"type": "integer", "minimum": 0}
+            },
+            "additionalProperties": true
+          }
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["artifact_id", "run_id", "kind", "mime_type"],
+            "properties": {
+              "artifact_id": {"type": "string"},
+              "run_id": {"type": "string"},
+              "kind": {"type": "string"},
+              "mime_type": {"type": ["string", "null"]},
+              "content_hash": {"type": ["string", "null"]}
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "provider_evidence": {
+      "type": "object",
+      "required": ["summary", "groups"],
+      "properties": {
+        "summary": {
+          "type": "object",
+          "required": ["total"],
+          "properties": {
+            "total": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": true
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["kind", "subject_type", "count"],
+            "properties": {
+              "kind": {"type": "string"},
+              "subject_type": {"type": "string"},
+              "count": {"type": "integer", "minimum": 0}
+            },
+            "additionalProperties": true
+          }
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["evidence_id", "kind", "subject_type", "subject_id"],
+            "properties": {
+              "evidence_id": {"type": "string"},
+              "kind": {"type": "string"},
+              "subject_type": {"type": "string"},
+              "subject_id": {"type": "string"},
+              "causation_id": {"type": ["string", "null"]},
+              "correlation_id": {"type": ["string", "null"]},
+              "summary": {"type": ["string", "null"]}
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}
