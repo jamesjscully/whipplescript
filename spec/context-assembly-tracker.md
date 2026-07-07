@@ -277,12 +277,13 @@ atomic apply). `compact_context` **deleted**.
   so it fires rarely (Decision 7). (`BodyAfterPrefix` refinement: `input_tokens` is
   the provider's own whole-prompt count, a faithful proxy; a tighter post-prefix
   delta can follow.)
-- [~] **Strategy #1 — turn-summarization** (Codex-local shape): `TurnSummarizingCompactor`
+- [x] **Strategy #1 — turn-summarization** (Codex-local shape): `TurnSummarizingCompactor`
   folds the middle into a handoff summary via one interleaved model round, keeping
   the System + first-User anchors and a byte-budgeted recent tail, re-injecting the
-  anchors ahead of the summary (v0.3). **Follow-on (Lb-4):** record the summary as a
-  `context.compaction` evidence artifact + a crash-mid-compaction resume proof
-  (reuse-on-replay is already load-bearing via the checkpointed folded transcript).
+  anchors ahead of the summary (v0.3). The compaction emits a `LoopObservation::Compacted`
+  the kernel records as a **`context.compaction` evidence artifact** (epoch / folded
+  count / summary bytes), and the summary is **reused on replay** — a resume from the
+  checkpointed folded transcript issues no second summarization round (unit-proven).
 - [x] **Apply-once + hold stable**: the folded prefix is installed once, the
   `compaction_epoch` bumped, and `last_input_tokens` reset so subsequent turns only
   append; the middle is never edited again (v0.3).

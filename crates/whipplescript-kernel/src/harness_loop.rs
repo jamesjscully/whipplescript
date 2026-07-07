@@ -201,6 +201,17 @@ pub enum LoopObservation {
         name: String,
         status: ToolStatus,
     },
+    /// A conversation compaction was applied at this epoch (Phase 4 Layer B): the
+    /// summary was recorded and the transcript folded to a fresh stable prefix. The
+    /// kernel records this as a `context.compaction` evidence artifact (Decision 8).
+    Compacted {
+        epoch: u32,
+        /// How many messages were folded into the summary.
+        folded_messages: usize,
+        /// Byte length of the recorded handoff summary (0 for a deterministic,
+        /// no-model rewrite).
+        summary_bytes: usize,
+    },
 }
 
 /// Terminal status of a brokered turn (layer 3). Maps to the existing
@@ -565,9 +576,15 @@ where
                 CompactionOutcome::Deterministic(rewritten) => {
                     // A pure rewrite (front-trim / hard-reset): install it, disarm,
                     // and persist the new prefix once (apply-once).
+                    let folded_messages = self.messages.len().saturating_sub(rewritten.len());
                     self.messages = rewritten;
                     self.compaction_epoch += 1;
                     self.last_input_tokens = 0;
+                    self.observations.push(LoopObservation::Compacted {
+                        epoch: self.compaction_epoch,
+                        folded_messages,
+                        summary_bytes: 0,
+                    });
                     (self.checkpoint)(&self.messages);
                 }
                 CompactionOutcome::NeedsModel(request) => {
@@ -649,12 +666,21 @@ where
                 self.model.parse_response(response),
                 self.pending_compaction.take(),
             ) {
-                (Ok(reply), Some(request)) => Some(self.compactor.assemble(&request, &reply.text)),
+                (Ok(reply), Some(request)) => Some((
+                    self.compactor.assemble(&request, &reply.text),
+                    request.request_messages.len(),
+                    reply.text.len(),
+                )),
                 _ => None,
             };
-            if let Some(messages) = folded {
+            if let Some((messages, folded_messages, summary_bytes)) = folded {
                 self.messages = messages;
                 self.compaction_epoch += 1;
+                self.observations.push(LoopObservation::Compacted {
+                    epoch: self.compaction_epoch,
+                    folded_messages,
+                    summary_bytes,
+                });
                 (self.checkpoint)(&self.messages);
             }
             self.last_input_tokens = 0;
@@ -1547,7 +1573,7 @@ mod tests {
                         "tool_result for {call_id} had no preceding tool_requested"
                     );
                 }
-                LoopObservation::ModelRequest { .. } => {}
+                LoopObservation::ModelRequest { .. } | LoopObservation::Compacted { .. } => {}
             }
         }
     }
@@ -1850,5 +1876,98 @@ mod tests {
         );
         // Three model rounds were built: main, summarization (no tools), main.
         assert_eq!(*client.tools_seen.borrow(), vec![true, false, true]);
+        // The compaction is recorded once as evidence (the `context.compaction`
+        // observation the kernel turns into an evidence artifact).
+        let compactions: Vec<_> = outcome
+            .observations
+            .iter()
+            .filter(|o| matches!(o, LoopObservation::Compacted { .. }))
+            .collect();
+        assert_eq!(compactions.len(), 1, "recorded exactly once");
+        assert!(matches!(
+            compactions[0],
+            LoopObservation::Compacted { epoch: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn a_compacted_transcript_is_reused_on_replay_not_resummarized() {
+        // First: a turn that compacts, capturing the folded transcript from the
+        // checkpoint (what the durable log would hold on a crash).
+        let replies = vec![
+            Ok(ModelReply {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: json!({ "path": "README.md" }),
+                }],
+                usage: json!({ "input_tokens": 950, "output_tokens": 1 }),
+            }),
+            Ok(final_reply("STRUCTURED HANDOFF")),
+            Ok(final_reply("first answer")),
+        ];
+        let client = CompactingHttpClient::new(replies, 1000);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "file body".to_string(),
+        });
+        let compactor = TurnSummarizingCompactor::new(9, 2, 10);
+        let mut folded: Option<Vec<ChatMessage>> = None;
+        {
+            let mut record = |messages: &[ChatMessage]| {
+                if messages.iter().any(
+                    |m| matches!(m, ChatMessage::User(t) if t.contains("compacted to a handoff")),
+                ) {
+                    folded = Some(messages.to_vec());
+                }
+            };
+            run_brokered_turn_http(
+                &client,
+                &exec,
+                &input(8),
+                &mut record,
+                &DummyHost,
+                &compactor,
+            );
+        }
+        let folded = folded.expect("a compaction occurred");
+
+        // Resume from the folded transcript. The handoff summary is already in it,
+        // so a fresh turn must NOT re-summarize — only one MAIN round to finish. The
+        // single-reply client would panic ("ran out of replies") if a second
+        // (summarization) round were issued, so reaching the answer proves the
+        // recorded summary is reused, never regenerated (Decision 7).
+        let mut resumed_input = input(8);
+        resumed_input.resume_from = folded;
+        let resumed_client =
+            CompactingHttpClient::new(vec![Ok(final_reply("resumed answer"))], 1000);
+        let resumed_exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: String::new(),
+        });
+        let outcome = {
+            let mut record = |_: &[ChatMessage]| {};
+            run_brokered_turn_http(
+                &resumed_client,
+                &resumed_exec,
+                &resumed_input,
+                &mut record,
+                &DummyHost,
+                &compactor,
+            )
+        };
+        assert_eq!(outcome.status, TurnStatus::Completed);
+        assert_eq!(outcome.summary, "resumed answer");
+        // Exactly one model round, and it offered tools (a MAIN call) — no
+        // summarization round was issued on replay.
+        assert_eq!(*resumed_client.tools_seen.borrow(), vec![true]);
+        assert!(
+            !outcome
+                .observations
+                .iter()
+                .any(|o| matches!(o, LoopObservation::Compacted { .. })),
+            "resume does not re-compact"
+        );
     }
 }

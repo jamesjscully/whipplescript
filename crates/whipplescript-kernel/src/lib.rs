@@ -203,6 +203,18 @@ fn brokered_observation_evidence(
                 "status": match status { ToolStatus::Ok => "ok", ToolStatus::Error => "error" },
             }),
         ),
+        LoopObservation::Compacted {
+            epoch,
+            folded_messages,
+            summary_bytes,
+        } => (
+            "context.compaction",
+            json!({
+                "epoch": epoch,
+                "folded_messages": folded_messages,
+                "summary_bytes": summary_bytes,
+            }),
+        ),
     }
 }
 
