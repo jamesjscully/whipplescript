@@ -155,6 +155,15 @@ others are active workshop material.
   ("model fills, whip assembles" — zero new syntax), **(C)** semantic checked
   declassifiers (NMIF-on-selector soundness, query-budget backstop). *Accepted
   direction; A modeled, B/C staged; refines DR-0027/0029.*
+- [0034-managed-vs-delegated-harnesses.md](0034-managed-vs-delegated-harnesses.md):
+  the flat harness/provider enum conflates two categorically different runtimes;
+  split it into a **`HarnessClass`** — **Managed** (owned; WhippleScript is the
+  runtime, hermetic context + full provenance) vs **Delegated** (codex/claude; a
+  foreign runtime that assembles its own context). Context-assembly knobs are
+  Managed-only, delegation knobs (un-crippled `setting_sources`) Delegated-only; the
+  evidence model forks (full provenance vs a `context: provider-assembled`
+  attestation); authority stays WhippleScript's for both. *Proposed; reframes/supersedes
+  context-assembly Phase 6; absorbs the candidate sidecar-protocol DR; retrofits DR-0024.*
 
 ## Historical Decision Trackers
 

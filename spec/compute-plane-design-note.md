@@ -165,8 +165,9 @@ placement revisit when platform autoscaling ships.
 
 - **DO tracker Phase 8** — holds the open build work; this note is its
   design.
-- **DR-0033** — Decisions 3/4/6/7 are load-bearing here; a build-time DR
-  should formalize the sidecar protocol (candidate DR-0034).
+- **DR-0033** — Decisions 3/4/6/7 are load-bearing here; the delegated-harness
+  architecture is now **DR-0034** (managed vs delegated harnesses), under which the
+  sidecar wire protocol is a follow-on formalization.
 - **Versioned workspace** — materialization + evidence-grade boundaries
   (the protocol's atomicity/hermeticity obligations); scheduling residual
   lands in §6 priority classes; cache GC joins its retention question.

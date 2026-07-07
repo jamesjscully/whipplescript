@@ -325,17 +325,18 @@ atomic apply). `compact_context` **deleted**.
 
 ---
 
-## Phase 6 — Delegated-path context (v2-ish; documented, not built first)
+## Phase 6 — Delegated-path context → **reframed by DR-0034**
 
-The native providers (codex/claude/pi) each speak agentskills.io themselves. The
-owned path is the pi-mirror; delegated turns should let the provider's *own*
-harness assemble context.
-
-- [ ] Decide + implement: stop force-disabling `setting_sources` so Claude reads
-  its own `AGENTS.md`/`CLAUDE.md`, and/or **materialize** attached skills into the
-  provider's skill directory so its native discovery finds them.
-- [ ] Reconcile provenance/evidence for provider-assembled context (we no longer
-  see every bundle; record what we can).
+**Superseded 2026-07-07 by [DR-0034](decision-records/0034-managed-vs-delegated-harnesses.md).**
+The original framing here — "make the external path look hermetic (un-disable
+`setting_sources` / materialize skills)" — was the wrong trade: it tried to force
+the delegated providers into the owned harness's guarantees, which they cannot
+give. DR-0034 splits the harness abstraction into a **`HarnessClass`** (Managed vs
+Delegated): Delegated harnesses assemble their **own** context (ambient config
+included, `setting_sources` un-crippled), context-assembly knobs become
+Managed-only, and the evidence model forks (full provenance vs a
+`context: provider-assembled` attestation). Build sequencing lives in DR-0034 §
+Decision 8; this Phase closes here as a pointer.
 
 ---
 
