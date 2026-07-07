@@ -27,6 +27,32 @@ use crate::sansio::run_to_completion;
 /// (matches the coerce path; DR-0024 lets operational errors cross redaction).
 const PROVIDER_ERROR_CAP: usize = 300;
 
+/// The context window (tokens) of a provider model, for the conversation-compaction
+/// trigger (context-assembly Phase 4). This is a **model capability**, derived from
+/// the provider + model id — never an operator config knob. The numbers are the
+/// window whip's requests actually get (e.g. Claude is 200k standard; the 1M-context
+/// beta requires an opt-in header whip does not send, so it is not claimed here).
+/// Unknown models fall back to the conservative default.
+pub fn model_context_window(provider: CoerceProvider, model: &str) -> u64 {
+    let model = model.to_ascii_lowercase();
+    match provider {
+        // Claude models are 200k standard context.
+        CoerceProvider::Anthropic => 200_000,
+        CoerceProvider::OpenAi => {
+            if model.contains("gpt-4.1") {
+                1_000_000
+            } else if model.contains("gpt-4o") || model.contains("gpt-4-turbo") {
+                128_000
+            } else if model.starts_with('o') || model.contains("-o1") || model.contains("-o3") {
+                // o1 / o3 / o4 reasoning models.
+                200_000
+            } else {
+                128_000
+            }
+        }
+    }
+}
+
 /// A live model client over one provider API. The CLI builds this with a
 /// `ureq`-backed transport and a resolved API key + model.
 pub struct RealHarnessModelClient<'a, T: CoerceTransport + ?Sized> {
@@ -83,6 +109,10 @@ impl<T: CoerceTransport + ?Sized> HttpModelClient for RealHarnessModelClient<'_,
         response: Result<HttpResponse, CoerceTransportError>,
     ) -> Result<ModelReply, HarnessModelError> {
         map_transport_response(self.provider, response)
+    }
+
+    fn context_window(&self) -> u64 {
+        model_context_window(self.provider, &self.model)
     }
 }
 
@@ -162,6 +192,10 @@ impl HttpModelClient for MessagesApiClient {
         response: Result<HttpResponse, CoerceTransportError>,
     ) -> Result<ModelReply, HarnessModelError> {
         map_transport_response(self.provider, response)
+    }
+
+    fn context_window(&self) -> u64 {
+        model_context_window(self.provider, &self.model)
     }
 }
 
@@ -512,6 +546,31 @@ mod tests {
     use super::*;
     use crate::harness_loop::ToolResultMsg;
     use std::cell::RefCell;
+
+    #[test]
+    fn context_window_is_derived_from_the_model_not_configured() {
+        // Claude: 200k standard (the 1M beta is not claimed since whip does not send
+        // the opt-in header).
+        assert_eq!(
+            model_context_window(CoerceProvider::Anthropic, "claude-opus-4-8"),
+            200_000
+        );
+        // OpenAI families map to their real windows.
+        assert_eq!(
+            model_context_window(CoerceProvider::OpenAi, "gpt-4o"),
+            128_000
+        );
+        assert_eq!(
+            model_context_window(CoerceProvider::OpenAi, "gpt-4.1"),
+            1_000_000
+        );
+        assert_eq!(model_context_window(CoerceProvider::OpenAi, "o3"), 200_000);
+        // An unrecognized OpenAI model takes the conservative family default.
+        assert_eq!(
+            model_context_window(CoerceProvider::OpenAi, "some-future-model"),
+            128_000
+        );
+    }
 
     struct FakeTransport {
         response: Result<HttpResponse, CoerceTransportError>,

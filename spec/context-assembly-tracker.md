@@ -272,11 +272,13 @@ atomic apply). `compact_context` **deleted**.
   (Decision 8); `awaiting`/`pending_compaction` snapshot fields make it
   eviction-safe. `NoopCompactor` is the equivalence oracle.
 - [x] **Trigger** = real-usage (last MAIN reply's `input_tokens`) ≥ 90% of the
-  model context window (`HttpModelClient::context_window`, default 200k); a message
-  floor + resetting `last_input_tokens` to 0 after each compaction gives hysteresis
-  so it fires rarely (Decision 7). (`BodyAfterPrefix` refinement: `input_tokens` is
-  the provider's own whole-prompt count, a faithful proxy; a tighter post-prefix
-  delta can follow.)
+  model context window; a message floor + resetting `last_input_tokens` to 0 after
+  each compaction gives hysteresis so it fires rarely (Decision 7). The window is a
+  **model capability**, derived from provider + model id (`model_context_window` —
+  Claude 200k, GPT-4o 128k, GPT-4.1 1M, o-series 200k; conservative fallback), never
+  an operator config knob. (`BodyAfterPrefix` refinement: `input_tokens` is the
+  provider's own whole-prompt count, a faithful proxy; a tighter post-prefix delta
+  can follow.)
 - [x] **Strategy #1 — turn-summarization** (Codex-local shape): `TurnSummarizingCompactor`
   folds the middle into a handoff summary via one interleaved model round, keeping
   the System + first-User anchors and a byte-budgeted recent tail, re-injecting the
