@@ -49,19 +49,26 @@ pub struct ClaudeAgentToolPolicy {
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,
     pub permission_mode: String,
-    pub setting_sources: Vec<String>,
+    /// Ambient-config sources the delegate may read (DR-0034 Decision 4). `None`
+    /// means the provider's own default — the key is omitted from the sidecar
+    /// payload so the SDK applies its native behavior. `Some(vec![])` is the
+    /// explicit `settings none` opt-out.
+    pub setting_sources: Option<Vec<String>>,
     pub mcp_config_ref: Option<String>,
 }
 
 impl ClaudeAgentToolPolicy {
     pub fn to_sidecar_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "allowed_tools": self.allowed_tools,
             "disallowed_tools": self.disallowed_tools,
             "permission_mode": self.permission_mode,
-            "setting_sources": self.setting_sources,
             "mcp_config_ref": self.mcp_config_ref,
-        })
+        });
+        if let Some(sources) = &self.setting_sources {
+            value["setting_sources"] = json!(sources);
+        }
+        value
     }
 }
 
@@ -77,6 +84,7 @@ pub fn build_claude_agent_tool_policy(
     workspace_policy: &str,
     approval_mode: Option<&str>,
     mcp_config_ref: Option<&str>,
+    settings: Option<&str>,
 ) -> Result<ClaudeAgentToolPolicy, ClaudeAgentPolicyError> {
     let Some(profile) = profile else {
         return Err(policy_error(
@@ -156,11 +164,27 @@ pub fn build_claude_agent_tool_policy(
         None => "default",
     }
     .to_owned();
+    // DR-0034 Decision 4: the `settings` knob selects which ambient-config sources
+    // the delegate may read. Unset means the provider default (None — no override),
+    // NOT the crippled empty set. `none` is the explicit opt-out. The parser
+    // validates the value; re-checking here keeps a raw provider_options bypass out.
+    let setting_sources = match settings {
+        None => None,
+        Some("project") => Some(strings(&["project"])),
+        Some("user") => Some(strings(&["user"])),
+        Some("none") => Some(Vec::new()),
+        Some(other) => {
+            return Err(policy_error(
+                "unsupported_settings_source",
+                format!("settings source `{other}` is not supported for Claude"),
+            ));
+        }
+    };
     Ok(ClaudeAgentToolPolicy {
         allowed_tools,
         disallowed_tools,
         permission_mode,
-        setting_sources: Vec::new(),
+        setting_sources,
         mcp_config_ref: mcp_config_ref.map(str::to_owned),
     })
 }
@@ -528,6 +552,10 @@ impl<T: ClaudeAgentSdkTransport> NativeProviderAdapter for ClaudeAgentSdkAdapter
                 .provider_options
                 .get("mcp_config_ref")
                 .and_then(Value::as_str),
+            request
+                .provider_options
+                .get("settings")
+                .and_then(Value::as_str),
         )
         .map_err(|error| {
             self.boundary_error(error.code, error.message, false, request.to_json_redacted())
@@ -632,7 +660,11 @@ fn claude_sidecar_request(
         json!(policy.disallowed_tools),
     );
     payload.insert("permission_mode".to_owned(), json!(policy.permission_mode));
-    payload.insert("setting_sources".to_owned(), json!(policy.setting_sources));
+    // Omitted when None so the SDK keeps its own default setting sources
+    // (DR-0034 Decision 4: unset means provider default, not the empty set).
+    if let Some(sources) = policy.setting_sources.as_ref() {
+        payload.insert("setting_sources".to_owned(), json!(sources));
+    }
     if let Some(mcp_config_ref) = policy.mcp_config_ref.as_deref() {
         payload.insert("mcp_config_ref".to_owned(), json!(mcp_config_ref));
     }
@@ -931,12 +963,71 @@ mod tests {
             "read_only",
             None,
             None,
+            None,
         )
         .expect("reader policy maps");
 
         assert_eq!(policy.allowed_tools, strings(&["Glob", "Grep", "Read"]));
         assert_eq!(policy.disallowed_tools, strings(&["Bash", "Edit", "Write"]));
         assert_eq!(policy.permission_mode, "default");
+    }
+
+    #[test]
+    fn policy_unset_settings_means_provider_default_and_omits_sidecar_key() {
+        // DR-0034 Decision 4: unset must be the provider's own default, NOT the
+        // crippled empty set — the key must be absent from the sidecar payload.
+        let policy = build_claude_agent_tool_policy(
+            Some("repo-reader"),
+            &["repo.read".to_owned()],
+            "read_only",
+            None,
+            None,
+            None,
+        )
+        .expect("reader policy maps");
+
+        assert_eq!(policy.setting_sources, None);
+        assert!(policy.to_sidecar_json().get("setting_sources").is_none());
+    }
+
+    #[test]
+    fn policy_maps_settings_sources_and_none_is_explicit_empty() {
+        for (settings, expected) in [
+            ("project", strings(&["project"])),
+            ("user", strings(&["user"])),
+            ("none", Vec::new()),
+        ] {
+            let policy = build_claude_agent_tool_policy(
+                Some("repo-reader"),
+                &["repo.read".to_owned()],
+                "read_only",
+                None,
+                None,
+                Some(settings),
+            )
+            .expect("reader policy maps");
+
+            assert_eq!(policy.setting_sources.as_deref(), Some(expected.as_slice()));
+            assert_eq!(
+                policy.to_sidecar_json().get("setting_sources"),
+                Some(&json!(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn policy_rejects_unknown_settings_source() {
+        let error = build_claude_agent_tool_policy(
+            Some("repo-reader"),
+            &["repo.read".to_owned()],
+            "read_only",
+            None,
+            None,
+            Some("workspace"),
+        )
+        .expect_err("unknown settings source denied");
+
+        assert_eq!(error.code, "unsupported_settings_source");
     }
 
     #[test]
@@ -947,6 +1038,7 @@ mod tests {
             "shared",
             Some("manual"),
             Some("mcp/readonly.json"),
+            None,
         )
         .expect("writer policy maps");
 
@@ -967,6 +1059,7 @@ mod tests {
             "shared",
             Some("manual"),
             None,
+            None,
         )
         .expect_err("reader write denied");
 
@@ -979,6 +1072,7 @@ mod tests {
             Some("repo-writer"),
             &["repo.write".to_owned()],
             "shared",
+            None,
             None,
             None,
         )
@@ -995,6 +1089,7 @@ mod tests {
             "read_only",
             Some("manual"),
             None,
+            None,
         )
         .expect_err("read only workspace denied");
 
@@ -1009,6 +1104,7 @@ mod tests {
             "remote_sandbox",
             Some("manual"),
             None,
+            None,
         )
         .expect_err("remote sandbox requires explicit workspace implementation");
 
@@ -1017,9 +1113,15 @@ mod tests {
 
     #[test]
     fn policy_rejects_missing_profile() {
-        let error =
-            build_claude_agent_tool_policy(None, &["repo.read".to_owned()], "shared", None, None)
-                .expect_err("profile required");
+        let error = build_claude_agent_tool_policy(
+            None,
+            &["repo.read".to_owned()],
+            "shared",
+            None,
+            None,
+            None,
+        )
+        .expect_err("profile required");
 
         assert_eq!(error.code, "missing_profile");
     }

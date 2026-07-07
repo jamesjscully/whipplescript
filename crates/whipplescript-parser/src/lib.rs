@@ -361,6 +361,10 @@ pub enum AgentField {
     /// (context-assembly Phase 5). One of `summarize`, `hard_reset`, `tool_results`,
     /// `none`.
     Compaction(Ident),
+    /// `settings <sources>`: which ambient-config sources a Delegated harness may
+    /// read when assembling its own context (DR-0034 Decision 4). One of `project`,
+    /// `user`, `none`. Unset means the provider's own default.
+    Settings(Ident),
     Unknown {
         name: Ident,
         span: SourceSpan,
@@ -1179,6 +1183,10 @@ pub struct IrAgent {
     /// `summarize` (default), `hard_reset`, `tool_results`, or `none`. `None` uses
     /// the harness default.
     pub compaction: Option<String>,
+    /// Ambient-config sources a Delegated harness may read (DR-0034 Decision 4):
+    /// `project`, `user`, or `none`. `None` means the provider's own default —
+    /// deliberately NOT the crippled empty set.
+    pub settings: Option<String>,
     /// The harness class (DR-0034): `Managed` (WhippleScript is the runtime) vs
     /// `Delegated` (a foreign runtime that assembles its own context). Derived from
     /// the resolved provider/harness kind at lowering.
@@ -2427,6 +2435,7 @@ fn agent_field_span(field: &AgentField) -> SourceSpan {
         | AgentField::Capabilities(_, span)
         | AgentField::Tools(_, span) => *span,
         AgentField::Compaction(strategy) => strategy.span,
+        AgentField::Settings(sources) => sources.span,
         AgentField::Unknown { span, .. } => *span,
     }
 }
@@ -2461,6 +2470,7 @@ fn agent_field_line(field: &AgentField) -> String {
             format!("  tools [{tools}]")
         }
         AgentField::Compaction(strategy) => format!("  compaction {}", strategy.name),
+        AgentField::Settings(sources) => format!("  settings {}", sources.name),
         AgentField::Unknown { name, .. } => format!("  {}", name.name),
     }
 }
@@ -3084,6 +3094,12 @@ impl IrProgram {
                     .as_deref()
                     .map(|strategy| format!(" compaction={strategy}"))
                     .unwrap_or_default();
+                // Settings likewise appends only when set (unset = provider default).
+                let settings = agent
+                    .settings
+                    .as_deref()
+                    .map(|sources| format!(" settings={sources}"))
+                    .unwrap_or_default();
                 // Harness class (DR-0034): Managed is the default/substrate, so only
                 // Delegated agents emit a class token — Managed agents' .ir is unchanged.
                 let class = match agent.harness_class {
@@ -3093,8 +3109,8 @@ impl IrProgram {
                 push_line(
                     &mut snapshot,
                     format!(
-                        "  agent {} harness={} provider={} profile={} capacity={} skills={} capabilities={} tools={}{}{}",
-                        agent.name, harness, provider, profile, capacity, skills, capabilities, tools, compaction, class
+                        "  agent {} harness={} provider={} profile={} capacity={} skills={} capabilities={} tools={}{}{}{}",
+                        agent.name, harness, provider, profile, capacity, skills, capabilities, tools, compaction, settings, class
                     ),
                 );
             }
@@ -6247,6 +6263,7 @@ fn lower_agent(
         capabilities: Vec::new(),
         tools: Vec::new(),
         compaction: None,
+        settings: None,
         // Filled after the field loop, once provider/harness are resolved.
         harness_class: HarnessClass::Managed,
     };
@@ -6407,6 +6424,35 @@ fn lower_agent(
                 }
                 lowered.compaction = Some(strategy.name);
             }
+            AgentField::Settings(sources) => {
+                const SOURCES: [&str; 3] = ["project", "user", "none"];
+                if lowered.settings.is_some() {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: sources.span,
+                        message: format!(
+                            "agent `{}` declares settings more than once",
+                            agent.name.name
+                        ),
+                        suggestion: Some("keep exactly one `settings` field".to_owned()),
+                    });
+                }
+                if !SOURCES.contains(&sources.name.as_str()) {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: sources.span,
+                        message: format!(
+                            "agent `{}` uses unknown settings source `{}`",
+                            agent.name.name, sources.name
+                        ),
+                        suggestion: Some(
+                            "supported settings sources are `project`, `user`, and `none`"
+                                .to_owned(),
+                        ),
+                    });
+                }
+                lowered.settings = Some(sources.name);
+            }
             AgentField::Unknown { name, .. } => {
                 diagnostics.push(Diagnostic { related: Vec::new(),
                     span: name.span,
@@ -6415,7 +6461,7 @@ fn lower_agent(
                         name.name, agent.name.name
                     ),
                     suggestion: Some(
-                        "supported agent fields are `provider`, `profile`, `capacity`, `skills`, `capabilities`, `tools`, and `compaction`".to_owned(),
+                        "supported agent fields are `provider`, `profile`, `capacity`, `skills`, `capabilities`, `tools`, `compaction`, and `settings`".to_owned(),
                     ),
                 });
             }
@@ -16772,6 +16818,9 @@ fn format_agent(agent: AgentDecl, formatted: &mut String) {
             AgentField::Compaction(strategy) => {
                 push_line(formatted, format!("  compaction {}", strategy.name));
             }
+            AgentField::Settings(sources) => {
+                push_line(formatted, format!("  settings {}", sources.name));
+            }
             AgentField::Unknown { name, .. } => {
                 push_line(formatted, format!("  {}", name.name));
             }
@@ -18821,6 +18870,13 @@ impl Parser<'_> {
                         self.synchronize_to_block_item();
                     }
                 }
+                "settings" => {
+                    if let Some(sources) = self.expect_ident("settings source") {
+                        fields.push(AgentField::Settings(sources));
+                    } else {
+                        self.synchronize_to_block_item();
+                    }
+                }
                 _ => {
                     let span = field_name.span;
                     fields.push(AgentField::Unknown {
@@ -20617,6 +20673,7 @@ impl Parser<'_> {
                 || self.at_ident("capabilities")
                 || self.at_ident("tools")
                 || self.at_ident("compaction")
+                || self.at_ident("settings")
             {
                 return;
             }
@@ -23074,6 +23131,60 @@ agent worker {
         let plain_ir = plain.ir.expect("ir");
         assert_eq!(plain_ir.agents[0].compaction, None);
         assert!(!plain_ir.to_snapshot().contains("compaction="));
+    }
+
+    #[test]
+    fn agent_settings_source_parses_lowers_formats_and_validates() {
+        // DR-0034 Decision 4: the delegated ambient-config knob.
+        let source = compile_program(
+            "workflow C\nagent w {\n  provider claude\n  profile \"p\"\n  capacity 1\n  settings project\n}\n",
+        );
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let ir = source.ir.expect("ir");
+        let agent = ir.agents.iter().find(|a| a.name == "w").expect("agent");
+        assert_eq!(agent.settings.as_deref(), Some("project"));
+
+        // Round-trips through the formatter and the .ir snapshot.
+        let formatted = format_program(
+            "workflow C\nagent w {\n  provider claude\n  profile \"p\"\n  capacity 1\n  settings project\n}\n",
+        )
+        .formatted
+        .expect("formats");
+        assert!(formatted.contains("settings project"), "{formatted}");
+        assert!(ir.to_snapshot().contains("settings=project"));
+
+        // An unknown source is a diagnostic (not silently accepted).
+        let bad = compile_program(
+            "workflow C\nagent w {\n  provider claude\n  profile \"p\"\n  capacity 1\n  settings everything\n}\n",
+        );
+        assert!(
+            bad.diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown settings source `everything`")),
+            "diagnostics: {:?}",
+            bad.diagnostics
+        );
+
+        // Declaring settings twice is a diagnostic.
+        let dup = compile_program(
+            "workflow C\nagent w {\n  provider claude\n  profile \"p\"\n  capacity 1\n  settings project\n  settings user\n}\n",
+        );
+        assert!(
+            dup.diagnostics
+                .iter()
+                .any(|d| d.message.contains("declares settings more than once")),
+            "diagnostics: {:?}",
+            dup.diagnostics
+        );
+
+        // An agent with no settings field lowers to None and adds no .ir token —
+        // unset means the provider's own default, not the empty set.
+        let plain = compile_program(
+            "workflow C\nagent w {\n  provider claude\n  profile \"p\"\n  capacity 1\n}\n",
+        );
+        let plain_ir = plain.ir.expect("ir");
+        assert_eq!(plain_ir.agents[0].settings, None);
+        assert!(!plain_ir.to_snapshot().contains("settings="));
     }
 
     #[test]

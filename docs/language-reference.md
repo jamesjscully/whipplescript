@@ -274,6 +274,13 @@ bounds concurrent turns and backs `is available` readiness. `capabilities`
 limits what the agent may be asked to do; `skills` attaches context bundles
 to its turns.
 
+`settings` (delegated harnesses, DR-0034) selects which of the delegate's own
+ambient-config sources it may read when assembling its context: `project`,
+`user`, or `none`. Unset means the provider's own default. Ambient config
+steers behavior only — the profile/capabilities envelope alone grants
+authority, so a delegate reading its own project config can never gain a tool
+the program did not authorize.
+
 ### `table`
 
 Static seed rows, typed against a class and recorded when the instance

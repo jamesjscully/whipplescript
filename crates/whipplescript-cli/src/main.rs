@@ -22095,7 +22095,10 @@ fn run_agent_effect(
     // (Decision 2) — the owned catalogue stays discover-all. Degrades to no skills
     // when the program is unavailable (e.g. `whip worker` without `--program`).
     let agent_name = effect.target.as_deref().unwrap_or("agent");
-    let declared_skills: Vec<String> = options
+    // `settings` rides along (DR-0034 Decision 4): the delegated ambient-config
+    // knob, resolved from the same agent declaration. Degrades to None (provider
+    // default) when the program is unavailable.
+    let (declared_skills, agent_settings): (Vec<String>, Option<String>) = options
         .program_path
         .as_deref()
         .and_then(|path| path.to_str())
@@ -22104,7 +22107,7 @@ fn run_agent_effect(
             ir.agents
                 .iter()
                 .find(|agent| agent.name == agent_name)
-                .map(|agent| agent.skills.clone())
+                .map(|agent| (agent.skills.clone(), agent.settings.clone()))
                 .unwrap_or_default()
         })
         .unwrap_or_default();
@@ -22248,6 +22251,7 @@ fn run_agent_effect(
                 effect,
                 &input_json,
                 provider_selection.provider_config.as_ref(),
+                agent_settings.as_deref(),
             )?;
             let mut adapter = match claude_agent_sdk_adapter(&provider_selection.provider_id) {
                 Ok(healthy_adapter) => healthy_adapter,
@@ -22929,6 +22933,7 @@ fn claude_native_turn_request(
     effect: &ClaimableEffect,
     input_json: &str,
     config: Option<&ProviderBindingConfig>,
+    settings: Option<&str>,
 ) -> Result<NativeProviderTurnRequest, StoreError> {
     let input = serde_json::from_str::<Value>(input_json)?;
     let prompt_json = input
@@ -22947,6 +22952,12 @@ fn claude_native_turn_request(
         )),
     );
     apply_provider_config_options(&mut provider_options, config);
+    // Inserted after the config options so the agent's declared `settings` knob
+    // (DR-0034 Decision 4) wins over ambient provider config; absent means the
+    // provider's own default (the adapter omits the sidecar key).
+    if let Some(settings) = settings {
+        provider_options.insert("settings".to_owned(), Value::String(settings.to_owned()));
+    }
     Ok(NativeProviderTurnRequest {
         provider_id: execution.provider.to_owned(),
         provider_kind: ProviderKind::Claude,
@@ -48938,6 +48949,7 @@ rule finish_batch
             &effect,
             r#"{"prompt":"review"}"#,
             Some(&claude_config),
+            Some("project"),
         )
         .expect("claude request builds");
 
@@ -48964,6 +48976,14 @@ rule finish_batch
                 .get("cwd")
                 .and_then(Value::as_str),
             Some("/tmp/whip-reviewer")
+        );
+        // The declared `settings` knob rides provider_options (DR-0034 Decision 4).
+        assert_eq!(
+            claude_request
+                .provider_options
+                .get("settings")
+                .and_then(Value::as_str),
+            Some("project")
         );
 
         let pi_config_json = json!({
