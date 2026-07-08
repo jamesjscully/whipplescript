@@ -1409,6 +1409,21 @@ pub struct IrEffectNode {
     /// selected by a low-integrity discriminant is rejected (DR §5.6 / §7.4). `None`
     /// for effects outside any `case`. Not part of the `.ir` snapshot.
     pub selected_by: Option<(String, String)>,
+    /// The `exec` surface form — raw command string vs manifest capability
+    /// (spec/std-script.md "Static checks" item 2) — surfaced so check-time
+    /// gates (hosted-raw demotion, manifest resolution) classify the effect
+    /// from the AST instead of re-scanning rule-body text. `None` for
+    /// non-`exec` effects. Not part of the `.ir` snapshot.
+    pub exec_target: Option<IrExecTarget>,
+}
+
+/// The two `exec` source forms (spec/std-script.md): a raw command string
+/// (`exec "cmd"`, dev-profile only) or an operator-manifest capability
+/// (`exec <name> with <record>`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IrExecTarget {
+    Raw,
+    Capability { name: String },
 }
 
 /// A lowered turn-access grant: the granted operations narrow the turn's effective
@@ -8562,6 +8577,7 @@ fn analyze_rule(
                 endorsed: false,
                 declassified: false,
                 selected_by: None,
+                exec_target: None,
             });
         }
     }
@@ -9710,6 +9726,20 @@ fn workflow_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
     }
 }
 
+/// The `exec` surface form (raw command vs manifest capability), surfaced so
+/// check-time gates classify exec effects without re-scanning rule-body text.
+fn exec_target_for_body(kind: &body::BodyEffectKind) -> Option<IrExecTarget> {
+    match kind {
+        body::BodyEffectKind::Exec { target, .. } => Some(match target {
+            body::ExecTarget::RawCommand(_) => IrExecTarget::Raw,
+            body::ExecTarget::Capability { name, .. } => {
+                IrExecTarget::Capability { name: name.clone() }
+            }
+        }),
+        _ => None,
+    }
+}
+
 /// Whether an effect carries the `endorsed` source marker (I-IFC3) — a `coerce` the
 /// author declared an integrity-raising crossing.
 fn endorsed_for_body(kind: &body::BodyEffectKind) -> bool {
@@ -9949,6 +9979,7 @@ fn walk_effects(
                 let workflow_target = workflow_target_for_body(&effect.kind);
                 let endorsed = endorsed_for_body(&effect.kind);
                 let declassified = declassified_for_body(&effect.kind);
+                let exec_target = exec_target_for_body(&effect.kind);
                 effects.push(IrEffectNode {
                     id,
                     kind,
@@ -9966,6 +9997,7 @@ fn walk_effects(
                     endorsed,
                     declassified,
                     selected_by: case_stack.last().cloned(),
+                    exec_target,
                 });
             }
             body::BodyStmt::After(after) => {
@@ -13976,6 +14008,56 @@ fn validate_body_effect_operands(
                         });
                     }
                     _ => {}
+                }
+                // `exec <name> with <binding>` requires a typed record binding
+                // (spec/std-script.md "Static checks" item 4): the binding is
+                // serialized to the script's stdin as a typed record, so an
+                // unknown or untyped binding cannot cross.
+                if let body::BodyEffectKind::Exec {
+                    target:
+                        body::ExecTarget::Capability {
+                            name,
+                            stdin_binding,
+                        },
+                    ..
+                } = &effect.kind
+                {
+                    match binding_types.get(stdin_binding) {
+                        None => {
+                            diagnostics.push(Diagnostic {
+                                related: Vec::new(),
+                                span: effect.span,
+                                message: format!(
+                                    "rule `{}` uses unknown binding `{stdin_binding}` in `exec {name} with {stdin_binding}` — `with` requires a typed record binding",
+                                    rule.name.name
+                                ),
+                                suggestion: Some(format!(
+                                    "bind a typed record first (e.g. `when <Class> as {stdin_binding}` or `coerce ... -> <Class> as {stdin_binding}`) and pass that binding to `with`"
+                                )),
+                            });
+                        }
+                        // A dotted binding without an indexed payload class is an
+                        // untyped runtime fact (`when fact <name> as x`) — no
+                        // static record shape crosses to stdin. Non-dotted
+                        // unknown classes are already reported at their binding
+                        // site (`matches unknown class` / unknown parse schema).
+                        Some(schema)
+                            if schema.contains('.') && !semantic.schemas.class_exists(schema) =>
+                        {
+                            diagnostics.push(Diagnostic {
+                                related: Vec::new(),
+                                span: effect.span,
+                                message: format!(
+                                    "rule `{}` passes untyped fact binding `{stdin_binding}` to `exec {name} with` — `with` requires a typed record binding",
+                                    rule.name.name
+                                ),
+                                suggestion: Some(format!(
+                                    "declare `signal {schema} {{ ... }}` for a typed reaction, or bind a declared class and pass that to `with`"
+                                )),
+                            });
+                        }
+                        Some(_) => {}
+                    }
                 }
                 if let body::BodyEffectKind::Exec {
                     parse_target: Some(parse),
@@ -26926,6 +27008,109 @@ rule j
                 .iter()
                 .any(|d| d.message.contains("not a typed path")),
             "exec -> Schema result fields should resolve: {:?}",
+            compiled.diagnostics
+        );
+        assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
+    }
+
+    #[test]
+    fn exec_with_requires_typed_record_binding() {
+        // spec/std-script.md "Static checks" item 4: `exec <name> with <binding>`
+        // serializes the binding to the script's stdin as a typed record, so the
+        // binding must be a typed record binding — unknown or untyped-fact
+        // bindings are check errors.
+        let source = |with_line: &str, when_line: &str| {
+            format!(
+                r#"
+@service
+workflow ExecWith
+
+class Request {{ text string }}
+class Report {{ message string }}
+
+output result Report
+
+rule go
+  when {when_line}
+=> {{
+  exec echo_report with {with_line} -> Report as report
+
+  after report succeeds as out {{
+    complete result {{
+      message out.message
+    }}
+  }}
+}}
+"#
+            )
+        };
+
+        // Positive: a class-typed `when` binding is a typed record binding.
+        let compiled = compile_program(&source("request", "Request as request"));
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("typed record binding")),
+            "typed record binding must pass: {:?}",
+            compiled.diagnostics
+        );
+        assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
+
+        // Negative: an unknown binding.
+        let compiled = compile_program(&source("missing", "Request as request"));
+        assert!(
+            compiled.diagnostics.iter().any(|d| d
+                .message
+                .contains("uses unknown binding `missing` in `exec echo_report with missing`")),
+            "unknown binding must be rejected: {:?}",
+            compiled.diagnostics
+        );
+
+        // Negative: an untyped runtime fact binding carries no record shape.
+        let compiled = compile_program(&source("g", "fact foo.bar as g"));
+        assert!(
+            compiled.diagnostics.iter().any(|d| d
+                .message
+                .contains("passes untyped fact binding `g` to `exec echo_report with`")),
+            "untyped fact binding must be rejected: {:?}",
+            compiled.diagnostics
+        );
+
+        // Positive: a typed result binding (`exec -> Schema as r`) is a typed
+        // record binding for a downstream `with`.
+        let chained = r#"
+@service
+workflow ExecWithChained
+
+class Request { text string }
+class Report { message string }
+
+output result Report
+
+rule go
+  when Request as request
+=> {
+  exec fetch_request with request -> Request as fetched
+
+  after fetched succeeds as staged {
+    exec echo_report with staged -> Report as report
+
+    after report succeeds as out {
+      complete result {
+        message out.message
+      }
+    }
+  }
+}
+"#;
+        let compiled = compile_program(chained);
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("typed record binding")),
+            "typed exec-result binding must pass: {:?}",
             compiled.diagnostics
         );
         assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);

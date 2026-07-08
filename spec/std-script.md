@@ -116,7 +116,8 @@ exec "cargo test" as y                        # raw form, dev profile only
     entry at load (main.rs:3143-3166).
   - `script.raw` — NEW: the demoted raw form's required capability (below).
     The operator script-manifest key `raw` is therefore reserved: manifest
-    keys must match `[a-z_][a-z0-9_]*` and must not be `raw` (load error).
+    keys must match `[a-z_][a-z0-9_]*` and must not be `raw` (load error;
+    shipped 2026-07-08, S6d-7, in `ScriptManifest::load`).
 - **Library id:** `std.script`, `standard: true`. `use std.script` registers
   it in the compile-time ContractRegistry; usage-driven auto-registration is
   NOT added (hard-off inverts it: the import gates the construct, per M5).
@@ -183,7 +184,7 @@ any provider run.
 >   grammar; the manifest pipeline forbids non-`capability.call` effect
 >   contracts, so the `exec.command` contract row is deliberately absent) and
 >   no parser build.rs entry (grammar-only list). The reserved-`raw` manifest
->   key check and the M8 static-check rewrites remain open (below).
+>   key check and the M8 static-check rewrites shipped in S6d-7 (below).
 > - **Tests** — store: forged-IR fixture (direct registration, raw + capability
 >   form) blocks at admission with no run row; seeded `script.raw` admits.
 >   CLI e2e: both two-key negatives (import+no-authority,
@@ -286,17 +287,29 @@ M8 tier 2: hand-coded core checks, named here as this package's demands
 1. **Hard-off:** any `exec` form without `use std.script` →
    `security.script_disabled` (both profiles).
 2. **Hosted raw:** raw string exec under `--exec-profile hosted` → error
-   suggesting the capability form (shipped, main.rs:3168-3242) — REWRITTEN
-   onto the AST/IR, replacing the fragile line-scan over rule bodies
-   (main.rs:3196-3208); M8 names this rewrite as owned by this slice.
+   suggesting the capability form (shipped) — REWRITTEN onto the AST/IR,
+   replacing the fragile line-scan over rule bodies; M8 named this rewrite as
+   owned by this slice. **Shipped 2026-07-08 (S6d-7):** `lint_hosted_exec`
+   (cli/main.rs) walks `IrEffectKind::ExecCommand` effect nodes — the same
+   structures `check_script_hard_off` walks — via the AST-derived
+   `exec_target` (raw vs capability) on `IrEffectNode`; exec-looking text in
+   prompts or string literals can no longer misfire the gate (regression
+   test: tell-prompt decoy).
 3. **Manifest resolution:** capability name absent from a supplied manifest →
    check error listing declared capabilities (shipped; keep).
 4. **`with` typing:** `with <binding>` requires a typed record binding —
-   closing the recorded gap where lowering accepts arbitrary text
-   (rule_lowering.rs:2627-2645).
+   closing the recorded gap where lowering accepts arbitrary text.
+   **Shipped 2026-07-08 (S6d-7):** check error in
+   `validate_body_effect_operands` (parser); unknown bindings and untyped
+   runtime-fact bindings are rejected, class-typed and typed-result bindings
+   pass.
 5. **Control-plane deny-list at check time:** manifest argv whose executable
    basename is `whip` (or a future denied list) is a manifest load error,
    mirroring the shipped runtime refusal so operators learn at pin time.
+   **Shipped 2026-07-08 (S6d-7):** `ScriptManifest::load` refuses denied
+   basenames using the shared `SCRIPT_DENIED_EXECUTABLES` list
+   (`script_argv_denied_executable`) that the runtime exec path also checks,
+   so the two sites cannot drift.
 
 ## Information-flow face
 

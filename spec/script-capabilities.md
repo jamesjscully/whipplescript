@@ -101,6 +101,15 @@ workspace, unreachable from any agent sandbox:
 }
 ```
 
+- **Keys are capability names.** Each manifest key mints the capability id
+  `script.<key>`, so keys must match `[a-z_][a-z0-9_]*`. The key `raw` is
+  reserved — it would shadow `script.raw`, the raw dev-exec form's capability
+  id ([`std-script.md`](std-script.md) "Capability ids"). Either violation is
+  a manifest **load error**.
+- **`whip` is refused at load.** An argv element whose executable basename is
+  `whip` (path forms like `/usr/bin/whip` included) is a manifest load error —
+  the same deny-list the runtime exec path re-checks (see "Hard exclusions"
+  below), surfaced at pin time so operators learn early.
 - **Identity is content.** The `sha256` pins the script bytes. An update is
   an explicit operator act: edit script, re-pin, with the old and new hashes
   in the audit trail. Names stay stable while content evolves; author-pinned
@@ -164,6 +173,8 @@ workspace, unreachable from any agent sandbox:
   `whip signal` or `whip revise` would let the authoring plane mint
   control-plane actions and the tier separation collapses. The native verbs
   (queue ops, typed signal injection, coordination) cover the legitimate cases.
+  Enforced from one deny-list at two points: manifest load refuses a `whip`
+  argv (pin time, above), and the runtime exec path re-checks before spawn.
 - **No script execution through agent providers.** An agent harness may have its
   own tools, but those tools are governed by the agent provider profile. They
   must not be used as an implicit fallback for `std.script`. If script execution

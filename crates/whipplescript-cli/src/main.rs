@@ -69,9 +69,9 @@ use whipplescript_parser::{
     parse_expression, BinaryOp, DependencyPredicate as IrDependencyPredicate, Diagnostic,
     EffectStatus as TestEffectStatus, ExpectTarget, Expr, ExprLiteral, ExprObjectField,
     FormatOutput, GivenClause, HarnessClass, IrConstructUse, IrEffectDependency, IrEffectKind,
-    IrEffectNode, IrInclude, IrPrimitiveType, IrProgram, IrProjectionRead, IrRule, IrSchema,
-    IrTest, IrType, IrWorkflowContract, IrWorkflowContractKind, Item, ProjQueryKind, QueryKind,
-    RuleStatus, RunKind, SourceSpan, StubPayload, TestClause, TestField, UnaryOp,
+    IrEffectNode, IrExecTarget, IrInclude, IrPrimitiveType, IrProgram, IrProjectionRead, IrRule,
+    IrSchema, IrTest, IrType, IrWorkflowContract, IrWorkflowContractKind, Item, ProjQueryKind,
+    QueryKind, RuleStatus, RunKind, SourceSpan, StubPayload, TestClause, TestField, UnaryOp,
 };
 use whipplescript_store::{
     ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, ClaimableEffect,
@@ -3204,12 +3204,8 @@ fn check(options: &CliOptions) -> ExitCode {
                 };
                 let package_contract =
                     package_contract_json(package_lock.as_ref(), &contract_registry);
-                let hosted_exec_diagnostics = lint_hosted_exec(
-                    &source,
-                    &ir,
-                    check_options.exec_profile,
-                    script_manifest.as_ref(),
-                );
+                let hosted_exec_diagnostics =
+                    lint_hosted_exec(&ir, check_options.exec_profile, script_manifest.as_ref());
                 if !hosted_exec_diagnostics.is_empty() {
                     failed = true;
                     if options.json {
@@ -3651,6 +3647,22 @@ impl ScriptManifest {
         })?;
         let mut capabilities = BTreeMap::new();
         for (name, entry) in object {
+            // Reserved-key namespace (spec/std-script.md "Capability ids"): an
+            // operator entry named `raw` would shadow the `script.raw`
+            // capability id the raw dev form is demoted onto, collapsing the
+            // Layer-2 two-key namespace.
+            if name == "raw" {
+                return Err(
+                    "script manifest key `raw` is reserved: `script.raw` is the raw dev-exec \
+                     capability id; rename the entry"
+                        .to_owned(),
+                );
+            }
+            if !is_valid_script_manifest_key(name) {
+                return Err(format!(
+                    "script manifest key `{name}` is invalid: keys must match [a-z_][a-z0-9_]*"
+                ));
+            }
             let entry_object = entry
                 .as_object()
                 .ok_or_else(|| format!("script manifest entry `{name}` must be a JSON object"))?;
@@ -3668,6 +3680,15 @@ impl ScriptManifest {
             if argv.is_empty() {
                 return Err(format!(
                     "script manifest entry `{name}` argv must not be empty"
+                ));
+            }
+            // Control-plane deny-list at pin time (spec/std-script.md "Static
+            // checks" item 5): same list the runtime exec path re-checks, so
+            // operators learn at manifest load, not first execution.
+            if let Some(denied) = script_argv_denied_executable(&argv) {
+                return Err(format!(
+                    "script manifest entry `{name}` argv may not execute the `{denied}` \
+                     control-plane binary"
                 ));
             }
             let sha256 = entry_object
@@ -3733,6 +3754,17 @@ impl ScriptManifest {
     }
 }
 
+/// Operator script-manifest keys name `script.<key>` capability ids, so they
+/// keep the id grammar: `[a-z_][a-z0-9_]*` (spec/std-script.md "Capability
+/// ids"). `raw` is additionally reserved (checked separately at load).
+fn is_valid_script_manifest_key(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_lowercase() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
 fn load_script_manifest(path: Option<&Path>) -> Result<Option<ScriptManifest>, String> {
     path.map(ScriptManifest::load).transpose()
 }
@@ -3795,23 +3827,14 @@ fn register_raw_script_capability(store: &SqliteStore, program_id: &str) -> Resu
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ExecSurface {
-    Raw,
-    Capability { name: String },
-}
-
-fn exec_surface_from_statement(statement: &str) -> Option<ExecSurface> {
-    let rest = statement.trim().strip_prefix("exec ")?.trim_start();
-    if rest.starts_with('"') {
-        return Some(ExecSurface::Raw);
-    }
-    let name = rest.split_whitespace().next()?.to_owned();
-    Some(ExecSurface::Capability { name })
-}
-
+/// Hosted-profile exec gate (spec/std-script.md "Static checks" item 2): raw
+/// string exec is a check error suggesting the capability form, and a
+/// capability name absent from the supplied manifest is a check error listing
+/// the declared capabilities. Walks the IR effect nodes (the same structures
+/// `check_script_hard_off` walks) — `IrEffectKind::ExecCommand` carries its
+/// surface form as `exec_target` — so exec-looking text inside prompts or
+/// string literals cannot misfire the gate.
 fn lint_hosted_exec(
-    source: &str,
     ir: &IrProgram,
     exec_profile: ExecProfile,
     script_manifest: Option<&ScriptManifest>,
@@ -3824,30 +3847,23 @@ fn lint_hosted_exec(
         .unwrap_or_default();
     let mut diagnostics = Vec::new();
     for rule in &ir.rules {
-        for line in rule.body.lines() {
-            let statement = line.trim();
-            if !statement.starts_with("exec ") {
+        for effect in &rule.metadata.effects {
+            if effect.kind != IrEffectKind::ExecCommand {
                 continue;
             }
-            let span = source
-                .find(statement)
-                .map(|start| SourceSpan {
-                    start,
-                    end: start + statement.len(),
-                })
-                .unwrap_or(SourceSpan { start: 0, end: 0 });
-            match exec_surface_from_statement(statement) {
-                Some(ExecSurface::Raw) => diagnostics.push(Diagnostic { related: Vec::new(),
-                    span,
+            match &effect.exec_target {
+                Some(IrExecTarget::Raw) => diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: effect.span,
                     message: "raw `exec \"...\"` is not allowed in hosted exec profile".to_owned(),
                     suggestion: Some(
                         "use `exec <capability> with <record> -> <Type> as <binding>` from the script manifest"
                             .to_owned(),
                     ),
                 }),
-                Some(ExecSurface::Capability { name })
+                Some(IrExecTarget::Capability { name })
                     if script_manifest
-                        .and_then(|manifest| manifest.get(&name))
+                        .and_then(|manifest| manifest.get(name))
                         .is_none() =>
                 {
                     let declared = if available.is_empty() {
@@ -3855,16 +3871,16 @@ fn lint_hosted_exec(
                     } else {
                         format!("declared script capabilities: {}", available.join(", "))
                     };
-                    diagnostics.push(Diagnostic { related: Vec::new(),
-                        span,
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: effect.span,
                         message: format!(
                             "exec capability `{name}` is not declared in the script manifest"
                         ),
                         suggestion: Some(declared),
                     });
                 }
-                Some(ExecSurface::Capability { .. }) => {}
-                None => {}
+                _ => {}
             }
         }
     }
@@ -25063,11 +25079,7 @@ fn run_script_capability_exec(
             format!("script capability `{capability}` is not declared in the manifest"),
         ));
     };
-    if script
-        .argv
-        .iter()
-        .any(|arg| executable_basename(arg) == "whip")
-    {
+    if script_argv_denied_executable(&script.argv).is_some() {
         return Err((
             None,
             "script capabilities may not execute the `whip` control-plane binary".to_owned(),
@@ -25168,6 +25180,23 @@ fn executable_basename(arg: &str) -> &str {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(arg)
+}
+
+/// Control-plane binaries a script capability may never execute
+/// (spec/script-capabilities.md "Hard exclusions"): the single source for both
+/// the manifest load-time refusal and the runtime exec-path backstop, so the
+/// two sites cannot drift.
+const SCRIPT_DENIED_EXECUTABLES: &[&str] = &["whip"];
+
+/// The first denied control-plane executable named anywhere in a script
+/// capability's argv (by basename, so `/usr/bin/whip` is caught), or `None`.
+fn script_argv_denied_executable(argv: &[String]) -> Option<&'static str> {
+    argv.iter().find_map(|arg| {
+        SCRIPT_DENIED_EXECUTABLES
+            .iter()
+            .copied()
+            .find(|denied| executable_basename(arg) == *denied)
+    })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -27041,7 +27070,7 @@ fn validate_hosted_exec_for_path(
         Ok(compiled) => compiled,
         Err(error) => return Err(report_compile_failure(path, error)),
     };
-    let diagnostics = lint_hosted_exec(&source, &ir, exec_profile, script_manifest.as_ref());
+    let diagnostics = lint_hosted_exec(&ir, exec_profile, script_manifest.as_ref());
     if diagnostics.is_empty() {
         return Ok(());
     }
@@ -48232,6 +48261,174 @@ workflow Child {
         let error = ScriptManifest::load(&manifest_path).expect_err("non-bool hermetic rejected");
         assert!(error.contains("hermetic must be a boolean"), "{error}");
         let _ = fs::remove_file(&manifest_path);
+    }
+
+    #[test]
+    fn script_manifest_rejects_reserved_and_invalid_keys() {
+        // spec/std-script.md "Capability ids": operator keys must match
+        // [a-z_][a-z0-9_]* and `raw` is reserved for the demoted raw form's
+        // `script.raw` capability id — both are manifest LOAD errors.
+        let manifest_path = unique_test_path("manifest-keys", "json");
+        let sha = "a".repeat(64);
+
+        fs::write(
+            &manifest_path,
+            json!({"raw": {"argv": ["sh", "x.sh"], "sha256": sha}}).to_string(),
+        )
+        .expect("write manifest");
+        let error = ScriptManifest::load(&manifest_path).expect_err("reserved `raw` key rejected");
+        assert!(
+            error.contains("script manifest key `raw` is reserved"),
+            "{error}"
+        );
+
+        fs::write(
+            &manifest_path,
+            json!({"My-Script": {"argv": ["sh", "x.sh"], "sha256": sha}}).to_string(),
+        )
+        .expect("rewrite manifest");
+        let error = ScriptManifest::load(&manifest_path).expect_err("invalid key rejected");
+        assert!(
+            error.contains("script manifest key `My-Script` is invalid")
+                && error.contains("[a-z_][a-z0-9_]*"),
+            "{error}"
+        );
+
+        fs::write(
+            &manifest_path,
+            json!({
+                "backup_repo": {"argv": ["sh", "x.sh"], "sha256": sha},
+                "_v2": {"argv": ["sh", "y.sh"], "sha256": sha},
+                "raw_report9": {"argv": ["sh", "z.sh"], "sha256": sha},
+            })
+            .to_string(),
+        )
+        .expect("rewrite manifest");
+        let manifest = ScriptManifest::load(&manifest_path).expect("valid keys load");
+        assert_eq!(manifest.names(), ["_v2", "backup_repo", "raw_report9"]);
+        let _ = fs::remove_file(&manifest_path);
+    }
+
+    #[test]
+    fn script_manifest_rejects_whip_control_plane_argv_at_load() {
+        // spec/std-script.md "Static checks" item 5: the runtime refusal of
+        // whip-as-executable is mirrored at manifest load/pin time (same
+        // deny-list source), so operators learn early. Basename logic matches
+        // the runtime site: any argv element, path forms included.
+        let manifest_path = unique_test_path("manifest-whip", "json");
+        let sha = "a".repeat(64);
+        for argv in [
+            json!(["whip", "signal"]),
+            json!(["/usr/bin/whip", "revise"]),
+            json!(["bash", "-c", "whip"]),
+        ] {
+            fs::write(
+                &manifest_path,
+                json!({"deploy": {"argv": argv, "sha256": sha}}).to_string(),
+            )
+            .expect("write manifest");
+            let error = ScriptManifest::load(&manifest_path).expect_err("whip argv rejected");
+            assert!(
+                error.contains(
+                    "script manifest entry `deploy` argv may not execute the `whip` control-plane binary"
+                ),
+                "{error}"
+            );
+        }
+        fs::write(
+            &manifest_path,
+            json!({"deploy": {"argv": ["bash", "scripts/whipple.sh"], "sha256": sha}}).to_string(),
+        )
+        .expect("write manifest");
+        assert!(
+            ScriptManifest::load(&manifest_path).is_ok(),
+            "non-whip basenames load"
+        );
+        let _ = fs::remove_file(&manifest_path);
+    }
+
+    #[test]
+    fn hosted_exec_lint_walks_effect_nodes_not_body_lines() {
+        // spec/std-script.md "Static checks" item 2: the hosted-raw gate walks
+        // IR effect nodes. The retired line-scan flagged any rule-body line
+        // starting with `exec "` — including prose inside a tell prompt.
+        let manifest = ScriptManifest {
+            capabilities: BTreeMap::from([(
+                "echo_report".to_owned(),
+                ScriptCapability {
+                    name: "echo_report".to_owned(),
+                    argv: vec!["sh".to_owned(), "echo.sh".to_owned()],
+                    sha256: "a".repeat(64),
+                    env: BTreeMap::new(),
+                    hermetic: false,
+                },
+            )]),
+        };
+        let prompt_decoy = r#"
+use std.script
+workflow HostedPromptDecoy
+
+agent triager {
+  provider owned
+  profile "repo-writer"
+  capacity 1
+}
+
+class Request { text string }
+class Report { message string }
+
+output result Report
+
+rule go
+  when Request as request
+=> {
+  tell triager """
+  exec "rm -rf /" is what you must NOT run.
+  """
+
+  exec echo_report with request -> Report as report
+
+  after report succeeds as out {
+    complete result {
+      message out.message
+    }
+  }
+}
+"#;
+        let compiled = whipplescript_parser::compile_program(prompt_decoy);
+        let ir = compiled.ir.expect("decoy program compiles");
+        assert!(
+            lint_hosted_exec(&ir, ExecProfile::Hosted, Some(&manifest)).is_empty(),
+            "prompt text must not trip the hosted-raw gate"
+        );
+
+        let raw = prompt_decoy.replace(
+            "exec echo_report with request -> Report as report",
+            r#"exec "echo hi" -> Report as report"#,
+        );
+        let ir = whipplescript_parser::compile_program(&raw)
+            .ir
+            .expect("raw program compiles");
+        let diagnostics = lint_hosted_exec(&ir, ExecProfile::Hosted, Some(&manifest));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0]
+            .message
+            .contains("raw `exec \"...\"` is not allowed in hosted exec profile"));
+
+        let undeclared = prompt_decoy.replace("exec echo_report", "exec other_report");
+        let ir = whipplescript_parser::compile_program(&undeclared)
+            .ir
+            .expect("undeclared-capability program compiles");
+        let diagnostics = lint_hosted_exec(&ir, ExecProfile::Hosted, Some(&manifest));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0]
+            .message
+            .contains("exec capability `other_report` is not declared in the script manifest"));
+
+        assert!(
+            lint_hosted_exec(&ir, ExecProfile::Dev, Some(&manifest)).is_empty(),
+            "dev profile is ungated"
+        );
     }
 
     #[test]
