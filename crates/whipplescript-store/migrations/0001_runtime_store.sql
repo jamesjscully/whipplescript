@@ -322,6 +322,15 @@ CREATE TABLE profiles (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Project-instruction documents (AGENTS.md / CLAUDE.md) for store-backed
+-- context resolution on hosts without a filesystem (context-assembly Phase 3).
+CREATE TABLE project_context_docs (
+    position INTEGER PRIMARY KEY,
+    path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    body TEXT NOT NULL
+);
+
 CREATE TABLE skills (
     skill_id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,

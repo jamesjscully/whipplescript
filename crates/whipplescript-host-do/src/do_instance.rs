@@ -21,6 +21,9 @@ use whipplescript_kernel::coerce::{CoerceRequest, CoerceResult, CoerceStatus};
 use whipplescript_kernel::coerce_native::{
     build_coerce_call_parts, build_request, parse_response, CoerceCall, CoerceProvider,
 };
+use whipplescript_kernel::context_assembly::{
+    render_project_context, BundleKind, BundleProvenance, ProjectInstruction,
+};
 use whipplescript_kernel::effect_config::EffectConfig;
 use whipplescript_kernel::effect_handlers::{
     run_capability_effect_generic, run_coordination_effect_generic, run_event_effect_generic,
@@ -42,7 +45,7 @@ use whipplescript_kernel::AgentTurnExecution;
 use whipplescript_kernel::{idempotency_key, CoerceExecution, RuntimeKernel};
 use whipplescript_parser::IrProgram;
 use whipplescript_store::files::FileStore;
-use whipplescript_store::{ClaimableEffect, RunStart, RuntimeStore, StoreError};
+use whipplescript_store::{ClaimableEffect, EvidenceRecord, RunStart, RuntimeStore, StoreError};
 
 /// Projected coerce provider credentials (the DO secrets plane supplies these; a
 /// live worker reads them from its bindings). Everything else the coerce HTTP
@@ -201,14 +204,43 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     .and_then(|value| value.as_str())
                     .unwrap_or_default()
                     .to_owned();
+                // Store-backed project instructions (context-assembly Phase 3
+                // item 4): the DO has no filesystem, so AGENTS.md/CLAUDE.md
+                // content registered at deploy resolves from the store — the
+                // same wrapper bytes the native fs path injects.
+                let docs = self.kernel.store().list_project_context_docs()?;
+                let (system, context_bundles) = if docs.is_empty() {
+                    ("You are a WhippleScript agent.".to_owned(), Vec::new())
+                } else {
+                    let instructions: Vec<ProjectInstruction> = docs
+                        .iter()
+                        .map(|doc| ProjectInstruction {
+                            path: doc.path.clone(),
+                            content: doc.body.clone(),
+                        })
+                        .collect();
+                    let block = render_project_context(&instructions);
+                    let bundles = docs
+                        .iter()
+                        .map(|doc| BundleProvenance {
+                            kind: BundleKind::ProjectContext,
+                            source: doc.path.clone(),
+                            version: String::new(),
+                            content_hash: doc.content_hash.clone(),
+                        })
+                        .collect();
+                    (
+                        format!("You are a WhippleScript agent.\n\n{block}"),
+                        bundles,
+                    )
+                };
                 let turn_input = BrokeredTurnInput {
-                    system: "You are a WhippleScript agent.".to_owned(),
+                    system,
                     user: prompt,
                     tools: Vec::new(),
                     max_steps: 8,
                     resume_from: Vec::new(),
-                    // DO agent stub: no context assembler yet, so no bundle rows.
-                    context_bundles: Vec::new(),
+                    context_bundles,
                     pinned_skills: Vec::new(),
                 };
                 let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "agent-run"]);
@@ -226,6 +258,28 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                         lease_expires_at: "2030-01-01T00:00:00Z",
                         metadata_json: "{}",
                     })?;
+                    // Context-assembly Phase 1 seam: one context.bundle row per
+                    // assembled bundle, fresh starts only (resume must not
+                    // duplicate) — same discipline as the native owned turn.
+                    for bundle in &turn_input.context_bundles {
+                        let metadata = serde_json::json!({
+                            "kind": bundle.kind.tag(),
+                            "source": bundle.source,
+                            "version": bundle.version,
+                            "content_hash": bundle.content_hash,
+                        })
+                        .to_string();
+                        self.kernel.store_mut().record_evidence(EvidenceRecord {
+                            instance_id: self.instance_id,
+                            kind: "context.bundle",
+                            subject_type: "run",
+                            subject_id: &run_id,
+                            causation_id: None,
+                            correlation_id: Some(&effect.effect_id),
+                            summary: Some(bundle.kind.tag()),
+                            metadata_json: &metadata,
+                        })?;
+                    }
                 }
                 let mut discard = |_: &[ChatMessage]| {};
                 // The DO agent turn is still a no-tools stub; conversation compaction
@@ -753,6 +807,150 @@ mod tests {
             .expect("status")
             .expect("instance row");
         assert_eq!(status.instance.status, "completed");
+    }
+
+    /// Store-backed project instructions (context-assembly Phase 3 item 4):
+    /// docs registered in the DO store ride into the agent turn's system prompt
+    /// with pi's exact wrapper, and each doc records a `context.bundle`
+    /// provenance row through the Phase 1 seam.
+    #[test]
+    fn do_agent_turn_injects_store_backed_project_context() {
+        use std::cell::RefCell;
+
+        /// A fake model that captures the system prompt it was asked to send.
+        struct CapturingModel {
+            systems: RefCell<Vec<String>>,
+        }
+        impl HttpModelClient for CapturingModel {
+            fn build_request(
+                &self,
+                messages: &[ChatMessage],
+                _tools: &[whipplescript_kernel::harness_loop::ToolSpec],
+            ) -> whipplescript_kernel::sansio::HttpRequest {
+                for message in messages {
+                    if let ChatMessage::System(system) = message {
+                        self.systems.borrow_mut().push(system.clone());
+                    }
+                }
+                whipplescript_kernel::sansio::HttpRequest {
+                    url: "https://provider/agent".to_owned(),
+                    headers: Vec::new(),
+                    body: serde_json::json!({}),
+                }
+            }
+            fn parse_response(
+                &self,
+                _response: Result<HttpResponse, TransportError>,
+            ) -> Result<
+                whipplescript_kernel::harness_loop::ModelReply,
+                whipplescript_kernel::harness_loop::HarnessModelError,
+            > {
+                Ok(whipplescript_kernel::harness_loop::ModelReply {
+                    text: "done".to_owned(),
+                    tool_calls: Vec::new(),
+                    usage: Default::default(),
+                })
+            }
+        }
+
+        let source = "workflow AgentDemo\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             agent helper {\n  provider owned\n  profile \"repo-reader\"\n  capacity 1\n}\n\n\
+             rule go\n  when started\n=> {\n  tell helper as reply \"\"\"\n  Do the thing.\n  \"\"\"\n\n\
+             \x20 after reply succeeds {\n    complete result { ok 1 }\n  }\n\n\
+             \x20 after reply fails {\n    complete result { ok 0 }\n  }\n}\n";
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("agent program compiles");
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('agent.tell', 'Run an agent turn.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+            "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) \
+             VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed agent provider");
+        }
+        store
+            .register_project_context_doc(0, "repo/AGENTS.md", "Always be excellent.")
+            .expect("doc registers");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: "src",
+                    ir_hash: "ir",
+                    compiler_version: "test",
+                },
+                &ir,
+            )
+            .expect("program version");
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/AgentDemo",
+                    effective_authority_json: "{}",
+                },
+            )
+            .expect("instance");
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .expect("start event");
+
+        let model = CapturingModel {
+            systems: RefCell::new(Vec::new()),
+        };
+        let driver = DoInstanceDriver {
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            agent_model: Some(&model),
+            agent_tools: &NoTools,
+            ir: &ir,
+            instance_id: &instance_id,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &OkHost);
+        assert!(
+            matches!(outcome, InstanceOutcome::Terminal),
+            "turn completes: {outcome:?}"
+        );
+
+        // The system prompt carried the store-resolved project context in pi's
+        // exact wrapper.
+        let systems = model.systems.borrow();
+        let system = systems.first().expect("a model round ran");
+        assert!(
+            system.contains("<project_instructions path=\"repo/AGENTS.md\">"),
+            "{system}"
+        );
+        assert!(system.contains("Always be excellent."), "{system}");
+
+        // One context.bundle provenance row rode the Phase 1 seam.
+        let driver = machine.into_driver();
+        let evidence = driver
+            .kernel
+            .store()
+            .list_evidence(&instance_id)
+            .expect("evidence");
+        let bundles: Vec<_> = evidence
+            .iter()
+            .filter(|row| row.kind == "context.bundle")
+            .collect();
+        assert_eq!(bundles.len(), 1, "one project-context bundle row");
+        assert!(
+            bundles[0].metadata_json.contains("project_context")
+                && bundles[0].metadata_json.contains("repo/AGENTS.md"),
+            "{}",
+            bundles[0].metadata_json
+        );
     }
 
     /// A host that answers any request with a 200 (the fake model ignores the body).

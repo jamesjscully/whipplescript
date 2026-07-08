@@ -238,9 +238,17 @@ Mirror pi's discovery exactly, registry-backed for the DO.
   via the owned harness `ProjectContext` bundle (rides the Phase 1 seam →
   `context.bundle` evidence). Disable flag = `WHIPPLESCRIPT_NO_CONTEXT_FILES`.
   Integration test (workspace AGENTS.md → project_context evidence).
-- [ ] On the DO (no fs): resolve the same content from the store (content-addressed)
-  — **follow-on** (like the skill activation read; the DO agent turn is still a
-  no-tools stub, so there is no DO-side consumer yet).
+- [x] On the DO (no fs): resolve the same content from the store (content-addressed)
+  — **DONE 2026-07-07**: `project_context_docs` table (native migration + DO
+  schema) + `register_project_context_doc`/`list_project_context_docs` on the
+  `RuntimeStore` trait (all three impls); the renderer lifted to
+  `kernel::context_assembly::render_project_context` (CLI delegates — both
+  hosts inject byte-identical wrapper bytes); wasm `create` accepts
+  deploy-shipped `[{path, content}]` docs, the worker shell passes them from
+  the POST bootstrap; the DO agent turn resolves docs from the store into the
+  system prompt and records one `context.bundle` provenance row per doc
+  (fresh-start-guarded, mirroring the native seam). Tested end-to-end
+  (capturing-model test asserts the wrapper bytes + the evidence row).
 
 ---
 

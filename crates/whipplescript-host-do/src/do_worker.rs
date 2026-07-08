@@ -150,6 +150,7 @@ impl<Sql: DoSql> DurableInstance<Sql> {
         input_json: &str,
         workflow_principal: &str,
         ports: DurableEffectPorts,
+        project_context: &[(String, String)],
     ) -> Result<Self, String> {
         let ir = whipplescript_parser::compile_program(program_source)
             .ir
@@ -166,6 +167,15 @@ impl<Sql: DoSql> DurableInstance<Sql> {
                 &ir,
             )
             .map_err(|error| format!("{error:?}"))?;
+        // Register deploy-shipped project instructions (context-assembly
+        // Phase 3 item 4) — content-addressed, idempotent by position, read by
+        // the agent turn's store-backed context resolution.
+        for (position, (path, body)) in project_context.iter().enumerate() {
+            kernel
+                .store()
+                .register_project_context_doc(position as i64, path, body)
+                .map_err(|error| format!("{error:?}"))?;
+        }
         let existing = kernel
             .store()
             .list_instances()
@@ -341,6 +351,7 @@ mod tests {
             "{}",
             "local/MinimalNoop",
             DurableEffectPorts::default(),
+            &[],
         )
         .expect("create");
         assert!(
@@ -373,6 +384,7 @@ mod tests {
             "{}",
             "local/TimerDemo",
             DurableEffectPorts::default(),
+            &[],
         )
         .expect("create");
 
@@ -444,7 +456,7 @@ mod tests {
             ..DurableEffectPorts::default()
         };
         let mut instance =
-            DurableInstance::create(base.sql, source, "{}", "local/CoerceScore", ports)
+            DurableInstance::create(base.sql, source, "{}", "local/CoerceScore", ports, &[])
                 .expect("create");
 
         // First step: the coerce effect suspends on `fetch`.
@@ -524,7 +536,7 @@ mod tests {
             ..DurableEffectPorts::default()
         };
         let mut instance =
-            DurableInstance::create(base.sql, source, "{}", "local/AgentDemo", ports)
+            DurableInstance::create(base.sql, source, "{}", "local/AgentDemo", ports, &[])
                 .expect("create");
 
         // First step: the agent turn's first model call suspends on `fetch`, and the

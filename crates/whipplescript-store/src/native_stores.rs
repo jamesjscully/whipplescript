@@ -261,6 +261,20 @@ impl RuntimeStore for NativeStores {
         self.runtime.register_skill(skill)
     }
 
+    fn register_project_context_doc(
+        &self,
+        position: i64,
+        path: &str,
+        body: &str,
+    ) -> StoreResult<()> {
+        self.runtime
+            .register_project_context_doc(position, path, body)
+    }
+
+    fn list_project_context_docs(&self) -> StoreResult<Vec<ProjectContextDoc>> {
+        self.runtime.list_project_context_docs()
+    }
+
     fn attach_skill(&self, attachment: SkillAttachment<'_>) -> StoreResult<()> {
         self.runtime.attach_skill(attachment)
     }

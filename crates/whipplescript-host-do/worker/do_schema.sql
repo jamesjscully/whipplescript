@@ -122,6 +122,10 @@
                 terminal_event_id TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT
             );
+            CREATE TABLE project_context_docs (
+                position INTEGER PRIMARY KEY, path TEXT NOT NULL,
+                content_hash TEXT NOT NULL, body TEXT NOT NULL
+            );
             CREATE TABLE skills (
                 skill_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, version TEXT NOT NULL,
                 source TEXT NOT NULL, source_path TEXT NOT NULL, content_hash TEXT NOT NULL,

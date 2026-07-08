@@ -331,6 +331,19 @@ pub struct CapabilityBinding<'a> {
     pub config_json: &'a str,
 }
 
+/// One project-instruction document (AGENTS.md / CLAUDE.md) registered for the
+/// durable object's store-backed context resolution (context-assembly Phase 3
+/// item 4). `position` is the injection order (root-most first, nearest-cwd
+/// last); `content_hash` is the body's hash so it is content-addressed and
+/// replay-stable, mirroring skills.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectContextDoc {
+    pub position: i64,
+    pub path: String,
+    pub content_hash: String,
+    pub body: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SkillRegistration<'a> {
     pub skill_id: &'a str,
@@ -2946,6 +2959,42 @@ impl SqliteStore {
         }
     }
 
+    /// Register (or replace) one project-instruction document at `position`
+    /// (context-assembly Phase 3 item 4). Content-addressed like skills: the
+    /// stored hash is the body's hash.
+    pub fn register_project_context_doc(
+        &self,
+        position: i64,
+        path: &str,
+        body: &str,
+    ) -> StoreResult<()> {
+        let content_hash = stable_hash_hex(body);
+        self.connection.execute(
+            "INSERT OR REPLACE INTO project_context_docs (position, path, content_hash, body) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![position, path, content_hash, body],
+        )?;
+        Ok(())
+    }
+
+    /// The registered project-instruction documents in injection order.
+    pub fn list_project_context_docs(&self) -> StoreResult<Vec<ProjectContextDoc>> {
+        let mut statement = self.connection.prepare(
+            "SELECT position, path, content_hash, body FROM project_context_docs \
+             ORDER BY position",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ProjectContextDoc {
+                position: row.get(0)?,
+                path: row.get(1)?,
+                content_hash: row.get(2)?,
+                body: row.get(3)?,
+            })
+        })?;
+        rows.collect::<result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     pub fn list_skills(&self) -> StoreResult<Vec<SkillView>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -5388,6 +5437,13 @@ pub trait RuntimeStore {
     ) -> StoreResult<Option<RegisteredProfilePolicy>>;
     fn bind_capability(&self, binding: CapabilityBinding<'_>) -> StoreResult<()>;
     fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()>;
+    fn register_project_context_doc(
+        &self,
+        position: i64,
+        path: &str,
+        body: &str,
+    ) -> StoreResult<()>;
+    fn list_project_context_docs(&self) -> StoreResult<Vec<ProjectContextDoc>>;
     fn attach_skill(&self, attachment: SkillAttachment<'_>) -> StoreResult<()>;
     fn list_skills(&self) -> StoreResult<Vec<SkillView>>;
     fn list_skill_attachments(
@@ -5651,6 +5707,19 @@ impl RuntimeStore for SqliteStore {
     fn bind_capability(&self, binding: CapabilityBinding<'_>) -> StoreResult<()> {
         self.bind_capability(binding)
     }
+    fn register_project_context_doc(
+        &self,
+        position: i64,
+        path: &str,
+        body: &str,
+    ) -> StoreResult<()> {
+        SqliteStore::register_project_context_doc(self, position, path, body)
+    }
+
+    fn list_project_context_docs(&self) -> StoreResult<Vec<ProjectContextDoc>> {
+        SqliteStore::list_project_context_docs(self)
+    }
+
     fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()> {
         self.register_skill(skill)
     }

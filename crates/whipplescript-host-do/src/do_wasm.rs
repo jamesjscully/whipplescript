@@ -238,7 +238,22 @@ impl WasmDurableInstance {
         principal: &str,
         coerce_config_json: Option<String>,
         agent_config_json: Option<String>,
+        project_context_json: Option<String>,
     ) -> Result<WasmDurableInstance, JsValue> {
+        // Deploy-shipped project instructions: `[{"path": ..., "content": ...}]`
+        // in injection order (context-assembly Phase 3 item 4).
+        let project_context: Vec<(String, String)> = match project_context_json {
+            Some(json) => serde_json::from_str::<Vec<serde_json::Value>>(&json)
+                .map_err(|error| JsValue::from_str(&error.to_string()))?
+                .into_iter()
+                .filter_map(|doc| {
+                    let path = doc.get("path")?.as_str()?.to_owned();
+                    let content = doc.get("content")?.as_str()?.to_owned();
+                    Some((path, content))
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         let coerce = match coerce_config_json {
             Some(json) => Some(parse_coerce_config(&json).map_err(|e| JsValue::from_str(&e))?),
             None => None,
@@ -260,6 +275,7 @@ impl WasmDurableInstance {
                 agent_model,
                 ..DurableEffectPorts::default()
             },
+            &project_context,
         )
         .map_err(|error| JsValue::from_str(&error))?;
         Ok(Self { inner })

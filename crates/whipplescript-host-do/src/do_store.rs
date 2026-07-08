@@ -4591,6 +4591,44 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         Ok(())
     }
 
+    fn register_project_context_doc(
+        &self,
+        position: i64,
+        path: &str,
+        body: &str,
+    ) -> StoreResult<()> {
+        // Content-addressed like skills: byte-identical hash across backends.
+        let content_hash = stable_hash_hex(body);
+        self.sql
+            .execute(
+                "INSERT OR REPLACE INTO project_context_docs (position, path, content_hash, body) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                &[int(position), text(path), text(&content_hash), text(body)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn list_project_context_docs(&self) -> StoreResult<Vec<ProjectContextDoc>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT position, path, content_hash, body FROM project_context_docs \
+                 ORDER BY position",
+                &[],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| ProjectContextDoc {
+                position: as_i64(&row[0]),
+                path: as_text(&row[1]),
+                content_hash: as_text(&row[2]),
+                body: as_text(&row[3]),
+            })
+            .collect())
+    }
+
     fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()> {
         serde_json::from_str::<Value>(skill.required_capabilities_json)?;
         serde_json::from_str::<Value>(skill.metadata_json)?;
@@ -7023,6 +7061,10 @@ pub(crate) mod test_support {
                 source_span_json TEXT, idempotency_key TEXT UNIQUE, status TEXT NOT NULL DEFAULT 'running',
                 terminal_event_id TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT
+            );
+            CREATE TABLE project_context_docs (
+                position INTEGER PRIMARY KEY, path TEXT NOT NULL,
+                content_hash TEXT NOT NULL, body TEXT NOT NULL
             );
             CREATE TABLE skills (
                 skill_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, version TEXT NOT NULL,

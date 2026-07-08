@@ -131,6 +131,10 @@ interface Bootstrap {
   program: string;
   input: string;
   principal: string;
+  // Deploy-shipped AGENTS.md/CLAUDE.md content (context-assembly Phase 3):
+  // [{ path, content }] in injection order; resolved from the DO store by the
+  // agent turn (the DO has no filesystem).
+  project_context?: { path: string; content: string }[];
 }
 
 export class WorkflowInstance implements DurableObject {
@@ -143,13 +147,15 @@ export class WorkflowInstance implements DurableObject {
   // suspension or terminal. Subsequent external events / alarms re-enter and drive
   // further; the durable state is entirely in DO SQLite.
   async fetch(request: Request): Promise<Response> {
-    const { program, input, principal } = (await request.json()) as Partial<Bootstrap>;
+    const { program, input, principal, project_context } =
+      (await request.json()) as Partial<Bootstrap>;
     let bootstrap: Bootstrap | undefined;
     if (program) {
       bootstrap = {
         program,
         input: input ?? "{}",
         principal: principal ?? "local/Workflow",
+        project_context,
       };
       // Persisted so an alarm (or a body-less poke) can rehydrate the wasm
       // instance without the caller resupplying the program.
@@ -200,6 +206,7 @@ export class WorkflowInstance implements DurableObject {
       bootstrap.principal,
       coerceConfig,
       agentConfig,
+      bootstrap.project_context ? JSON.stringify(bootstrap.project_context) : undefined,
     );
 
     // The sans-IO loop: step -> maybe fetch -> step, until a terminal or a park.

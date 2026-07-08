@@ -43,7 +43,7 @@ function testEffectFree() {
     "  complete result {", '    source "external.started"', '    state "observed"', "  }", "}",
   ].join("\n");
   const bridge = freshInstanceEnv([]);
-  const inst = WasmDurableInstance.create(bridge, source, "{}", "local/MinimalNoop", undefined, undefined);
+  const inst = WasmDurableInstance.create(bridge, source, "{}", "local/MinimalNoop", undefined, undefined, undefined);
   const outcome = JSON.parse(inst.step(undefined, Date.now()));
   assert.strictEqual(outcome.kind, "terminal", `effect-free: ${JSON.stringify(outcome)}`);
   assert.strictEqual(inst.status(), "completed");
@@ -71,7 +71,7 @@ function testCoerceSuspendResume() {
     provider: "anthropic", base_url: "https://api.anthropic.com",
     api_key: "test-key", model: "claude-test", max_tokens: 1024,
   });
-  const inst = WasmDurableInstance.create(bridge, source, "{}", "local/CoerceScore", coerceConfig, undefined);
+  const inst = WasmDurableInstance.create(bridge, source, "{}", "local/CoerceScore", coerceConfig, undefined, undefined);
 
   // First step: the coerce effect suspends on `fetch`.
   const first = JSON.parse(inst.step(undefined, Date.now()));
@@ -115,7 +115,7 @@ function testAgentSuspendResume() {
     provider: "anthropic", base_url: "https://api.anthropic.com",
     api_key: "test-key", model: "claude-test", max_tokens: 4096,
   });
-  const inst = WasmDurableInstance.create(bridge, source, "{}", "local/AgentDemo", undefined, agentConfig);
+  const inst = WasmDurableInstance.create(bridge, source, "{}", "local/AgentDemo", undefined, agentConfig, undefined);
 
   // First step: the agent turn's first model call suspends on `fetch`.
   const first = JSON.parse(inst.step(undefined, Date.now()));
