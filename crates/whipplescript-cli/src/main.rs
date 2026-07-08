@@ -207,6 +207,7 @@ fn main() -> ExitCode {
         Some("retry") => retry(&options),
         Some("recover") => recover(&options),
         Some("auth") => auth_command(&options),
+        Some("deploy") => deploy_command(&options),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             ExitCode::SUCCESS
@@ -273,6 +274,251 @@ impl CliOptions {
     }
 }
 
+/// `whip deploy` v1 (compute plane P8): one command that ships the DO runtime
+/// to Cloudflare — wasm kernel build, optional provider secrets, deploy —
+/// with wrangler underneath, never surfaced as something the user must learn.
+/// v1 deploys the worker shell (workspace image + pool provisioning join when
+/// the container tier lands).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeployPlan {
+    worker_dir: PathBuf,
+    name: Option<String>,
+    dry_run: bool,
+    skip_build: bool,
+    set_secrets: bool,
+}
+
+/// One subprocess the deploy will run, in order. `stdin_value` is piped to
+/// the child (used to hand secret values to `wrangler secret put` without
+/// putting them in argv).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeployStep {
+    label: &'static str,
+    program: &'static str,
+    args: Vec<String>,
+    stdin_value: Option<String>,
+}
+
+fn parse_deploy_args(
+    args: &[String],
+    env_worker_dir: Option<&Path>,
+    cwd: &Path,
+) -> Result<DeployPlan, String> {
+    let mut worker_dir: Option<PathBuf> = env_worker_dir.map(Path::to_path_buf);
+    let mut name = None;
+    let mut dry_run = false;
+    let mut skip_build = false;
+    let mut set_secrets = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--worker-dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--worker-dir requires a path".to_owned())?;
+                worker_dir = Some(PathBuf::from(value));
+            }
+            "--name" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--name requires a worker name".to_owned())?;
+                name = Some(value.clone());
+            }
+            "--dry-run" => dry_run = true,
+            "--skip-build" => skip_build = true,
+            "--set-secrets" => set_secrets = true,
+            other => return Err(format!("unknown deploy argument `{other}`")),
+        }
+    }
+    let worker_dir = match worker_dir {
+        Some(dir) => dir,
+        None => discover_worker_dir(cwd).ok_or_else(|| {
+            "no worker directory found: pass --worker-dir <path>, set \
+             WHIPPLESCRIPT_WORKER_DIR, or run inside a checkout containing \
+             crates/whipplescript-host-do/worker"
+                .to_owned()
+        })?,
+    };
+    if !worker_dir.join("wrangler.toml").is_file() {
+        return Err(format!(
+            "`{}` is not a deployable worker directory (no wrangler.toml)",
+            worker_dir.display()
+        ));
+    }
+    Ok(DeployPlan {
+        worker_dir,
+        name,
+        dry_run,
+        skip_build,
+        set_secrets,
+    })
+}
+
+/// Walk upward from `cwd` looking for the in-repo worker shell.
+fn discover_worker_dir(cwd: &Path) -> Option<PathBuf> {
+    let mut current = Some(cwd);
+    while let Some(dir) = current {
+        let candidate = dir.join("crates/whipplescript-host-do/worker");
+        if candidate.join("wrangler.toml").is_file() {
+            return Some(candidate);
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+/// The ordered subprocess sequence for a plan. Pure so the sequence is
+/// testable; `node_modules_present` and `secret_values` are probed by the
+/// caller.
+fn deploy_steps(
+    plan: &DeployPlan,
+    node_modules_present: bool,
+    secret_values: &[(&str, String)],
+) -> Vec<DeployStep> {
+    let mut steps = Vec::new();
+    if !plan.skip_build && !node_modules_present {
+        steps.push(DeployStep {
+            label: "install worker dependencies",
+            program: "npm",
+            args: vec!["install".to_owned()],
+            stdin_value: None,
+        });
+    }
+    if !plan.skip_build {
+        steps.push(DeployStep {
+            label: "build wasm kernel",
+            program: "npm",
+            args: vec!["run".to_owned(), "build:wasm".to_owned()],
+            stdin_value: None,
+        });
+    }
+    if plan.set_secrets && !plan.dry_run {
+        for (key, value) in secret_values {
+            let mut args = vec!["secret".to_owned(), "put".to_owned(), (*key).to_owned()];
+            if let Some(name) = &plan.name {
+                args.push("--name".to_owned());
+                args.push(name.clone());
+            }
+            steps.push(DeployStep {
+                label: "set provider secret",
+                program: "wrangler",
+                args,
+                stdin_value: Some(value.clone()),
+            });
+        }
+    }
+    let mut deploy_args = vec!["deploy".to_owned()];
+    if plan.dry_run {
+        deploy_args.push("--dry-run".to_owned());
+    }
+    if let Some(name) = &plan.name {
+        deploy_args.push("--name".to_owned());
+        deploy_args.push(name.clone());
+    }
+    steps.push(DeployStep {
+        label: if plan.dry_run {
+            "validate deploy (dry run)"
+        } else {
+            "deploy to Cloudflare"
+        },
+        program: "wrangler",
+        args: deploy_args,
+        stdin_value: None,
+    });
+    steps
+}
+
+/// The provider secrets `--set-secrets` forwards from the local environment.
+const DEPLOY_SECRET_KEYS: [&str; 2] = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
+
+fn deploy_command(options: &CliOptions) -> ExitCode {
+    let env_worker_dir = env::var_os("WHIPPLESCRIPT_WORKER_DIR").map(PathBuf::from);
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let plan = match parse_deploy_args(&options.args, env_worker_dir.as_deref(), &cwd) {
+        Ok(plan) => plan,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
+    for tool in ["npm", "wrangler"] {
+        if which_on_path(tool).is_none() {
+            eprintln!(
+                "`{tool}` is required for deployment but was not found on PATH; \
+                 install Node.js (npm) and wrangler (`npm install -g wrangler`)"
+            );
+            return ExitCode::from(2);
+        }
+    }
+    let secret_values = DEPLOY_SECRET_KEYS
+        .iter()
+        .filter_map(|key| env::var(key).ok().map(|value| (*key, value)))
+        .collect::<Vec<_>>();
+    if plan.set_secrets {
+        for key in DEPLOY_SECRET_KEYS {
+            if !secret_values.iter().any(|(name, _)| *name == key) {
+                println!("note: {key} is not set locally; skipping that secret");
+            }
+        }
+    }
+    let node_modules_present = plan.worker_dir.join("node_modules").is_dir();
+    let steps = deploy_steps(&plan, node_modules_present, &secret_values);
+    for step in &steps {
+        println!("deploy: {} ...", step.label);
+        let mut command = Command::new(step.program);
+        command.args(&step.args).current_dir(&plan.worker_dir);
+        let status = if let Some(stdin_value) = &step.stdin_value {
+            command.stdin(Stdio::piped());
+            match command.spawn() {
+                Ok(mut child) => {
+                    if let Some(stdin) = child.stdin.as_mut() {
+                        if let Err(error) = stdin.write_all(stdin_value.as_bytes()) {
+                            eprintln!("deploy: failed to hand off secret: {error}");
+                            let _ = child.kill();
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                    drop(child.stdin.take());
+                    child.wait()
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            command.status()
+        };
+        match status {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                eprintln!(
+                    "deploy: step `{}` failed with status {}",
+                    step.label,
+                    status.code().unwrap_or(-1)
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("deploy: step `{}` failed to start: {error}", step.label);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if plan.dry_run {
+        println!("deploy: dry run complete — bundle validated, nothing published");
+    } else {
+        println!("deploy: complete");
+    }
+    ExitCode::SUCCESS
+}
+
+/// Locate `tool` on PATH (portable `which`).
+fn which_on_path(tool: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(tool);
+        candidate.is_file().then_some(candidate)
+    })
+}
+
 fn print_usage() {
     println!(
         "whipplescript {} ({})",
@@ -284,7 +530,7 @@ fn print_usage() {
     println!(
         "          artifacts, inbox, signal, items, leases, ledger, counters, evidence, diagnostics, trace"
     );
-    println!("          otel-export, pause, resume, cancel, retry, recover, doctor");
+    println!("          otel-export, pause, resume, cancel, retry, recover, doctor, deploy");
     println!("run `whip <command> --help` or `whip help <command>` for command usage");
 }
 
@@ -333,6 +579,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "skills" => "usage: whip [--json] skills [--root <workflow>] <workflow.whip>",
         "skill" => "usage: whip [--store path] [--json] skill <list | validate <SKILL.md|dir> | install <SKILL.md|dir>>",
         "auth" => "usage: whip auth <status | set <openai|anthropic> <key>>",
+        "deploy" => "usage: whip deploy [--worker-dir <path>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]",
         "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--from <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
         _ => return None,
     })
@@ -24448,9 +24695,14 @@ fn run_script_capability_exec(
     };
     if let Some(stdin) = child.stdin.as_mut() {
         if let Err(error) = stdin.write_all(stdin_json.as_bytes()) {
-            let _ = child.kill();
-            let _ = fs::remove_file(&verified_path);
-            return Err((None, format!("exec command failed to write stdin: {error}")));
+            // A script that never reads stdin can exit before the write lands;
+            // EPIPE here just means "input not consumed", not a failed run —
+            // the child's own output and exit code decide the outcome.
+            if error.kind() != io::ErrorKind::BrokenPipe {
+                let _ = child.kill();
+                let _ = fs::remove_file(&verified_path);
+                return Err((None, format!("exec command failed to write stdin: {error}")));
+            }
         }
     }
     let output = match child.wait_with_output() {
@@ -47078,6 +47330,111 @@ workflow Child {
     }
 
     #[test]
+    fn deploy_plan_resolves_worker_dir_and_flags() {
+        // Explicit flag wins; unknown args are rejected; missing wrangler.toml
+        // is rejected. Use the real in-repo worker dir as the valid target.
+        let repo_worker = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates dir")
+            .join("whipplescript-host-do/worker");
+        let args = vec![
+            "--worker-dir".to_owned(),
+            repo_worker.display().to_string(),
+            "--name".to_owned(),
+            "staging".to_owned(),
+            "--dry-run".to_owned(),
+            "--skip-build".to_owned(),
+        ];
+        let plan = parse_deploy_args(&args, None, Path::new("/nowhere")).expect("plan resolves");
+        assert_eq!(plan.worker_dir, repo_worker);
+        assert_eq!(plan.name.as_deref(), Some("staging"));
+        assert!(plan.dry_run);
+        assert!(plan.skip_build);
+        assert!(!plan.set_secrets);
+
+        let error = parse_deploy_args(&["--bogus".to_owned()], None, Path::new("/nowhere"))
+            .expect_err("unknown arg rejected");
+        assert!(error.contains("unknown deploy argument"), "{error}");
+
+        let error = parse_deploy_args(
+            &["--worker-dir".to_owned(), "/nowhere".to_owned()],
+            None,
+            Path::new("/nowhere"),
+        )
+        .expect_err("non-worker dir rejected");
+        assert!(error.contains("no wrangler.toml"), "{error}");
+
+        // Repo discovery: walking up from inside the repo finds the shell.
+        let discovered = discover_worker_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("worker dir discovered from repo");
+        assert_eq!(discovered, repo_worker);
+    }
+
+    #[test]
+    fn deploy_steps_sequence_matches_plan() {
+        let plan = DeployPlan {
+            worker_dir: PathBuf::from("/w"),
+            name: Some("staging".to_owned()),
+            dry_run: false,
+            skip_build: false,
+            set_secrets: true,
+        };
+        let secrets = vec![("ANTHROPIC_API_KEY", "sk-test".to_owned())];
+        let steps = deploy_steps(&plan, false, &secrets);
+        let labels = steps.iter().map(|step| step.label).collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "install worker dependencies",
+                "build wasm kernel",
+                "set provider secret",
+                "deploy to Cloudflare",
+            ]
+        );
+        let secret_step = &steps[2];
+        assert_eq!(secret_step.program, "wrangler");
+        assert_eq!(
+            secret_step.args,
+            vec!["secret", "put", "ANTHROPIC_API_KEY", "--name", "staging"]
+        );
+        assert_eq!(secret_step.stdin_value.as_deref(), Some("sk-test"));
+        assert_eq!(
+            steps[3].args,
+            vec!["deploy", "--name", "staging"],
+            "secret value must never appear in deploy argv"
+        );
+
+        // Dry run: no install (node_modules present), no secrets pushed, and
+        // wrangler validates without publishing.
+        let dry = DeployPlan {
+            worker_dir: PathBuf::from("/w"),
+            name: None,
+            dry_run: true,
+            skip_build: false,
+            set_secrets: true,
+        };
+        let steps = deploy_steps(&dry, true, &secrets);
+        let labels = steps.iter().map(|step| step.label).collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec!["build wasm kernel", "validate deploy (dry run)"]
+        );
+        assert_eq!(steps[1].args, vec!["deploy", "--dry-run"]);
+
+        // Skip-build: straight to deploy.
+        let quick = DeployPlan {
+            worker_dir: PathBuf::from("/w"),
+            name: None,
+            dry_run: false,
+            skip_build: true,
+            set_secrets: false,
+        };
+        let steps = deploy_steps(&quick, false, &[]);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].args, vec!["deploy"]);
+    }
+
+    #[test]
     fn script_manifest_parses_hermetic_flag() {
         let manifest_path = unique_test_path("manifest-hermetic", "json");
         let sha = "a".repeat(64);
@@ -47297,10 +47654,6 @@ workflow Child {
             .expect("exec effect settles");
         }
 
-        // The script spawned exactly once: the second effect was a cache hit.
-        let witness = fs::read_to_string(&witness_path).expect("witness file exists");
-        assert_eq!(witness.lines().count(), 1, "witness: {witness:?}");
-
         let store = SqliteStore::open(&store_path).expect("reopen store");
         let runs = store.list_runs(&instance_id).expect("runs");
         let run_for = |effect_id: &str| {
@@ -47310,6 +47663,14 @@ workflow Child {
         };
         let first_meta = json_from_str(&run_for("exec-1").metadata_json);
         let second_meta = json_from_str(&run_for("exec-2").metadata_json);
+
+        // The script spawned exactly once: the second effect was a cache hit.
+        let witness = fs::read_to_string(&witness_path).expect("witness file exists");
+        assert_eq!(
+            witness.lines().count(),
+            1,
+            "witness: {witness:?} first: {first_meta} second: {second_meta}"
+        );
         assert_eq!(first_meta["cache"]["hit"], json!(false), "{first_meta}");
         assert_eq!(second_meta["cache"]["hit"], json!(true), "{second_meta}");
         assert_eq!(

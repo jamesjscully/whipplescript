@@ -698,9 +698,20 @@ fixed-size `getRandom` pools). Open build work:
 - [ ] IFC span enforcement: default-deny egress + allowlists derived from
       the exec-grant declarations; verify counterfactual execs are
       network-denied by default on this host.
-- [ ] `whip deploy` v1: one zero-config command (wasm kernel + image +
+- [x] `whip deploy` v1: one zero-config command (wasm kernel + image +
       DO/bucket/pool provisioning + secrets; wrangler underneath, never
       surfaced).
+      DONE 2026-07-07 (v1 = everything currently deployable): `whip deploy`
+      orchestrates npm install → wasm build → optional `--set-secrets`
+      (forwards ANTHROPIC/OPENAI keys from local env via piped stdin, never
+      argv) → wrangler deploy; `--dry-run` validates without publishing;
+      worker-dir resolution = `--worker-dir` → `WHIPPLESCRIPT_WORKER_DIR` →
+      upward repo discovery. Live-verified: real deploy to
+      whipplescript-runtime.jamesjscully.workers.dev + effect-free workflow
+      driven to completed on the deployed worker. Fixed en route: spurious
+      EPIPE failure when a pinned script exits without reading stdin.
+      Residuals (join the container tier when it lands): image build/push,
+      pool provisioning, object-tier bucket (P7 by design).
 
 ---
 
