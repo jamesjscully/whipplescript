@@ -1117,6 +1117,14 @@ privileged std manifest authors the class; bite: an unprivileged manifest with
 the same row is rejected). The two shapes above are the *grammar*; the
 authorability door is orthogonal *authorization*.
 
+DELIVERED (2026-07-08, S6d-5): the privilege key is "compiled into the
+binary" — a manifest is privileged iff its raw JSON is byte-identical to an
+`EMBEDDED_STD_MANIFESTS` entry, so it literally is the platform copy and a
+same-name different-content file gains nothing. Vendor and lock manifests keep
+the flat rejection; report contract registries key the same door on
+registration identity with an embedded std construct. The per-tuple privilege
+catalog for third parties stays deferred.
+
 ### Model expectation (S6b, model-first)
 
 `construct-grammar.maude` gains parse-coverage + bite for the two shapes:

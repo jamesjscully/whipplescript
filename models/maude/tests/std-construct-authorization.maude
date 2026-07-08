@@ -43,4 +43,18 @@ search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
   unknownUse(bogus)
   =>* authorized(bogus) RESIDUAL:Cfg .
 
+--- Coverage (authorability door): an EMBEDDED manifest may declare a construct
+--- in a non-package-authorable lowering class.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  declaresInternalClass(stdMemory, recall) embedded(stdMemory)
+  =>* classAuthorized(recall) RESIDUAL:Cfg .
+
+--- Bite (door): a vendor manifest declaring the same internal-class row is
+--- never admitted, even with a lock -- the lock grants supply-chain authority,
+--- not class authority. If [door-embedded] keyed on anything weaker than
+--- embedded, this would find a solution.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  declaresInternalClass(vendorKit, fetch) lockProvides(vendorKit)
+  =>* classAuthorized(fetch) RESIDUAL:Cfg .
+
 quit .

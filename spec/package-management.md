@@ -248,6 +248,15 @@ hash. Only non-`std.` packages selected by the package set are locked and hashed
 Signing and manifest provenance for first- and third-party packages are deferred
 (see Deferred Items).
 
+Being compiled into the binary is also the authorability privilege key
+(S6d-5): a manifest construct in a `package_authorable: false` lowering class
+(e.g. `signal_source`, `clock_source`, `resource_effect`) is admitted only
+when the manifest's raw JSON is byte-identical to an embedded std manifest —
+it literally is the platform copy, unforgeable by third parties. A same-name,
+different-content file (including one claiming a `std.*` name) keeps the flat
+rejection, as do all vendor and lock manifests. A privilege-tuple catalog for
+third-party internal lowerings stays deferred.
+
 ## CLI
 
 ### `whip package sync`

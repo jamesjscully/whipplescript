@@ -209,20 +209,18 @@ program×capability `capability_bound` gate stays as the policy check, and
 channel-scoped provider resolution is a separate, explicit selection step on
 top of it.
 
-**Registered gap — `source interaction` cannot ride the manifest as shipped.**
-Its lowering class `signal_source` is `package_authorable: false` in the
-platform catalog (core/lib.rs; asserted at core/lib.rs:1149), and manifest
-validation hard-rejects such rows (cli/main.rs:17082-17084: package constructs
-must use an authorable platform lowering); the only shipped privilege
-mechanism, `reserved_keyword_privileges` (core/lib.rs:559-582), covers
-reserved keywords, not lowering-class authorability. Resolution is a named S6
-dependency (see Spec amendments): either S6 extends the catalog (promote
-`signal_source` to package-authorable for std, or extend the privilege tuple
-to cover lowering classes) — which triggers a
-std-construct-authorization.maude re-model — or `source interaction` stays
-core-registered (as `channel` effectively is today) and the manifest carries
-no row for it, an asymmetry this design accepts until S6 decides.
-std.ingress/std.time embedded manifests hit the same wall per E4.
+**Gap RESOLVED 2026-07-08 (S6d-5, authorability door).** `source
+interaction`'s lowering class `signal_source` is `package_authorable: false`
+in the platform catalog, and manifest validation used to hard-reject such
+rows unconditionally. The door now admits a platform-internal lowering row
+when — and only when — the manifest is a platform-embedded std manifest
+(privilege key: byte-identity with the `EMBEDDED_STD_MANIFESTS` copy at the
+manifest layer; full registration-identity with an embedded construct at the
+report-registry layer), modeled as `[door-embedded]` in
+std-construct-authorization.maude. So a future embedded std.messaging (or
+std.ingress/std.time per E4) manifest CAN carry a `source interaction` row;
+vendor manifests keep the flat rejection, and third-party privilege tuples
+stay deferred.
 
 ## Static checks
 

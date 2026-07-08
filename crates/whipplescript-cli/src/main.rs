@@ -13798,9 +13798,9 @@ fn verify_contract_registry_platform_vocabulary(
                 "{construct_label} uses lowering_target `{lowering_target}` incompatible with construct_family `{family}`"
             ));
         }
-        if !lowering.package_authorable {
+        if !lowering.package_authorable && !registry_construct_is_embedded_std_copy(construct) {
             return Err(format!(
-                "{construct_label}.lowering_target `{lowering_target}` is platform-internal and cannot be used by package constructs"
+                "{construct_label}.lowering_target `{lowering_target}` is platform-internal and cannot be used by package constructs (only platform-embedded std manifests may use internal lowerings)"
             ));
         }
         if let Some(required_scope) = lowering.required_scope {
@@ -16637,6 +16637,47 @@ fn is_embedded_std_manifest(name: &str) -> bool {
         .any(|(embedded, _)| *embedded == name)
 }
 
+/// Whether `raw_json` is byte-identical to a manifest in `embedded` (in
+/// production, `EMBEDDED_STD_MANIFESTS`; parameterized so the authorability-
+/// door privilege key is unit-testable with a synthetic manifest set). The key
+/// is byte-identity of the raw manifest JSON: the manifest literally IS the
+/// platform copy compiled into the binary — unforgeable by third parties, and
+/// a same-name different-content file gains nothing.
+///
+/// The door admits `package_authorable: false` lowering classes only for such
+/// a copy. Today neither embedded manifest declares a non-authorable lowering
+/// (every std construct is `capability_call`), so the door is exercised only
+/// by tests; it exists so future decl-family std manifests (`signal_source` /
+/// `clock_source` / `resource_effect`) can ship embedded. A privilege-tuple
+/// catalog for third parties stays deferred.
+fn manifest_is_embedded_copy(raw_json: &str, embedded: &[(&str, &str)]) -> bool {
+    embedded
+        .iter()
+        .any(|(_, manifest_json)| *manifest_json == raw_json)
+}
+
+/// Whether a report contract-registry construct entry is the platform's own
+/// embedded std copy: some `EMBEDDED_STD_MANIFESTS` registry registers a
+/// construct with the same identity and lowering row. Report registries carry
+/// merged embedded std entries rather than manifest bytes, so the manifest
+/// byte-identity key cannot apply at that layer; registration identity is the
+/// equivalent check there (a same-id, different-shape entry gains nothing).
+fn registry_construct_is_embedded_std_copy(construct: &Value) -> bool {
+    let field = |name: &str| construct.get(name).and_then(Value::as_str);
+    embedded_std_manifests().iter().any(|manifest| {
+        manifest.registry.constructs.iter().any(|form| {
+            field("id") == Some(form.id.as_str())
+                && field("library_id") == Some(form.library_id.as_str())
+                && field("version") == Some(form.version.as_str())
+                && field("construct_family") == Some(form.construct_family.as_str())
+                && field("keyword") == Some(form.keyword.as_str())
+                && field("scope") == Some(form.scope.as_str())
+                && field("lowering_target") == Some(form.lowering_target.as_str())
+                && field("target_capability") == form.target_capability.as_deref()
+        })
+    })
+}
+
 /// Parse the embedded std manifests. Panics only if a manifest baked into the
 /// binary is invalid (a build-time bug, guarded by `embedded_std_manifests_parse`).
 fn embedded_std_manifests() -> Vec<PackageManifest> {
@@ -17593,6 +17634,20 @@ fn package_manifest_from_json(
     path: &Path,
     manifest_json: String,
 ) -> Result<PackageManifest, String> {
+    package_manifest_from_json_with_embedded(path, manifest_json, EMBEDDED_STD_MANIFESTS)
+}
+
+/// `package_manifest_from_json` against an explicit embedded manifest set.
+/// A manifest byte-identical to an embedded entry validates as privileged: the
+/// authorability door admits `package_authorable: false` lowering classes for
+/// the platform's own compiled-in std copies only (see
+/// `manifest_is_embedded_copy`).
+fn package_manifest_from_json_with_embedded(
+    path: &Path,
+    manifest_json: String,
+    embedded: &[(&str, &str)],
+) -> Result<PackageManifest, String> {
+    let privileged = manifest_is_embedded_copy(&manifest_json, embedded);
     let value = serde_json::from_str::<Value>(&manifest_json).map_err(|error| {
         format!(
             "failed to parse package manifest `{}`: {error}",
@@ -17616,7 +17671,14 @@ fn package_manifest_from_json(
     let providers = package_provider_contracts(path, &value)?;
     let registry =
         package_manifest_registry(path, &value, &name, &version, &capabilities, &providers)?;
-    validate_package_manifest_consistency(path, &value, &capabilities, &providers, &registry)?;
+    validate_package_manifest_consistency(
+        path,
+        &value,
+        &capabilities,
+        &providers,
+        &registry,
+        privileged,
+    )?;
     let workflow_tools = package_manifest_workflow_tools(path, &value)?;
 
     Ok(PackageManifest {
@@ -17715,12 +17777,17 @@ fn package_manifest_workflow_tools(
     Ok(tools)
 }
 
+/// `privileged` marks the platform's own embedded std copy (byte-identity with
+/// an `EMBEDDED_STD_MANIFESTS` entry, computed by the caller): the
+/// authorability door admits `package_authorable: false` lowering classes for
+/// it and for nothing else.
 fn validate_package_manifest_consistency(
     path: &Path,
     value: &Value,
     capabilities: &BTreeMap<String, PackageCapabilityContract>,
     providers: &[PackageProviderContract],
     registry: &ContractRegistry,
+    privileged: bool,
 ) -> Result<(), String> {
     let declared_capabilities = capabilities.keys().cloned().collect::<BTreeSet<_>>();
     let mut provider_kinds_by_capability = BTreeMap::<String, BTreeSet<String>>::new();
@@ -17801,9 +17868,9 @@ fn validate_package_manifest_consistency(
                         ));
                     }
                 }
-                if !lowering.package_authorable {
+                if !lowering.package_authorable && !privileged {
                     problems.push(format!(
-                        "construct `{}` uses platform-internal lowering_target `{}`; package constructs must use an authorable platform lowering",
+                        "construct `{}` uses platform-internal lowering_target `{}`; package constructs must use an authorable platform lowering (only platform-embedded std manifests may use internal lowerings)",
                         form.id, form.lowering_target
                     ));
                 }
@@ -39341,6 +39408,157 @@ coerce review() -> Review {
         .expect_err("manifest should reject platform-internal construct lowering");
         assert!(
             error.contains("platform-internal lowering_target `core_effect`"),
+            "{error}"
+        );
+    }
+
+    /// A synthetic std manifest declaring a construct in a real
+    /// `package_authorable: false` lowering class (`signal_source`,
+    /// `source_declaration` family, no grammar/interfaces required) — otherwise
+    /// fully valid, so the only failure under test is the authorability door.
+    const INTERNAL_LOWERING_STD_MANIFEST: &str = r#"
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.pulse",
+  "name": "std.pulse",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.pulse",
+      "version": "0.1.0",
+      "constructs": [
+        {
+          "id": "pulse.source",
+          "construct_family": "source_declaration",
+          "keyword": "pulse",
+          "scope": "top_level",
+          "lowering_target": "signal_source"
+        }
+      ]
+    }
+  ]
+}
+"#;
+
+    #[test]
+    fn package_manifest_rejects_internal_lowering_without_embedded_privilege() {
+        // The normal (vendor/lock/file) path: the manifest is not the platform's
+        // embedded copy, so the flat rejection stands.
+        let error = package_manifest_from_json(
+            Path::new("std-pulse.json"),
+            INTERNAL_LOWERING_STD_MANIFEST.to_owned(),
+        )
+        .expect_err("a non-embedded manifest must not author an internal lowering");
+        assert!(
+            error.contains("platform-internal lowering_target `signal_source`")
+                && error.contains("only platform-embedded std manifests"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn package_manifest_admits_internal_lowering_for_embedded_copy() {
+        // The authorability door: the same bytes validated as an entry of the
+        // embedded manifest set are the platform copy and may use internal
+        // lowerings.
+        let manifest = package_manifest_from_json_with_embedded(
+            Path::new("<embedded:std.pulse>"),
+            INTERNAL_LOWERING_STD_MANIFEST.to_owned(),
+            &[("std.pulse", INTERNAL_LOWERING_STD_MANIFEST)],
+        )
+        .expect("the platform's own embedded copy may use internal lowerings");
+        assert_eq!(manifest.name, "std.pulse");
+        assert_eq!(manifest.registry.constructs.len(), 1);
+        assert_eq!(
+            manifest.registry.constructs[0].lowering_target,
+            "signal_source"
+        );
+    }
+
+    #[test]
+    fn package_manifest_std_name_grants_no_internal_lowering_privilege() {
+        // Name alone grants nothing: a `std.evil` manifest with an internal
+        // lowering is rejected through the normal path, and stays rejected even
+        // against an embedded set whose entries have different bytes — only
+        // byte-identity with the embedded copy is the privilege key.
+        let evil = INTERNAL_LOWERING_STD_MANIFEST.replace("std.pulse", "std.evil");
+        let error = package_manifest_from_json(Path::new("std-evil.json"), evil.clone())
+            .expect_err("a std.*-named manifest file must not author an internal lowering");
+        assert!(
+            error.contains("platform-internal lowering_target `signal_source`"),
+            "{error}"
+        );
+        let error = package_manifest_from_json_with_embedded(
+            Path::new("std-evil.json"),
+            evil,
+            &[("std.pulse", INTERNAL_LOWERING_STD_MANIFEST)],
+        )
+        .expect_err("different bytes must not inherit embedded privilege");
+        assert!(
+            error.contains("platform-internal lowering_target `signal_source`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn embedded_std_manifests_parse() {
+        // Guard: every real embedded manifest validates clean through the full
+        // manifest validation (`embedded_std_manifests` panics otherwise). None
+        // declares a non-authorable lowering today, so the authorability door is
+        // exercised only by the synthetic tests above.
+        let manifests = embedded_std_manifests();
+        assert_eq!(manifests.len(), EMBEDDED_STD_MANIFESTS.len());
+        for ((name, _), manifest) in EMBEDDED_STD_MANIFESTS.iter().zip(&manifests) {
+            assert_eq!(&manifest.name, name);
+        }
+    }
+
+    #[test]
+    fn registry_construct_embedded_std_copy_requires_full_identity() {
+        // The report-registry layer keys on registration identity with an
+        // embedded std construct; any drifted field breaks the match.
+        let recall = json!({
+            "id": "memory.recall",
+            "library_id": "std.memory",
+            "version": "0.1.0",
+            "construct_family": "effect_operation",
+            "keyword": "recall",
+            "scope": "rule_body",
+            "lowering_target": "capability_call",
+            "target_capability": "memory.query",
+        });
+        assert!(registry_construct_is_embedded_std_copy(&recall));
+        let mut forged = recall.clone();
+        forged["lowering_target"] = json!("core_effect");
+        assert!(!registry_construct_is_embedded_std_copy(&forged));
+        let mut renamed = recall;
+        renamed["library_id"] = json!("std.evil");
+        assert!(!registry_construct_is_embedded_std_copy(&renamed));
+    }
+
+    #[test]
+    fn report_registry_rejects_internal_lowering_for_non_embedded_construct() {
+        // The report-registry enforcement site: a package-library construct
+        // with an internal lowering that is not the platform's embedded copy is
+        // rejected (a reserved-looking library name grants nothing).
+        let registry = json!({
+            "libraries": [{ "id": "std.evil", "version": "0.1.0", "standard": false }],
+            "constructs": [{
+                "id": "evil.source",
+                "library_id": "std.evil",
+                "version": "0.1.0",
+                "construct_family": "source_declaration",
+                "keyword": "pulse",
+                "scope": "top_level",
+                "lowering_target": "signal_source",
+            }],
+            "effect_contracts": [],
+        });
+        let error = verify_contract_registry_platform_vocabulary(&registry, "report")
+            .expect_err("a non-embedded internal-lowering construct must be rejected");
+        assert!(
+            error.contains("platform-internal")
+                && error.contains("only platform-embedded std manifests"),
             "{error}"
         );
     }

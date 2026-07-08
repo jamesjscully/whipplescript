@@ -64,4 +64,16 @@ mod WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION is
   --- this rule can never fire for it.
   rl [locked-ok] : thirdPartyUse(P, U) lockAdmitted(P)
     => authorized(U) lockAdmitted(P) .
+
+  --- Authorability door (S6d-5). Some platform lowering classes are NOT
+  --- package-authorable (resource_effect, signal_source, clock_source, ...):
+  --- a manifest construct in such a class is admitted only when the manifest
+  --- is EMBEDDED -- compiled into the binary is the privilege key. A lock
+  --- grants supply-chain authority but never class authority.
+  op embedded : Pkg -> Cfg [ctor] .     --- the manifest ships compiled into the binary
+  op declaresInternalClass : Pkg Use -> Cfg [ctor] . --- construct in a non-authorable class
+  op classAuthorized : Use -> Cfg [ctor] . --- the internal-class construct is admitted
+
+  rl [door-embedded] : declaresInternalClass(P, U) embedded(P)
+    => classAuthorized(U) embedded(P) .
 endm

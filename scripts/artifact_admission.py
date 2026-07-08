@@ -371,6 +371,63 @@ def validate_platform_construct_catalog_shape(
                     )
 
 
+_EMBEDDED_STD_CONSTRUCT_IDENTITIES: set[tuple[Any, ...]] | None = None
+
+
+def embedded_std_construct_identities() -> set[tuple[Any, ...]]:
+    """Identity tuples of the platform-embedded std manifest constructs.
+
+    Python mirror of `registry_construct_is_embedded_std_copy` (cli/main.rs):
+    the authorability door admits a platform-internal lowering row only when
+    the construct is identical to a registration in an embedded std manifest
+    (std/manifests/*.json). Fail-closed: an unreadable manifest contributes
+    nothing, so the flat rejection stands.
+    """
+    global _EMBEDDED_STD_CONSTRUCT_IDENTITIES
+    if _EMBEDDED_STD_CONSTRUCT_IDENTITIES is not None:
+        return _EMBEDDED_STD_CONSTRUCT_IDENTITIES
+    identities: set[tuple[Any, ...]] = set()
+    manifests_dir = Path(__file__).resolve().parent.parent / "std" / "manifests"
+    for path in sorted(manifests_dir.glob("*.json")):
+        try:
+            manifest = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        for library in manifest.get("libraries", []) or []:
+            if not isinstance(library, dict):
+                continue
+            for construct in library.get("constructs", []) or []:
+                if not isinstance(construct, dict):
+                    continue
+                identities.add(
+                    (
+                        construct.get("id"),
+                        library.get("id"),
+                        library.get("version"),
+                        construct.get("construct_family"),
+                        construct.get("keyword"),
+                        construct.get("scope"),
+                        construct.get("lowering_target"),
+                        construct.get("target_capability"),
+                    )
+                )
+    _EMBEDDED_STD_CONSTRUCT_IDENTITIES = identities
+    return identities
+
+
+def construct_is_embedded_std_copy(construct: dict[str, Any]) -> bool:
+    return (
+        construct.get("id"),
+        construct.get("library_id"),
+        construct.get("version"),
+        construct.get("construct_family"),
+        construct.get("keyword"),
+        construct.get("scope"),
+        construct.get("lowering_target"),
+        construct.get("target_capability"),
+    ) in embedded_std_construct_identities()
+
+
 def contract_registry_package_library_ids(registry: dict[str, Any]) -> set[str]:
     return {
         library["id"]
@@ -578,10 +635,13 @@ def validate_contract_registry_platform_vocabulary(
                 f"{construct_label} uses lowering_target `{lowering_target}` incompatible "
                 f"with construct_family `{family}`"
             )
-        if lowering.get("package_authorable") is not True:
+        if lowering.get("package_authorable") is not True and not construct_is_embedded_std_copy(
+            construct
+        ):
             raise SystemExit(
                 f"{construct_label}.lowering_target `{lowering_target}` is platform-internal "
-                "and cannot be used by package constructs"
+                "and cannot be used by package constructs "
+                "(only platform-embedded std manifests may use internal lowerings)"
             )
         required_scope = lowering.get("required_scope")
         if isinstance(required_scope, str) and scope != required_scope:
