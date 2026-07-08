@@ -669,6 +669,24 @@ fixed-size `getRandom` pools). Open build work:
 - [ ] Class-A executor pool: workspace-DO-owned, `getRandom`-routed lite/
       basic instances; priority queue (production > working >
       counterfactual); manual size knob w/ working zero-config default.
+      PARTIAL 2026-07-08 — the executor + the full exec-over-HTTP round are
+      BUILT; the container/pool tier remains: (a) `whip executor` = the
+      Class-A sidecar (crates/whipplescript-cli/src/exec_server.rs;
+      `whip-executor/1` wire — sha-verified inline script bytes, `{script}`
+      argv slot, cleaned env, bounded timeout, 512KB stream caps; verified
+      over live HTTP); (b) kernel::exec_http = the shared pure halves
+      (request build / response parse / content key / typed ingest / settle —
+      wasm-clean, byte-identical content keys across hosts); (c) the DO
+      `exec.command` arm: store-backed script capabilities
+      (`script_capabilities` on RuntimeStore ×3 impls, pin-verified at
+      registration), cache-lookup-first (a hit settles with NO HTTP round —
+      proven by test), miss → NeedsHttp → settle + cache record; wired
+      through DurableEffectPorts/create(exec_config_json, scripts_json) +
+      index.ts (WHIP_EXECUTOR_URL) and validated through the real
+      wasm-bindgen boundary (validate.cjs exec round green). REMAINING for
+      [x]: Cloudflare container packaging of `whip executor`, workspace-DO
+      pool ownership + getRandom routing + priority queue (platform
+      container tier — production enable is a billing decision).
 - [x] Delta-kernel result cache: content-keyed memoization in the
       effect-ledger discipline (script+env+input hashes); eviction joins
       the versioned-workspace retention policy.

@@ -27,6 +27,7 @@ use whipplescript_kernel::claude_agent_sdk::{
 use whipplescript_kernel::codex_app_server::{
     CodexAppServerAdapter, CodexAppServerClient, StdioCodexAppServerTransport,
 };
+use whipplescript_kernel::exec_http::{ingest_exec_stdout, ExecIngest};
 use whipplescript_kernel::{
     coerce::{CoerceRequest, FakeCoerceClient},
     effect_config::EffectConfig,
@@ -24525,83 +24526,12 @@ fn run_coordination_effect(
 }
 
 /// The validated result of `-> Schema` / `-> each Schema` stdout ingestion.
-#[derive(Debug)]
-enum ExecIngest {
-    Single(Value),
-    Stream(Vec<Value>),
-}
-
 type ExecOutcome =
     Result<(i32, String, String, Option<ExecIngest>), (Option<(i32, String, String)>, String)>;
 
 /// Parses and validates exec stdout against the effect's embedded contract
 /// (spec/json-ingestion.md). Streams are all-or-nothing: any malformed line
 /// fails the whole effect so a partial stream never half-commits.
-fn ingest_exec_stdout(contract: &Value, stdout: &str) -> Result<ExecIngest, String> {
-    let schema = contract
-        .get("schema")
-        .and_then(Value::as_str)
-        .unwrap_or("json");
-    let shape = contract.get("shape").cloned().unwrap_or(Value::Null);
-    let each = contract
-        .get("each")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let text = stdout.trim();
-    if !each {
-        let value: Value = serde_json::from_str(text)
-            .map_err(|error| format!("stdout is not valid JSON for `{schema}`: {error}"))?;
-        if !value.is_object() {
-            return Err(format!(
-                "stdout must be a single JSON object conforming to `{schema}`"
-            ));
-        }
-        let mut errors = Vec::new();
-        validate_ingest_value(&value, &shape, "$", &mut errors);
-        if !errors.is_empty() {
-            return Err(format!(
-                "stdout does not conform to `{schema}`: {}",
-                errors.join("; ")
-            ));
-        }
-        return Ok(ExecIngest::Single(value));
-    }
-    let elements: Vec<Value> = if text.starts_with('[') {
-        serde_json::from_str::<Value>(text)
-            .map_err(|error| format!("stdout is not a valid JSON array of `{schema}`: {error}"))?
-            .as_array()
-            .cloned()
-            .ok_or_else(|| format!("stdout must be a JSON array or JSONL stream of `{schema}`"))?
-    } else {
-        let mut items = Vec::new();
-        for (index, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let value = serde_json::from_str(line).map_err(|error| {
-                format!(
-                    "line {} is not valid JSON for `{schema}`: {error}",
-                    index + 1
-                )
-            })?;
-            items.push(value);
-        }
-        items
-    };
-    let mut errors = Vec::new();
-    for (index, element) in elements.iter().enumerate() {
-        validate_ingest_value(element, &shape, &format!("[{index}]"), &mut errors);
-    }
-    if !errors.is_empty() {
-        return Err(format!(
-            "stream does not conform to `{schema}`: {}",
-            errors.join("; ")
-        ));
-    }
-    Ok(ExecIngest::Stream(elements))
-}
-
 fn truncate_exec_bytes(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     text.chars().take(8192).collect::<String>()
@@ -24835,30 +24765,18 @@ fn exec_content_key(
     stdin_json: &str,
     parse_contract: &Option<Value>,
 ) -> String {
-    let mut material = String::new();
-    material.push_str("exec.command\x00");
-    material.push_str(&script.sha256);
-    material.push('\x00');
-    for arg in &script.argv {
-        material.push_str(arg);
-        material.push('\x1f');
-    }
-    material.push('\x00');
-    for (name, value) in resolved_env {
-        material.push_str(name);
-        material.push('=');
-        material.push_str(value);
-        material.push('\x1f');
-    }
-    material.push('\x00');
-    material.push_str(&compute_environment_hash());
-    material.push('\x00');
-    material.push_str(stdin_json);
-    material.push('\x00');
-    if let Some(contract) = parse_contract {
-        material.push_str(&contract.to_string());
-    }
-    sha256_hex(material.as_bytes())
+    let resolved_env = resolved_env
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    whipplescript_kernel::exec_http::exec_content_key(
+        &script.sha256,
+        &script.argv,
+        &resolved_env,
+        &compute_environment_hash(),
+        stdin_json,
+        parse_contract,
+    )
 }
 
 /// Decode a cached exec result back into the success outcome shape. Returns

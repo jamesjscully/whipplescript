@@ -371,6 +371,34 @@ pub struct ComputeResultRegistration<'a> {
     pub source_effect_id: &'a str,
 }
 
+/// One operator-pinned script capability registered in the store (compute
+/// plane P8): the store-backed mirror of the native filesystem script
+/// manifest, for hosts with no filesystem (the DO builds `whip-executor/1`
+/// requests from these rows). `body` is the full script text; `sha256` is
+/// the operator's pin — the host layer verifies body-vs-pin at registration
+/// and the executor re-verifies before running (the TOCTOU discipline).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScriptCapabilityRecord {
+    pub name: String,
+    pub argv_json: String,
+    pub sha256: String,
+    pub env_json: String,
+    pub hermetic: bool,
+    pub body: String,
+}
+
+/// Registration input for one script capability (`INSERT OR REPLACE`: a
+/// re-pin is an explicit operator act, same as the native manifest).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScriptCapabilityRegistration<'a> {
+    pub name: &'a str,
+    pub argv_json: &'a str,
+    pub sha256: &'a str,
+    pub env_json: &'a str,
+    pub hermetic: bool,
+    pub body: &'a str,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SkillRegistration<'a> {
     pub skill_id: &'a str,
@@ -3022,6 +3050,51 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
+    /// Register (or re-pin) one script capability (compute plane P8). The
+    /// caller is responsible for verifying `body` hashes to `sha256` before
+    /// registering; the store records what it is given.
+    pub fn register_script_capability(
+        &self,
+        registration: ScriptCapabilityRegistration<'_>,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO script_capabilities \
+             (name, argv_json, sha256, env_json, hermetic, body) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                registration.name,
+                registration.argv_json,
+                registration.sha256,
+                registration.env_json,
+                registration.hermetic,
+                registration.body,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Look up one registered script capability by name (compute plane P8).
+    pub fn get_script_capability(&self, name: &str) -> StoreResult<Option<ScriptCapabilityRecord>> {
+        self.connection
+            .query_row(
+                "SELECT name, argv_json, sha256, env_json, hermetic, body \
+                 FROM script_capabilities WHERE name = ?1",
+                params![name],
+                |row| {
+                    Ok(ScriptCapabilityRecord {
+                        name: row.get(0)?,
+                        argv_json: row.get(1)?,
+                        sha256: row.get(2)?,
+                        env_json: row.get(3)?,
+                        hermetic: row.get::<_, i64>(4)? != 0,
+                        body: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     /// Record one delta-kernel result under its content key (compute plane
     /// P8-1). First-writer-wins: returns `true` when this call inserted the
     /// entry, `false` when the key was already recorded (the existing entry is
@@ -5524,6 +5597,11 @@ pub trait RuntimeStore {
         registration: ComputeResultRegistration<'_>,
     ) -> StoreResult<bool>;
     fn lookup_compute_result(&self, content_key: &str) -> StoreResult<Option<ComputeCachedResult>>;
+    fn register_script_capability(
+        &self,
+        registration: ScriptCapabilityRegistration<'_>,
+    ) -> StoreResult<()>;
+    fn get_script_capability(&self, name: &str) -> StoreResult<Option<ScriptCapabilityRecord>>;
     fn attach_skill(&self, attachment: SkillAttachment<'_>) -> StoreResult<()>;
     fn list_skills(&self) -> StoreResult<Vec<SkillView>>;
     fn list_skill_attachments(
@@ -5809,6 +5887,17 @@ impl RuntimeStore for SqliteStore {
 
     fn lookup_compute_result(&self, content_key: &str) -> StoreResult<Option<ComputeCachedResult>> {
         SqliteStore::lookup_compute_result(self, content_key)
+    }
+
+    fn register_script_capability(
+        &self,
+        registration: ScriptCapabilityRegistration<'_>,
+    ) -> StoreResult<()> {
+        SqliteStore::register_script_capability(self, registration)
+    }
+
+    fn get_script_capability(&self, name: &str) -> StoreResult<Option<ScriptCapabilityRecord>> {
+        SqliteStore::get_script_capability(self, name)
     }
 
     fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()> {

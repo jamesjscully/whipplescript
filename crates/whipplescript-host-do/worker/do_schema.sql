@@ -132,6 +132,11 @@
                 source_effect_id TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE script_capabilities (
+                name TEXT PRIMARY KEY, argv_json TEXT NOT NULL, sha256 TEXT NOT NULL,
+                env_json TEXT NOT NULL DEFAULT '{}', hermetic INTEGER NOT NULL DEFAULT 0,
+                body TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE skills (
                 skill_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, version TEXT NOT NULL,
                 source TEXT NOT NULL, source_path TEXT NOT NULL, content_hash TEXT NOT NULL,

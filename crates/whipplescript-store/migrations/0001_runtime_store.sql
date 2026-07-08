@@ -345,6 +345,20 @@ CREATE TABLE compute_result_cache (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Operator-pinned script capabilities (compute plane P8): store-backed mirror
+-- of the filesystem script manifest for hosts without a filesystem. body =
+-- full script text; sha256 = the operator pin verified at registration and
+-- re-verified by the executor before running.
+CREATE TABLE script_capabilities (
+    name TEXT PRIMARY KEY,
+    argv_json TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    env_json TEXT NOT NULL DEFAULT '{}',
+    hermetic INTEGER NOT NULL DEFAULT 0,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE skills (
     skill_id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,

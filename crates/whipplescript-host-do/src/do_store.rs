@@ -4670,6 +4670,47 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         }))
     }
 
+    fn register_script_capability(
+        &self,
+        registration: ScriptCapabilityRegistration<'_>,
+    ) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "INSERT OR REPLACE INTO script_capabilities \
+                 (name, argv_json, sha256, env_json, hermetic, body) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[
+                    text(registration.name),
+                    text(registration.argv_json),
+                    text(registration.sha256),
+                    text(registration.env_json),
+                    int(i64::from(registration.hermetic)),
+                    text(registration.body),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn get_script_capability(&self, name: &str) -> StoreResult<Option<ScriptCapabilityRecord>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT name, argv_json, sha256, env_json, hermetic, body \
+                 FROM script_capabilities WHERE name = ?1",
+                &[text(name)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| ScriptCapabilityRecord {
+            name: as_text(&row[0]),
+            argv_json: as_text(&row[1]),
+            sha256: as_text(&row[2]),
+            env_json: as_text(&row[3]),
+            hermetic: as_i64(&row[4]) != 0,
+            body: as_text(&row[5]),
+        }))
+    }
+
     fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()> {
         serde_json::from_str::<Value>(skill.required_capabilities_json)?;
         serde_json::from_str::<Value>(skill.metadata_json)?;
@@ -7112,6 +7153,11 @@ pub(crate) mod test_support {
                 result_json TEXT NOT NULL, source_instance_id TEXT NOT NULL,
                 source_effect_id TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE script_capabilities (
+                name TEXT PRIMARY KEY, argv_json TEXT NOT NULL, sha256 TEXT NOT NULL,
+                env_json TEXT NOT NULL DEFAULT '{}', hermetic INTEGER NOT NULL DEFAULT 0,
+                body TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE skills (
                 skill_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, version TEXT NOT NULL,

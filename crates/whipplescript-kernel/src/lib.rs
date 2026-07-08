@@ -10,6 +10,7 @@ pub mod coerce_native;
 pub mod context_assembly;
 pub mod effect_config;
 pub mod effect_handlers;
+pub mod exec_http;
 pub mod harness;
 pub mod harness_loop;
 pub mod harness_model;

@@ -40,6 +40,9 @@ export interface Env {
   // Dev/test override for the provider endpoint (e.g. a local mock in
   // `wrangler dev`); production omits it and uses the real Anthropic API.
   WHIP_PROVIDER_BASE_URL?: string;
+  // Class-A executor sidecar (compute plane P8): where exec.command effects
+  // go as whip-executor/1 HTTP rounds. Unset = exec effects error.
+  WHIP_EXECUTOR_URL?: string;
 }
 
 // The DO schema (33 tables) as a bundled text module (wrangler.toml `rules`).
@@ -135,6 +138,17 @@ interface Bootstrap {
   // [{ path, content }] in injection order; resolved from the DO store by the
   // agent turn (the DO has no filesystem).
   project_context?: { path: string; content: string }[];
+  // Deploy-shipped script capabilities (compute plane P8): the DO-store
+  // mirror of the native script manifest. Each body is verified against its
+  // sha256 pin at registration; argv carries the "{script}" placeholder.
+  scripts?: {
+    name: string;
+    argv: string[];
+    sha256: string;
+    env?: Record<string, string>;
+    hermetic?: boolean;
+    body: string;
+  }[];
 }
 
 export class WorkflowInstance implements DurableObject {
@@ -199,6 +213,17 @@ export class WorkflowInstance implements DurableObject {
         : undefined;
     const coerceConfig = anthropicConfig("claude-3-5-sonnet-latest", 1024);
     const agentConfig = anthropicConfig("claude-3-5-sonnet-latest", 4096);
+    // Class-A exec sidecar wiring (compute plane P8): the executor URL comes
+    // from the environment; script env references resolve against DO secrets.
+    const execConfig = this.env.WHIP_EXECUTOR_URL
+      ? JSON.stringify({
+          base_url: this.env.WHIP_EXECUTOR_URL,
+          env: {
+            ...(this.env.ANTHROPIC_API_KEY ? { ANTHROPIC_API_KEY: this.env.ANTHROPIC_API_KEY } : {}),
+            ...(this.env.OPENAI_API_KEY ? { OPENAI_API_KEY: this.env.OPENAI_API_KEY } : {}),
+          },
+        })
+      : undefined;
     const instance = WasmDurableInstance.create(
       bridge,
       bootstrap.program,
@@ -207,6 +232,8 @@ export class WorkflowInstance implements DurableObject {
       coerceConfig,
       agentConfig,
       bootstrap.project_context ? JSON.stringify(bootstrap.project_context) : undefined,
+      execConfig,
+      bootstrap.scripts ? JSON.stringify(bootstrap.scripts) : undefined,
     );
 
     // The sans-IO loop: step -> maybe fetch -> step, until a terminal or a park.

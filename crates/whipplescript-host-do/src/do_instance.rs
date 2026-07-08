@@ -31,6 +31,10 @@ use whipplescript_kernel::effect_handlers::{
     run_human_effect_generic, run_loft_effect_generic, run_notify_effect_generic,
     run_queue_effect_generic, CapabilityContract, DeliveryGovernance, FixtureCapabilityProvider,
 };
+use whipplescript_kernel::exec_http::{
+    build_executor_exec_request, decode_cached_exec_result, exec_content_key, ingest_exec_stdout,
+    parse_executor_exec_response, settle_exec_http_result, ExecSettleContext,
+};
 use whipplescript_kernel::harness_loop::{
     provider_result_from_brokered_turn, BrokeredTurnInput, BrokeredTurnMachine,
     BrokeredTurnSnapshot, ChatMessage, HttpModelClient, NoopCompactor, ToolExecutor,
@@ -64,6 +68,19 @@ pub struct CoerceProviderConfig {
 
 use crate::do_store::{do_load_agent_snapshot, do_save_agent_snapshot, DoSql, DoSqliteStore};
 
+/// Projected executor-sidecar wiring (compute plane P8): where Class-A exec
+/// effects go (the DO cannot spawn processes — exec is HTTP to the sidecar,
+/// DR-0033 Decision 7). `env_values` backs the script manifests' `env:`
+/// references (the DO secrets plane supplies them); `environment_epoch` is
+/// the delta-kernel cache's environment component (the workspace image
+/// digest once the container tier wires it).
+pub struct ExecutorSidecarConfig {
+    pub base_url: String,
+    pub env_values: std::collections::BTreeMap<String, String>,
+    pub environment_epoch: String,
+    pub timeout_ms: Option<u64>,
+}
+
 /// Drives a workflow instance's rule pass + effect discovery on the durable object.
 pub struct DoInstanceDriver<'a, Sql: DoSql> {
     /// One held kernel over the DO's SQLite (backs runtime + coordination +
@@ -82,6 +99,9 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     /// Executes tool calls the model requests within a turn (nested effects). A live
     /// DO brokers these as HTTP to a sidecar; tests inject a fake.
     pub agent_tools: &'a dyn ToolExecutor,
+    /// Executor-sidecar wiring for Class-A exec effects (compute plane P8), or
+    /// `None` if no sidecar is configured (an `exec.command` then errors).
+    pub exec: Option<&'a ExecutorSidecarConfig>,
     pub ir: &'a IrProgram,
     pub instance_id: &'a str,
 }
@@ -458,6 +478,197 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     }
                 }
             }
+            // Class-A exec (compute plane P8): the DO cannot spawn processes,
+            // so a script-capability exec is one `whip-executor/1` HTTP round
+            // to the sidecar — with the delta-kernel result cache consulted
+            // first (a hit settles without any HTTP at all).
+            "exec.command" => {
+                let cfg = self.exec.ok_or_else(|| {
+                    StoreError::Conflict(
+                        "executor sidecar is not configured on this durable object".to_owned(),
+                    )
+                })?;
+                let input = json_from_str(&effect.input_json);
+                let mode = input
+                    .get("mode")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("raw");
+                if mode != "capability" {
+                    return Err(StoreError::Conflict(
+                        "raw exec is not allowed on the durable object; declare a script \
+                         capability"
+                            .to_owned(),
+                    ));
+                }
+                let capability = input
+                    .get("capability")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                let parse_contract = input.get("parse").cloned();
+                let stdin = input
+                    .get("stdin")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let stdin_json = stdin.to_string();
+                let script = self
+                    .kernel
+                    .store()
+                    .get_script_capability(&capability)?
+                    .ok_or_else(|| {
+                        StoreError::Conflict(format!(
+                            "script capability `{capability}` is not registered in the store"
+                        ))
+                    })?;
+                let argv: Vec<String> =
+                    serde_json::from_str(&script.argv_json).map_err(|error| {
+                        StoreError::Conflict(format!(
+                            "script capability `{capability}` argv is invalid: {error}"
+                        ))
+                    })?;
+                let env_refs: std::collections::BTreeMap<String, String> =
+                    serde_json::from_str(&script.env_json).map_err(|error| {
+                        StoreError::Conflict(format!(
+                            "script capability `{capability}` env is invalid: {error}"
+                        ))
+                    })?;
+                let mut resolved_env = Vec::new();
+                for (name, reference) in env_refs {
+                    let Some(env_name) = reference.strip_prefix("env:") else {
+                        return Err(StoreError::Conflict(format!(
+                            "script capability `{capability}` env `{name}` must use an env: \
+                             reference"
+                        )));
+                    };
+                    let value = cfg.env_values.get(env_name).ok_or_else(|| {
+                        StoreError::Conflict(format!(
+                            "script capability `{capability}` requires `{env_name}`, which the \
+                             executor config does not supply"
+                        ))
+                    })?;
+                    resolved_env.push((name, value.clone()));
+                }
+                let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "exec-run"]);
+                let lease_id =
+                    idempotency_key(&[self.instance_id, &effect.effect_id, "exec-lease"]);
+                let content_key = script.hermetic.then(|| {
+                    exec_content_key(
+                        &script.sha256,
+                        &argv,
+                        &resolved_env,
+                        &cfg.environment_epoch,
+                        &stdin_json,
+                        &parse_contract,
+                    )
+                });
+                let ingest_schema = parse_contract
+                    .as_ref()
+                    .and_then(|contract| contract.get("schema"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("json")
+                    .to_owned();
+                match incoming {
+                    None => {
+                        self.kernel.start_run(RunStart {
+                            instance_id: self.instance_id,
+                            effect_id: &effect.effect_id,
+                            run_id: &run_id,
+                            provider: "exec",
+                            worker_id: "whip-exec",
+                            lease_id: &lease_id,
+                            lease_expires_at: "2030-01-01T00:00:00Z",
+                            metadata_json: &serde_json::json!({
+                                "mode": "capability", "capability": capability,
+                            })
+                            .to_string(),
+                        })?;
+                        // Delta-kernel cache: a hit settles right here — no
+                        // container wakes, no HTTP round.
+                        if let Some(key) = &content_key {
+                            if let Some(hit) = self
+                                .kernel
+                                .store()
+                                .lookup_compute_result(key)?
+                                .and_then(|entry| decode_cached_exec_result(&entry.result_json))
+                            {
+                                let ctx = ExecSettleContext {
+                                    instance_id: self.instance_id,
+                                    effect_id: &effect.effect_id,
+                                    run_id: &run_id,
+                                    capability: &capability,
+                                    script_sha256: &script.sha256,
+                                    cache: Some((key, true)),
+                                    ingest_schema: &ingest_schema,
+                                };
+                                let event =
+                                    settle_exec_http_result(&mut self.kernel, &ctx, Ok(hit))?;
+                                return Ok(EffectStep::Done(event));
+                            }
+                        }
+                        let request = build_executor_exec_request(
+                            &cfg.base_url,
+                            &effect.effect_id,
+                            &script.sha256,
+                            &script.body,
+                            &argv,
+                            &resolved_env,
+                            &stdin,
+                            cfg.timeout_ms,
+                        )
+                        .map_err(StoreError::Conflict)?;
+                        return Ok(EffectStep::NeedsHttp(request));
+                    }
+                    resumed => {
+                        let outcome = match resumed {
+                            Some(Ok(response)) => match parse_executor_exec_response(&response) {
+                                Ok(result) if result.timed_out => Err((
+                                    Some((result.exit_code, result.stdout, result.stderr)),
+                                    "exec command timed out on the executor sidecar".to_owned(),
+                                )),
+                                Ok(result) if result.exit_code != 0 => Err((
+                                    Some((result.exit_code, result.stdout.clone(), result.stderr)),
+                                    format!("exec command exited with status {}", result.exit_code),
+                                )),
+                                Ok(result) => match &parse_contract {
+                                    Some(contract) => {
+                                        match ingest_exec_stdout(contract, &result.stdout) {
+                                            Ok(ingested) => Ok((
+                                                result.exit_code,
+                                                result.stdout,
+                                                result.stderr,
+                                                Some(ingested),
+                                            )),
+                                            Err(reason) => Err((
+                                                Some((
+                                                    result.exit_code,
+                                                    result.stdout,
+                                                    result.stderr,
+                                                )),
+                                                reason,
+                                            )),
+                                        }
+                                    }
+                                    None => {
+                                        Ok((result.exit_code, result.stdout, result.stderr, None))
+                                    }
+                                },
+                                Err(reason) => Err((None, reason)),
+                            },
+                            other => Err((None, format!("executor transport error: {other:?}"))),
+                        };
+                        let ctx = ExecSettleContext {
+                            instance_id: self.instance_id,
+                            effect_id: &effect.effect_id,
+                            run_id: &run_id,
+                            capability: &capability,
+                            script_sha256: &script.sha256,
+                            cache: content_key.as_deref().map(|key| (key, false)),
+                            ingest_schema: &ingest_schema,
+                        };
+                        settle_exec_http_result(&mut self.kernel, &ctx, outcome)?
+                    }
+                }
+            }
             "tracker.file" | "tracker.claim" | "tracker.release" | "tracker.finish" => {
                 run_queue_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
             }
@@ -598,6 +809,7 @@ mod tests {
             coerce: None,
             agent_model: None,
             agent_tools: &NoTools,
+            exec: None,
             ir: &ir,
             instance_id: &instance_id,
         };
@@ -634,6 +846,221 @@ mod tests {
                 }),
             }))
         }
+    }
+
+    // Class-A exec over the sidecar (compute plane P8): the first exec builds a
+    // `whip-executor/1` request and suspends on HTTP; settling records the
+    // delta-kernel cache entry; an identical second exec settles from the cache
+    // with NO HTTP round at all.
+    #[test]
+    fn do_instance_driver_execs_over_the_sidecar_and_serves_the_second_from_cache() {
+        use whipplescript_kernel::exec_http;
+        use whipplescript_store::{NewEffect, RuleCommit, ScriptCapabilityRegistration};
+
+        let source = "workflow ExecJudge\n\noutput result Verdict\n\n\
+             class Verdict {\n  ok int\n}\n";
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("exec program compiles");
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('script.judge', 'Run an operator-pinned script capability.', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_script_judge', NULL, 'script.judge', 'builtin-script', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed script capability");
+        }
+        let script_body = "read line\necho '{\"verdict\":\"pass\"}'\n";
+        let script_sha = exec_http::sha256_hex(script_body.as_bytes());
+        store
+            .register_script_capability(ScriptCapabilityRegistration {
+                name: "judge",
+                argv_json: r#"["sh", "{script}"]"#,
+                sha256: &script_sha,
+                env_json: "{}",
+                hermetic: true,
+                body: script_body,
+            })
+            .expect("register script");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: "src-exec",
+                    ir_hash: "ir-exec",
+                    compiler_version: "test",
+                },
+                &ir,
+            )
+            .expect("program version");
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/ExecJudge",
+                    effective_authority_json: "{}",
+                },
+            )
+            .expect("instance");
+        let effect_input = serde_json::json!({
+            "mode": "capability",
+            "capability": "judge",
+            "stdin": {"n": 1},
+        })
+        .to_string();
+        let effects = [
+            NewEffect {
+                effect_id: "exec-1",
+                kind: "exec.command",
+                target: None,
+                input_json: &effect_input,
+                status: "queued",
+                idempotency_key: "rule=go;effect=exec-1",
+                required_capabilities_json: r#"["script.judge"]"#,
+                profile: None,
+                correlation_id: None,
+                source_span_json: None,
+                timeout_seconds: None,
+            },
+            NewEffect {
+                effect_id: "exec-2",
+                kind: "exec.command",
+                target: None,
+                input_json: &effect_input,
+                status: "queued",
+                idempotency_key: "rule=go;effect=exec-2",
+                required_capabilities_json: r#"["script.judge"]"#,
+                profile: None,
+                correlation_id: None,
+                source_span_json: None,
+                timeout_seconds: None,
+            },
+        ];
+        kernel
+            .store_mut()
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "go",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-go"),
+            })
+            .expect("commit exec effects");
+
+        let exec_cfg = ExecutorSidecarConfig {
+            base_url: "http://executor:8080".to_owned(),
+            env_values: std::collections::BTreeMap::new(),
+            environment_epoch: "test-epoch".to_owned(),
+            timeout_ms: Some(10_000),
+        };
+        let mut driver = DoInstanceDriver {
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            exec: Some(&exec_cfg),
+            ir: &ir,
+            instance_id: &instance_id,
+        };
+        let claimable = |effect_id: &str| ClaimableEffect {
+            effect_id: effect_id.to_owned(),
+            kind: "exec.command".to_owned(),
+            target: None,
+            profile: None,
+            input_json: effect_input.clone(),
+            required_capabilities_json: r#"["script.judge"]"#.to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        };
+
+        // First exec: builds the whip-executor/1 request and suspends on HTTP.
+        let step = driver
+            .run_effect(&claimable("exec-1"), None)
+            .expect("first exec prepares");
+        let request = match step {
+            EffectStep::NeedsHttp(request) => request,
+            other => panic!("expected NeedsHttp, got {other:?}"),
+        };
+        assert_eq!(request.url, "http://executor:8080/exec");
+        assert_eq!(
+            request.body["protocol"],
+            serde_json::json!(exec_http::EXECUTOR_PROTOCOL)
+        );
+        assert_eq!(request.body["script_sha256"], serde_json::json!(script_sha));
+        assert_eq!(request.body["script_index"], serde_json::json!(1));
+        assert_eq!(
+            exec_http::base64_decode(request.body["script_b64"].as_str().expect("b64"))
+                .expect("decodes"),
+            script_body.as_bytes()
+        );
+
+        // Resume with the sidecar's canned response: the effect settles.
+        let response = HttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "protocol": exec_http::EXECUTOR_PROTOCOL,
+                "effect_id": "exec-1",
+                "exit_code": 0,
+                "timed_out": false,
+                "stdout": "{\"verdict\":\"pass\"}\n",
+                "stderr": "",
+            }),
+        };
+        let step = driver
+            .run_effect(&claimable("exec-1"), Some(Ok(response)))
+            .expect("first exec settles");
+        assert!(matches!(step, EffectStep::Done(_)), "{step:?}");
+
+        // Second identical exec: served from the delta-kernel cache — DONE
+        // immediately on prepare, no HTTP round.
+        let step = driver
+            .run_effect(&claimable("exec-2"), None)
+            .expect("second exec settles from cache");
+        assert!(
+            matches!(step, EffectStep::Done(_)),
+            "expected a cache-hit settle with no HTTP, got {step:?}"
+        );
+
+        let runs = driver.kernel.store().list_runs(&instance_id).expect("runs");
+        let meta_for = |effect_id: &str| {
+            serde_json::from_str::<serde_json::Value>(
+                &runs
+                    .iter()
+                    .find(|run| run.effect_id == effect_id)
+                    .unwrap_or_else(|| panic!("run for {effect_id}"))
+                    .metadata_json,
+            )
+            .expect("metadata json")
+        };
+        let first = meta_for("exec-1");
+        let second = meta_for("exec-2");
+        assert_eq!(first["cache"]["hit"], serde_json::json!(false), "{first}");
+        assert_eq!(second["cache"]["hit"], serde_json::json!(true), "{second}");
+        assert_eq!(
+            first["cache"]["content_key"],
+            second["cache"]["content_key"]
+        );
+        assert_eq!(first["stdout"], second["stdout"]);
+        assert_eq!(first["sha256"], serde_json::json!(script_sha));
+
+        let content_key = first["cache"]["content_key"]
+            .as_str()
+            .expect("content key")
+            .to_owned();
+        let entry = driver
+            .kernel
+            .store()
+            .lookup_compute_result(&content_key)
+            .expect("cache lookup")
+            .expect("cache entry");
+        assert_eq!(entry.source_effect_id, "exec-1");
     }
 
     // The architectural crux (DR-0033): a coerce HTTP effect SUSPENDS the instance
@@ -703,6 +1130,7 @@ mod tests {
             coerce: Some(&cfg),
             agent_model: None,
             agent_tools: &NoTools,
+            exec: None,
             ir: &ir,
             instance_id: &instance_id,
         };
@@ -813,6 +1241,7 @@ mod tests {
             coerce: None,
             agent_model: Some(&model),
             agent_tools: &NoTools,
+            exec: None,
             ir: &ir,
             instance_id: &instance_id,
         };
@@ -936,6 +1365,7 @@ mod tests {
             coerce: None,
             agent_model: Some(&model),
             agent_tools: &NoTools,
+            exec: None,
             ir: &ir,
             instance_id: &instance_id,
         };

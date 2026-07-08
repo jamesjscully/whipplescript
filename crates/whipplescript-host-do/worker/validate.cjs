@@ -3,6 +3,7 @@
 // real SQLite (node:sqlite) as the DoSqlBridge. This is the live worker path minus
 // only Cloudflare's `state.storage.sql` (swapped for node:sqlite) + `wrangler deploy`.
 const assert = require("node:assert");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
@@ -136,7 +137,57 @@ function testAgentSuspendResume() {
   console.log("PASS  agent workflow -> needs_http -> (fetch) -> terminal (two steps)");
 }
 
+
+// 4) A Class-A EXEC workflow (compute plane P8): the exec.command effect builds a
+//    whip-executor/1 request and SUSPENDS on fetch; the sidecar's canned response
+//    RESUMES it to a terminal -- and the delta-kernel cache entry is recorded.
+function testExecSuspendResume() {
+  const source = [
+    "workflow ExecJudge", "", "output result Verdict", "",
+    "class Verdict {", "  ok int", "}", "",
+    "rule go", "  when started", "=> {", "  exec judge with input as check", "",
+    "  after check succeeds {", "    complete result { ok 1 }", "  }", "",
+    "  after check fails {", "    complete result { ok 0 }", "  }", "}",
+  ].join("\n");
+  const seed = [
+    "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('script.judge', 'Run an operator-pinned script.', '{}')",
+    "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_script_judge', NULL, 'script.judge', 'builtin-script', '{}')",
+  ];
+  const bridge = freshInstanceEnv(seed);
+  const body = "echo ok\n";
+  const sha = crypto.createHash("sha256").update(body).digest("hex");
+  const execConfig = JSON.stringify({ base_url: "http://executor:8080", environment_epoch: "test-epoch" });
+  const scripts = JSON.stringify([
+    { name: "judge", argv: ["sh", "{script}"], sha256: sha, hermetic: true, body },
+  ]);
+  const inst = WasmDurableInstance.create(
+    bridge, source, "{}", "local/ExecJudge",
+    undefined, undefined, undefined, execConfig, scripts,
+  );
+
+  // First step: the exec effect suspends on the sidecar fetch.
+  const first = JSON.parse(inst.step(undefined, Date.now()));
+  assert.strictEqual(first.kind, "needs_http", `exec step1: ${JSON.stringify(first)}`);
+  assert.ok(first.request.url.endsWith("/exec"), "request targets the executor");
+  assert.strictEqual(first.request.body.protocol, "whip-executor/1");
+  assert.strictEqual(first.request.body.script_sha256, sha);
+
+  // The shell performs the fetch; feed the sidecar's canned result back.
+  const response = JSON.stringify({
+    status: 200,
+    body: {
+      protocol: "whip-executor/1", effect_id: "e", exit_code: 0,
+      timed_out: false, stdout: "ok\n", stderr: "",
+    },
+  });
+  const second = JSON.parse(inst.step(response, Date.now()));
+  assert.strictEqual(second.kind, "terminal", `exec step2: ${JSON.stringify(second)}`);
+  assert.strictEqual(inst.status(), "completed");
+  console.log("PASS  exec workflow -> needs_http (whip-executor/1) -> terminal (two steps)");
+}
+
 testEffectFree();
 testCoerceSuspendResume();
 testAgentSuspendResume();
+testExecSuspendResume();
 console.log("\nALL PASS: the wasm DO runtime drives real workflows over real SQLite through the wasm-bindgen boundary.");

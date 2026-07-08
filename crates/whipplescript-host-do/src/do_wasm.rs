@@ -23,9 +23,11 @@ use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_model::MessagesApiClient;
 use whipplescript_kernel::sansio::{HttpResponse, TransportError};
 
-use crate::do_instance::CoerceProviderConfig;
+use crate::do_instance::{CoerceProviderConfig, ExecutorSidecarConfig};
 use crate::do_store::DoSql;
-use crate::do_worker::{DurableEffectPorts, DurableInstance, DurableStepOutcome};
+use crate::do_worker::{
+    DurableEffectPorts, DurableInstance, DurableStepOutcome, ScriptCapabilityInput,
+};
 
 #[wasm_bindgen]
 extern "C" {
@@ -216,6 +218,72 @@ fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
     ))
 }
 
+/// Parse the executor-sidecar config JSON (compute plane P8).
+fn parse_exec_config(json: &str) -> Result<ExecutorSidecarConfig, String> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    let base_url = value
+        .get("base_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("exec config needs base_url")?
+        .to_owned();
+    let env_values = match value.get("env") {
+        None | Some(serde_json::Value::Null) => std::collections::BTreeMap::new(),
+        Some(env) => serde_json::from_value(env.clone())
+            .map_err(|error| format!("exec config env must map names to strings: {error}"))?,
+    };
+    Ok(ExecutorSidecarConfig {
+        base_url,
+        env_values,
+        environment_epoch: value
+            .get("environment_epoch")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("do-v0")
+            .to_owned(),
+        timeout_ms: value.get("timeout_ms").and_then(serde_json::Value::as_u64),
+    })
+}
+
+/// Parse the deploy-shipped script capabilities (compute plane P8).
+fn parse_scripts(json: &str) -> Result<Vec<ScriptCapabilityInput>, String> {
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(json).map_err(|error| error.to_string())?;
+    entries
+        .into_iter()
+        .map(|entry| {
+            let field = |name: &str| {
+                entry
+                    .get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            };
+            let name = field("name").ok_or("script entry needs name")?;
+            let argv: Vec<String> = serde_json::from_value(
+                entry
+                    .get("argv")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .map_err(|error| format!("script `{name}` argv must be a string array: {error}"))?;
+            let env = match entry.get("env") {
+                None | Some(serde_json::Value::Null) => std::collections::BTreeMap::new(),
+                Some(env) => serde_json::from_value(env.clone())
+                    .map_err(|error| format!("script `{name}` env: {error}"))?,
+            };
+            Ok(ScriptCapabilityInput {
+                sha256: field("sha256").ok_or(format!("script `{name}` needs sha256"))?,
+                body: field("body").ok_or(format!("script `{name}` needs body"))?,
+                hermetic: entry
+                    .get("hermetic")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                name,
+                argv,
+                env,
+            })
+        })
+        .collect()
+}
+
 /// The durable-object instance as the Worker shell sees it.
 #[wasm_bindgen]
 pub struct WasmDurableInstance {
@@ -231,6 +299,13 @@ impl WasmDurableInstance {
     /// `coerce_config_json` for `coerce` effects, `agent_config_json` for the
     /// (multi-round) `agent.tell` turn. A live agent turn with tools also needs a
     /// tool executor over an HTTP sidecar (the remaining async-tool seam).
+    /// Two further optional args wire the Class-A compute plane (P8):
+    /// `exec_config_json` = `{"base_url", "env"?: {NAME: value}, "environment_epoch"?,
+    /// "timeout_ms"?}` pointing at the executor sidecar; `scripts_json` = an
+    /// array of `{"name", "argv": [.., "{script}", ..], "sha256", "env"?,
+    /// "hermetic"?, "body"}` script capabilities registered into the DO store
+    /// (each body verified against its pin, fail-closed).
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         bridge: DoSqlBridge,
         program: &str,
@@ -239,6 +314,8 @@ impl WasmDurableInstance {
         coerce_config_json: Option<String>,
         agent_config_json: Option<String>,
         project_context_json: Option<String>,
+        exec_config_json: Option<String>,
+        scripts_json: Option<String>,
     ) -> Result<WasmDurableInstance, JsValue> {
         // Deploy-shipped project instructions: `[{"path": ..., "content": ...}]`
         // in injection order (context-assembly Phase 3 item 4).
@@ -265,6 +342,14 @@ impl WasmDurableInstance {
                 )),
                 None => None,
             };
+        let exec = match exec_config_json {
+            Some(json) => Some(parse_exec_config(&json).map_err(|e| JsValue::from_str(&e))?),
+            None => None,
+        };
+        let scripts = match scripts_json {
+            Some(json) => parse_scripts(&json).map_err(|e| JsValue::from_str(&e))?,
+            None => Vec::new(),
+        };
         let inner = DurableInstance::create(
             JsDoSql { bridge },
             program,
@@ -273,9 +358,11 @@ impl WasmDurableInstance {
             DurableEffectPorts {
                 coerce,
                 agent_model,
+                exec,
                 ..DurableEffectPorts::default()
             },
             &project_context,
+            &scripts,
         )
         .map_err(|error| JsValue::from_str(&error))?;
         Ok(Self { inner })

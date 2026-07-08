@@ -24,10 +24,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
-/// Protocol marker; requests naming another protocol are rejected.
-pub const EXECUTOR_PROTOCOL: &str = "whip-executor/1";
+pub use whipplescript_kernel::exec_http::EXECUTOR_PROTOCOL;
+use whipplescript_kernel::exec_http::{base64_decode, sha256_hex};
 
 /// Per-stream response cap. Bounded so a runaway script cannot balloon the
 /// response; the flag tells the caller truncation happened.
@@ -341,67 +340,10 @@ fn stage_verified_script(sha256: &str, bytes: &[u8], extension: &str) -> std::io
     Ok(path)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// Minimal base64 (standard alphabet, `=` padding) decode — enough for the
-/// executor wire without a new dependency.
-pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    fn value(ch: u8) -> Option<u32> {
-        match ch {
-            b'A'..=b'Z' => Some(u32::from(ch - b'A')),
-            b'a'..=b'z' => Some(u32::from(ch - b'a') + 26),
-            b'0'..=b'9' => Some(u32::from(ch - b'0') + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let input = input.trim_end_matches('=');
-    let mut output = Vec::with_capacity(input.len() * 3 / 4);
-    let mut accumulator = 0u32;
-    let mut bits = 0u32;
-    for byte in input.bytes() {
-        let chunk = value(byte)?;
-        accumulator = (accumulator << 6) | chunk;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push((accumulator >> bits) as u8);
-        }
-    }
-    Some(output)
-}
-
-/// Standard-alphabet base64 encode — the request-building counterpart, used
-/// by tests here; the production request builder lives host-side with the
-/// NeedsHttp lift.
-#[cfg(test)]
-pub fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let mut accumulator = 0u32;
-        for (index, byte) in chunk.iter().enumerate() {
-            accumulator |= u32::from(*byte) << (16 - 8 * index);
-        }
-        for position in 0..4 {
-            if position <= chunk.len() {
-                let index = ((accumulator >> (18 - 6 * position)) & 0x3f) as usize;
-                output.push(ALPHABET[index] as char);
-            } else {
-                output.push('=');
-            }
-        }
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use whipplescript_kernel::exec_http::base64_encode;
 
     fn exec_request(script: &str, stdin: Value) -> Value {
         json!({

@@ -25,7 +25,7 @@ use whipplescript_parser::IrProgram;
 use whipplescript_store::files::FileStore;
 use whipplescript_store::{ClaimableEffect, NewInstanceAuthority, RuntimeStore, StoreError};
 
-use crate::do_instance::{CoerceProviderConfig, DoInstanceDriver};
+use crate::do_instance::{CoerceProviderConfig, DoInstanceDriver, ExecutorSidecarConfig};
 use crate::do_store::{DoSql, DoSqliteStore};
 
 /// What one [`DurableInstance::step`] yields back to the worker shell.
@@ -122,6 +122,21 @@ pub struct DurableEffectPorts {
     pub coerce: Option<CoerceProviderConfig>,
     pub agent_model: Option<Box<dyn HttpModelClient>>,
     pub agent_tools: Option<Box<dyn ToolExecutor>>,
+    /// Executor-sidecar wiring for Class-A exec effects (compute plane P8).
+    pub exec: Option<ExecutorSidecarConfig>,
+}
+
+/// One operator-pinned script capability shipped with the deploy (compute
+/// plane P8): the DO-store mirror of a native script-manifest entry. `argv`
+/// must carry the `{script}` placeholder element; `body` must hash to
+/// `sha256` (verified at registration — fail-closed).
+pub struct ScriptCapabilityInput {
+    pub name: String,
+    pub argv: Vec<String>,
+    pub sha256: String,
+    pub env: std::collections::BTreeMap<String, String>,
+    pub hermetic: bool,
+    pub body: String,
 }
 
 /// A workflow instance running on the durable object as a resumable step machine.
@@ -136,6 +151,7 @@ pub struct DurableInstance<Sql: DoSql> {
     coerce: Option<CoerceProviderConfig>,
     agent_model: Option<Box<dyn HttpModelClient>>,
     agent_tools: Box<dyn ToolExecutor>,
+    exec: Option<ExecutorSidecarConfig>,
 }
 
 impl<Sql: DoSql> DurableInstance<Sql> {
@@ -151,6 +167,7 @@ impl<Sql: DoSql> DurableInstance<Sql> {
         workflow_principal: &str,
         ports: DurableEffectPorts,
         project_context: &[(String, String)],
+        scripts: &[ScriptCapabilityInput],
     ) -> Result<Self, String> {
         let ir = whipplescript_parser::compile_program(program_source)
             .ir
@@ -174,6 +191,33 @@ impl<Sql: DoSql> DurableInstance<Sql> {
             kernel
                 .store()
                 .register_project_context_doc(position as i64, path, body)
+                .map_err(|error| format!("{error:?}"))?;
+        }
+        // Register deploy-shipped script capabilities (compute plane P8),
+        // verifying each body against its operator pin — fail-closed, the
+        // same TOCTOU discipline the native manifest loader applies.
+        for script in scripts {
+            let actual = whipplescript_kernel::exec_http::sha256_hex(script.body.as_bytes());
+            if actual != script.sha256 {
+                return Err(format!(
+                    "script capability `{}` hash mismatch: expected {}, got {actual}",
+                    script.name, script.sha256
+                ));
+            }
+            let argv_json = serde_json::to_string(&script.argv)
+                .map_err(|error| format!("script `{}` argv: {error}", script.name))?;
+            let env_json = serde_json::to_string(&script.env)
+                .map_err(|error| format!("script `{}` env: {error}", script.name))?;
+            kernel
+                .store()
+                .register_script_capability(whipplescript_store::ScriptCapabilityRegistration {
+                    name: &script.name,
+                    argv_json: &argv_json,
+                    sha256: &script.sha256,
+                    env_json: &env_json,
+                    hermetic: script.hermetic,
+                    body: &script.body,
+                })
                 .map_err(|error| format!("{error:?}"))?;
         }
         let existing = kernel
@@ -218,6 +262,7 @@ impl<Sql: DoSql> DurableInstance<Sql> {
             agent_tools: ports
                 .agent_tools
                 .unwrap_or_else(|| Box::new(NoToolExecutor)),
+            exec: ports.exec,
         })
     }
 
@@ -246,6 +291,7 @@ impl<Sql: DoSql> DurableInstance<Sql> {
             coerce: self.coerce.as_ref(),
             agent_model: self.agent_model.as_deref(),
             agent_tools: self.agent_tools.as_ref(),
+            exec: self.exec.as_ref(),
             ir: &self.ir,
             instance_id: &self.instance_id,
         };
@@ -352,6 +398,7 @@ mod tests {
             "local/MinimalNoop",
             DurableEffectPorts::default(),
             &[],
+            &[],
         )
         .expect("create");
         assert!(
@@ -384,6 +431,7 @@ mod tests {
             "{}",
             "local/TimerDemo",
             DurableEffectPorts::default(),
+            &[],
             &[],
         )
         .expect("create");
@@ -434,6 +482,7 @@ mod tests {
             "{}",
             "local/ClockDemo",
             DurableEffectPorts::default(),
+            &[],
             &[],
         )
         .expect("create");
@@ -502,7 +551,7 @@ mod tests {
             ..DurableEffectPorts::default()
         };
         let mut instance =
-            DurableInstance::create(base.sql, source, "{}", "local/CoerceScore", ports, &[])
+            DurableInstance::create(base.sql, source, "{}", "local/CoerceScore", ports, &[], &[])
                 .expect("create");
 
         // First step: the coerce effect suspends on `fetch`.
@@ -582,7 +631,7 @@ mod tests {
             ..DurableEffectPorts::default()
         };
         let mut instance =
-            DurableInstance::create(base.sql, source, "{}", "local/AgentDemo", ports, &[])
+            DurableInstance::create(base.sql, source, "{}", "local/AgentDemo", ports, &[], &[])
                 .expect("create");
 
         // First step: the agent turn's first model call suspends on `fetch`, and the

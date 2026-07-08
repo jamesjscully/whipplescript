@@ -286,6 +286,17 @@ impl RuntimeStore for NativeStores {
         self.runtime.lookup_compute_result(content_key)
     }
 
+    fn register_script_capability(
+        &self,
+        registration: ScriptCapabilityRegistration<'_>,
+    ) -> StoreResult<()> {
+        self.runtime.register_script_capability(registration)
+    }
+
+    fn get_script_capability(&self, name: &str) -> StoreResult<Option<ScriptCapabilityRecord>> {
+        self.runtime.get_script_capability(name)
+    }
+
     fn attach_skill(&self, attachment: SkillAttachment<'_>) -> StoreResult<()> {
         self.runtime.attach_skill(attachment)
     }
