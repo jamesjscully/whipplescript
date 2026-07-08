@@ -683,10 +683,20 @@ fixed-size `getRandom` pools). Open build work:
       proven by test), miss → NeedsHttp → settle + cache record; wired
       through DurableEffectPorts/create(exec_config_json, scripts_json) +
       index.ts (WHIP_EXECUTOR_URL) and validated through the real
-      wasm-bindgen boundary (validate.cjs exec round green). REMAINING for
-      [x]: Cloudflare container packaging of `whip executor`, workspace-DO
-      pool ownership + getRandom routing + priority queue (platform
-      container tier — production enable is a billing decision).
+      wasm-bindgen boundary (validate.cjs exec round green). CONTAINER TIER
+      PROVEN LOCALLY 2026-07-08 (b23c155): executor/Dockerfile
+      (trixie-slim — glibc 2.39; bookworm exits 1) + [[containers]]
+      ExecutorContainer (lite, max 4) + getRandom routing in performFetch
+      (executor-sentinel URLs → container stub, not network) — full path
+      validated under wrangler dev with real Docker: exec effect →
+      whip-executor/1 → container ran the script → settled completed +
+      cache entry recorded. Two live-run bugs fixed: bootstrap destructure
+      dropped `scripts`; create() now registers script.<name> capability
+      schema/binding rows (policy gate) alongside bodies. REMAINING for
+      [x]: production container enable (account billing — Jack's call;
+      `wrangler deploy` then ships the same config) + priority queue
+      (production > working > counterfactual — needs the workspace-DO
+      broker; v1 = getRandom only, documented).
 - [x] Delta-kernel result cache: content-keyed memoization in the
       effect-ledger discipline (script+env+input hashes); eviction joins
       the versioned-workspace retention policy.
