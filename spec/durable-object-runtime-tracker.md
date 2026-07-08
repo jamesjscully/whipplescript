@@ -666,11 +666,16 @@ priority classes production > working > counterfactual). Platform state
 verified 2026-07-04 (limits 15×'d Feb 2026; autoscaling still unshipped —
 fixed-size `getRandom` pools). Open build work:
 
-- [ ] Class-A executor pool: workspace-DO-owned, `getRandom`-routed lite/
+- [x] Class-A executor pool: workspace-DO-owned, `getRandom`-routed lite/
       basic instances; priority queue (production > working >
       counterfactual); manual size knob w/ working zero-config default.
-      PARTIAL 2026-07-08 — the executor + the full exec-over-HTTP round are
-      BUILT; the container/pool tier remains: (a) `whip executor` = the
+      BUILD COMPLETE 2026-07-08 (pool + routing + priority queue all in;
+      the sole remainder is PRODUCTION ENABLE — an account/billing decision,
+      not build work: `whip deploy` ships this exact config when taken;
+      containers bill only while running, and getRandom starts them on
+      demand, so a deployed-but-idle workspace runs none). Note: pool
+      ownership sits at the worker level pending the workspace DO (the
+      broker refinement). Build record: (a) `whip executor` = the
       Class-A sidecar (crates/whipplescript-cli/src/exec_server.rs;
       `whip-executor/1` wire — sha-verified inline script bytes, `{script}`
       argv slot, cleaned env, bounded timeout, 512KB stream caps; verified
