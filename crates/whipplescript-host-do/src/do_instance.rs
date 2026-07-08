@@ -189,6 +189,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     tools: Vec::new(),
                     max_steps: 8,
                     resume_from: Vec::new(),
+                    user_images: Vec::new(),
                     // DO agent stub: no context assembler yet, so no bundle rows.
                     context_bundles: Vec::new(),
                     pinned_skills: Vec::new(),

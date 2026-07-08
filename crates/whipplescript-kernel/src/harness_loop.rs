@@ -67,11 +67,26 @@ pub trait ToolExecutor {
     fn execute(&self, call: &ToolCall) -> ToolOutcome;
 }
 
+/// One inline image attached to a user message (pi-conformance §6, v1 scope:
+/// effect-input images only — the read-tool image path is deferred).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ImageBlock {
+    /// The image MIME type, e.g. `image/png`.
+    pub media_type: String,
+    /// The raw image bytes, base64-encoded.
+    pub data_base64: String,
+}
+
 /// One message in the model conversation the driver maintains.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ChatMessage {
     System(String),
-    User(String),
+    /// A user turn: text plus any inline images (pi-conformance §6).
+    User {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageBlock>,
+    },
     /// An assistant turn: free text plus any tool calls it requested.
     Assistant {
         text: String,
@@ -79,6 +94,16 @@ pub enum ChatMessage {
     },
     /// The results of the assistant's tool calls, correlated by call id.
     ToolResults(Vec<ToolResultMsg>),
+}
+
+impl ChatMessage {
+    /// A text-only user message (the overwhelmingly common case).
+    pub fn user_text(text: impl Into<String>) -> Self {
+        ChatMessage::User {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
 }
 
 /// A tool result as it appears back in the conversation.
@@ -305,6 +330,10 @@ pub struct BrokeredTurnInput {
     /// this persisted transcript instead of starting fresh from system+user. A
     /// dangling final tool-call (crash between request and result) is tolerated.
     pub resume_from: Vec<ChatMessage>,
+    /// Inline images attached to the turn's user message (pi-conformance §6).
+    /// Empty for text-only turns (the default); providers that lack vision error
+    /// informatively in v1 (no omission-note degradation yet).
+    pub user_images: Vec<ImageBlock>,
     /// Per-bundle provenance for the assembled system prompt (context-assembly
     /// Phase 1, Decision 5). The turn runner records one `context.bundle` evidence
     /// row per entry, before the turn, on a fresh start only (not on resume, so
@@ -344,7 +373,10 @@ where
     let mut messages = if input.resume_from.is_empty() {
         vec![
             ChatMessage::System(input.system.clone()),
-            ChatMessage::User(input.user.clone()),
+            ChatMessage::User {
+                text: input.user.clone(),
+                images: input.user_images.clone(),
+            },
         ]
     } else {
         // Resume-from-projection: continue from the persisted transcript, dropping
@@ -712,7 +744,10 @@ where
             self.messages = if self.input.resume_from.is_empty() {
                 vec![
                     ChatMessage::System(self.input.system.clone()),
-                    ChatMessage::User(self.input.user.clone()),
+                    ChatMessage::User {
+                        text: self.input.user.clone(),
+                        images: self.input.user_images.clone(),
+                    },
                 ]
             } else {
                 sanitize_resume_messages(self.input.resume_from.clone())
@@ -1054,7 +1089,7 @@ impl Compactor for TurnSummarizingCompactor {
         let folded_json = chat_messages_to_json(fold);
         let request_messages = vec![
             ChatMessage::System(SUMMARIZE_INSTRUCTION.to_string()),
-            ChatMessage::User(format!(
+            ChatMessage::user_text(format!(
                 "Summarize this earlier portion of the conversation:\n{folded_json}"
             )),
         ];
@@ -1067,7 +1102,7 @@ impl Compactor for TurnSummarizingCompactor {
 
     fn assemble(&self, request: &SummarizationRequest, summary: &str) -> Vec<ChatMessage> {
         let mut out = request.anchors.clone();
-        out.push(ChatMessage::User(format!(
+        out.push(ChatMessage::user_text(format!(
             "[Earlier conversation compacted to a handoff summary]\n{summary}"
         )));
         out.extend(request.keep_tail.iter().cloned());
@@ -1388,7 +1423,25 @@ pub fn chat_messages_to_json(messages: &[ChatMessage]) -> Value {
 fn chat_message_to_json(message: &ChatMessage) -> Value {
     match message {
         ChatMessage::System(text) => json!({ "role": "system", "text": text }),
-        ChatMessage::User(text) => json!({ "role": "user", "text": text }),
+        ChatMessage::User { text, images } => {
+            // Wire-format stability: a text-only user message keeps the exact
+            // pre-images shape, so persisted transcripts round-trip unchanged.
+            if images.is_empty() {
+                json!({ "role": "user", "text": text })
+            } else {
+                json!({
+                    "role": "user",
+                    "text": text,
+                    "images": images
+                        .iter()
+                        .map(|image| json!({
+                            "media_type": image.media_type,
+                            "data_base64": image.data_base64,
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            }
+        }
         ChatMessage::Assistant { text, tool_calls } => json!({
             "role": "assistant",
             "text": text,
@@ -1430,7 +1483,34 @@ fn chat_message_from_json(value: &Value) -> Option<ChatMessage> {
     };
     match value.get("role").and_then(Value::as_str)? {
         "system" => Some(ChatMessage::System(text(value))),
-        "user" => Some(ChatMessage::User(text(value))),
+        "user" => {
+            // Old-format entries carry no `images` key → empty (compatibility).
+            let images = value
+                .get("images")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| ImageBlock {
+                            media_type: item
+                                .get("media_type")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            data_base64: item
+                                .get("data_base64")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(ChatMessage::User {
+                text: text(value),
+                images,
+            })
+        }
         "assistant" => {
             let tool_calls = value
                 .get("tool_calls")
@@ -1629,6 +1709,7 @@ mod tests {
             }],
             max_steps,
             resume_from: Vec::new(),
+            user_images: Vec::new(),
             context_bundles: Vec::new(),
             pinned_skills: Vec::new(),
         }
@@ -2155,7 +2236,7 @@ mod tests {
         let mut input = input(8);
         input.resume_from = vec![
             ChatMessage::System("s".into()),
-            ChatMessage::User("u".into()),
+            ChatMessage::user_text("u"),
             ChatMessage::Assistant {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
@@ -2200,7 +2281,7 @@ mod tests {
     fn transcript_json_round_trips() {
         let messages = vec![
             ChatMessage::System("s".into()),
-            ChatMessage::User("u".into()),
+            ChatMessage::user_text("u"),
             ChatMessage::Assistant {
                 text: "t".into(),
                 tool_calls: vec![ToolCall {
@@ -2218,6 +2299,92 @@ mod tests {
         ];
         let json = chat_messages_to_json(&messages);
         assert_eq!(chat_messages_from_json(&json), messages);
+    }
+
+    #[test]
+    fn user_transcript_json_keeps_the_pre_images_wire_shape() {
+        // Serde compatibility (pi-conformance §6): a text-only user entry
+        // serializes exactly as it did before images existed...
+        let json = chat_messages_to_json(&[ChatMessage::user_text("u")]);
+        assert_eq!(json, json!([{ "role": "user", "text": "u" }]));
+        // ...and an old-format persisted transcript (no `images` key) parses
+        // with images empty, so pre-images transcripts round-trip.
+        let old = json!([
+            { "role": "system", "text": "s" },
+            { "role": "user", "text": "hello" },
+        ]);
+        assert_eq!(
+            chat_messages_from_json(&old),
+            vec![
+                ChatMessage::System("s".into()),
+                ChatMessage::User {
+                    text: "hello".into(),
+                    images: Vec::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transcript_json_round_trips_user_images() {
+        let messages = vec![ChatMessage::User {
+            text: "what is in this picture?".into(),
+            images: vec![ImageBlock {
+                media_type: "image/png".into(),
+                data_base64: "aGVsbG8=".into(),
+            }],
+        }];
+        let json = chat_messages_to_json(&messages);
+        assert_eq!(json[0]["images"][0]["media_type"], json!("image/png"));
+        assert_eq!(json[0]["images"][0]["data_base64"], json!("aGVsbG8="));
+        assert_eq!(chat_messages_from_json(&json), messages);
+    }
+
+    #[test]
+    fn turn_input_images_seed_the_first_user_message() {
+        // pi-conformance §6: both the reference loop and the stepped machine
+        // seed the turn's images into the first User message.
+        let mut input = input(4);
+        input.user_images = vec![ImageBlock {
+            media_type: "image/jpeg".into(),
+            data_base64: "QUJD".into(),
+        }];
+        let expected_seed = ChatMessage::User {
+            text: input.user.clone(),
+            images: input.user_images.clone(),
+        };
+
+        let client = ScriptedClient::new(vec![Ok(final_reply("done"))]);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "R".into(),
+        });
+        let mut loop_seed: Vec<ChatMessage> = Vec::new();
+        let mut record_loop = |messages: &[ChatMessage]| {
+            if loop_seed.is_empty() {
+                loop_seed = messages.to_vec();
+            }
+        };
+        run_brokered_loop(&client, &exec, &input, &mut record_loop);
+        assert_eq!(loop_seed[1], expected_seed);
+
+        let http = ScriptedHttpClient::new(vec![Ok(final_reply("done"))]);
+        let mut machine_seed: Vec<ChatMessage> = Vec::new();
+        let mut record_machine = |messages: &[ChatMessage]| {
+            if machine_seed.is_empty() {
+                machine_seed = messages.to_vec();
+            }
+        };
+        run_brokered_turn_http(
+            &http,
+            &exec,
+            &input,
+            &mut record_machine,
+            &DummyHost,
+            &NoopCompactor,
+            None,
+        );
+        assert_eq!(machine_seed[1], expected_seed);
     }
 
     #[test]
@@ -2275,7 +2442,7 @@ mod tests {
         let c = TurnSummarizingCompactor::new(9, 2, 10);
         let transcript = vec![
             ChatMessage::System("sys".into()),
-            ChatMessage::User("task".into()),
+            ChatMessage::user_text("task"),
             ChatMessage::Assistant {
                 text: "middle-1".into(),
                 tool_calls: Vec::new(),
@@ -2284,7 +2451,7 @@ mod tests {
                 text: "middle-2".into(),
                 tool_calls: Vec::new(),
             },
-            ChatMessage::User("recent".into()),
+            ChatMessage::user_text("recent"),
         ];
         match c.plan(&transcript, &stats(950, 1000, transcript.len())) {
             CompactionOutcome::NeedsModel(req) => {
@@ -2297,7 +2464,9 @@ mod tests {
                 let rebuilt = c.assemble(&req, "HANDOFF");
                 assert_eq!(rebuilt[0], transcript[0]);
                 assert_eq!(rebuilt[1], transcript[1]);
-                assert!(matches!(&rebuilt[2], ChatMessage::User(t) if t.contains("HANDOFF")));
+                assert!(
+                    matches!(&rebuilt[2], ChatMessage::User { text: t, .. } if t.contains("HANDOFF"))
+                );
                 assert_eq!(*rebuilt.last().expect("rebuilt tail"), transcript[4]);
             }
             CompactionOutcome::Deterministic(_) => panic!("expected a summarization round"),
@@ -2378,7 +2547,7 @@ mod tests {
         let outcome = {
             let mut record = |messages: &[ChatMessage]| {
                 if messages.iter().any(
-                    |m| matches!(m, ChatMessage::User(t) if t.contains("compacted to a handoff")),
+                    |m| matches!(m, ChatMessage::User { text: t, .. } if t.contains("compacted to a handoff")),
                 ) {
                     folded_seen = true;
                 }
@@ -2445,7 +2614,7 @@ mod tests {
         {
             let mut record = |messages: &[ChatMessage]| {
                 if messages.iter().any(
-                    |m| matches!(m, ChatMessage::User(t) if t.contains("compacted to a handoff")),
+                    |m| matches!(m, ChatMessage::User { text: t, .. } if t.contains("compacted to a handoff")),
                 ) {
                     folded = Some(messages.to_vec());
                 }
@@ -2506,7 +2675,7 @@ mod tests {
         let c = HardResetCompactor::new(9, 2, 10);
         let transcript = vec![
             ChatMessage::System("sys".into()),
-            ChatMessage::User("task".into()),
+            ChatMessage::user_text("task"),
             ChatMessage::Assistant {
                 text: "middle-1".into(),
                 tool_calls: Vec::new(),
@@ -2515,7 +2684,7 @@ mod tests {
                 text: "middle-2".into(),
                 tool_calls: Vec::new(),
             },
-            ChatMessage::User("recent".into()),
+            ChatMessage::user_text("recent"),
         ];
         assert!(c.should_compact(&stats(950, 1000, transcript.len())));
         match c.plan(&transcript, &stats(950, 1000, transcript.len())) {
@@ -2555,7 +2724,7 @@ mod tests {
         }]);
         let transcript = vec![
             ChatMessage::System("sys".into()),
-            ChatMessage::User("task".into()),
+            ChatMessage::user_text("task"),
             ChatMessage::Assistant {
                 text: "reading".into(),
                 tool_calls: vec![ToolCall {
@@ -2566,7 +2735,7 @@ mod tests {
             },
             captured,
             small,
-            ChatMessage::User("recent".into()),
+            ChatMessage::user_text("recent"),
         ];
         match c.plan(&transcript, &stats(950, 1000, transcript.len())) {
             CompactionOutcome::Deterministic(out) => {
@@ -2628,7 +2797,7 @@ mod tests {
     fn front_trim_drops_oldest_pairs_keeping_anchors_and_a_paired_tail() {
         let messages = vec![
             ChatMessage::System("sys".into()),
-            ChatMessage::User("task".into()),
+            ChatMessage::user_text("task"),
             assistant_tool_call("a1"),
             tool_results("a1"),
             assistant_tool_call("a2"),
