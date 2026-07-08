@@ -181,9 +181,14 @@ replace git for working branches + workstreams.)*
 
 ## Phase 3 — conversational runtime readiness (the Pi-replacement surface, whip half) · **v0.3** (fork item → v0.4)
 
-- [ ] Chat-shaped instance: a long-lived conversational instance pattern —
-      persistent thread = instance event log + restorable context; resumes
-      across process restarts.
+- [x] Chat-shaped instance — **v1 DONE 2026-07-07**: `agent { thread
+      continue }` (Managed-only knob; parser + partition diagnostics); a new
+      tell seeds from the agent's latest completed-turn transcript (found via
+      the agent.turn.completed fact) and appends the new user message; the
+      machine now persists the FINAL assistant reply into the transcript, so
+      the thread ends on the answer. Persistent thread = the recorded
+      transcript events — survives restarts by construction. Branching (chat
+      fork) stays v0.4 per the fork item below.
 - [ ] Instance fork surface (chat fork) over branches. **[v0.4 — needs Phase 1 branches.]**
 - [x] **Pi-conformance checklist**: extraction pass DONE 2026-07-07 →
       **`spec/pi-conformance-checklist.md`** (pi-mono @ 351efc8; tool
@@ -193,12 +198,28 @@ replace git for working branches + workstreams.)*
       temp files; bounded `max_steps`; no token streaming. *(System-prompt
       seam, skills, project instructions, compaction are OWNED by
       `context-assembly-tracker.md` — closed.)*
-- [ ] Implement the checklist deltas in the owned harness.
-- [ ] Multimodal input: image content blocks on the agent-turn (and
-      coerce, where sensible) effect surface.
-- [ ] Workbench event projection: a stable turn/effect event-stream shape
-      (tool dispatch/settle, pending-asks) consumable by an external UI —
-      **no token streaming** (settled 2026-07-04).
+- [x] Implement the checklist deltas — **DONE 2026-07-07** (commits
+      c776b9d, dbf6263, 23c7823, 436f291, 2d3dc03): owned-loop cooperative
+      cancel (TurnStatus::Cancelled + durable-cancellation probe between
+      rounds), bounded provider auto-retry (3, transient errors only), read
+      line-window/continuation notices + binary guard, grep regex + context +
+      line cap, edit robustness (arg tolerance/BOM/overlap), OpenAI is_error
+      marker. Residual (small, non-blocking): §2 length-stop tool-call
+      handling (fail truncated tool calls with a re-issue message) — needs a
+      stop_reason field on ModelReply.
+- [x] Multimodal input — **v1 DONE 2026-07-07** (2d3dc03): ImageBlock;
+      ChatMessage::User {text, images} with a back-compatible transcript
+      shape; tell effect input accepts an `images` array; Anthropic base64
+      source blocks / OpenAI input_image parts. Read-tool image path +
+      resizing deferred (needs an image codec dep); coerce images deferred
+      until a use case.
+- [x] Workbench event projection — **DONE 2026-07-07** (2d3dc03): the dev
+      NDJSON stream (whipplescript.dev_stream.v0 envelope, monotone
+      sequence) gains `dev.evidence` (incremental tool dispatch/settle +
+      turn-observation evidence rows, shape-only) and `dev.asks` (the
+      pending human-ask set, re-emitted on change) alongside the existing
+      dev.events/step/worker/idle/report. No token streaming, per the
+      settled decision.
 
 ## Phase 4 — policy plane + auth · **v0.4**
 
