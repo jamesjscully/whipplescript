@@ -449,7 +449,11 @@ fn emit_declaration_row(
                 Some(connective)
             }
         };
-        let required = clause
+        // `required`/`missing_summary` are validated here (fail-fast contract on
+        // the grammar manifests) but NOT emitted into the parse table: required-ness
+        // is a validation concern the typed-node builder / CLI validator owns, not
+        // something the parser needs. Read-and-discard to keep the build-time check.
+        clause
             .get("required")
             .and_then(Value::as_bool)
             .unwrap_or_else(|| fail(&format!("grammar clause `{name}` missing bool `required`")));
@@ -475,7 +479,8 @@ fn emit_declaration_row(
             .get("unknown_hint")
             .and_then(Value::as_str)
             .unwrap_or_else(|| fail(&format!("grammar clause `{name}` missing `unknown_hint`")));
-        let missing_summary = clause
+        // Contract-only field (see the `required` note above); validated, not emitted.
+        clause
             .get("missing_summary")
             .and_then(Value::as_str)
             .unwrap_or_else(|| {
@@ -512,10 +517,8 @@ fn emit_declaration_row(
              \x20               words: {words_expr},\n\
              \x20               connective: {connective_expr},\n\
              \x20               kind: {kind_variant},\n\
-             \x20               required: {required},\n\
              \x20               list: {list},\n\
              \x20               unknown_hint: {unknown_hint:?},\n\
-             \x20               missing_summary: {missing_summary:?},\n\
              \x20           }},\n"
         ));
     }

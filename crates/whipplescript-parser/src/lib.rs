@@ -17876,21 +17876,24 @@ enum DeclAstKind {
 /// (`words` = the build-time-split clause-name tokens; single-word names are a
 /// one-element slice), an optional `connective` consumed before the value
 /// (`Some("by")` for ledger `partition by`; shares Shape 2's vocabulary plus
-/// `by`), a value `kind`, and whether it is `required` and/or a `[ ... ]`
-/// `list`. The two carried diagnostic strings (`unknown_hint`,
-/// `missing_summary`) let a later dispatch slice reproduce the hand parser's
-/// messages. The order-free analog of `body::EffectSlotSpec`.
+/// `by`), a value `kind`, whether it is a `[ ... ]` `list`, and the
+/// `unknown_hint` shown when a sibling clause name is not recognized. The
+/// order-free analog of `body::EffectSlotSpec`.
+///
+/// `required`/`missing_summary` are NOT carried here: required-ness is a
+/// validation concern, not a parse concern. For the std decls it is enforced
+/// by the typed-node builder (`item_from_decl_ast`, the hand-written seam,
+/// which also owns the bespoke domain guidance); the manifest still declares
+/// `required`/`missing_summary` as the third-party contract validated by the
+/// CLI manifest validator.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
 struct ClauseSpec {
     name: &'static str,
     words: &'static [&'static str],
     connective: Option<&'static str>,
     kind: ClauseKind,
-    required: bool,
     list: bool,
     unknown_hint: &'static str,
-    missing_summary: &'static str,
 }
 
 /// The full grammar of one `declaration_block` construct (Shape 1). `keyword`
