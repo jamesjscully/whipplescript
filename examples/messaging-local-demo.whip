@@ -2,6 +2,10 @@
 description "Outbound messaging over the native local-mailbox provider (S5 first real CapabilityProvider)"
 workflow MessagingLocalDemo
 
+# `send via` comes from the embedded `std.messaging` package; the import
+# authorizes it with no package lock.
+use std.messaging
+
 # A `channel` declaring `provider local` selects the native, file-backed local
 # mailbox provider behind the S5 CapabilityProvider seam: outbound `send`
 # appends a JSON line to a mailbox file derived from the store path. Every other

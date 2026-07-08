@@ -2,6 +2,8 @@
 description "Support triage — UNSAFE: the lethal trifecta in a single rule"
 workflow SupportTriageUnsafe
 
+use std.messaging
+
 # A naive agent author wires up the obvious flow: pull the customer's record, log
 # whatever the inbound email said, and email a personalized reply. Each step looks
 # innocuous. Together they (1) leak confidential CRM data to an untrusted recipient

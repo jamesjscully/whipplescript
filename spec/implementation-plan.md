@@ -2197,6 +2197,14 @@ Goal: port standard packages in dependency order, one lowering class at a time.
     `send_to_unknown_channel_is_rejected`; CLI e2e
     `send_via_channel_runs_under_fixture_and_completes`. Docs: language-reference.md,
     spec/messaging.md. Full gate green.
+  **SUPERSEDED 2026-07-08 (S6d-3, import ladder):** `send` migrated from the
+  ambient parser builtin to the embedded `std.messaging` manifest
+  (`examples/packages/messaging.json`): `use std.messaging` authorizes it with
+  no lock; the parser builtin block and `construct_use_is_standard_builtin`
+  were deleted, leaving `construct_use_is_embedded_std` as the single no-lock
+  exemption, and an unauthorized `send` now gets an "add `use std.messaging`"
+  hint. Core reference data stays in whipplescript-core, drift-guarded by
+  `embedded_messaging_manifest_matches_core_reference_data`.
   **INBOUND `when message from` SHIPPED 2026-06-23 (fixture parity, the symmetric
   counterpart of outbound `send`):** `when message from <channel> as msg` binds the
   built-in `Message` envelope (`binding_from_when` → `Message`), lowers to a

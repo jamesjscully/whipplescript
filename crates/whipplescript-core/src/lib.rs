@@ -622,12 +622,13 @@ pub struct ContractRegistryDiagnostic {
 // --- Embedded standard-package manifest data (M5) -----------------------------
 //
 // std packages ship as data compiled into the binary rather than as scattered
-// per-package builtin functions. This is the first entry (std.messaging `send`);
-// the parser's `contract_registry` and the CLI both source std definitions from
-// here, so there is one source of truth. Each `std_*` function returns the same
-// `ConstructRegistration` / `EffectContract` the parser previously hand-rolled,
-// so the move is behaviour-preserving. Later slices relocate the remaining std
-// libraries here and drive `use std.*` authority from the same data.
+// per-package builtin functions. The `std_*` functions below are the reference
+// data for `std.messaging` (`send`): the shipped registration now comes from the
+// embedded `examples/packages/messaging.json` manifest (S6d-3), and a CLI guard
+// test asserts the manifest transcribes these functions field-for-field so the
+// two can never drift while both exist. The schema strings are the JSON-fragment
+// form the package-manifest validator accepts (named schema references are not
+// manifest-expressible).
 
 /// The `messaging.send` capability id — the target of the `send` construct and
 /// the id of its `capability.call` effect contract.
@@ -661,7 +662,15 @@ pub fn std_messaging_send_construct() -> ConstructRegistration {
             phase: CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME.to_owned(),
             cardinality: CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE.to_owned(),
         }],
-        provides: Vec::new(),
+        // `capability_call` lowering requires a provided EffectHandle; the
+        // type_ref names the built-in receipt class a `send … as r` binding sees.
+        provides: vec![ConstructInterface {
+            kind: CONSTRUCT_INTERFACE_EFFECT_HANDLE.to_owned(),
+            name: None,
+            type_ref: Some("MessageSendReceipt".to_owned()),
+            phase: CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME.to_owned(),
+            cardinality: CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE.to_owned(),
+        }],
         lowering_target: CONSTRUCT_LOWERING_CAPABILITY_CALL.to_owned(),
         target_capability: Some(MESSAGING_SEND_CAPABILITY.to_owned()),
     }
@@ -676,8 +685,14 @@ pub fn std_messaging_send_effect_contract() -> EffectContract {
         version: "v0".to_owned(),
         effect_kind: "capability.call".to_owned(),
         source_forms: vec!["send".to_owned()],
-        input_schema: Some("messaging.send.input".to_owned()),
-        output_schema: Some("MessageSendReceipt".to_owned()),
+        // JSON-fragment schemas (the package-manifest-expressible form; keys
+        // serialize sorted). The output fragment is the `MessageSendReceipt`
+        // built-in class shape; the construct's provided EffectHandle carries
+        // the class name.
+        input_schema: Some(r#"{"channel":"string","text":"string"}"#.to_owned()),
+        output_schema: Some(
+            r#"{"channel":"string","delivered":"bool","provider_message_id":"string"}"#.to_owned(),
+        ),
         required_capabilities: vec![MESSAGING_SEND_CAPABILITY.to_owned()],
         provider_kinds: vec!["messaging".to_owned()],
         projected_facts: vec!["effect.output".to_owned()],

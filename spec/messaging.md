@@ -98,9 +98,10 @@ values.
 
 **Status: SHIPPED 2026-06-20** (outbound). `send via <channel> { text … [markdown …]
 [thread_id …] } as <binding>` parses and lowers to a `messaging.send`
-`capability.call`. As a standard-library construct it is exempt from the package
-lock (1929 OPTION A — built into the compiler, not a third-party supply-chain
-construct; see `models/maude/std-construct-authorization.maude`). The named
+`capability.call`. The construct is provided by the embedded `std.messaging`
+package manifest: `use std.messaging` authorizes it with no package lock (the
+binary is its own supply chain — not a third-party supply-chain construct; see
+`models/maude/std-construct-authorization.maude`). The named
 channel must be declared (`send via <unknown>` is a compile error). Under the
 fixture provider the effect records a delivery receipt; live providers below are
 the roadmap. Inbound `when message from <channel>` still needs a runtime

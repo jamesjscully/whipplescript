@@ -16603,10 +16603,16 @@ impl LoadedPackageLock {
 /// claim such a name (see `is_reserved_std_package_name`), so the embedded copy
 /// always wins. Add more std packages by appending `(name, include_str!(..))`
 /// pairs here.
-const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[(
-    "std.memory",
-    include_str!("../../../examples/packages/memory.json"),
-)];
+const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
+    (
+        "std.memory",
+        include_str!("../../../examples/packages/memory.json"),
+    ),
+    (
+        "std.messaging",
+        include_str!("../../../examples/packages/messaging.json"),
+    ),
+];
 
 /// Whether `name` claims the reserved `std.*` package namespace. Std packages
 /// ship embedded in the platform binary (the binary is its own supply chain), so
@@ -16638,16 +16644,6 @@ fn embedded_std_manifests() -> Vec<PackageManifest> {
         .collect()
 }
 
-/// A registry holding every embedded std manifest's contracts/constructs — used
-/// to authorize a construct use (e.g. `recall`) without a lock.
-fn embedded_std_registry() -> ContractRegistry {
-    let mut registry = ContractRegistry::default();
-    for manifest in embedded_std_manifests() {
-        registry.merge(manifest.registry);
-    }
-    registry
-}
-
 /// Merge embedded std manifests into `registry` for every imported name that is
 /// NOT already `provided` (e.g. by the lock). The lock wins: a provided name is
 /// skipped so its manifest is never double-merged with the embedded copy.
@@ -16668,17 +16664,23 @@ fn merge_embedded_std_manifests(
     }
 }
 
+/// The embedded std package (import name) that provides `use_form`, if any.
+/// Drives both the lock exemption (`construct_use_is_embedded_std`) and the
+/// "add `use <package>`" hint when the package is not imported.
+fn embedded_std_package_for_use(use_form: &IrConstructUse) -> Option<String> {
+    embedded_std_manifests()
+        .into_iter()
+        .find(|manifest| registry_construct_for_use(&manifest.registry, use_form).is_some())
+        .map(|manifest| manifest.name)
+}
+
 /// Whether a construct use is authorized by an embedded std manifest whose owning
-/// package is actually imported. This is the no-lock exemption for embedded
-/// packages, mirroring the standard-library built-in exemption.
+/// package is actually imported. This is the single no-lock exemption: the binary
+/// is its own supply chain for `std.*` packages, and importing the package is
+/// what authorizes its constructs (the import ladder).
 fn construct_use_is_embedded_std(ir: &IrProgram, use_form: &IrConstructUse) -> bool {
-    let embedded_registry = embedded_std_registry();
-    let Some(form) = registry_construct_for_use(&embedded_registry, use_form) else {
-        return false;
-    };
-    ir.uses
-        .iter()
-        .any(|use_decl| use_decl.name == form.library_id)
+    embedded_std_package_for_use(use_form)
+        .is_some_and(|package| ir.uses.iter().any(|use_decl| use_decl.name == package))
 }
 
 fn contract_registry_for_ir(
@@ -16710,19 +16712,17 @@ fn validate_construct_uses(
         // use are unsatisfiable. Name every blocker so a workflow that imports a
         // package without (yet) using a construct is still reported.
         //
-        // EXCEPTION (1929 OPTION A): standard-library constructs are built into
-        // the compiler, not fetched from a supply chain, so they are exempt from
-        // the lock requirement. A construct use is exempt only when the (built-in)
-        // registry authorizes it AND its owning library is `standard` — keying on a
-        // recognized built-in registration, not a name, so a third-party package
+        // EXCEPTION (M5 embedded manifest): a std package compiled into the binary
+        // (e.g. `std.memory`, `std.messaging`) is its own supply chain, so an
+        // import of — or a construct owned by — an embedded manifest is exempt
+        // from the lock, provided the owning package is actually imported. A
+        // construct owned by an embedded manifest that is NOT imported gets an
+        // "add `use <package>`" fix instead of the lock advice. Keyed on a
+        // recognized embedded registration, not a name, so a third-party package
         // cannot bypass the lock by claiming the std namespace. Modeled in
         // `models/maude/std-construct-authorization.maude`.
-        //
-        // EXCEPTION (M5 embedded manifest): a std package compiled into the binary
-        // (e.g. `std.memory`) is likewise its own supply chain, so an import of —
-        // or a construct owned by — an embedded manifest is exempt from the lock
-        // too.
         let mut blockers = BTreeSet::new();
+        let mut missing_imports = BTreeSet::new();
         for use_decl in &ir.uses {
             if use_decl.name.starts_with("std.") || is_embedded_std_manifest(&use_decl.name) {
                 continue;
@@ -16730,26 +16730,47 @@ fn validate_construct_uses(
             blockers.insert(format!("import `{}`", use_decl.name));
         }
         for form in &uses {
-            if construct_use_is_standard_builtin(registry, form)
-                || construct_use_is_embedded_std(ir, form)
-            {
+            if construct_use_is_embedded_std(ir, form) {
                 continue;
             }
-            blockers.insert(format!("construct `{}`", form.keyword));
+            match embedded_std_package_for_use(form) {
+                Some(package) => {
+                    missing_imports.insert(format!(
+                        "construct `{}` is provided by the embedded std package `{package}`; add `use {package}`",
+                        form.keyword
+                    ));
+                }
+                None => {
+                    blockers.insert(format!("construct `{}`", form.keyword));
+                }
+            }
         }
-        if blockers.is_empty() {
+        let mut problems = missing_imports.into_iter().collect::<Vec<_>>();
+        if !blockers.is_empty() {
+            problems.push(format!(
+                "{} requires a package lock; run `whip package sync` to create `{DEFAULT_PACKAGE_LOCK_FILE}`, or pass `--package-lock <path>`",
+                blockers.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if problems.is_empty() {
             return Ok(());
         }
-        return Err(format!(
-            "{} requires a package lock; run `whip package sync` to create `{DEFAULT_PACKAGE_LOCK_FILE}`, or pass `--package-lock <path>`",
-            blockers.into_iter().collect::<Vec<_>>().join(", ")
-        ));
+        return Err(problems.join("; "));
     };
     if uses.is_empty() {
         return Ok(());
     }
     for use_form in uses {
         let Some(form) = registry_construct_for_use(registry, use_form) else {
+            // An embedded std construct fails here only when its package is not
+            // imported (an imported embedded manifest is merged before this
+            // check), so the fix is the import, not the lock.
+            if let Some(package) = embedded_std_package_for_use(use_form) {
+                return Err(format!(
+                    "construct `{}` is provided by the embedded std package `{package}`; add `use {package}`",
+                    use_form.keyword
+                ));
+            }
             return Err(format!(
                 "package lock `{}` does not authorize `{}` as a {} {} construct lowering to `{}`",
                 package_lock.path.display(),
@@ -16769,33 +16790,6 @@ fn validate_construct_uses(
         }
     }
     Ok(())
-}
-
-/// Whether a construct use is authorized by a standard-library built-in (1929
-/// OPTION A): the registry must hold a matching construct registration AND a
-/// matching `capability.call` effect contract, both owned by a `standard` library.
-/// This is the lock exemption — keyed on a real built-in registration, never on a
-/// name alone, so a third-party package cannot bypass the lock by claiming the std
-/// namespace.
-fn construct_use_is_standard_builtin(
-    registry: &ContractRegistry,
-    use_form: &IrConstructUse,
-) -> bool {
-    let Some(form) = registry_construct_for_use(registry, use_form) else {
-        return false;
-    };
-    let library_is_standard = registry
-        .libraries
-        .iter()
-        .any(|library| library.id == form.library_id && library.standard);
-    if !library_is_standard {
-        return false;
-    }
-    registry.effect_contracts.iter().any(|contract| {
-        contract.id == use_form.target_capability
-            && contract.effect_kind == "capability.call"
-            && contract.library_id == form.library_id
-    })
 }
 
 fn registry_construct_for_use<'a>(
@@ -39891,6 +39885,118 @@ rule start
                 && error.contains("cannot be provided by a package lock"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn embedded_messaging_manifest_matches_core_reference_data() {
+        // The embedded `std.messaging` manifest must transcribe the core
+        // reference data (`std_messaging_send_construct` /
+        // `std_messaging_send_effect_contract`) field-for-field, so the two can
+        // never drift while both exist. The only sanctioned difference is the
+        // version: the core data carries the old builtin's `v0`, the manifest
+        // carries the package version.
+        let manifest = embedded_std_manifests()
+            .into_iter()
+            .find(|manifest| manifest.name == "std.messaging")
+            .expect("std.messaging ships as an embedded manifest");
+
+        let construct = manifest
+            .registry
+            .constructs
+            .iter()
+            .find(|form| form.keyword == "send")
+            .expect("manifest registers the send construct");
+        let mut expected_construct = whipplescript_core::std_messaging_send_construct();
+        expected_construct.version = manifest.version.clone();
+        assert_eq!(construct, &expected_construct);
+
+        let contract = manifest
+            .registry
+            .effect_contracts
+            .iter()
+            .find(|contract| contract.id == "messaging.send")
+            .expect("manifest registers the messaging.send effect contract");
+        let mut expected_contract = whipplescript_core::std_messaging_send_effect_contract();
+        expected_contract.version = manifest.version.clone();
+        assert_eq!(contract, &expected_contract);
+    }
+
+    #[test]
+    fn send_requires_std_messaging_import_and_validates_lock_free_with_it() {
+        // `send` migrated from an ambient parser builtin to the embedded
+        // `std.messaging` manifest (the import ladder): without
+        // `use std.messaging` it is rejected with the import hint; with the
+        // import it validates with no package lock at all.
+        let source = |uses: &str| {
+            format!(
+                r##"
+@service
+workflow Notify
+{uses}
+class Trigger {{
+  id string
+}}
+
+channel alerts {{
+  provider slack
+  destination "#ops"
+}}
+
+rule notify
+  when Trigger as t
+=> {{
+  send via alerts {{
+    text "hello"
+  }} as sent
+}}
+"##
+            )
+        };
+        let without_import = whipplescript_parser::compile_program(&source(""))
+            .ir
+            .expect("source compiles");
+        let error = contract_registry_for_ir(None, &without_import)
+            .expect_err("send without `use std.messaging` must be rejected");
+        assert!(
+            error.contains("construct `send`")
+                && error.contains("embedded std package `std.messaging`")
+                && error.contains("add `use std.messaging`"),
+            "{error}"
+        );
+
+        // A package lock does not change the fix: `send` is embedded-owned, so
+        // the lock path emits the same import hint instead of blaming the lock.
+        let (temp_dir, lock_path, _) = write_portable_notes_lock("send-import-hint");
+        let lock = load_package_lock_file(&lock_path).expect("lock loads");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let locked_error = lock
+            .registry_for_ir(&without_import)
+            .expect_err("send without `use std.messaging` is rejected under a lock too");
+        assert!(
+            locked_error.contains("add `use std.messaging`"),
+            "{locked_error}"
+        );
+
+        let with_import = whipplescript_parser::compile_program(&source("\nuse std.messaging\n"))
+            .ir
+            .expect("source compiles");
+        let registry = contract_registry_for_ir(None, &with_import)
+            .expect("`use std.messaging` authorizes send with no lock");
+        assert!(
+            registry.constructs.iter().any(|form| {
+                form.keyword == "send"
+                    && form.library_id == "std.messaging"
+                    && form.target_capability.as_deref() == Some("messaging.send")
+            }),
+            "embedded resolution authorizes the `send` construct"
+        );
+        assert!(
+            registry.effect_contracts.iter().any(|contract| {
+                contract.id == "messaging.send" && contract.effect_kind == "capability.call"
+            }),
+            "embedded resolution registers the messaging.send contract"
+        );
+        assert_eq!(registry.validate(), Vec::new());
     }
 
     #[test]

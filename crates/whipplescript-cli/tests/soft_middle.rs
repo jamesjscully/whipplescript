@@ -520,9 +520,10 @@ flow f
     let _ = fs::remove_file(source);
 }
 
-/// 1929 OPTION A: `send via <channel>` (std.messaging) compiles with NO package
-/// lock (the std-library exemption), runs as a `messaging.send` capability.call
-/// under the fixture provider, and the workflow completes on `after sent succeeds`.
+/// `send via <channel>` (std.messaging) compiles with NO package lock — the
+/// embedded `std.messaging` manifest authorizes it via `use std.messaging` —
+/// runs as a `messaging.send` capability.call under the fixture provider, and
+/// the workflow completes on `after sent succeeds`.
 #[test]
 fn send_via_channel_runs_under_fixture_and_completes() {
     let bin = env!("CARGO_BIN_EXE_whip");
@@ -533,6 +534,8 @@ fn send_via_channel_runs_under_fixture_and_completes() {
         r##"
 @service
 workflow Notify
+
+use std.messaging
 
 output result Done
 
@@ -577,7 +580,8 @@ rule notify
     .expect("write source");
 
     let store_str = store.to_str().expect("utf-8");
-    // No `--package-lock`: the std-library exemption must let `send` compile + run.
+    // No `--package-lock`: the embedded `std.messaging` manifest must let
+    // `send` compile + run.
     let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &[]);
     let instance = dev
         .get("instance_id")
@@ -617,7 +621,8 @@ fn send_via_local_channel_delivers_to_local_mailbox() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/messaging-local-demo.whip");
 
     let store_str = store.to_str().expect("utf-8");
-    // No `--package-lock`: the std-library exemption lets `send` compile + run.
+    // No `--package-lock`: the embedded `std.messaging` manifest lets `send`
+    // compile + run.
     let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &[]);
     let instance = dev
         .get("instance_id")

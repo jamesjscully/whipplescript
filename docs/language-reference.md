@@ -1370,9 +1370,10 @@ channel release_room {
 
 `provider` is required; `workspace` and `destination` are optional provider
 config. Secrets and credentials are always references in provider config, never
-literal source values. Declaring a channel auto-registers `std.messaging` in the
-program's library contract (you do not have to write `use std.messaging`
-separately, though it is accepted as a dotted package name).
+literal source values. Declaring a channel auto-registers the `std.messaging`
+library in the program's library contract, which covers inbound
+`when message from <channel>`; the outbound `send` construct additionally
+requires importing the package with `use std.messaging`.
 
 Send an outbound message with `send via <channel> { ... } as <binding>`:
 
@@ -1391,9 +1392,10 @@ rule notify
 ```
 
 `text` is required; `markdown` and `thread_id` are optional. `send` lowers to a
-`messaging.send` capability call. Because `std.messaging` is a standard library
-built into the compiler, `send` needs **no** package lock (third-party
-constructs still require `whip package sync`). The named channel must be
+`messaging.send` capability call. The construct is provided by the embedded
+`std.messaging` package: add `use std.messaging` to the workflow and `send`
+needs **no** package lock — the manifest ships inside the `whip` binary
+(third-party constructs still require `whip package sync`). The named channel must be
 declared — `send via <unknown>` is a compile error. Under the fixture provider
 `send` records a delivery receipt without contacting a real platform; live
 Slack/email delivery is provider-configured.

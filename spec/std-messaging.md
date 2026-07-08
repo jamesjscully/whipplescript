@@ -19,7 +19,8 @@ Binds to [`std-package-ecosystem-shape.md`](std-package-ecosystem-shape.md)
 - **Why it belongs as a package.** Messaging is a semantic domain (E2) whose
   value is provider plurality behind one envelope. The provider set is exactly
   the thing that must grow without core changes; the construct surface is small
-  and already lock-exempt via the built-in registry (main.rs:16073-16105).
+  and lock-exempt via the embedded `std.messaging` manifest (S6d-3:
+  `use std.messaging` authorizes `send` with no package lock).
 - **What is NOT in the package.** Typed outside-input admission (std.ingress
   owns `signal`/`source` generally; messaging contributes only the
   `interaction` source provider); peer workflow signals (`emit signal … to`,
@@ -68,8 +69,10 @@ manifest rows authorize post-parse):
 - `send via <channel> { text <expr> [markdown <expr>] [thread_id <expr>]
   [interactions { … }] } as <binding>` — shipped except `interactions` (new,
   slice 6); effect_operation, lowering class capability_call.
-  - **Effect kind: `capability.call`** (shipped: the built-in contract
-    registers `effect_kind: "capability.call"`, parser/lib.rs:3311; the
+  - **Effect kind: `capability.call`** (shipped: the embedded
+    `std.messaging` manifest's contract registers
+    `effect_kind: "capability.call"` — reference data in
+    whipplescript-core `std_messaging_send_effect_contract`; the
     lowering emits kind `capability.call` with target capability
     `messaging.send`, kernel/rule_lowering.rs:2288-2299; the seeded provider
     row keys effect_kind `capability.call`,

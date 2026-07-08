@@ -13,8 +13,7 @@ use std::{
     fmt,
 };
 use whipplescript_core::{
-    ConstructRegistration, ContractRegistry, EffectContract, LibraryRegistration,
-    TypedOutputValidation, MESSAGING_SEND_CAPABILITY,
+    ContractRegistry, EffectContract, LibraryRegistration, TypedOutputValidation,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2830,29 +2829,14 @@ impl IrProgram {
             }
         }
 
-        // Built-in standard-library construct registrations. Unlike third-party
-        // packages (whose constructs come from a package manifest + lock), these
-        // are compiled into the platform, so they are available without a lock and
-        // are EXEMPT from the package-lock requirement (1929 OPTION A). Registered
-        // only when actually used, so channel-only programs and registry-shape
-        // tests are unaffected. Modeled in
+        // Package-owned construct registrations (e.g. `send`, `recall`) are NOT
+        // registered here: they come from a package manifest — embedded std
+        // manifests included — merged in by the CLI when the owning package is
+        // imported (`use std.messaging`). Modeled in
         // `models/maude/std-construct-authorization.maude`.
-        let mut constructs = Vec::new();
-        if self
-            .construct_uses()
-            .iter()
-            .any(|use_form| use_form.keyword == "send")
-        {
-            register_standard_library(&mut libraries, "std.messaging");
-            constructs.push(builtin_messaging_send_construct());
-            contracts
-                .entry((MESSAGING_SEND_CAPABILITY.to_owned(), "v0".to_owned()))
-                .or_insert_with(builtin_messaging_send_effect_contract);
-        }
-
         ContractRegistry {
             libraries: libraries.into_values().collect(),
-            constructs,
+            constructs: Vec::new(),
             effect_contracts: contracts.into_values().collect(),
         }
     }
@@ -3394,19 +3378,6 @@ impl IrProgram {
 
         snapshot
     }
-}
-
-/// Built-in `std.messaging` `send` construct registration. The data now lives in
-/// `whipplescript_core` as embedded std-manifest data (M5); this is a thin
-/// delegate so `contract_registry` and the parser tests keep their call site.
-fn builtin_messaging_send_construct() -> ConstructRegistration {
-    whipplescript_core::std_messaging_send_construct()
-}
-
-/// Built-in `std.messaging` `messaging.send` `capability.call` effect contract.
-/// Data lives in `whipplescript_core` (M5 embedded std-manifest data).
-fn builtin_messaging_send_effect_contract() -> EffectContract {
-    whipplescript_core::std_messaging_send_effect_contract()
 }
 
 fn register_standard_library(libraries: &mut BTreeMap<String, LibraryRegistration>, id: &str) {
@@ -20985,10 +20956,13 @@ rule notify
 "##;
 
     #[test]
-    fn send_lowers_to_messaging_capability_call_and_registers_builtin() {
-        // 1929 OPTION A: `send via <channel>` lowers to a `messaging.send`
-        // capability.call and registers a built-in `std.messaging` construct +
-        // effect contract (so it is lock-exempt).
+    fn send_lowers_to_messaging_capability_call_without_builtin_registration() {
+        // `send via <channel>` lowers to a `messaging.send` capability.call
+        // construct use. The construct/contract registration itself is NOT a
+        // parser builtin any more: it comes from the embedded `std.messaging`
+        // manifest, merged by the CLI when the program imports the package
+        // (`use std.messaging`). The parser still registers the `std.messaging`
+        // standard library from the `channel` declaration (the ambient decl tier).
         let compiled = compile_program(SEND_PROGRAM);
         assert_eq!(
             compiled.diagnostics,
@@ -21002,31 +20976,24 @@ rule notify
         assert_eq!(uses[0].keyword, "send");
         assert_eq!(uses[0].target_capability, "messaging.send");
         let registry = ir.contract_registry();
-        let send_construct = registry
-            .constructs
-            .iter()
-            .find(|form| form.keyword == "send")
-            .expect("built-in send construct registration");
-        assert_eq!(send_construct.library_id, "std.messaging");
-        assert_eq!(
-            send_construct.target_capability.as_deref(),
-            Some("messaging.send")
+        assert!(
+            registry.constructs.is_empty(),
+            "the parser registers no builtin constructs: {:?}",
+            registry.constructs
+        );
+        assert!(
+            !registry
+                .effect_contracts
+                .iter()
+                .any(|c| c.id == "messaging.send"),
+            "the messaging.send contract comes from the embedded manifest, not the parser"
         );
         assert!(
             registry
                 .libraries
                 .iter()
                 .any(|lib| lib.id == "std.messaging" && lib.standard),
-            "std.messaging must be a standard library"
-        );
-        assert!(
-            registry
-                .effect_contracts
-                .iter()
-                .any(|c| c.id == "messaging.send"
-                    && c.effect_kind == "capability.call"
-                    && c.library_id == "std.messaging"),
-            "built-in messaging.send effect contract must be registered"
+            "the channel declaration still registers the std.messaging standard library"
         );
     }
 

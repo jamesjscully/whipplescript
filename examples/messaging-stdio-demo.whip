@@ -2,6 +2,10 @@
 description "Outbound messaging over the native stdio provider (writes a marker line to stdout)"
 workflow MessagingStdioDemo
 
+# `send via` comes from the embedded `std.messaging` package; the import
+# authorizes it with no package lock.
+use std.messaging
+
 # A `channel` declaring `provider stdio` selects the native stdio provider
 # behind the S5 CapabilityProvider seam: outbound `send` writes one
 # `[messaging.stdio] channel=… text=…` line to the process stdout. Every other

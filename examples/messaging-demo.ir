@@ -5,6 +5,8 @@ source_descriptions
 "Inbound + outbound messaging: react to a channel message and reply on the same channel" workflow MessagingDemo
 workflow_contracts
   output result ref<Handled>
+uses
+  package std.messaging
 schemas
   class Handled
     reply string
