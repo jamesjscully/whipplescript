@@ -62,9 +62,9 @@ function testCoerceSuspendResume() {
     "  after review fails {", "    complete result { score 0.0 }", "  }", "}",
   ].join("\n");
   const seed = [
-    "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('coerce', 'Coerce.', '{}')",
-    "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_coerce_builtin', 'coerce', 'builtin-coerce', 'coerce', '{}')",
-    "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_coerce_builtin', NULL, 'coerce', 'builtin-coerce', '{}')",
+    "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('schema.coerce', 'Coerce.', '{}')",
+    "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_coerce_builtin', 'schema.coerce', 'builtin-coerce', 'schema.coerce', '{}')",
+    "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_coerce_builtin', NULL, 'schema.coerce', 'builtin-coerce', '{}')",
   ];
   const bridge = freshInstanceEnv(seed);
   const coerceConfig = JSON.stringify({
