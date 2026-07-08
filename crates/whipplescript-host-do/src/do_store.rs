@@ -4629,6 +4629,47 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .collect())
     }
 
+    fn record_compute_result(
+        &self,
+        registration: ComputeResultRegistration<'_>,
+    ) -> StoreResult<bool> {
+        let inserted = self
+            .sql
+            .execute(
+                "INSERT OR IGNORE INTO compute_result_cache \
+                 (content_key, effect_kind, result_json, source_instance_id, source_effect_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    text(registration.content_key),
+                    text(registration.effect_kind),
+                    text(registration.result_json),
+                    text(registration.source_instance_id),
+                    text(registration.source_effect_id),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(inserted > 0)
+    }
+
+    fn lookup_compute_result(&self, content_key: &str) -> StoreResult<Option<ComputeCachedResult>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT content_key, effect_kind, result_json, source_instance_id, \
+                 source_effect_id, created_at FROM compute_result_cache WHERE content_key = ?1",
+                &[text(content_key)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| ComputeCachedResult {
+            content_key: as_text(&row[0]),
+            effect_kind: as_text(&row[1]),
+            result_json: as_text(&row[2]),
+            source_instance_id: as_text(&row[3]),
+            source_effect_id: as_text(&row[4]),
+            created_at: as_text(&row[5]),
+        }))
+    }
+
     fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()> {
         serde_json::from_str::<Value>(skill.required_capabilities_json)?;
         serde_json::from_str::<Value>(skill.metadata_json)?;
@@ -7065,6 +7106,12 @@ pub(crate) mod test_support {
             CREATE TABLE project_context_docs (
                 position INTEGER PRIMARY KEY, path TEXT NOT NULL,
                 content_hash TEXT NOT NULL, body TEXT NOT NULL
+            );
+            CREATE TABLE compute_result_cache (
+                content_key TEXT PRIMARY KEY, effect_kind TEXT NOT NULL,
+                result_json TEXT NOT NULL, source_instance_id TEXT NOT NULL,
+                source_effect_id TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE skills (
                 skill_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, version TEXT NOT NULL,

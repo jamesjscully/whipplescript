@@ -70,14 +70,14 @@ use whipplescript_parser::{
     RuleStatus, RunKind, SourceSpan, StubPayload, TestClause, TestField, UnaryOp,
 };
 use whipplescript_store::{
-    ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, ClaimableEffect, DerivedFact,
-    DiagnosticRecord, DiagnosticView, EffectCancellation, EffectCompletion, EffectView, EventView,
-    EvidenceLink, EvidenceLinkView, EvidenceRecord, EvidenceView, FactView, HumanAnswer,
-    InboxItemView, InstanceView, NewEvent, NewFact, NewInboxItem, NewInstanceAuthority,
-    NewWorkflowInvocation, ProviderValidationEvidence, RetryEffect, RevisionActivation,
-    RevisionCancellationImpact, RevisionCandidate, RevisionCompatibilityDiagnostic,
-    RevisionCompatibilityReport, RunStart, RunView, RuntimeStore, SqliteStore, StatusView,
-    StoreError, WorkflowInvocationView, WorkflowRevisionView,
+    ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, ClaimableEffect,
+    ComputeResultRegistration, DerivedFact, DiagnosticRecord, DiagnosticView, EffectCancellation,
+    EffectCompletion, EffectView, EventView, EvidenceLink, EvidenceLinkView, EvidenceRecord,
+    EvidenceView, FactView, HumanAnswer, InboxItemView, InstanceView, NewEvent, NewFact,
+    NewInboxItem, NewInstanceAuthority, NewWorkflowInvocation, ProviderValidationEvidence,
+    RetryEffect, RevisionActivation, RevisionCancellationImpact, RevisionCandidate,
+    RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RunStart, RunView, RuntimeStore,
+    SqliteStore, StatusView, StoreError, WorkflowInvocationView, WorkflowRevisionView,
 };
 // File-effect byte I/O routes through the FileStore seam (DR-0033 Phase 4); the
 // native backing is `std::fs`.
@@ -3289,6 +3289,11 @@ struct ScriptCapability {
     argv: Vec<String>,
     sha256: String,
     env: BTreeMap<String, String>,
+    /// Operator-declared hermeticity (compute plane P8-1): the script's output
+    /// depends only on its argv, declared env, and stdin, so results are
+    /// memoizable by content key in the delta-kernel result cache. Opt-in per
+    /// manifest entry (`"hermetic": true`); default false = never cached.
+    hermetic: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -3368,6 +3373,15 @@ impl ScriptManifest {
                 })
                 .transpose()?
                 .unwrap_or_default();
+            let hermetic = match entry_object.get("hermetic") {
+                None => false,
+                Some(Value::Bool(flag)) => *flag,
+                Some(_) => {
+                    return Err(format!(
+                        "script manifest entry `{name}` hermetic must be a boolean"
+                    ))
+                }
+            };
             capabilities.insert(
                 name.clone(),
                 ScriptCapability {
@@ -3375,6 +3389,7 @@ impl ScriptManifest {
                     argv,
                     sha256,
                     env,
+                    hermetic,
                 },
             );
         }
@@ -24230,6 +24245,7 @@ fn run_coordination_effect(
 }
 
 /// The validated result of `-> Schema` / `-> each Schema` stdout ingestion.
+#[derive(Debug)]
 enum ExecIngest {
     Single(Value),
     Stream(Vec<Value>),
@@ -24408,26 +24424,12 @@ fn run_script_capability_exec(
     argv[script_index] = verified_path.display().to_string();
     let mut command = Command::new(&argv[0]);
     command.args(&argv[1..]);
-    for (name, reference) in &script.env {
-        let Some(env_name) = reference.strip_prefix("env:") else {
-            return Err((
-                None,
-                format!("script capability `{capability}` env `{name}` must use an env: reference"),
-            ));
-        };
-        match env::var(env_name) {
-            Ok(value) => {
-                command.env(name, value);
-            }
-            Err(_) => {
-                return Err((
-                    None,
-                    format!(
-                        "script capability `{capability}` requires missing environment variable `{env_name}`"
-                    ),
-                ))
-            }
-        }
+    let resolved_env = match resolve_script_capability_env(script) {
+        Ok(resolved_env) => resolved_env,
+        Err(reason) => return Err((None, reason)),
+    };
+    for (name, value) in &resolved_env {
+        command.env(name, value);
     }
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
@@ -24499,6 +24501,127 @@ fn write_verified_script_copy(
     Ok(path)
 }
 
+/// Resolve a script capability's declared `env:` references against the host
+/// environment. Shared by the runner (which injects the values) and the
+/// delta-kernel content key (the resolved values are inputs to a hermetic
+/// script, so they participate in the cache identity).
+fn resolve_script_capability_env(
+    script: &ScriptCapability,
+) -> Result<BTreeMap<String, String>, String> {
+    let capability = &script.name;
+    let mut resolved = BTreeMap::new();
+    for (name, reference) in &script.env {
+        let Some(env_name) = reference.strip_prefix("env:") else {
+            return Err(format!(
+                "script capability `{capability}` env `{name}` must use an env: reference"
+            ));
+        };
+        match env::var(env_name) {
+            Ok(value) => {
+                resolved.insert(name.clone(), value);
+            }
+            Err(_) => {
+                return Err(format!(
+                    "script capability `{capability}` requires missing environment variable `{env_name}`"
+                ))
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// The host-environment component of the delta-kernel content key. On the
+/// native host this is a declared epoch (`WHIPPLESCRIPT_COMPUTE_ENV_HASH`,
+/// e.g. a toolchain image digest) — bumping it invalidates every cached
+/// result, which is how environment changes roll the cache. The compute-plane
+/// host wires the workspace image digest here (P8 image-digest box).
+fn compute_environment_hash() -> String {
+    env::var("WHIPPLESCRIPT_COMPUTE_ENV_HASH").unwrap_or_else(|_| "native-v0".to_owned())
+}
+
+/// Content key for a hermetic script-capability exec (compute plane P8-1):
+/// sha256 over script hash + argv + resolved env + host environment + effect
+/// input (stdin + parse contract). Identical invocations — same pinned
+/// script, same inputs, same environment — get the same key, so the second
+/// one is served from the delta-kernel result cache without a run.
+fn exec_content_key(
+    script: &ScriptCapability,
+    resolved_env: &BTreeMap<String, String>,
+    stdin_json: &str,
+    parse_contract: &Option<Value>,
+) -> String {
+    let mut material = String::new();
+    material.push_str("exec.command\x00");
+    material.push_str(&script.sha256);
+    material.push('\x00');
+    for arg in &script.argv {
+        material.push_str(arg);
+        material.push('\x1f');
+    }
+    material.push('\x00');
+    for (name, value) in resolved_env {
+        material.push_str(name);
+        material.push('=');
+        material.push_str(value);
+        material.push('\x1f');
+    }
+    material.push('\x00');
+    material.push_str(&compute_environment_hash());
+    material.push('\x00');
+    material.push_str(stdin_json);
+    material.push('\x00');
+    if let Some(contract) = parse_contract {
+        material.push_str(&contract.to_string());
+    }
+    sha256_hex(material.as_bytes())
+}
+
+/// Decode a cached exec result back into the success outcome shape. Returns
+/// `None` (treated as a miss) if the recorded JSON does not decode, so a
+/// malformed entry degrades to a real run instead of an error.
+fn decode_cached_exec_result(
+    result_json: &str,
+) -> Option<(i32, String, String, Option<ExecIngest>)> {
+    let value = serde_json::from_str::<Value>(result_json).ok()?;
+    let exit_code = i32::try_from(value.get("exit_code")?.as_i64()?).ok()?;
+    let stdout = value.get("stdout")?.as_str()?.to_owned();
+    let stderr = value.get("stderr")?.as_str()?.to_owned();
+    let ingested = match value.get("ingested") {
+        None | Some(Value::Null) => None,
+        Some(ingested) => {
+            if let Some(single) = ingested.get("single") {
+                Some(ExecIngest::Single(single.clone()))
+            } else if let Some(stream) = ingested.get("stream").and_then(Value::as_array) {
+                Some(ExecIngest::Stream(stream.clone()))
+            } else {
+                return None;
+            }
+        }
+    };
+    Some((exit_code, stdout, stderr, ingested))
+}
+
+/// Encode a successful exec outcome for the delta-kernel result cache.
+fn encode_cached_exec_result(
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+    ingested: &Option<ExecIngest>,
+) -> String {
+    let ingested_value = match ingested {
+        None => Value::Null,
+        Some(ExecIngest::Single(value)) => json!({"single": value}),
+        Some(ExecIngest::Stream(elements)) => json!({"stream": elements}),
+    };
+    json!({
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "ingested": ingested_value,
+    })
+    .to_string()
+}
+
 fn run_exec_effect(
     store_path: &Path,
     instance_id: &str,
@@ -24535,7 +24658,40 @@ fn run_exec_effect(
             .to_string(),
     })?;
 
-    let outcome = if mode == "capability" {
+    // Delta-kernel result cache (compute plane P8-1): a hermetic script
+    // capability is memoizable by content key (script hash + argv + resolved
+    // env + host environment + stdin/parse inputs). A hit settles the effect
+    // from the recorded result without spawning the script. Env-resolution
+    // failure degrades to the real runner, which owns the error surface.
+    let cache_key = if mode == "capability" {
+        script_manifest
+            .and_then(|manifest| manifest.get(&capability))
+            .filter(|script| script.hermetic)
+            .and_then(|script| {
+                let stdin_json = input
+                    .get("stdin")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_string();
+                resolve_script_capability_env(script).ok().map(|resolved| {
+                    exec_content_key(script, &resolved, &stdin_json, &parse_contract)
+                })
+            })
+    } else {
+        None
+    };
+    let cached_result = match &cache_key {
+        Some(content_key) => kernel
+            .store()
+            .lookup_compute_result(content_key)?
+            .and_then(|hit| decode_cached_exec_result(&hit.result_json)),
+        None => None,
+    };
+    let cache_hit = cached_result.is_some();
+
+    let outcome = if let Some(result) = cached_result {
+        Ok(result)
+    } else if mode == "capability" {
         run_script_capability_exec(script_manifest, &capability, &input, &parse_contract)
     } else if exec_profile.is_hosted() {
         Err((
@@ -24560,6 +24716,9 @@ fn run_exec_effect(
 
     match outcome {
         Ok((exit_code, stdout, stderr, ingested)) => {
+            let cache_payload = cache_key
+                .as_ref()
+                .map(|_| encode_cached_exec_result(exit_code, &stdout, &stderr, &ingested));
             let mut value = json!({
                 "mode": mode,
                 "command": command,
@@ -24575,6 +24734,26 @@ fn run_exec_effect(
                 {
                     insert_json_field(&mut value, "sha256", Value::String(sha256));
                 }
+            }
+            if let (Some(content_key), Some(result_json)) = (&cache_key, &cache_payload) {
+                // First writer wins: an existing entry for the key stays
+                // canonical, so a replayed populate is a no-op.
+                if !cache_hit {
+                    kernel
+                        .store()
+                        .record_compute_result(ComputeResultRegistration {
+                            content_key,
+                            effect_kind: "exec.command",
+                            result_json,
+                            source_instance_id: instance_id,
+                            source_effect_id: &effect.effect_id,
+                        })?;
+                }
+                insert_json_field(
+                    &mut value,
+                    "cache",
+                    json!({"content_key": content_key, "hit": cache_hit}),
+                );
             }
             let terminal = kernel.complete_run(EffectCompletion {
                 instance_id,
@@ -46896,6 +47075,265 @@ workflow Child {
             "whipplescript-{label}-{}-{stamp}.{ext}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn script_manifest_parses_hermetic_flag() {
+        let manifest_path = unique_test_path("manifest-hermetic", "json");
+        let sha = "a".repeat(64);
+        fs::write(
+            &manifest_path,
+            json!({
+                "cached": {"argv": ["sh", "judge.sh"], "sha256": sha, "hermetic": true},
+                "plain": {"argv": ["sh", "other.sh"], "sha256": sha},
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let manifest = ScriptManifest::load(&manifest_path).expect("manifest loads");
+        assert!(manifest.get("cached").expect("cached entry").hermetic);
+        assert!(!manifest.get("plain").expect("plain entry").hermetic);
+
+        fs::write(
+            &manifest_path,
+            json!({"bad": {"argv": ["sh", "x.sh"], "sha256": sha, "hermetic": "yes"}}).to_string(),
+        )
+        .expect("rewrite manifest");
+        let error = ScriptManifest::load(&manifest_path).expect_err("non-bool hermetic rejected");
+        assert!(error.contains("hermetic must be a boolean"), "{error}");
+        let _ = fs::remove_file(&manifest_path);
+    }
+
+    #[test]
+    fn exec_content_key_tracks_script_env_and_input_identity() {
+        let script = ScriptCapability {
+            name: "judge".to_owned(),
+            argv: vec!["sh".to_owned(), "judge.sh".to_owned()],
+            sha256: "a".repeat(64),
+            env: BTreeMap::new(),
+            hermetic: true,
+        };
+        let env_values = BTreeMap::from([("MODEL".to_owned(), "m1".to_owned())]);
+        let key = exec_content_key(&script, &env_values, r#"{"n":1}"#, &None);
+        // Stable on identical identity.
+        assert_eq!(
+            key,
+            exec_content_key(&script, &env_values, r#"{"n":1}"#, &None)
+        );
+        // Sensitive to each identity component: stdin, env value, script hash.
+        assert_ne!(
+            key,
+            exec_content_key(&script, &env_values, r#"{"n":2}"#, &None)
+        );
+        let other_env = BTreeMap::from([("MODEL".to_owned(), "m2".to_owned())]);
+        assert_ne!(
+            key,
+            exec_content_key(&script, &other_env, r#"{"n":1}"#, &None)
+        );
+        let mut rehashed = script.clone();
+        rehashed.sha256 = "b".repeat(64);
+        assert_ne!(
+            key,
+            exec_content_key(&rehashed, &env_values, r#"{"n":1}"#, &None)
+        );
+        // Sensitive to the parse contract.
+        assert_ne!(
+            key,
+            exec_content_key(
+                &script,
+                &env_values,
+                r#"{"n":1}"#,
+                &Some(json!({"schema": "S"}))
+            )
+        );
+    }
+
+    #[test]
+    fn cached_exec_result_encode_decode_roundtrip() {
+        for ingested in [
+            None,
+            Some(ExecIngest::Single(json!({"ok": true}))),
+            Some(ExecIngest::Stream(vec![json!(1), json!(2)])),
+        ] {
+            let encoded = encode_cached_exec_result(0, "out", "err", &ingested);
+            let (exit_code, stdout, stderr, decoded) =
+                decode_cached_exec_result(&encoded).expect("decodes");
+            assert_eq!(exit_code, 0);
+            assert_eq!(stdout, "out");
+            assert_eq!(stderr, "err");
+            match (&ingested, &decoded) {
+                (None, None) => {}
+                (Some(ExecIngest::Single(a)), Some(ExecIngest::Single(b))) => assert_eq!(a, b),
+                (Some(ExecIngest::Stream(a)), Some(ExecIngest::Stream(b))) => assert_eq!(a, b),
+                other => panic!("ingested shape changed across roundtrip: {other:?}"),
+            }
+        }
+        assert!(decode_cached_exec_result("not json").is_none());
+        assert!(decode_cached_exec_result(r#"{"exit_code":0}"#).is_none());
+    }
+
+    /// Delta-kernel result cache end-to-end (compute plane P8-1): the second
+    /// exec of a hermetic script capability on identical inputs settles from
+    /// the cache — the script demonstrably does not spawn again, the run is
+    /// marked as a hit, and the recorded entry credits the populating effect.
+    #[test]
+    fn hermetic_capability_exec_served_from_cache_on_second_run() {
+        let store_path = unique_test_path("exec-cache", "sqlite");
+        let program_path = unique_test_path("exec-cache", "whip");
+        let script_path = unique_test_path("exec-cache-script", "sh");
+        let witness_path = unique_test_path("exec-cache-witness", "log");
+
+        // The script appends a witness line per spawn, so "did it actually
+        // run" is observable from the outside.
+        let script_body = format!("echo ran >> {}\necho ok\n", witness_path.display());
+        fs::write(&script_path, &script_body).expect("write script");
+        let script_sha = sha256_hex(script_body.as_bytes());
+        let manifest = ScriptManifest {
+            capabilities: BTreeMap::from([(
+                "judge".to_owned(),
+                ScriptCapability {
+                    name: "judge".to_owned(),
+                    argv: vec!["sh".to_owned(), script_path.display().to_string()],
+                    sha256: script_sha,
+                    env: BTreeMap::new(),
+                    hermetic: true,
+                },
+            )]),
+        };
+
+        let source = "workflow ExecCache {\n}\n";
+        fs::write(&program_path, source).expect("write program");
+        let (source_text, ir) = match compile_source_path_with_root(
+            program_path.to_str().unwrap_or_default(),
+            Some("ExecCache"),
+        ) {
+            Ok(compiled) => compiled,
+            Err(error) => panic!("{}", child_compile_error("ExecCache", error)),
+        };
+        let snapshot = ir.to_snapshot();
+        let mut kernel = RuntimeKernel::new(SqliteStore::open(&store_path).expect("store"));
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &stable_hash_hex(&source_text),
+                    ir_hash: &stable_hash_hex(&snapshot),
+                    compiler_version: whipplescript_core::version(),
+                },
+                &ir,
+            )
+            .expect("program version");
+        let instance_id = kernel.create_instance(&version, "{}").expect("instance");
+        register_script_manifest_capabilities(kernel.store(), &manifest, &version.program_id)
+            .expect("register script capabilities");
+        drop(kernel);
+
+        let effect_input = json!({
+            "mode": "capability",
+            "capability": "judge",
+            "stdin": {"n": 1},
+        })
+        .to_string();
+        let effects = [
+            NewEffect {
+                effect_id: "exec-1",
+                kind: "exec.command",
+                target: None,
+                input_json: &effect_input,
+                status: "queued",
+                idempotency_key: "rule=start;effect=exec-1",
+                required_capabilities_json: r#"["script.judge"]"#,
+                profile: None,
+                correlation_id: None,
+                source_span_json: None,
+                timeout_seconds: None,
+            },
+            NewEffect {
+                effect_id: "exec-2",
+                kind: "exec.command",
+                target: None,
+                input_json: &effect_input,
+                status: "queued",
+                idempotency_key: "rule=start;effect=exec-2",
+                required_capabilities_json: r#"["script.judge"]"#,
+                profile: None,
+                correlation_id: None,
+                source_span_json: None,
+                timeout_seconds: None,
+            },
+        ];
+        SqliteStore::open(&store_path)
+            .expect("reopen store for commit")
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("commit exec effects");
+
+        for effect_id in ["exec-1", "exec-2"] {
+            let claimable = ClaimableEffect {
+                effect_id: effect_id.to_owned(),
+                kind: "exec.command".to_owned(),
+                target: None,
+                profile: None,
+                input_json: effect_input.clone(),
+                required_capabilities_json: r#"["script.judge"]"#.to_owned(),
+                declared_profiles_json: "[]".to_owned(),
+            };
+            run_exec_effect(
+                &store_path,
+                &instance_id,
+                &claimable,
+                ExecProfile::Dev,
+                Some(&manifest),
+            )
+            .expect("exec effect settles");
+        }
+
+        // The script spawned exactly once: the second effect was a cache hit.
+        let witness = fs::read_to_string(&witness_path).expect("witness file exists");
+        assert_eq!(witness.lines().count(), 1, "witness: {witness:?}");
+
+        let store = SqliteStore::open(&store_path).expect("reopen store");
+        let runs = store.list_runs(&instance_id).expect("runs");
+        let run_for = |effect_id: &str| {
+            runs.iter()
+                .find(|run| run.effect_id == effect_id)
+                .unwrap_or_else(|| panic!("run for {effect_id}"))
+        };
+        let first_meta = json_from_str(&run_for("exec-1").metadata_json);
+        let second_meta = json_from_str(&run_for("exec-2").metadata_json);
+        assert_eq!(first_meta["cache"]["hit"], json!(false), "{first_meta}");
+        assert_eq!(second_meta["cache"]["hit"], json!(true), "{second_meta}");
+        assert_eq!(
+            first_meta["cache"]["content_key"],
+            second_meta["cache"]["content_key"]
+        );
+        assert_eq!(first_meta["stdout"], second_meta["stdout"]);
+        assert_eq!(run_for("exec-2").status, "completed");
+
+        // The recorded entry credits the populating effect (provenance).
+        let content_key = first_meta["cache"]["content_key"]
+            .as_str()
+            .expect("content key recorded")
+            .to_owned();
+        let entry = store
+            .lookup_compute_result(&content_key)
+            .expect("cache lookup")
+            .expect("cache entry recorded");
+        assert_eq!(entry.source_effect_id, "exec-1");
+        assert_eq!(entry.effect_kind, "exec.command");
+
+        for path in [&store_path, &program_path, &script_path, &witness_path] {
+            let _ = fs::remove_file(path);
+        }
     }
 
     fn create_runtime_identity_instance(

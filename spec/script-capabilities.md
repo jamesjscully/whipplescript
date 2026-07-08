@@ -112,6 +112,17 @@ workspace, unreachable from any agent sandbox:
   the effect runs; queued effects use the current pin; the run evidence
   records the hash that actually executed. Replay re-reads the recorded
   outcome, so replay determinism is untouched by manifest evolution.
+- **Hermeticity is an operator declaration** (`"hermetic": true`, default
+  false; compute plane P8-1). It asserts the script's output depends only on
+  its argv, declared env, and stdin — which makes successful results
+  memoizable in the delta-kernel result cache by content key (script sha256 +
+  argv + resolved env values + host environment epoch + stdin/parse inputs).
+  A repeat invocation with an identical key settles from the recorded result
+  without spawning; the run metadata carries `cache.hit` and the content key,
+  and the cache entry credits the populating effect. Non-hermetic entries and
+  raw `exec` are never cached. The host environment epoch is
+  `WHIPPLESCRIPT_COMPUTE_ENV_HASH` (the compute plane wires the workspace
+  image digest here); bumping it invalidates every cached result.
 
 ## Enforcement
 

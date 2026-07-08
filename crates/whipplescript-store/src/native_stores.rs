@@ -275,6 +275,17 @@ impl RuntimeStore for NativeStores {
         self.runtime.list_project_context_docs()
     }
 
+    fn record_compute_result(
+        &self,
+        registration: ComputeResultRegistration<'_>,
+    ) -> StoreResult<bool> {
+        self.runtime.record_compute_result(registration)
+    }
+
+    fn lookup_compute_result(&self, content_key: &str) -> StoreResult<Option<ComputeCachedResult>> {
+        self.runtime.lookup_compute_result(content_key)
+    }
+
     fn attach_skill(&self, attachment: SkillAttachment<'_>) -> StoreResult<()> {
         self.runtime.attach_skill(attachment)
     }

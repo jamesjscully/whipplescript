@@ -331,6 +331,20 @@ CREATE TABLE project_context_docs (
     body TEXT NOT NULL
 );
 
+-- Delta-kernel result cache (compute plane P8-1): content-keyed memoization
+-- of hermetic exec results, workspace-wide (not instance-scoped). Content key
+-- = script hash + environment hash + input hashes. First writer wins; a key
+-- is immutable once recorded (same key = same canonical result by
+-- construction). Eviction joins the versioned-workspace retention policy.
+CREATE TABLE compute_result_cache (
+    content_key TEXT PRIMARY KEY,
+    effect_kind TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    source_instance_id TEXT NOT NULL,
+    source_effect_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE skills (
     skill_id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,

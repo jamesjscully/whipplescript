@@ -344,6 +344,33 @@ pub struct ProjectContextDoc {
     pub body: String,
 }
 
+/// One recorded delta-kernel result (compute plane P8-1): the cached outcome
+/// of a hermetic Class-A invocation, keyed by its content key (script hash +
+/// environment hash + input hashes). Workspace-wide — not instance-scoped —
+/// so a validator/judge on untouched inputs never runs twice. The source ids
+/// record provenance (which run populated the entry).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeCachedResult {
+    pub content_key: String,
+    pub effect_kind: String,
+    pub result_json: String,
+    pub source_instance_id: String,
+    pub source_effect_id: String,
+    pub created_at: String,
+}
+
+/// Registration input for one delta-kernel cache entry. Insertion is
+/// first-writer-wins (`INSERT OR IGNORE`): a content key is immutable once
+/// recorded, which is what makes served-from-cache results canonical.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ComputeResultRegistration<'a> {
+    pub content_key: &'a str,
+    pub effect_kind: &'a str,
+    pub result_json: &'a str,
+    pub source_instance_id: &'a str,
+    pub source_effect_id: &'a str,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SkillRegistration<'a> {
     pub skill_id: &'a str,
@@ -2995,6 +3022,54 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
+    /// Record one delta-kernel result under its content key (compute plane
+    /// P8-1). First-writer-wins: returns `true` when this call inserted the
+    /// entry, `false` when the key was already recorded (the existing entry is
+    /// canonical and left untouched).
+    pub fn record_compute_result(
+        &self,
+        registration: ComputeResultRegistration<'_>,
+    ) -> StoreResult<bool> {
+        let inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO compute_result_cache \
+             (content_key, effect_kind, result_json, source_instance_id, source_effect_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                registration.content_key,
+                registration.effect_kind,
+                registration.result_json,
+                registration.source_instance_id,
+                registration.source_effect_id,
+            ],
+        )?;
+        Ok(inserted > 0)
+    }
+
+    /// Look up a delta-kernel result by content key (compute plane P8-1).
+    pub fn lookup_compute_result(
+        &self,
+        content_key: &str,
+    ) -> StoreResult<Option<ComputeCachedResult>> {
+        self.connection
+            .query_row(
+                "SELECT content_key, effect_kind, result_json, source_instance_id, \
+                 source_effect_id, created_at FROM compute_result_cache WHERE content_key = ?1",
+                params![content_key],
+                |row| {
+                    Ok(ComputeCachedResult {
+                        content_key: row.get(0)?,
+                        effect_kind: row.get(1)?,
+                        result_json: row.get(2)?,
+                        source_instance_id: row.get(3)?,
+                        source_effect_id: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     pub fn list_skills(&self) -> StoreResult<Vec<SkillView>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -5444,6 +5519,11 @@ pub trait RuntimeStore {
         body: &str,
     ) -> StoreResult<()>;
     fn list_project_context_docs(&self) -> StoreResult<Vec<ProjectContextDoc>>;
+    fn record_compute_result(
+        &self,
+        registration: ComputeResultRegistration<'_>,
+    ) -> StoreResult<bool>;
+    fn lookup_compute_result(&self, content_key: &str) -> StoreResult<Option<ComputeCachedResult>>;
     fn attach_skill(&self, attachment: SkillAttachment<'_>) -> StoreResult<()>;
     fn list_skills(&self) -> StoreResult<Vec<SkillView>>;
     fn list_skill_attachments(
@@ -5718,6 +5798,17 @@ impl RuntimeStore for SqliteStore {
 
     fn list_project_context_docs(&self) -> StoreResult<Vec<ProjectContextDoc>> {
         SqliteStore::list_project_context_docs(self)
+    }
+
+    fn record_compute_result(
+        &self,
+        registration: ComputeResultRegistration<'_>,
+    ) -> StoreResult<bool> {
+        SqliteStore::record_compute_result(self, registration)
+    }
+
+    fn lookup_compute_result(&self, content_key: &str) -> StoreResult<Option<ComputeCachedResult>> {
+        SqliteStore::lookup_compute_result(self, content_key)
     }
 
     fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()> {
@@ -9770,9 +9861,60 @@ mod tests {
             "skill_attachments",
             "capability_bindings",
             "inbox_items",
+            "compute_result_cache",
         ] {
             assert!(store.table_exists(table).expect("table lookup"), "{table}");
         }
+    }
+
+    /// Delta-kernel result cache (compute plane P8-1): a recorded content key
+    /// is served back on lookup, and insertion is first-writer-wins — the
+    /// existing entry stays canonical, mirroring the Maude model's
+    /// at-most-one-run-per-key invariant (compute-result-cache.maude I1).
+    #[test]
+    fn compute_result_cache_roundtrip_and_first_writer_wins() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        assert_eq!(
+            store
+                .lookup_compute_result("key-1")
+                .expect("lookup on empty cache"),
+            None
+        );
+
+        let inserted = store
+            .record_compute_result(ComputeResultRegistration {
+                content_key: "key-1",
+                effect_kind: "exec.command",
+                result_json: r#"{"exit_code":0,"stdout":"first"}"#,
+                source_instance_id: "instance-a",
+                source_effect_id: "effect-1",
+            })
+            .expect("first record");
+        assert!(inserted, "first writer inserts");
+
+        let replay = store
+            .record_compute_result(ComputeResultRegistration {
+                content_key: "key-1",
+                effect_kind: "exec.command",
+                result_json: r#"{"exit_code":0,"stdout":"second"}"#,
+                source_instance_id: "instance-b",
+                source_effect_id: "effect-2",
+            })
+            .expect("second record");
+        assert!(!replay, "second writer is ignored");
+
+        let hit = store
+            .lookup_compute_result("key-1")
+            .expect("lookup")
+            .expect("entry exists");
+        assert_eq!(hit.result_json, r#"{"exit_code":0,"stdout":"first"}"#);
+        assert_eq!(hit.source_instance_id, "instance-a");
+        assert_eq!(hit.source_effect_id, "effect-1");
+        assert_eq!(hit.effect_kind, "exec.command");
+        assert_eq!(
+            store.lookup_compute_result("key-2").expect("other key"),
+            None
+        );
     }
 
     #[cfg(unix)]

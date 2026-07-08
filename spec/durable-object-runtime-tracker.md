@@ -669,9 +669,22 @@ fixed-size `getRandom` pools). Open build work:
 - [ ] Class-A executor pool: workspace-DO-owned, `getRandom`-routed lite/
       basic instances; priority queue (production > working >
       counterfactual); manual size knob w/ working zero-config default.
-- [ ] Delta-kernel result cache: content-keyed memoization in the
+- [x] Delta-kernel result cache: content-keyed memoization in the
       effect-ledger discipline (script+env+input hashes); eviction joins
       the versioned-workspace retention policy.
+      DONE 2026-07-07: Maude model first (compute-result-cache.maude — I1
+      at-most-one-run-per-key, I2 no-stale-serve, stale-mutant bite; in the
+      gate). `compute_result_cache` table + `record_compute_result` /
+      `lookup_compute_result` on `RuntimeStore` (all 3 impls + 3 schemas;
+      first-writer-wins). Opt-in = `"hermetic": true` on the script-manifest
+      entry (spec/script-capabilities.md); content key = sha256(script sha +
+      argv + resolved env values + `WHIPPLESCRIPT_COMPUTE_ENV_HASH` epoch +
+      stdin/parse). Native exec serves hits without spawning (run metadata
+      `cache.hit` + content key; entry credits populating effect); successful
+      completions only (failures re-run). End-to-end witness test proves the
+      script spawns once. Residual: DO-side serve path lands with the Class-A
+      executor box (no DO exec exists yet); eviction = retention policy (by
+      design); image-digest→env-hash wiring = its own box below.
 - [ ] Materialization protocol endpoints: pull-missing-blobs → run →
       diff-back keyed by effect id (atomic/recorded/complete; idempotent
       by Decisions 3/4); Class-A batching (several execs per manifest

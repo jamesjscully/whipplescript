@@ -126,6 +126,12 @@
                 position INTEGER PRIMARY KEY, path TEXT NOT NULL,
                 content_hash TEXT NOT NULL, body TEXT NOT NULL
             );
+            CREATE TABLE compute_result_cache (
+                content_key TEXT PRIMARY KEY, effect_kind TEXT NOT NULL,
+                result_json TEXT NOT NULL, source_instance_id TEXT NOT NULL,
+                source_effect_id TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE skills (
                 skill_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, version TEXT NOT NULL,
                 source TEXT NOT NULL, source_path TEXT NOT NULL, content_hash TEXT NOT NULL,
