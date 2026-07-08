@@ -17914,6 +17914,100 @@ struct DeclarationBlockSpec {
 // unit-tests it; nothing dispatches through it yet.
 include!(concat!(env!("OUT_DIR"), "/declaration_block_grammar.rs"));
 
+/// The parsed value of one matched `declaration_block` clause. A `Scalar` clause
+/// is literal-polymorphic: `cap`/`slots`/`context limit` carry a `Number`, while
+/// file-store `root` and channel `destination` carry `Str` — the grammar marks
+/// both `scalar` and the per-decl builder casts to the field's width/shape.
+/// `Missing` records a clause whose name matched but whose value failed to parse,
+/// so the first-word span is still captured (file-store `root_span` is set on the
+/// clause keyword regardless of the value's fate).
+#[derive(Clone, Debug)]
+enum ClauseValue {
+    Ident(Ident),
+    Duration(u64),
+    Number(u32),
+    Str(StringLiteral),
+    Globs(Vec<String>),
+    Flag,
+    Missing,
+}
+
+/// The order-free accumulator a generic `parse_declaration_block` fills as it
+/// reads a decl's brace block, keyed by the spec clause `name`; the per-decl
+/// typed-node builder reads it by name. Each record also carries the FIRST
+/// clause-name-word token span (file-store/memory-pool serialize these into the
+/// AST for `whip fmt`). Last write wins, matching the hand parsers' field
+/// overwrite. The Shape-1 analog of the ordered field vector Shape 2 builds.
+struct ClauseBag {
+    records: Vec<(&'static str, SourceSpan, ClauseValue)>,
+}
+
+impl ClauseBag {
+    fn new() -> Self {
+        ClauseBag {
+            records: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, name: &'static str, first_word_span: SourceSpan, value: ClauseValue) {
+        self.records.push((name, first_word_span, value));
+    }
+
+    fn get(&self, name: &str) -> Option<&(&'static str, SourceSpan, ClauseValue)> {
+        self.records
+            .iter()
+            .rev()
+            .find(|(clause, _, _)| *clause == name)
+    }
+
+    fn ident(&self, name: &str) -> Option<Ident> {
+        match self.get(name) {
+            Some((_, _, ClauseValue::Ident(ident))) => Some(ident.clone()),
+            _ => None,
+        }
+    }
+
+    fn duration(&self, name: &str) -> Option<u64> {
+        match self.get(name) {
+            Some((_, _, ClauseValue::Duration(seconds))) => Some(*seconds),
+            _ => None,
+        }
+    }
+
+    fn number(&self, name: &str) -> Option<u32> {
+        match self.get(name) {
+            Some((_, _, ClauseValue::Number(value))) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn text(&self, name: &str) -> Option<String> {
+        self.text_literal(name).map(|literal| literal.value)
+    }
+
+    fn text_literal(&self, name: &str) -> Option<StringLiteral> {
+        match self.get(name) {
+            Some((_, _, ClauseValue::Str(literal))) => Some(literal.clone()),
+            _ => None,
+        }
+    }
+
+    fn globs(&self, name: &str) -> Vec<String> {
+        match self.get(name) {
+            Some((_, _, ClauseValue::Globs(values))) => values.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn flag(&self, name: &str) -> bool {
+        matches!(self.get(name), Some((_, _, ClauseValue::Flag)))
+    }
+
+    fn span(&self, name: &str) -> Option<SourceSpan> {
+        self.get(name).map(|(_, span, _)| *span)
+    }
+}
+
 struct Parser<'a> {
     source: &'a str,
     tokens: Vec<Token>,
@@ -18293,6 +18387,17 @@ impl Parser<'_> {
         pending_tags: &mut Vec<TagDecl>,
         pending_description: &mut Option<StringLiteral>,
     ) -> Option<Item> {
+        // Data-driven `declaration_block` dispatch (Shape 1), the first check —
+        // the analog of `body.rs`'s `effect_operation_spec` hook. Head-word peek;
+        // the five real exceptions (harness/agent/signal/source/coerce) and all
+        // core decls are absent from the grammar table, so table membership is
+        // the partition. Every declaration-family construct parses through
+        // `parse_declaration_block` + its typed-node builder — no hand parsers.
+        if let Some(spec) = self.declaration_block_spec_at() {
+            self.reject_pending_tags(pending_tags, spec.keyword);
+            self.reject_pending_description(pending_description, spec.keyword);
+            return self.parse_declaration_block(spec);
+        }
         if self.at_ident("include") {
             self.reject_pending_tags(pending_tags, "include");
             self.reject_pending_description(pending_description, "include");
@@ -18320,22 +18425,6 @@ impl Parser<'_> {
             self.reject_pending_tags(pending_tags, "action");
             self.reject_pending_description(pending_description, "action");
             self.parse_action().map(Item::Action)
-        } else if self.at_ident("tracker") {
-            self.reject_pending_tags(pending_tags, "tracker");
-            self.reject_pending_description(pending_description, "tracker");
-            self.parse_tracker().map(Item::Tracker)
-        } else if self.at_ident("channel") {
-            self.reject_pending_tags(pending_tags, "channel");
-            self.reject_pending_description(pending_description, "channel");
-            self.parse_channel().map(Item::Channel)
-        } else if self.at_ident("file") {
-            self.reject_pending_tags(pending_tags, "file store");
-            self.reject_pending_description(pending_description, "file store");
-            self.parse_file_store().map(Item::FileStore)
-        } else if self.at_ident("memory") {
-            self.reject_pending_tags(pending_tags, "memory pool");
-            self.reject_pending_description(pending_description, "memory pool");
-            self.parse_memory_pool().map(Item::MemoryPool)
         } else if self.at_ident("harness") {
             self.reject_pending_tags(pending_tags, "harness");
             self.reject_pending_description(pending_description, "harness");
@@ -18361,18 +18450,6 @@ impl Parser<'_> {
             self.reject_pending_tags(pending_tags, "test");
             self.reject_pending_description(pending_description, "test");
             self.parse_test().map(Item::Test)
-        } else if self.at_ident("lease") {
-            self.reject_pending_tags(pending_tags, "lease");
-            self.reject_pending_description(pending_description, "lease");
-            self.parse_lease().map(Item::Lease)
-        } else if self.at_ident("ledger") {
-            self.reject_pending_tags(pending_tags, "ledger");
-            self.reject_pending_description(pending_description, "ledger");
-            self.parse_ledger().map(Item::Ledger)
-        } else if self.at_ident("counter") {
-            self.reject_pending_tags(pending_tags, "counter");
-            self.reject_pending_description(pending_description, "counter");
-            self.parse_counter().map(Item::Counter)
         } else if self.at_ident("class") {
             self.reject_pending_tags(pending_tags, "class");
             self.reject_pending_description(pending_description, "class");
@@ -18400,8 +18477,6 @@ impl Parser<'_> {
     /// (`keyword_words[0]`, NOT a 2-token peek — a 2-token peek mis-routes a
     /// malformed `file <x>` to the wrong diagnostic; tail validation belongs in
     /// the per-decl parser). The exact analog of `body::effect_operation_spec`.
-    /// D2.0 scaffolding: not wired into `parse_declaration_item` yet.
-    #[allow(dead_code)]
     fn declaration_block_spec_at(&self) -> Option<&'static DeclarationBlockSpec> {
         let head = match self.peek().map(|token| &token.kind) {
             Some(TokenKind::Ident(value)) => value.as_str(),
@@ -18410,6 +18485,339 @@ impl Parser<'_> {
         DECLARATION_BLOCK_GRAMMAR
             .iter()
             .find(|spec| spec.keyword_words.first() == Some(&head))
+    }
+
+    /// The single generic top-level `declaration_block` parser (Shape 1) — the
+    /// analog of `body::parse_effect_operation`. The head word is already matched
+    /// by `declaration_block_spec_at`; this consumes the keyword (validating any
+    /// tail word, e.g. `store` after `file`), the name, and an order-free brace
+    /// block of clauses into a `ClauseBag`, then hands off to the per-decl typed
+    /// node builder (`item_from_decl_ast`). Unknown clauses emit the spec's
+    /// `unknown_hint` and resynchronize (file-store precedent).
+    fn parse_declaration_block(&mut self, spec: &'static DeclarationBlockSpec) -> Option<Item> {
+        let head = *spec.keyword_words.first()?;
+        let start = self.expect_keyword(head)?.span.start;
+        for tail in &spec.keyword_words[1..] {
+            if !self.consume_ident(tail) {
+                self.expected(format!("`{tail}` after `{head}`"));
+                return None;
+            }
+        }
+        let name = self.expect_ident(&format!("{} name", spec.keyword))?;
+        self.expect_symbol('{')?;
+        let field_label = format!("{} field", spec.keyword);
+        let mut bag = ClauseBag::new();
+        while !self.is_at_end() && !self.at_symbol('}') {
+            let Some(field) = self.expect_ident(&field_label) else {
+                self.synchronize_to_block_item();
+                continue;
+            };
+            // Greedy multi-word clause-name match: `field` is the first word;
+            // extend with follow words while some clause name is a longer prefix
+            // match (file-store `allow read`/`allow write`, memory `context limit`).
+            let first_word_span = field.span;
+            let mut words = vec![field.name];
+            let matched = loop {
+                let depth = words.len();
+                if let Some(clause) = spec.clauses.iter().find(|clause| {
+                    clause.words.len() == depth
+                        && clause
+                            .words
+                            .iter()
+                            .zip(&words)
+                            .all(|(a, b)| *a == b.as_str())
+                }) {
+                    break Some(clause);
+                }
+                let extendable = spec.clauses.iter().any(|clause| {
+                    clause.words.len() > depth
+                        && clause
+                            .words
+                            .iter()
+                            .zip(&words)
+                            .all(|(a, b)| *a == b.as_str())
+                });
+                if !extendable {
+                    break None;
+                }
+                let Some(next) = self.expect_ident("clause name") else {
+                    break None;
+                };
+                words.push(next.name);
+            };
+            let Some(clause) = matched else {
+                let hint = spec.clauses.first().map(|clause| clause.unknown_hint);
+                self.diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: first_word_span,
+                    message: format!("unknown {} field `{}`", spec.keyword, words.join(" ")),
+                    suggestion: hint.map(str::to_owned),
+                });
+                self.synchronize_to_block_item();
+                continue;
+            };
+            // Clause connective (ledger `partition by`): mandatory (M2) — a
+            // missing connective is a parse error, like a Shape 2 slot connective.
+            if let Some(connective) = clause.connective {
+                if !self.consume_ident(connective) {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: first_word_span,
+                        message: format!("expected `{connective}` after `{}`", clause.name),
+                        suggestion: Some(format!("write `{} {connective} <field>`", clause.name)),
+                    });
+                    self.synchronize_to_block_item();
+                    continue;
+                }
+            }
+            let value = self.parse_clause_value(clause);
+            bag.record(clause.name, first_word_span, value);
+        }
+        let close = self.expect_symbol('}')?;
+        let span = SourceSpan {
+            start,
+            end: close.span.end,
+        };
+        self.item_from_decl_ast(spec.ast_kind, &bag, name, span)
+    }
+
+    /// Parse one clause's value by its `ClauseKind`, recording `Missing` on a
+    /// failed parse so the clause's first-word span is still captured. A `Scalar`
+    /// is literal-polymorphic (number or string); the builder casts.
+    fn parse_clause_value(&mut self, clause: &ClauseSpec) -> ClauseValue {
+        match clause.kind {
+            ClauseKind::Identifier | ClauseKind::Schema => self
+                .expect_ident(&format!("{} value", clause.name))
+                .map_or(ClauseValue::Missing, ClauseValue::Ident),
+            ClauseKind::Duration => self
+                .parse_decl_duration_seconds(&format!("{} duration", clause.name))
+                .map_or(ClauseValue::Missing, ClauseValue::Duration),
+            ClauseKind::Scalar => match self.peek().map(|token| &token.kind) {
+                Some(TokenKind::String(_)) => self
+                    .expect_string(&format!("{} value", clause.name))
+                    .map_or(ClauseValue::Missing, ClauseValue::Str),
+                _ => self
+                    .expect_u32(&format!("{} value", clause.name))
+                    .map_or(ClauseValue::Missing, |(value, _)| {
+                        ClauseValue::Number(value)
+                    }),
+            },
+            ClauseKind::Glob if clause.list => {
+                // Route glob lists through the shared list parser UNCHANGED — it
+                // keeps its "skill string" element label (avoids file-store
+                // negative-fixture churn).
+                let globs = self
+                    .parse_string_list()
+                    .map(|(literals, _)| literals.into_iter().map(|l| l.value).collect())
+                    .unwrap_or_default();
+                ClauseValue::Globs(globs)
+            }
+            ClauseKind::Glob => self
+                .expect_string(&format!("{} value", clause.name))
+                .map_or(ClauseValue::Missing, ClauseValue::Str),
+            ClauseKind::Flag => ClauseValue::Flag,
+            // No migrated decl carries an expression clause; recorded inert.
+            ClauseKind::Expression => ClauseValue::Missing,
+        }
+    }
+
+    /// The one hand-written seam of the data-driven pipeline: build the distinct
+    /// typed AST node each `declaration_block` lowers to from the order-free
+    /// `ClauseBag`, reproducing each hand parser's required-field check, bespoke
+    /// missing-field diagnostic, and field-width casts exactly (so success `.ir`
+    /// and coord IR fields are byte-identical).
+    fn item_from_decl_ast(
+        &mut self,
+        ast_kind: DeclAstKind,
+        bag: &ClauseBag,
+        name: Ident,
+        span: SourceSpan,
+    ) -> Option<Item> {
+        match ast_kind {
+            DeclAstKind::Tracker => {
+                let Some(provider) = bag.ident("provider") else {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span,
+                        message: format!("tracker `{}` is missing a provider", name.name),
+                        suggestion: Some(
+                            "add `provider builtin` inside the tracker block".to_owned(),
+                        ),
+                    });
+                    return None;
+                };
+                Some(Item::Tracker(TrackerDecl {
+                    name,
+                    provider,
+                    span,
+                }))
+            }
+            DeclAstKind::Channel => {
+                let Some(provider) = bag.ident("provider") else {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span,
+                        message: format!("channel `{}` is missing a provider", name.name),
+                        suggestion: Some(
+                            "add `provider <name>` inside the channel block".to_owned(),
+                        ),
+                    });
+                    return None;
+                };
+                Some(Item::Channel(ChannelDecl {
+                    name,
+                    provider,
+                    workspace: bag.ident("workspace"),
+                    destination: bag.text_literal("destination"),
+                    span,
+                }))
+            }
+            DeclAstKind::Counter => {
+                let key_type = bag.ident("key");
+                let cap = bag.number("cap").map(i64::from);
+                // `reset`: identifier + membership check; an invalid period keeps
+                // the value (matching the hand parser) but emits the enum diagnostic.
+                let reset = bag.ident("reset").map(|period| {
+                    if !matches!(
+                        period.name.as_str(),
+                        "hourly" | "daily" | "weekly" | "monthly"
+                    ) {
+                        self.diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: period.span,
+                            message: format!("unknown reset period `{}`", period.name),
+                            suggestion: Some(
+                                "use `hourly`, `daily`, `weekly`, or `monthly`".to_owned(),
+                            ),
+                        });
+                    }
+                    period.name
+                });
+                let shared = bag.flag("shared");
+                let (Some(key_type), Some(cap), Some(reset)) = (key_type, cap, reset) else {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span,
+                        message: format!(
+                            "counter `{}` must declare `key`, `cap`, and `reset`",
+                            name.name
+                        ),
+                        suggestion: Some(
+                            "every counter is bounded: declare all three fields".to_owned(),
+                        ),
+                    });
+                    return None;
+                };
+                Some(Item::Counter(CounterDecl {
+                    name,
+                    key_type,
+                    cap,
+                    reset,
+                    shared,
+                    span,
+                }))
+            }
+            DeclAstKind::Lease => {
+                let key_type = bag.ident("key");
+                let slots = bag.number("slots").unwrap_or(1);
+                let ttl_seconds = bag.duration("ttl");
+                let shared = bag.flag("shared");
+                let (Some(key_type), Some(ttl_seconds)) = (key_type, ttl_seconds) else {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span,
+                        message: format!(
+                            "lease `{}` must declare a `key` type and a `ttl` backstop",
+                            name.name
+                        ),
+                        suggestion: Some(
+                            "every lease is bounded: declare `key <Type>` and `ttl <duration>`"
+                                .to_owned(),
+                        ),
+                    });
+                    return None;
+                };
+                Some(Item::Lease(LeaseDecl {
+                    name,
+                    key_type,
+                    slots,
+                    ttl_seconds,
+                    shared,
+                    span,
+                }))
+            }
+            DeclAstKind::Ledger => {
+                let entry_schema = bag.ident("entry");
+                let partition_field = bag.ident("partition");
+                let retain_seconds = bag.duration("retain");
+                let shared = bag.flag("shared");
+                let (Some(entry_schema), Some(partition_field), Some(retain_seconds)) =
+                    (entry_schema, partition_field, retain_seconds)
+                else {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span,
+                        message: format!(
+                            "ledger `{}` must declare `entry`, `partition by`, and `retain`",
+                            name.name
+                        ),
+                        suggestion: Some(
+                            "every ledger is bounded and partitioned: declare all three fields"
+                                .to_owned(),
+                        ),
+                    });
+                    return None;
+                };
+                Some(Item::Ledger(LedgerDecl {
+                    name,
+                    entry_schema,
+                    partition_field,
+                    retain_seconds,
+                    shared,
+                    span,
+                }))
+            }
+            DeclAstKind::FileStore => {
+                let root_span = bag.span("root");
+                let read_span = bag.span("allow read");
+                let write_span = bag.span("allow write");
+                let read_globs = bag.globs("allow read");
+                let write_globs = bag.globs("allow write");
+                let Some(root) = bag.text("root") else {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span,
+                        message: format!("file store `{}` is missing a root", name.name),
+                        suggestion: Some(
+                            "add `root \"<dir>\"` inside the file store block".to_owned(),
+                        ),
+                    });
+                    return None;
+                };
+                Some(Item::FileStore(FileStoreDecl {
+                    name,
+                    root,
+                    read_globs,
+                    write_globs,
+                    root_span,
+                    read_span,
+                    write_span,
+                    span,
+                }))
+            }
+            DeclAstKind::MemoryPool => {
+                let context_limit = bag.number("context limit").map(u64::from);
+                // The span serializes only alongside a value (hand parser sets it
+                // inside the successful-parse branch).
+                let context_limit_span = context_limit.and(bag.span("context limit"));
+                Some(Item::MemoryPool(MemoryPoolDecl {
+                    name,
+                    context_limit,
+                    context_limit_span,
+                    span,
+                }))
+            }
+        }
     }
 
     fn parse_pattern(&mut self) -> Option<PatternDecl> {
@@ -18599,514 +19007,6 @@ impl Parser<'_> {
                 None
             }
         }
-    }
-
-    fn parse_lease(&mut self) -> Option<LeaseDecl> {
-        let start = self.expect_keyword("lease")?.span.start;
-        let name = self.expect_ident("lease name")?;
-        self.expect_symbol('{')?;
-        let mut key_type = None;
-        let mut slots = 1u32;
-        let mut ttl_seconds = None;
-        let mut shared = false;
-        while !self.is_at_end() && !self.at_symbol('}') {
-            let Some(field) = self.expect_ident("lease field") else {
-                self.synchronize_to_block_item();
-                continue;
-            };
-            match field.name.as_str() {
-                "shared" => shared = true,
-                "key" => key_type = self.expect_ident("key type"),
-                "slots" => {
-                    slots = self
-                        .expect_u32("slots value")
-                        .map(|(value, _)| value)
-                        .unwrap_or(1);
-                }
-                "ttl" => ttl_seconds = self.parse_decl_duration_seconds("ttl duration"),
-                other => {
-                    self.diagnostics.push(Diagnostic {
-                        related: Vec::new(),
-                        span: field.span,
-                        message: format!("unknown lease field `{other}`"),
-                        suggestion: Some(
-                            "lease fields are `shared`, `key`, `slots`, and `ttl`".to_owned(),
-                        ),
-                    });
-                    self.synchronize_to_block_item();
-                }
-            }
-        }
-        let close = self.expect_symbol('}')?;
-        let span = SourceSpan {
-            start,
-            end: close.span.end,
-        };
-        let (Some(key_type), Some(ttl_seconds)) = (key_type, ttl_seconds) else {
-            self.diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span,
-                message: format!(
-                    "lease `{}` must declare a `key` type and a `ttl` backstop",
-                    name.name
-                ),
-                suggestion: Some(
-                    "every lease is bounded: declare `key <Type>` and `ttl <duration>`".to_owned(),
-                ),
-            });
-            return None;
-        };
-        Some(LeaseDecl {
-            name,
-            key_type,
-            slots,
-            ttl_seconds,
-            shared,
-            span,
-        })
-    }
-
-    fn parse_ledger(&mut self) -> Option<LedgerDecl> {
-        let start = self.expect_keyword("ledger")?.span.start;
-        let name = self.expect_ident("ledger name")?;
-        self.expect_symbol('{')?;
-        let mut entry_schema = None;
-        let mut partition_field = None;
-        let mut retain_seconds = None;
-        let mut shared = false;
-        while !self.is_at_end() && !self.at_symbol('}') {
-            let Some(field) = self.expect_ident("ledger field") else {
-                self.synchronize_to_block_item();
-                continue;
-            };
-            match field.name.as_str() {
-                "shared" => shared = true,
-                "entry" => entry_schema = self.expect_ident("entry schema"),
-                "partition" => {
-                    if self.at_ident("by") {
-                        self.advance();
-                    } else {
-                        self.diagnostics.push(Diagnostic {
-                            related: Vec::new(),
-                            span: field.span,
-                            message: "expected `by` after `partition`".to_owned(),
-                            suggestion: Some("write `partition by <field>`".to_owned()),
-                        });
-                    }
-                    partition_field = self.expect_ident("partition field");
-                }
-                "retain" => retain_seconds = self.parse_decl_duration_seconds("retain duration"),
-                other => {
-                    self.diagnostics.push(Diagnostic {
-                        related: Vec::new(),
-                        span: field.span,
-                        message: format!("unknown ledger field `{other}`"),
-                        suggestion: Some(
-                            "ledger fields are `shared`, `entry`, `partition by`, and `retain`"
-                                .to_owned(),
-                        ),
-                    });
-                    self.synchronize_to_block_item();
-                }
-            }
-        }
-        let close = self.expect_symbol('}')?;
-        let span = SourceSpan {
-            start,
-            end: close.span.end,
-        };
-        let (Some(entry_schema), Some(partition_field), Some(retain_seconds)) =
-            (entry_schema, partition_field, retain_seconds)
-        else {
-            self.diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span,
-                message: format!(
-                    "ledger `{}` must declare `entry`, `partition by`, and `retain`",
-                    name.name
-                ),
-                suggestion: Some(
-                    "every ledger is bounded and partitioned: declare all three fields".to_owned(),
-                ),
-            });
-            return None;
-        };
-        Some(LedgerDecl {
-            name,
-            entry_schema,
-            partition_field,
-            retain_seconds,
-            shared,
-            span,
-        })
-    }
-
-    fn parse_counter(&mut self) -> Option<CounterDecl> {
-        let start = self.expect_keyword("counter")?.span.start;
-        let name = self.expect_ident("counter name")?;
-        self.expect_symbol('{')?;
-        let mut key_type = None;
-        let mut cap = None;
-        let mut reset = None;
-        let mut shared = false;
-        while !self.is_at_end() && !self.at_symbol('}') {
-            let Some(field) = self.expect_ident("counter field") else {
-                self.synchronize_to_block_item();
-                continue;
-            };
-            match field.name.as_str() {
-                "shared" => shared = true,
-                "key" => key_type = self.expect_ident("key type"),
-                "cap" => {
-                    cap = self
-                        .expect_u32("cap value")
-                        .map(|(value, _)| i64::from(value))
-                }
-                "reset" => {
-                    let period = self.expect_ident("reset period")?;
-                    if !matches!(
-                        period.name.as_str(),
-                        "hourly" | "daily" | "weekly" | "monthly"
-                    ) {
-                        self.diagnostics.push(Diagnostic {
-                            related: Vec::new(),
-                            span: period.span,
-                            message: format!("unknown reset period `{}`", period.name),
-                            suggestion: Some(
-                                "use `hourly`, `daily`, `weekly`, or `monthly`".to_owned(),
-                            ),
-                        });
-                    }
-                    reset = Some(period.name);
-                }
-                other => {
-                    self.diagnostics.push(Diagnostic {
-                        related: Vec::new(),
-                        span: field.span,
-                        message: format!("unknown counter field `{other}`"),
-                        suggestion: Some(
-                            "counter fields are `shared`, `key`, `cap`, and `reset`".to_owned(),
-                        ),
-                    });
-                    self.synchronize_to_block_item();
-                }
-            }
-        }
-        let close = self.expect_symbol('}')?;
-        let span = SourceSpan {
-            start,
-            end: close.span.end,
-        };
-        let (Some(key_type), Some(cap), Some(reset)) = (key_type, cap, reset) else {
-            self.diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span,
-                message: format!(
-                    "counter `{}` must declare `key`, `cap`, and `reset`",
-                    name.name
-                ),
-                suggestion: Some("every counter is bounded: declare all three fields".to_owned()),
-            });
-            return None;
-        };
-        Some(CounterDecl {
-            name,
-            key_type,
-            cap,
-            reset,
-            shared,
-            span,
-        })
-    }
-
-    fn parse_tracker(&mut self) -> Option<TrackerDecl> {
-        let start = self.expect_keyword("tracker")?.span.start;
-        let name = self.expect_ident("tracker name")?;
-        self.expect_symbol('{')?;
-        let mut provider = None;
-        while !self.is_at_end() && !self.at_symbol('}') {
-            let Some(field) = self.expect_ident("tracker field") else {
-                self.synchronize_to_block_item();
-                continue;
-            };
-            match field.name.as_str() {
-                "provider" => {
-                    provider = self.expect_ident("provider name");
-                }
-                other => {
-                    self.diagnostics.push(Diagnostic {
-                        related: Vec::new(),
-                        span: field.span,
-                        message: format!("unknown tracker field `{other}`"),
-                        suggestion: Some("the only tracker field is `provider`".to_owned()),
-                    });
-                    self.synchronize_to_block_item();
-                }
-            }
-        }
-        let close = self.expect_symbol('}')?;
-        let Some(provider) = provider else {
-            self.diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span: SourceSpan {
-                    start,
-                    end: close.span.end,
-                },
-                message: format!("tracker `{}` is missing a provider", name.name),
-                suggestion: Some("add `provider builtin` inside the tracker block".to_owned()),
-            });
-            return None;
-        };
-        Some(TrackerDecl {
-            name,
-            provider,
-            span: SourceSpan {
-                start,
-                end: close.span.end,
-            },
-        })
-    }
-
-    fn parse_channel(&mut self) -> Option<ChannelDecl> {
-        let start = self.expect_keyword("channel")?.span.start;
-        let name = self.expect_ident("channel name")?;
-        self.expect_symbol('{')?;
-        let mut provider = None;
-        let mut workspace = None;
-        let mut destination = None;
-        while !self.is_at_end() && !self.at_symbol('}') {
-            let Some(field) = self.expect_ident("channel field") else {
-                self.synchronize_to_block_item();
-                continue;
-            };
-            match field.name.as_str() {
-                "provider" => {
-                    provider = self.expect_ident("channel provider");
-                }
-                "workspace" => {
-                    workspace = self.expect_ident("channel workspace");
-                }
-                "destination" => {
-                    destination = self.expect_string("channel destination");
-                }
-                other => {
-                    self.diagnostics.push(Diagnostic {
-                        related: Vec::new(),
-                        span: field.span,
-                        message: format!("unknown channel field `{other}`"),
-                        suggestion: Some(
-                            "channel fields are `provider`, `workspace`, and `destination`"
-                                .to_owned(),
-                        ),
-                    });
-                    self.synchronize_to_block_item();
-                }
-            }
-        }
-        let close = self.expect_symbol('}')?;
-        let Some(provider) = provider else {
-            self.diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span: SourceSpan {
-                    start,
-                    end: close.span.end,
-                },
-                message: format!("channel `{}` is missing a provider", name.name),
-                suggestion: Some("add `provider <name>` inside the channel block".to_owned()),
-            });
-            return None;
-        };
-        Some(ChannelDecl {
-            name,
-            provider,
-            workspace,
-            destination,
-            span: SourceSpan {
-                start,
-                end: close.span.end,
-            },
-        })
-    }
-
-    fn parse_file_store(&mut self) -> Option<FileStoreDecl> {
-        let start = self.expect_keyword("file")?.span.start;
-        if !self.consume_ident("store") {
-            self.expected("`store` after `file`");
-            return None;
-        }
-        let name = self.expect_ident("file store name")?;
-        self.expect_symbol('{')?;
-        let mut root = None;
-        let mut read_globs = Vec::new();
-        let mut write_globs = Vec::new();
-        let mut root_span = None;
-        let mut read_span = None;
-        let mut write_span = None;
-        while !self.is_at_end() && !self.at_symbol('}') {
-            let Some(field) = self.expect_ident("file store field") else {
-                self.synchronize_to_block_item();
-                continue;
-            };
-            match field.name.as_str() {
-                "root" => {
-                    root_span = Some(field.span);
-                    root = self
-                        .expect_string("file store root")
-                        .map(|literal| literal.value);
-                }
-                // `allow read [...]` / `allow write [...]`: narrow which paths
-                // (relative to root) the store permits. Optional — an absent
-                // clause means any path inside the root.
-                "allow" => {
-                    let Some(direction) = self.expect_ident("`read` or `write` after `allow`")
-                    else {
-                        self.synchronize_to_block_item();
-                        continue;
-                    };
-                    let globs = self
-                        .parse_string_list()
-                        .map(|(literals, _)| {
-                            literals.into_iter().map(|literal| literal.value).collect()
-                        })
-                        .unwrap_or_default();
-                    match direction.name.as_str() {
-                        "read" => {
-                            read_span = Some(field.span);
-                            read_globs = globs;
-                        }
-                        "write" => {
-                            write_span = Some(field.span);
-                            write_globs = globs;
-                        }
-                        other => {
-                            self.diagnostics.push(Diagnostic {
-                                related: Vec::new(),
-                                span: direction.span,
-                                message: format!("unknown `allow` direction `{other}`"),
-                                suggestion: Some(
-                                    "use `allow read [...]` or `allow write [...]`".to_owned(),
-                                ),
-                            });
-                        }
-                    }
-                }
-                other => {
-                    self.diagnostics.push(Diagnostic {
-                        related: Vec::new(),
-                        span: field.span,
-                        message: format!("unknown file store field `{other}`"),
-                        suggestion: Some(
-                            "file store fields are `root`, `allow read [...]`, `allow write [...]`"
-                                .to_owned(),
-                        ),
-                    });
-                    self.synchronize_to_block_item();
-                }
-            }
-        }
-        let close = self.expect_symbol('}')?;
-        let Some(root) = root else {
-            self.diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span: SourceSpan {
-                    start,
-                    end: close.span.end,
-                },
-                message: format!("file store `{}` is missing a root", name.name),
-                suggestion: Some("add `root \"<dir>\"` inside the file store block".to_owned()),
-            });
-            return None;
-        };
-        Some(FileStoreDecl {
-            name,
-            root,
-            read_globs,
-            write_globs,
-            root_span,
-            read_span,
-            write_span,
-            span: SourceSpan {
-                start,
-                end: close.span.end,
-            },
-        })
-    }
-
-    /// `memory pool <name> { context limit <n> }` (std.memory, MEM-1). Mirrors
-    /// `parse_file_store`: a two-word keyword, a name, and a brace block whose
-    /// only v1 clause is the optional `context limit <int>`. Unknown clauses are
-    /// rejected (file-store precedent). v1 pools are provider-less, so there is
-    /// no `provider` clause.
-    fn parse_memory_pool(&mut self) -> Option<MemoryPoolDecl> {
-        let start = self.expect_keyword("memory")?.span.start;
-        if !self.consume_ident("pool") {
-            self.expected("`pool` after `memory`");
-            return None;
-        }
-        let name = self.expect_ident("memory pool name")?;
-        self.expect_symbol('{')?;
-        let mut context_limit = None;
-        let mut context_limit_span = None;
-        while !self.is_at_end() && !self.at_symbol('}') {
-            let Some(field) = self.expect_ident("memory pool field") else {
-                self.synchronize_to_block_item();
-                continue;
-            };
-            match field.name.as_str() {
-                // `context limit <n>`: the optional recall packing budget. Not
-                // provider config — it lowers into the `capability.call` effect
-                // input alongside `pool` and `query`.
-                "context" => {
-                    if !self.consume_ident("limit") {
-                        self.expected("`limit` after `context`");
-                        self.synchronize_to_block_item();
-                        continue;
-                    }
-                    if let Some((value, _span)) = self.expect_u32("context limit value") {
-                        context_limit_span = Some(field.span);
-                        context_limit = Some(u64::from(value));
-                    } else {
-                        self.synchronize_to_block_item();
-                    }
-                }
-                // `provider` is deliberately rejected here: provider selection is
-                // binding-owned (the manifest `bindings[]`), so a pool-level
-                // provider clause would be a decorative clause nothing reads.
-                "provider" => {
-                    self.diagnostics.push(Diagnostic {
-                        related: Vec::new(),
-                        span: field.span,
-                        message: "memory pools have no `provider` clause".to_owned(),
-                        suggestion: Some(
-                            "provider selection is binding-owned (the manifest `bindings[]`)"
-                                .to_owned(),
-                        ),
-                    });
-                    self.synchronize_to_block_item();
-                }
-                other => {
-                    self.diagnostics.push(Diagnostic {
-                        related: Vec::new(),
-                        span: field.span,
-                        message: format!("unknown memory pool field `{other}`"),
-                        suggestion: Some(
-                            "the only memory pool field is `context limit <n>`".to_owned(),
-                        ),
-                    });
-                    self.synchronize_to_block_item();
-                }
-            }
-        }
-        let close = self.expect_symbol('}')?;
-        Some(MemoryPoolDecl {
-            name,
-            context_limit,
-            context_limit_span,
-            span: SourceSpan {
-                start,
-                end: close.span.end,
-            },
-        })
     }
 
     fn parse_harness(&mut self) -> Option<HarnessDecl> {
@@ -21622,6 +21522,43 @@ counter shared_budget {
             .counters
             .iter()
             .any(|counter| counter.name == "shared_budget" && counter.shared));
+    }
+
+    #[test]
+    fn file_store_clause_spans_are_first_word_tokens() {
+        // HARD INVARIANT: root_span/read_span/write_span are the FIRST
+        // clause-name-word token span (`root`/`allow`/`allow`), not the value or
+        // a joined multi-word span. These serialize into FileStoreDecl and feed
+        // `whip fmt`; the `.ir` golden does not witness them, so assert directly
+        // (mirrors examples/file-store-demo.whip).
+        let source = r#"
+workflow FileSpanProbe
+file store notes_store {
+  root "./data"
+  allow read ["notes/**"]
+  allow write ["notes/**"]
+}
+"#;
+        let parsed = parse_program(source);
+        assert_eq!(
+            parsed.diagnostics,
+            Vec::new(),
+            "unexpected diagnostics: {:?}",
+            parsed.diagnostics
+        );
+        let store = parsed
+            .program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::FileStore(decl) => Some(decl),
+                _ => None,
+            })
+            .expect("file store decl");
+        let text_at = |span: SourceSpan| &source[span.start..span.end];
+        assert_eq!(text_at(store.root_span.expect("root span")), "root");
+        assert_eq!(text_at(store.read_span.expect("read span")), "allow");
+        assert_eq!(text_at(store.write_span.expect("write span")), "allow");
     }
 
     #[test]
@@ -28318,8 +28255,10 @@ memory pool project_memory {
 
     #[test]
     fn rejects_unknown_and_provider_memory_pool_clauses() {
-        // Unknown clauses are rejected (file-store precedent); `provider` gets a
-        // dedicated binding-owned hint since v1 pools are provider-less.
+        // Unknown clauses are rejected (file-store precedent). Since the
+        // declaration-family migration (M2), `provider` is no longer a bespoke
+        // "pools have no provider" clause but a generic unknown field — v1 pools
+        // are provider-less, so it is simply not in the grammar.
         let unknown = compile_program("workflow U\n\nmemory pool p {\n  retention 5\n}\n");
         assert!(
             unknown
@@ -28334,7 +28273,7 @@ memory pool project_memory {
             provider
                 .diagnostics
                 .iter()
-                .any(|d| d.message.contains("memory pools have no `provider` clause")),
+                .any(|d| d.message.contains("unknown memory pool field `provider`")),
             "{:?}",
             provider.diagnostics
         );
