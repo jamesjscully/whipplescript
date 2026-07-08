@@ -21,8 +21,8 @@ use whipplescript_kernel::coerce_native::{
 use whipplescript_kernel::context_assembly::{assemble, BundleKind, ContextBundle};
 use whipplescript_kernel::harness_loop::{
     BrokeredTurnInput, ChatMessage, Compactor, HardResetCompactor, HarnessModelClient,
-    HarnessModelError, HttpModelClient, ModelReply, NoopCompactor, ToolCall, ToolExecutor,
-    ToolOutcome, ToolResultCompactor, ToolSpec, ToolStatus, TurnSummarizingCompactor,
+    HarnessModelError, HttpModelClient, ImageBlock, ModelReply, NoopCompactor, ToolCall,
+    ToolExecutor, ToolOutcome, ToolResultCompactor, ToolSpec, ToolStatus, TurnSummarizingCompactor,
 };
 use whipplescript_kernel::harness_model::RealHarnessModelClient;
 use whipplescript_kernel::sansio::{HostDriver, IoRequest, IoResult};
@@ -2674,6 +2674,39 @@ fn turn_pinned_skills_from_input(input_json: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Inline images attached to the tell effect input (pi-conformance §6): an
+/// optional `images` array of `{media_type|mediaType, data_base64|data}` objects
+/// alongside the prompt. Entries missing either field are skipped (best-effort,
+/// like the other optional input keys); text-only turns yield an empty vec.
+fn turn_images_from_input(input_json: &str) -> Vec<ImageBlock> {
+    serde_json::from_str::<Value>(input_json)
+        .ok()
+        .and_then(|input| {
+            input.get("images").and_then(Value::as_array).map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let media_type = item
+                            .get("media_type")
+                            .or_else(|| item.get("mediaType"))
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())?;
+                        let data_base64 = item
+                            .get("data_base64")
+                            .or_else(|| item.get("data"))
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())?;
+                        Some(ImageBlock {
+                            media_type: media_type.to_owned(),
+                            data_base64: data_base64.to_owned(),
+                        })
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
 fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, String> {
     let input = serde_json::from_str::<Value>(input_json)
         .map_err(|error| format!("owned turn input is not valid JSON: {error}"))?;
@@ -3032,6 +3065,8 @@ pub fn run_owned_agent_turn(
         // The runner populates resume_from from any persisted transcript on
         // crash recovery (slice 6); a fresh turn starts empty.
         resume_from: Vec::new(),
+        // Inline images from the tell effect input (pi-conformance §6).
+        user_images: turn_images_from_input(input_json),
         // Per-bundle provenance for the assembled prompt; the runner records one
         // context.bundle evidence row each before the turn (Decision 5).
         context_bundles: assembled.bundles,
@@ -3737,6 +3772,36 @@ mod tests {
         ));
         assert_eq!(allowed.status, ToolStatus::Ok);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn turn_images_from_input_parses_both_key_spellings_and_defaults_empty() {
+        // No `images` key (the common text-only tell) → empty.
+        assert!(turn_images_from_input(r#"{"prompt":"work"}"#).is_empty());
+        // Both accepted spellings parse; malformed entries are skipped.
+        let images = turn_images_from_input(
+            r#"{
+                "prompt": "what is this?",
+                "images": [
+                    { "media_type": "image/png", "data_base64": "aGVsbG8=" },
+                    { "mediaType": "image/jpeg", "data": "QUJD" },
+                    { "media_type": "image/gif" }
+                ]
+            }"#,
+        );
+        assert_eq!(
+            images,
+            vec![
+                ImageBlock {
+                    media_type: "image/png".to_owned(),
+                    data_base64: "aGVsbG8=".to_owned(),
+                },
+                ImageBlock {
+                    media_type: "image/jpeg".to_owned(),
+                    data_base64: "QUJD".to_owned(),
+                },
+            ]
+        );
     }
 
     #[test]

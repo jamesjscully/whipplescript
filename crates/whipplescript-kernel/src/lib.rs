@@ -291,7 +291,10 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         if resume_from.is_empty() && ctx.thread_continue {
             let mut thread = self.load_agent_thread_transcript(ctx.instance_id, ctx.agent);
             if !thread.is_empty() {
-                thread.push(crate::harness_loop::ChatMessage::User(input.user.clone()));
+                thread.push(crate::harness_loop::ChatMessage::User {
+                    text: input.user.clone(),
+                    images: input.user_images.clone(),
+                });
                 resume_from = thread;
             }
         }
@@ -8394,7 +8397,7 @@ rule wait
         // completed fact event, exactly the shapes the runner records.
         let transcript = crate::harness_loop::chat_messages_to_json(&[
             ChatMessage::System("sys".to_owned()),
-            ChatMessage::User("first question".to_owned()),
+            ChatMessage::user_text("first question"),
             ChatMessage::Assistant {
                 text: "first answer".to_owned(),
                 tool_calls: Vec::new(),

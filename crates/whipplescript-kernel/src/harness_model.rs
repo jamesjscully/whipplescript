@@ -296,8 +296,26 @@ fn anthropic_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) 
     for message in messages {
         match message {
             ChatMessage::System(text) => system_parts.push(text.clone()),
-            ChatMessage::User(text) => {
-                out.push(json!({ "role": "user", "content": text }));
+            ChatMessage::User { text, images } => {
+                // Text-only user messages keep the plain-string content shape
+                // (byte-stable requests → provider cache stability); images
+                // switch to content blocks (pi-conformance §6).
+                if images.is_empty() {
+                    out.push(json!({ "role": "user", "content": text }));
+                } else {
+                    let mut content: Vec<Value> = vec![json!({ "type": "text", "text": text })];
+                    for image in images {
+                        content.push(json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": image.media_type,
+                                "data": image.data_base64,
+                            },
+                        }));
+                    }
+                    out.push(json!({ "role": "user", "content": content }));
+                }
             }
             ChatMessage::Assistant { text, tool_calls } => {
                 let mut content: Vec<Value> = Vec::new();
@@ -389,8 +407,28 @@ fn openai_input(messages: &[ChatMessage]) -> Vec<Value> {
             ChatMessage::System(text) => {
                 out.push(json!({ "role": "system", "content": text }));
             }
-            ChatMessage::User(text) => {
-                out.push(json!({ "role": "user", "content": text }));
+            ChatMessage::User { text, images } => {
+                // Text-only stays a plain string (cache stability); images use
+                // Responses content parts with data-URL `input_image` entries
+                // (pi-conformance §6).
+                if images.is_empty() {
+                    out.push(json!({ "role": "user", "content": text }));
+                } else {
+                    let mut content: Vec<Value> = vec![json!({
+                        "type": "input_text",
+                        "text": text,
+                    })];
+                    for image in images {
+                        content.push(json!({
+                            "type": "input_image",
+                            "image_url": format!(
+                                "data:{};base64,{}",
+                                image.media_type, image.data_base64
+                            ),
+                        }));
+                    }
+                    out.push(json!({ "role": "user", "content": content }));
+                }
             }
             ChatMessage::Assistant { text, tool_calls } => {
                 if !text.is_empty() {
@@ -596,7 +634,7 @@ mod tests {
     fn convo() -> Vec<ChatMessage> {
         vec![
             ChatMessage::System("be helpful".into()),
-            ChatMessage::User("read the file".into()),
+            ChatMessage::user_text("read the file"),
             ChatMessage::Assistant {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
@@ -717,6 +755,68 @@ mod tests {
         let input = openai_input(&messages);
         assert_eq!(input[0]["output"], json!("hello"));
         assert_eq!(input[1]["output"], json!("error: read of `x` failed"));
+    }
+
+    #[test]
+    fn anthropic_user_images_emit_base64_source_blocks() {
+        // pi-conformance §6: an image-bearing user message becomes content
+        // blocks; a text-only one keeps the plain-string shape (cache stability).
+        let messages = vec![
+            ChatMessage::user_text("plain"),
+            ChatMessage::User {
+                text: "what is this?".into(),
+                images: vec![crate::harness_loop::ImageBlock {
+                    media_type: "image/png".into(),
+                    data_base64: "aGVsbG8=".into(),
+                }],
+            },
+        ];
+        let (_, msgs) = anthropic_messages(&messages);
+        assert_eq!(msgs[0]["content"], json!("plain"));
+        assert_eq!(
+            msgs[1]["content"][0],
+            json!({ "type": "text", "text": "what is this?" })
+        );
+        assert_eq!(
+            msgs[1]["content"][1],
+            json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "aGVsbG8=",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn openai_user_images_emit_input_image_parts() {
+        // pi-conformance §6: Responses content parts with a data-URL
+        // `input_image`; a text-only user message stays a plain string.
+        let messages = vec![
+            ChatMessage::user_text("plain"),
+            ChatMessage::User {
+                text: "what is this?".into(),
+                images: vec![crate::harness_loop::ImageBlock {
+                    media_type: "image/png".into(),
+                    data_base64: "aGVsbG8=".into(),
+                }],
+            },
+        ];
+        let input = openai_input(&messages);
+        assert_eq!(input[0]["content"], json!("plain"));
+        assert_eq!(
+            input[1]["content"][0],
+            json!({ "type": "input_text", "text": "what is this?" })
+        );
+        assert_eq!(
+            input[1]["content"][1],
+            json!({
+                "type": "input_image",
+                "image_url": "data:image/png;base64,aGVsbG8=",
+            })
+        );
     }
 
     #[test]

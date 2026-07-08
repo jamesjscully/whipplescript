@@ -25841,15 +25841,13 @@ fn dev(options: &CliOptions) -> ExitCode {
     {
         return ExitCode::FAILURE;
     }
-    let mut last_streamed_event_sequence = 0_i64;
+    let mut dev_stream_cursors = DevStreamCursors::default();
     if let Err(code) = stream_dev_event_deltas(
         &mut stream,
         &options.store_path,
         &started.instance_id,
-        last_streamed_event_sequence,
-    )
-    .map(|sequence| last_streamed_event_sequence = sequence)
-    {
+        &mut dev_stream_cursors,
+    ) {
         return code;
     }
     let mut steps = Vec::new();
@@ -25875,10 +25873,8 @@ fn dev(options: &CliOptions) -> ExitCode {
             &mut stream,
             &options.store_path,
             &started.instance_id,
-            last_streamed_event_sequence,
-        )
-        .map(|sequence| last_streamed_event_sequence = sequence)
-        {
+            &mut dev_stream_cursors,
+        ) {
             return code;
         }
         let worker_report = match run_worker_once(
@@ -25914,10 +25910,8 @@ fn dev(options: &CliOptions) -> ExitCode {
             &mut stream,
             &options.store_path,
             &started.instance_id,
-            last_streamed_event_sequence,
-        )
-        .map(|sequence| last_streamed_event_sequence = sequence)
-        {
+            &mut dev_stream_cursors,
+        ) {
             return code;
         }
         // Newly-admitted `file` source lines are fresh signals the next `step`
@@ -26010,10 +26004,8 @@ fn dev(options: &CliOptions) -> ExitCode {
         &mut stream,
         &options.store_path,
         &started.instance_id,
-        last_streamed_event_sequence,
-    )
-    .map(|sequence| last_streamed_event_sequence = sequence)
-    {
+        &mut dev_stream_cursors,
+    ) {
         return code;
     }
     let diagnostics = match store.list_diagnostics(Some(&started.instance_id)) {
@@ -26203,41 +26195,128 @@ fn validate_hosted_exec_for_path(
     Err(ExitCode::FAILURE)
 }
 
+/// Incremental cursors for the dev NDJSON stream (workbench projection):
+/// the event-log high-water mark, the evidence rows already emitted, and a
+/// fingerprint of the pending-ask set (re-emitted only when it changes).
+#[derive(Default)]
+struct DevStreamCursors {
+    after_sequence: i64,
+    evidence_emitted: usize,
+    asks_fingerprint: String,
+}
+
 fn stream_dev_event_deltas(
     stream: &mut DevStream,
     store_path: &Path,
     instance_id: &str,
-    after_sequence: i64,
-) -> Result<i64, ExitCode> {
+    cursors: &mut DevStreamCursors,
+) -> Result<(), ExitCode> {
     if !stream.enabled() {
-        return Ok(after_sequence);
+        return Ok(());
     }
     let store = match SqliteStore::open(store_path) {
         Ok(store) => store,
         Err(error) => return Err(report_store_error("failed to open store", error)),
     };
+    // Evidence deltas (`dev.evidence`): tool dispatch/settle, context bundles,
+    // turn observations — the shape-only rows an external UI renders as turn
+    // progress (no token streaming; observations are evidence, never facts).
+    if let Ok(evidence) = store.list_evidence(instance_id) {
+        if evidence.len() > cursors.evidence_emitted {
+            let rows = evidence[cursors.evidence_emitted..]
+                .iter()
+                .map(|row| {
+                    json!({
+                        "evidence_id": row.evidence_id,
+                        "kind": row.kind,
+                        "subject_type": row.subject_type,
+                        "subject_id": row.subject_id,
+                        "correlation_id": row.correlation_id,
+                        "summary": row.summary,
+                        "metadata": serde_json::from_str::<Value>(&row.metadata_json)
+                            .unwrap_or(Value::Null),
+                        "created_at": row.created_at,
+                    })
+                })
+                .collect::<Vec<_>>();
+            cursors.evidence_emitted = evidence.len();
+            if stream
+                .emit(
+                    "dev.evidence",
+                    json!({
+                        "instance_id": instance_id,
+                        "count": rows.len(),
+                        "evidence": rows,
+                    }),
+                )
+                .is_err()
+            {
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
+    // Pending-ask snapshot (`dev.asks`), emitted only when the set changes —
+    // the command-to-unblock surface an external UI shows as an inbox.
+    if let Ok(items) = store.list_inbox_items(Some("pending")) {
+        let pending = items
+            .iter()
+            .filter(|item| item.instance_id == instance_id)
+            .collect::<Vec<_>>();
+        let fingerprint = pending
+            .iter()
+            .map(|item| item.inbox_item_id.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        if fingerprint != cursors.asks_fingerprint {
+            cursors.asks_fingerprint = fingerprint;
+            let asks = pending
+                .iter()
+                .map(|item| {
+                    json!({
+                        "item_id": item.inbox_item_id,
+                        "effect_id": item.effect_id,
+                        "prompt": item.prompt,
+                        "created_at": item.created_at,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if stream
+                .emit(
+                    "dev.asks",
+                    json!({
+                        "instance_id": instance_id,
+                        "count": asks.len(),
+                        "asks": asks,
+                    }),
+                )
+                .is_err()
+            {
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
     let events = match store.list_events(instance_id) {
         Ok(events) => events,
         Err(error) => return Err(report_store_error("failed to stream dev events", error)),
     };
     let new_events = events
         .iter()
-        .filter(|event| event.sequence > after_sequence)
+        .filter(|event| event.sequence > cursors.after_sequence)
         .collect::<Vec<_>>();
     if new_events.is_empty() {
-        return Ok(after_sequence);
+        return Ok(());
     }
     let latest_sequence = new_events
         .iter()
         .map(|event| event.sequence)
         .max()
-        .unwrap_or(after_sequence);
+        .unwrap_or(cursors.after_sequence);
     if stream
         .emit(
             "dev.events",
             json!({
                 "instance_id": instance_id,
-                "after_sequence": after_sequence,
+                "after_sequence": cursors.after_sequence,
                 "count": new_events.len(),
                 "events": new_events
                     .iter()
@@ -26249,7 +26328,8 @@ fn stream_dev_event_deltas(
     {
         return Err(ExitCode::FAILURE);
     }
-    Ok(latest_sequence)
+    cursors.after_sequence = latest_sequence;
+    Ok(())
 }
 
 struct DevReportJsonInput<'a> {

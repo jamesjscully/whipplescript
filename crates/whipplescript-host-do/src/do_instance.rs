@@ -262,6 +262,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     tools: Vec::new(),
                     max_steps: 8,
                     resume_from: Vec::new(),
+                    user_images: Vec::new(),
                     context_bundles,
                     pinned_skills: Vec::new(),
                 };
