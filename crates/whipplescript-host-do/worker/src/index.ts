@@ -23,6 +23,7 @@
 import wasmModule from "../pkg/whipplescript_host_do_bg.wasm";
 import * as bindings from "../pkg/whipplescript_host_do_bg.js";
 import { WasmDurableInstance, __wbg_set_wasm } from "../pkg/whipplescript_host_do_bg.js";
+import { Container, getRandom } from "@cloudflare/containers";
 
 const wasmInstance = new WebAssembly.Instance(wasmModule, {
   "./whipplescript_host_do_bg.js": bindings,
@@ -41,9 +42,25 @@ export interface Env {
   // `wrangler dev`); production omits it and uses the real Anthropic API.
   WHIP_PROVIDER_BASE_URL?: string;
   // Class-A executor sidecar (compute plane P8): where exec.command effects
-  // go as whip-executor/1 HTTP rounds. Unset = exec effects error.
+  // go as whip-executor/1 HTTP rounds. Unset = exec effects error. URLs on
+  // this host are routed to the EXECUTOR container pool, not the network.
   WHIP_EXECUTOR_URL?: string;
+  EXECUTOR: DurableObjectNamespace<ExecutorContainer>;
 }
+
+// One Class-A executor instance (compute plane P8): a container running
+// `whip executor` (whip-executor/1), paired 1:1 with this controlling DO.
+// Stateless by design — hermeticity is demanded and audited, which is what
+// makes the pool shareable. Egress default-deny is the container posture:
+// the executor only ever answers this worker's in-cluster fetches.
+export class ExecutorContainer extends Container {
+  defaultPort = 8080;
+  sleepAfter = "10m";
+}
+
+// Fixed pool size until platform autoscaling ships (manual knob, working
+// zero-config default). `getRandom` is location-blind today — accepted.
+const EXECUTOR_POOL_SIZE = 4;
 
 // The DO schema (33 tables) as a bundled text module (wrangler.toml `rules`).
 import DO_SCHEMA from "../do_schema.sql";
@@ -112,17 +129,27 @@ type StepOutcome =
   | { kind: "failed"; message: string };
 
 // Perform one suspended HTTP round and marshal the result back for `step`.
-async function performFetch(req: {
-  url: string;
-  headers: [string, string][];
-  body: unknown;
-}): Promise<string> {
+// Requests targeting the executor sentinel host are routed to a
+// getRandom-picked container in the EXECUTOR pool instead of the network.
+async function performFetch(
+  req: {
+    url: string;
+    headers: [string, string][];
+    body: unknown;
+  },
+  env?: Env,
+): Promise<string> {
   try {
-    const resp = await fetch(req.url, {
+    const init = {
       method: "POST",
       headers: Object.fromEntries(req.headers),
       body: JSON.stringify(req.body),
-    });
+    };
+    const executorHost = env?.WHIP_EXECUTOR_URL;
+    const resp =
+      executorHost && req.url.startsWith(executorHost)
+        ? await (await getRandom(env.EXECUTOR, EXECUTOR_POOL_SIZE)).fetch(req.url, init)
+        : await fetch(req.url, init);
     return JSON.stringify({ status: resp.status, body: await resp.json() });
   } catch (error) {
     // The core maps `{"error": ...}` to a TransportError terminal.
@@ -161,7 +188,7 @@ export class WorkflowInstance implements DurableObject {
   // suspension or terminal. Subsequent external events / alarms re-enter and drive
   // further; the durable state is entirely in DO SQLite.
   async fetch(request: Request): Promise<Response> {
-    const { program, input, principal, project_context } =
+    const { program, input, principal, project_context, scripts } =
       (await request.json()) as Partial<Bootstrap>;
     let bootstrap: Bootstrap | undefined;
     if (program) {
@@ -170,6 +197,7 @@ export class WorkflowInstance implements DurableObject {
         input: input ?? "{}",
         principal: principal ?? "local/Workflow",
         project_context,
+        scripts,
       };
       // Persisted so an alarm (or a body-less poke) can rehydrate the wasm
       // instance without the caller resupplying the program.
@@ -245,7 +273,7 @@ export class WorkflowInstance implements DurableObject {
     for (;;) {
       const outcome = JSON.parse(instance.step(responseJson, Date.now())) as StepOutcome;
       if (outcome.kind === "needs_http") {
-        responseJson = await performFetch(outcome.request);
+        responseJson = await performFetch(outcome.request, this.env);
         continue;
       }
       if (outcome.kind === "parked" && outcome.next_due_unix_ms != null) {

@@ -7,11 +7,15 @@
     "build:wasm": "cargo build -p whipplescript-host-do --no-default-features --target wasm32-unknown-unknown --release && wasm-bindgen ../../../target/wasm32-unknown-unknown/release/whipplescript_host_do.wasm --out-dir pkg --target bundler",
     "deploy": "npm run build:wasm && wrangler deploy",
     "dev": "npm run build:wasm && wrangler dev",
-    "validate": "cargo build -p whipplescript-host-do --no-default-features --target wasm32-unknown-unknown --release && wasm-bindgen ../../../target/wasm32-unknown-unknown/release/whipplescript_host_do.wasm --out-dir pkg --target nodejs && node validate.cjs"
+    "validate": "cargo build -p whipplescript-host-do --no-default-features --target wasm32-unknown-unknown --release && wasm-bindgen ../../../target/wasm32-unknown-unknown/release/whipplescript_host_do.wasm --out-dir pkg --target nodejs && node validate.cjs",
+    "build:executor": "cargo build --release -p whipplescript --bin whip && cp ../../../target/release/whip executor/whip"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240909.0",
+    "@cloudflare/workers-types": "^5.20260708.1",
     "typescript": "^5.5.0",
-    "wrangler": "^3.78.0"
+    "wrangler": "^4.108.0"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7"
   }
 }

@@ -13,9 +13,32 @@ rules = [{ type = "Text", globs = ["**/*.sql"] }]
 name = "WORKFLOW_INSTANCE"
 class_name = "WorkflowInstance"
 
+# The Class-A executor pool (compute plane P8): `whip executor` containers,
+# each paired 1:1 with an ExecutorContainer DO; the workflow DO routes
+# whip-executor/1 rounds to a getRandom-picked instance. Pool size is the
+# manual knob until platform autoscaling ships.
+[[durable_objects.bindings]]
+name = "EXECUTOR"
+class_name = "ExecutorContainer"
+
+[[containers]]
+class_name = "ExecutorContainer"
+image = "./executor/Dockerfile"
+max_instances = 4
+instance_type = "lite"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["WorkflowInstance"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["ExecutorContainer"]
+
+[vars]
+# Sentinel host for the executor pool: exec NeedsHttp rounds whose URL
+# targets this host are routed to a container stub, not the public network.
+WHIP_EXECUTOR_URL = "http://executor"
 
 # The wasm module built from the #[wasm_bindgen] surface (crate whipplescript-host-do).
 # `wasm-pack build --target bundler` emits worker/pkg/*; the bundler inlines the .wasm.

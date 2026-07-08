@@ -219,6 +219,30 @@ impl<Sql: DoSql> DurableInstance<Sql> {
                     body: &script.body,
                 })
                 .map_err(|error| format!("{error:?}"))?;
+            // The policy gate reuses the standard capability machinery
+            // (spec/script-capabilities.md): each entry registers as
+            // `script.<name>` with a binding, so an exec naming an
+            // unregistered script blocks as blocked_by_capability.
+            let capability = format!("script.{}", script.name);
+            kernel
+                .store()
+                .register_capability_schema(whipplescript_store::CapabilitySchemaRegistration {
+                    capability: &capability,
+                    description: "Run an operator-pinned script capability.",
+                    schema_json: "{}",
+                    registered_by_package_id: None,
+                })
+                .map_err(|error| format!("{error:?}"))?;
+            kernel
+                .store()
+                .bind_capability(whipplescript_store::CapabilityBinding {
+                    binding_id: &format!("binding_script_{}", script.name),
+                    program_id: None,
+                    capability: &capability,
+                    provider: "builtin-script",
+                    config_json: "{}",
+                })
+                .map_err(|error| format!("{error:?}"))?;
         }
         let existing = kernel
             .store()
