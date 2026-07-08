@@ -97,6 +97,7 @@ mod ifc;
 mod principal;
 mod project_context;
 mod skills_loader;
+mod turn_server;
 
 const CORE_EFFECT_LOWERING_CLASS: &str = "core_effect";
 const SCHEDULE_LOWERING_CLASS: &str = "schedule_emitter";

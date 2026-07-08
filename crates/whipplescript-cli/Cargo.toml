@@ -18,6 +18,8 @@ whipplescript-store = { version = "0.2.0", path = "../whipplescript-store" }
 regex = "1"
 serde_json = "1"
 sha2 = "0.10"
+# RFC6455 handshake digest for the Class-B turn server (compute plane P8).
+sha1 = "0.10"
 chrono = { version = "0.4.45", default-features = false, features = ["alloc", "std"] }
 chrono-tz = "0.10.4"
 ureq = { version = "2", features = ["json"] }

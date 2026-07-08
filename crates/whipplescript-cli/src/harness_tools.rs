@@ -114,8 +114,7 @@ const GREP_MAX_LINE_CHARS: usize = 500;
 /// reading binary content as text (pi-conformance §1 binary guard).
 const BINARY_SNIFF_BYTES: usize = 8_192;
 
-#[cfg(test)]
-fn file_tool_specs_for_profile(profile: Option<&str>) -> Vec<ToolSpec> {
+pub(crate) fn file_tool_specs_for_profile(profile: Option<&str>) -> Vec<ToolSpec> {
     let policy = HarnessProfilePolicy::for_profile(profile);
     file_tool_specs_for_policy(&policy)
 }

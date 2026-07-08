@@ -70,6 +70,8 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
     let path = parts.next().unwrap_or_default().to_owned();
 
     let mut content_length = 0usize;
+    let mut websocket_key = None;
+    let mut wants_upgrade = false;
     loop {
         let mut line = String::new();
         reader.read_line(&mut line)?;
@@ -80,7 +82,24 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
         if let Some((name, value)) = line.split_once(':') {
             if name.eq_ignore_ascii_case("content-length") {
                 content_length = value.trim().parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("sec-websocket-key") {
+                websocket_key = Some(value.trim().to_owned());
+            } else if name.eq_ignore_ascii_case("upgrade")
+                && value.trim().eq_ignore_ascii_case("websocket")
+            {
+                wants_upgrade = true;
             }
+        }
+    }
+
+    // Class-B turn channel (whip-turn/1): hand the raw socket to the
+    // WebSocket handler. Safe because an upgrade request has no body and the
+    // client sends no frames until it sees the 101 — the buffered reader has
+    // consumed exactly through the header terminator.
+    if method == "GET" && path == "/turn" && wants_upgrade {
+        if let Some(key) = websocket_key {
+            drop(reader);
+            return crate::turn_server::handle_turn_websocket(stream, &key);
         }
     }
 
