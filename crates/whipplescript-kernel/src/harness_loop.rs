@@ -389,6 +389,13 @@ where
         usage = merge_usage(usage, reply.usage.clone());
 
         if reply.is_final() {
+            // Mirror the stepped machine: the final assistant reply joins the
+            // persisted transcript (pi-conformance §4).
+            messages.push(ChatMessage::Assistant {
+                text: reply.text.clone(),
+                tool_calls: Vec::new(),
+            });
+            checkpoint(&messages);
             return BrokeredTurnOutcome {
                 status: TurnStatus::Completed,
                 summary: reply.text,
@@ -802,6 +809,15 @@ where
         self.last_input_tokens = input_tokens_of(&reply.usage);
 
         if reply.is_final() {
+            // Persist the final assistant reply into the transcript before
+            // settling (pi-conformance §4): the completed conversation is what
+            // a `thread continue` follow-up turn seeds from — without this the
+            // thread would end on the last tool round, not the answer.
+            self.messages.push(ChatMessage::Assistant {
+                text: reply.text.clone(),
+                tool_calls: Vec::new(),
+            });
+            (self.checkpoint)(&self.messages);
             return Outcome::Settle(BrokeredTurnOutcome {
                 status: TurnStatus::Completed,
                 summary: reply.text,
@@ -1717,6 +1733,42 @@ mod tests {
         );
         assert!(matches!(out.status, TurnStatus::Failed), "{out:?}");
         assert_eq!(out.summary, "provider error: Overloaded");
+    }
+
+    /// The final checkpoint of a completed turn includes the final assistant
+    /// reply (pi-conformance §4) — the persisted conversation a
+    /// `thread continue` follow-up seeds from ends on the answer.
+    #[test]
+    fn completed_turn_checkpoints_the_final_assistant_reply() {
+        let http = ScriptedHttpClient::new(vec![
+            Ok(tool_reply("c1", "read")),
+            Ok(final_reply("the answer")),
+        ]);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "R".to_string(),
+        });
+        let mut checkpoints: Vec<Value> = Vec::new();
+        let out = run_brokered_turn_http(
+            &http,
+            &exec,
+            &input(5),
+            &mut |messages: &[ChatMessage]| checkpoints.push(chat_messages_to_json(messages)),
+            &DummyHost,
+            &NoopCompactor,
+            None,
+        );
+        assert!(matches!(out.status, TurnStatus::Completed));
+        let last = checkpoints.last().expect("checkpoints recorded");
+        let rebuilt = chat_messages_from_json(last);
+        assert!(
+            matches!(
+                rebuilt.last(),
+                Some(ChatMessage::Assistant { text, tool_calls })
+                    if text == "the answer" && tool_calls.is_empty()
+            ),
+            "final message is the assistant answer: {rebuilt:?}"
+        );
     }
 
     /// Cooperative cancel (pi-conformance §3): a cancellation request arriving

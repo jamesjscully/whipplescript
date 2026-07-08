@@ -3039,11 +3039,33 @@ pub fn run_owned_agent_turn(
         // input; recorded once as `skills.pinned` provenance by the runner.
         pinned_skills: turn_pinned_skills_from_input(input_json),
     };
+    // Conversation compaction (context-assembly Phase 4/5): the strategy is selected
+    // by the agent declaration (`compaction: summarize | hard_reset | tool_results |
+    // none`), resolved from the program IR; default = turn-summarization. It fires
+    // only when real usage nears the window, so the fixture path (whose usage carries
+    // no input tokens) never compacts.
+    let (compaction_strategy, thread_continue): (Option<String>, bool) = program_path
+        .and_then(|path| path.to_str())
+        .and_then(|path| crate::compile_source_path_with_root(path, root).ok())
+        .and_then(|(_, ir)| {
+            ir.agents
+                .iter()
+                .find(|declared| declared.name == agent)
+                .map(|declared| {
+                    (
+                        declared.compaction.clone(),
+                        declared.thread.as_deref() == Some("continue"),
+                    )
+                })
+        })
+        .unwrap_or((None, false));
+
     let ctx = BrokeredTurnContext {
         instance_id,
         effect_id,
         agent,
         profile,
+        thread_continue,
     };
 
     // Slice-2 envelope: hold a durable workspace lease for the unit of work so
@@ -3068,20 +3090,6 @@ pub fn run_owned_agent_turn(
     }
     drop(coordination);
 
-    // Conversation compaction (context-assembly Phase 4/5): the strategy is selected
-    // by the agent declaration (`compaction: summarize | hard_reset | tool_results |
-    // none`), resolved from the program IR; default = turn-summarization. It fires
-    // only when real usage nears the window, so the fixture path (whose usage carries
-    // no input tokens) never compacts.
-    let compaction_strategy: Option<String> = program_path
-        .and_then(|path| path.to_str())
-        .and_then(|path| crate::compile_source_path_with_root(path, root).ok())
-        .and_then(|(_, ir)| {
-            ir.agents
-                .iter()
-                .find(|declared| declared.name == agent)
-                .and_then(|declared| declared.compaction.clone())
-        });
     let compactor: Box<dyn Compactor> = match compaction_strategy.as_deref() {
         Some("hard_reset") => Box::new(HardResetCompactor::default()),
         Some("tool_results") => Box::new(ToolResultCompactor::default()),
