@@ -355,6 +355,14 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                     idempotency_key: Some(&key),
                 });
             };
+            // Cooperative cancel (pi-conformance §3): probe the durable
+            // cancellation surface between model rounds. Errors read as "not
+            // cancelled" — a probe failure must not kill a healthy turn.
+            let cancel_probe = || {
+                store
+                    .effect_has_open_cancellation_request(ctx.instance_id, ctx.effect_id)
+                    .unwrap_or(false)
+            };
             crate::harness_loop::run_brokered_turn_http(
                 client,
                 executor,
@@ -362,6 +370,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 &mut checkpoint,
                 host,
                 compactor,
+                Some(&cancel_probe),
             )
         };
 
@@ -392,6 +401,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             TurnStatus::Completed => ("completed", "agent.turn.completed"),
             TurnStatus::Failed => ("failed", "agent.turn.failed"),
             TurnStatus::TimedOut => ("timed_out", "agent.turn.timed_out"),
+            TurnStatus::Cancelled => ("cancelled", "agent.turn.cancelled"),
         };
 
         let completion = EffectCompletion {
@@ -414,6 +424,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             TurnStatus::Completed => self.complete_run(completion)?,
             TurnStatus::Failed => self.fail_run(completion)?,
             TurnStatus::TimedOut => self.timeout_run(completion)?,
+            TurnStatus::Cancelled => self.cancel_run(completion)?,
         };
 
         // The single terminal fact (layer 3) -- the only fact a brokered turn

@@ -221,6 +221,9 @@ pub enum TurnStatus {
     Completed,
     Failed,
     TimedOut,
+    /// A durable cancellation request was observed between model rounds
+    /// (pi-conformance §3: cooperative abort; the partial transcript persists).
+    Cancelled,
 }
 
 /// The outcome of a brokered turn: exactly one terminal, plus the in-turn stream
@@ -243,8 +246,10 @@ pub struct BrokeredTurnOutcome {
 pub fn provider_result_from_brokered_turn(outcome: &BrokeredTurnOutcome) -> ProviderRunResult {
     let (status, failure) = match outcome.status {
         TurnStatus::Completed => (ProviderRunStatus::Completed, None),
-        TurnStatus::Failed | TurnStatus::TimedOut => {
-            let error_kind = if matches!(outcome.status, TurnStatus::TimedOut) {
+        TurnStatus::Failed | TurnStatus::TimedOut | TurnStatus::Cancelled => {
+            let error_kind = if matches!(outcome.status, TurnStatus::Cancelled) {
+                "cancelled"
+            } else if matches!(outcome.status, TurnStatus::TimedOut) {
                 "timeout"
             } else {
                 "provider_error"
@@ -353,10 +358,21 @@ where
     let mut observations: Vec<LoopObservation> = Vec::new();
     let mut usage = Value::Null;
 
-    for step in 0..input.max_steps {
+    let mut provider_retries: u32 = 0;
+    let mut step = 0;
+    while step < input.max_steps {
         observations.push(LoopObservation::ModelRequest { step });
         let reply = match client.next(&messages, &input.tools) {
             Ok(reply) => reply,
+            // Bounded auto-retry on transient provider errors (pi-conformance
+            // §2), mirroring the stepped machine byte-for-byte.
+            Err(error)
+                if is_retryable_provider_error(&error)
+                    && provider_retries < MAX_PROVIDER_RETRIES =>
+            {
+                provider_retries += 1;
+                continue;
+            }
             Err(error) => {
                 return BrokeredTurnOutcome {
                     status: match error {
@@ -411,6 +427,7 @@ where
         // Persist the transcript after the step so a crash mid-turn leaves a
         // projection to resume from (DR-0024 resume-from-projection).
         checkpoint(&messages);
+        step += 1;
     }
 
     BrokeredTurnOutcome {
@@ -487,6 +504,14 @@ where
     compaction_epoch: u32,
     pending_compaction: Option<SummarizationRequest>,
     overflow_trims: u32,
+    /// Transient provider-error retries used so far this turn (bounded by
+    /// [`MAX_PROVIDER_RETRIES`]).
+    provider_retries: u32,
+    /// Cooperative cancellation probe, consulted before each main model call
+    /// (pi-conformance §3). `None` = not cancellable (tests, hosts without a
+    /// cancellation surface). Probed between rounds only, so an in-flight tool
+    /// settles before the check — the settle-before-release discipline.
+    cancel_check: Option<&'a dyn Fn() -> bool>,
 }
 
 impl<'a, M, E> BrokeredTurnMachine<'a, M, E>
@@ -517,6 +542,8 @@ where
             compaction_epoch: 0,
             pending_compaction: None,
             overflow_trims: 0,
+            provider_retries: 0,
+            cancel_check: None,
         }
     }
 
@@ -551,7 +578,17 @@ where
             compaction_epoch: snapshot.compaction_epoch,
             pending_compaction: snapshot.pending_compaction,
             overflow_trims: snapshot.overflow_trims,
+            provider_retries: 0,
+            cancel_check: None,
         }
+    }
+
+    /// Arm the cooperative cancellation probe (pi-conformance §3). The runner
+    /// passes a closure over the durable `effect_cancellation_requests`
+    /// surface; the machine consults it before each main model call.
+    pub fn with_cancel_check(mut self, probe: &'a dyn Fn() -> bool) -> Self {
+        self.cancel_check = Some(probe);
+        self
     }
 
     /// Capture the machine's full mid-turn state so a host can persist it between
@@ -617,6 +654,19 @@ where
 
     /// Prepare the main agent model call for the current step (observe + build).
     fn main_call(&mut self) -> Outcome<BrokeredTurnOutcome> {
+        // Cooperative cancel (pi-conformance §3): every model round funnels
+        // through here, so this is the between-rounds check. The transcript was
+        // checkpointed after the last settle — the partial conversation
+        // persists, mirroring pi's aborted-message-kept semantics.
+        if self.cancel_check.is_some_and(|probe| probe()) {
+            return Outcome::Settle(BrokeredTurnOutcome {
+                status: TurnStatus::Cancelled,
+                summary: "turn cancelled by request".to_owned(),
+                steps: self.step,
+                observations: std::mem::take(&mut self.observations),
+                usage: std::mem::take(&mut self.usage),
+            });
+        }
         self.awaiting = Awaiting::Main;
         self.observations
             .push(LoopObservation::ModelRequest { step: self.step });
@@ -726,6 +776,15 @@ where
                         return self.main_call();
                     }
                 }
+                // Bounded auto-retry on transient provider errors
+                // (pi-conformance §2): re-issue the same main call. The
+                // transcript is untouched — the failed round produced nothing.
+                if is_retryable_provider_error(&error)
+                    && self.provider_retries < MAX_PROVIDER_RETRIES
+                {
+                    self.provider_retries += 1;
+                    return self.main_call();
+                }
                 return Outcome::Settle(BrokeredTurnOutcome {
                     status: match error {
                         HarnessModelError::Timeout => TurnStatus::TimedOut,
@@ -798,12 +857,16 @@ pub fn run_brokered_turn_http<M, E>(
     checkpoint: &mut dyn FnMut(&[ChatMessage]),
     host: &impl HostDriver,
     compactor: &dyn Compactor,
+    cancel_check: Option<&dyn Fn() -> bool>,
 ) -> BrokeredTurnOutcome
 where
     M: HttpModelClient + ?Sized,
     E: ToolExecutor + ?Sized,
 {
     let mut machine = BrokeredTurnMachine::new(model, executor, input, checkpoint, compactor);
+    if let Some(probe) = cancel_check {
+        machine = machine.with_cancel_check(probe);
+    }
     run_to_completion(&mut machine, host)
 }
 
@@ -1199,6 +1262,41 @@ fn message_size_bytes(message: &ChatMessage) -> usize {
 
 /// How many times a single turn may front-trim on repeated context-window errors
 /// before giving up and failing (Lb-5 overflow fallback).
+/// Bound on transient-provider-error retries per turn (pi-conformance §2:
+/// pi's session auto-retry runs 3 attempts). The sans-IO machine re-issues the
+/// same request immediately — backoff delay, if any, belongs to the host.
+const MAX_PROVIDER_RETRIES: u32 = 3;
+
+/// Whether a provider/transport error is transient (rate limit, overloaded,
+/// server error, network blip) and worth re-issuing. Context overflow is
+/// EXCLUDED — that is compaction's job (the Lb-5 fallback above).
+fn is_retryable_provider_error(error: &HarnessModelError) -> bool {
+    match error {
+        HarnessModelError::Timeout => false,
+        HarnessModelError::Transport(_) => true,
+        HarnessModelError::Provider(message) => {
+            if is_context_overflow(error) {
+                return false;
+            }
+            let lower = message.to_ascii_lowercase();
+            [
+                "overloaded",
+                "rate limit",
+                "rate_limit",
+                "429",
+                "529",
+                "500",
+                "502",
+                "503",
+                "server error",
+                "internal error",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker))
+        }
+    }
+}
+
 const MAX_OVERFLOW_TRIMS: u32 = 3;
 
 /// Whether a model error is a provider context-window overflow (the prompt is too
@@ -1574,6 +1672,104 @@ mod tests {
         }
     }
 
+    /// Transient provider errors auto-retry (bounded); a persistent one still
+    /// fails the turn after the retry budget (pi-conformance §2).
+    #[test]
+    fn brokered_turn_retries_transient_provider_errors() {
+        // One overloaded error, then success: the turn completes.
+        let http = ScriptedHttpClient::new(vec![
+            Err(HarnessModelError::Provider("Overloaded".to_string())),
+            Ok(final_reply("ok after retry")),
+        ]);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "R".to_string(),
+        });
+        let out = run_brokered_turn_http(
+            &http,
+            &exec,
+            &input(5),
+            &mut |_msgs: &[ChatMessage]| {},
+            &DummyHost,
+            &NoopCompactor,
+            None,
+        );
+        assert!(matches!(out.status, TurnStatus::Completed), "{out:?}");
+        assert_eq!(out.summary, "ok after retry");
+
+        // Persistently overloaded: fails after MAX_PROVIDER_RETRIES + 1 calls.
+        let errors: Vec<Result<ModelReply, HarnessModelError>> = (0..4)
+            .map(|_| Err(HarnessModelError::Provider("Overloaded".to_string())))
+            .collect();
+        let http = ScriptedHttpClient::new(errors);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "R".to_string(),
+        });
+        let out = run_brokered_turn_http(
+            &http,
+            &exec,
+            &input(5),
+            &mut |_msgs: &[ChatMessage]| {},
+            &DummyHost,
+            &NoopCompactor,
+            None,
+        );
+        assert!(matches!(out.status, TurnStatus::Failed), "{out:?}");
+        assert_eq!(out.summary, "provider error: Overloaded");
+    }
+
+    /// Cooperative cancel (pi-conformance §3): a cancellation request arriving
+    /// after the first tool round settles the turn as `Cancelled` before the
+    /// next model call; the partial transcript was already checkpointed.
+    #[test]
+    fn brokered_turn_cancels_between_model_rounds() {
+        use std::cell::Cell;
+        let http = ScriptedHttpClient::new(vec![
+            Ok(tool_reply("c1", "read")),
+            Ok(final_reply("never reached")),
+        ]);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "R".to_string(),
+        });
+        let cancelled = Cell::new(false);
+        let probe = || cancelled.get();
+        let mut checkpoints: Vec<Value> = Vec::new();
+        let mut record = |messages: &[ChatMessage]| {
+            // The cancellation request lands while the first tool executes:
+            // flip the probe at the checkpoint AFTER the tool results append.
+            checkpoints.push(chat_messages_to_json(messages));
+            if checkpoints.len() >= 2 {
+                cancelled.set(true);
+            }
+        };
+        let out = run_brokered_turn_http(
+            &http,
+            &exec,
+            &input(5),
+            &mut record,
+            &DummyHost,
+            &NoopCompactor,
+            Some(&probe),
+        );
+        assert!(
+            matches!(out.status, TurnStatus::Cancelled),
+            "cancelled between rounds: {:?}",
+            out.status
+        );
+        assert_eq!(out.summary, "turn cancelled by request");
+        assert_eq!(
+            exec.calls.borrow().len(),
+            1,
+            "the in-flight tool settled before the check"
+        );
+        assert!(
+            checkpoints.len() >= 2,
+            "the partial transcript persisted before cancellation"
+        );
+    }
+
     /// Drive the same scenario through both the imperative `run_brokered_loop`
     /// and the stepped `run_brokered_turn_http`, and assert every observable is
     /// identical: terminal, summary, step count, the in-turn observation stream,
@@ -1607,6 +1803,7 @@ mod tests {
                 &mut record,
                 &DummyHost,
                 &NoopCompactor,
+                None,
             )
         };
 
@@ -1649,6 +1846,7 @@ mod tests {
                 &mut record,
                 &DummyHost,
                 &NoopCompactor,
+                None,
             )
         };
 
@@ -1711,8 +1909,14 @@ mod tests {
 
     #[test]
     fn brokered_turn_machine_matches_loop_on_model_error() {
+        // Transport errors are retryable (pi-conformance §2): both loops burn
+        // the full retry budget, then fail identically.
         assert_loops_equivalent(
-            || vec![Err(HarnessModelError::Transport("boom".to_string()))],
+            || {
+                (0..4)
+                    .map(|_| Err(HarnessModelError::Transport("boom".to_string())))
+                    .collect()
+            },
             8,
         );
     }
@@ -2134,6 +2338,7 @@ mod tests {
                 &mut record,
                 &DummyHost,
                 &compactor,
+                None,
             )
         };
 
@@ -2200,6 +2405,7 @@ mod tests {
                 &mut record,
                 &DummyHost,
                 &compactor,
+                None,
             );
         }
         let folded = folded.expect("a compaction occurred");
@@ -2226,6 +2432,7 @@ mod tests {
                 &mut record,
                 &DummyHost,
                 &compactor,
+                None,
             )
         };
         assert_eq!(outcome.status, TurnStatus::Completed);
@@ -2418,6 +2625,7 @@ mod tests {
                 &mut record,
                 &DummyHost,
                 &NoopCompactor,
+                None,
             )
         };
         // The turn recovered rather than failing on the overflow.
@@ -2469,6 +2677,7 @@ mod tests {
                 &mut record,
                 &DummyHost,
                 &NoopCompactor,
+                None,
             )
         };
         assert_eq!(outcome.status, TurnStatus::Failed);
