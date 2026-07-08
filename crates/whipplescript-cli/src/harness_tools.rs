@@ -263,8 +263,8 @@ fn file_tool_specs_for_turn(
     policy: &HarnessProfilePolicy,
     access: &TurnToolAccess,
 ) -> Vec<ToolSpec> {
-    let read_files = access.file.read_globs.is_some();
-    let write_files = access.file.write_globs.is_some();
+    let read_files = access.file.grants_read();
+    let write_files = access.file.grants_write();
     file_tool_specs_for_policy(policy)
         .into_iter()
         .filter(|spec| match spec.name.as_str() {
@@ -318,7 +318,10 @@ pub struct WorkflowToolEntry {
 /// `file store` path policy (no absolute/`..` escape; optional read/write globs).
 pub struct FileToolExecutor {
     root: PathBuf,
-    file_policy: Option<FileToolPolicy>,
+    /// `None` = direct/test executor with no policy (workspace root, any path
+    /// inside it). `Some(scopes)` = a turn/store policy is installed; an empty
+    /// `Some` denies all file tools (no store granted this turn).
+    file_policy: Option<Vec<FileStoreScope>>,
     bash_allow: Vec<String>,
     profile_policy: HarnessProfilePolicy,
     tracker_queue: Option<String>,
@@ -355,27 +358,45 @@ pub struct FileToolExecutor {
     content_store_path: Option<PathBuf>,
 }
 
+/// One granted file store's turn scope (Q3 turn-grant ∩ store-policy fix). Carries
+/// both the turn grant's globs (what the turn asked for) and the store's own
+/// declared `allow` globs (the policy ceiling). A path is authorized only if it is
+/// inside the store `root` AND matches both glob sets — the turn grant can never
+/// widen the store policy. Paths resolve against the STORE root, not the workspace.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct FileToolPolicy {
+struct FileStoreScope {
     store_name: String,
-    read_globs: Option<Vec<String>>,
-    write_globs: Option<Vec<String>>,
+    /// Store root, workspace-relative and normalized (`""` = the workspace root).
+    root: String,
+    /// Turn-grant read globs (store-root-relative). `None` = read not granted this
+    /// turn; `Some(empty)` = granted with no glob restriction (any path in root).
+    grant_read: Option<Vec<String>>,
+    grant_write: Option<Vec<String>>,
+    /// The store's declared `allow read`/`allow write` globs (the ceiling the grant
+    /// is intersected against). Empty = any path inside the root.
+    store_read: Vec<String>,
+    store_write: Vec<String>,
 }
 
+/// The per-turn file authority: one scope per granted `file store`. Deny = empty.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TurnFileAccess {
-    store_name: String,
-    read_globs: Option<Vec<String>>,
-    write_globs: Option<Vec<String>>,
+    scopes: Vec<FileStoreScope>,
 }
 
 impl TurnFileAccess {
     fn deny_all() -> Self {
-        Self {
-            store_name: "turn_access".to_owned(),
-            read_globs: None,
-            write_globs: None,
-        }
+        Self { scopes: Vec::new() }
+    }
+
+    /// Any granted store exposes a read tool (the model-facing tool gate).
+    fn grants_read(&self) -> bool {
+        self.scopes.iter().any(|scope| scope.grant_read.is_some())
+    }
+
+    /// Any granted store exposes a write tool.
+    fn grants_write(&self) -> bool {
+        self.scopes.iter().any(|scope| scope.grant_write.is_some())
     }
 }
 
@@ -757,32 +778,30 @@ impl FileToolExecutor {
         allow_read: Vec<String>,
         allow_write: Vec<String>,
     ) -> Self {
-        self.file_policy = Some(FileToolPolicy {
+        // A store-only policy (no turn narrowing): the grant is unrestricted
+        // (`Some(empty)` = any inside root) and the store `allow` globs are the
+        // ceiling. Rooted at the workspace (`""`).
+        self.file_policy = Some(vec![FileStoreScope {
             store_name: store_name.into(),
-            read_globs: Some(allow_read),
-            write_globs: Some(allow_write),
-        });
+            root: String::new(),
+            grant_read: Some(Vec::new()),
+            grant_write: Some(Vec::new()),
+            store_read: allow_read,
+            store_write: allow_write,
+        }]);
         self
     }
 
     #[cfg(test)]
     fn with_turn_file_access(mut self, access: TurnFileAccess) -> Self {
-        self.file_policy = Some(FileToolPolicy {
-            store_name: access.store_name,
-            read_globs: access.read_globs,
-            write_globs: access.write_globs,
-        });
+        self.file_policy = Some(access.scopes);
         self.command_run_granted = Some(false);
         self.tracker_access = Some(TurnTrackerAccess::deny_all());
         self
     }
 
     fn with_turn_tool_access(mut self, access: TurnToolAccess) -> Self {
-        self.file_policy = Some(FileToolPolicy {
-            store_name: access.file.store_name,
-            read_globs: access.file.read_globs,
-            write_globs: access.file.write_globs,
-        });
+        self.file_policy = Some(access.file.scopes);
         self.command_run_granted = Some(access.command_run);
         self.tracker_access = Some(access.tracker);
         self
@@ -812,21 +831,65 @@ impl FileToolExecutor {
                 self.profile_policy.profile_name()
             ));
         }
-        let Some(policy) = &self.file_policy else {
+        let Some(scopes) = &self.file_policy else {
             return crate::file_path_policy_error(path, "workspace", &[], op);
         };
-        let globs = if op == "write" {
-            policy.write_globs.as_ref()
-        } else {
-            policy.read_globs.as_ref()
-        };
-        match globs {
-            Some(globs) => crate::file_path_policy_error(path, &policy.store_name, globs, op),
-            None => Some(format!(
-                "file {op} is not granted for store `{}` in this turn",
-                policy.store_name
-            )),
+        if scopes.is_empty() {
+            return Some(format!("file {op} is not granted for this turn"));
         }
+        // Absolute / `..` paths escape any store root and are refused before routing.
+        if Path::new(path).is_absolute()
+            || Path::new(path)
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Some(format!("path `{path}` escapes the store root"));
+        }
+        let is_write = op == "write";
+        // Route to the granted store whose root contains the path (longest match).
+        let Some(scope) = scopes
+            .iter()
+            .filter(|scope| store_root_contains(&scope.root, path))
+            .max_by_key(|scope| scope.root.len())
+        else {
+            return Some(format!(
+                "path `{path}` is outside every file store granted to this turn"
+            ));
+        };
+        let grant_globs = if is_write {
+            &scope.grant_write
+        } else {
+            &scope.grant_read
+        };
+        let Some(grant_globs) = grant_globs else {
+            return Some(format!(
+                "file {op} is not granted for store `{}` in this turn",
+                scope.store_name
+            ));
+        };
+        // Resolve the path against the STORE root (not the workspace): strip the
+        // root prefix so both the turn grant globs and the store `allow` globs —
+        // which are store-root-relative — apply in the same coordinate space.
+        let relative = store_relative_path(&scope.root, path);
+        // Turn-grant ceiling: the path must match the grant globs (empty = any).
+        if !grant_globs.is_empty()
+            && !grant_globs
+                .iter()
+                .any(|glob| crate::glob_match(glob, &relative))
+        {
+            return Some(format!(
+                "path `{path}` is not in the turn grant for store `{}` (`{op}`)",
+                scope.store_name
+            ));
+        }
+        // Store-policy ceiling (the Q3 fix): intersect with the store's own `allow`
+        // globs — empty = any inside root. A turn grant cannot widen the store.
+        let store_globs = if is_write {
+            &scope.store_write
+        } else {
+            &scope.store_read
+        };
+        crate::file_path_policy_error(&relative, &scope.store_name, store_globs, op)
     }
 
     /// Override the bash allow-list (test/programmatic use).
@@ -2619,6 +2682,69 @@ pub fn owned_workspace_root() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
+/// Normalize a `file store` root to a `/`-joined path prefix with no leading `./`
+/// or trailing `/`. `"."`, `"./"`, and `""` all normalize to `""` (workspace root).
+fn normalize_store_root(root: &str) -> String {
+    root.trim()
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Whether the (normalized) store `root` contains the workspace-relative `path`.
+/// The empty root (workspace root) contains everything.
+fn store_root_contains(root: &str, path: &str) -> bool {
+    root.is_empty() || path == root || path.starts_with(&format!("{root}/"))
+}
+
+/// The `path` re-expressed relative to the store `root` (the prefix stripped), so
+/// store-root-relative globs apply. Callers guarantee `store_root_contains` first.
+fn store_relative_path(root: &str, path: &str) -> String {
+    if root.is_empty() {
+        return path.to_owned();
+    }
+    if path == root {
+        return String::new();
+    }
+    path.strip_prefix(&format!("{root}/"))
+        .unwrap_or(path)
+        .to_owned()
+}
+
+/// Extract a `Vec<String>` from an optional JSON array of strings (empty otherwise).
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The store-policy snapshot lowering embeds next to a file-store grant (Q3): the
+/// store `root` (normalized) and its declared `allow read`/`allow write` globs.
+/// Absent (hand-built payloads, non-file grants) = workspace root, no ceiling.
+fn parse_store_policy(grant: &Value) -> (String, Vec<String>, Vec<String>) {
+    let Some(policy) = grant.get("store_policy") else {
+        return (String::new(), Vec::new(), Vec::new());
+    };
+    let root = policy
+        .get("root")
+        .and_then(Value::as_str)
+        .map(normalize_store_root)
+        .unwrap_or_default();
+    (
+        root,
+        string_array(policy.get("allow_read")),
+        string_array(policy.get("allow_write")),
+    )
+}
+
 fn merge_grant_globs(slot: &mut Option<Vec<String>>, globs: Vec<String>) {
     match slot {
         None => *slot = Some(globs),
@@ -2715,9 +2841,8 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
     if grants.is_empty() {
         return Ok(TurnToolAccess::deny_all());
     }
-    let mut store_names = Vec::<String>::new();
-    let mut read_globs = None;
-    let mut write_globs = None;
+    let mut scopes = Vec::<FileStoreScope>::new();
+    let mut file_resources = Vec::<String>::new();
     let mut command_run = false;
     let mut tracker = TurnTrackerAccess::deny_all();
     for (grant_index, grant) in grants.iter().enumerate() {
@@ -2730,6 +2855,9 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
             .get("operations")
             .and_then(Value::as_array)
             .ok_or_else(|| format!("access_grants[{grant_index}].operations must be an array"))?;
+        // This grant's own read/write globs (before the store-policy intersection).
+        let mut grant_read: Option<Vec<String>> = None;
+        let mut grant_write: Option<Vec<String>> = None;
         let mut has_file_operation = false;
         for operation in operations {
             let operation_name = operation
@@ -2740,11 +2868,11 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
             match operation_name {
                 "read" | "import" if resource != TRACKER_RESOURCE => {
                     has_file_operation = true;
-                    merge_grant_globs(&mut read_globs, globs)
+                    merge_grant_globs(&mut grant_read, globs)
                 }
                 "write" | "export" if resource != TRACKER_RESOURCE => {
                     has_file_operation = true;
-                    merge_grant_globs(&mut write_globs, globs)
+                    merge_grant_globs(&mut grant_write, globs)
                 }
                 "run" if resource == "command" => command_run = true,
                 "file" | "add" if resource == TRACKER_RESOURCE => tracker.file = true,
@@ -2758,22 +2886,46 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
                 _ => {}
             }
         }
-        if has_file_operation && !store_names.iter().any(|existing| existing == resource) {
-            store_names.push(resource.to_owned());
+        if !has_file_operation {
+            continue;
+        }
+        if !file_resources.iter().any(|existing| existing == resource) {
+            file_resources.push(resource.to_owned());
+        }
+        let (root, store_read, store_write) = parse_store_policy(grant);
+        // One scope per store. Repeated `with access to <store>` grants on the same
+        // store merge their globs; the store policy snapshot is identical across them.
+        match scopes.iter_mut().find(|scope| scope.store_name == resource) {
+            Some(existing) => {
+                if let Some(globs) = grant_read {
+                    merge_grant_globs(&mut existing.grant_read, globs);
+                }
+                if let Some(globs) = grant_write {
+                    merge_grant_globs(&mut existing.grant_write, globs);
+                }
+                if existing.root.is_empty() {
+                    existing.root = root;
+                }
+                if existing.store_read.is_empty() {
+                    existing.store_read = store_read;
+                }
+                if existing.store_write.is_empty() {
+                    existing.store_write = store_write;
+                }
+            }
+            None => scopes.push(FileStoreScope {
+                store_name: resource.to_owned(),
+                root,
+                grant_read,
+                grant_write,
+                store_read,
+                store_write,
+            }),
         }
     }
-    let store_name = match store_names.as_slice() {
-        [only] => only.clone(),
-        [] => "turn_access".to_owned(),
-        _ => "turn_access".to_owned(),
-    };
     Ok(TurnToolAccess {
-        file: TurnFileAccess {
-            store_name,
-            read_globs,
-            write_globs,
-        },
-        file_resources: store_names,
+        file: TurnFileAccess { scopes },
+        file_resources,
         command_run,
         tracker,
     })
@@ -3852,6 +4004,167 @@ mod tests {
         assert_eq!(read_blocked.status, ToolStatus::Error);
         assert_eq!(write_allowed.status, ToolStatus::Ok);
         assert_eq!(write_blocked.status, ToolStatus::Error);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- Q3 turn-grant ∩ store-policy intersection (spec/std-files.md slice F1) ---
+
+    /// The core security property: a turn grant ALONE does not authorize a file op
+    /// the store policy denies. The grant is `read ["**"]` (matches everything) but
+    /// the store's own `allow read` is `["logs/*"]`; reading `secret.txt` must be
+    /// denied by the store clamp even though the grant glob would match it. This is
+    /// non-vacuous — `glob_match("**", "secret.txt")` is asserted true, so without
+    /// the store intersection the read would be allowed.
+    #[test]
+    fn turn_grant_alone_does_not_widen_the_store_policy() {
+        // The grant glob `**` matches the denied path; only the store clamp stops it.
+        assert!(crate::glob_match("**", "secret.txt"));
+
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("logs")).expect("logs dir");
+        std::fs::write(root.join("logs/app.log"), "entry").expect("seed log");
+        std::fs::write(root.join("secret.txt"), "top secret").expect("seed secret");
+        let input = json!({
+            "access_grants": [
+                {
+                    "resource": "project_files",
+                    "operations": [
+                        {"operation": "read", "globs": ["**"]}
+                    ],
+                    "store_policy": {
+                        "root": ".",
+                        "allow_read": ["logs/*"],
+                        "allow_write": []
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let access = turn_file_access_from_input(&input).expect("parse grants");
+        let exec = FileToolExecutor::new(&root).with_turn_file_access(access);
+
+        let in_policy = exec.execute(&call(TOOL_READ, json!({ "path": "logs/app.log" })));
+        let clamped = exec.execute(&call(TOOL_READ, json!({ "path": "secret.txt" })));
+
+        assert_eq!(
+            in_policy.status,
+            ToolStatus::Ok,
+            "store-allowed read passes"
+        );
+        assert_eq!(
+            clamped.status,
+            ToolStatus::Error,
+            "grant `**` cannot widen the store's `allow read [\"logs/*\"]`"
+        );
+        assert!(
+            clamped.content.contains("allow read"),
+            "denied by the store policy, not the grant: {}",
+            clamped.content
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A path outside the store `root` is denied even when the grant glob would
+    /// match it — paths resolve against the STORE root, not the workspace root.
+    #[test]
+    fn path_outside_store_root_is_denied() {
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("data")).expect("data dir");
+        std::fs::write(root.join("data/in.txt"), "ok").expect("seed in-root");
+        std::fs::write(root.join("secret.txt"), "outside").expect("seed outside");
+        let input = json!({
+            "access_grants": [
+                {
+                    "resource": "data_store",
+                    "operations": [
+                        {"operation": "read", "globs": ["**"]}
+                    ],
+                    "store_policy": {
+                        "root": "data",
+                        "allow_read": [],
+                        "allow_write": []
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let access = turn_file_access_from_input(&input).expect("parse grants");
+        let exec = FileToolExecutor::new(&root).with_turn_file_access(access);
+
+        let in_root = exec.execute(&call(TOOL_READ, json!({ "path": "data/in.txt" })));
+        let outside = exec.execute(&call(TOOL_READ, json!({ "path": "secret.txt" })));
+
+        assert_eq!(
+            in_root.status,
+            ToolStatus::Ok,
+            "path inside store root passes"
+        );
+        assert_eq!(
+            outside.status,
+            ToolStatus::Error,
+            "path outside the store root is denied despite grant `**`"
+        );
+        assert!(
+            outside.content.contains("outside every file store"),
+            "denied for being outside the store root: {}",
+            outside.content
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A two-store grant yields two DISTINCT scopes: a path in store A's root routes
+    /// to A's scope and is NOT authorized by store B's (read-only-absent) grant.
+    #[test]
+    fn two_store_grant_exposes_distinct_scopes() {
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("a")).expect("a dir");
+        std::fs::create_dir_all(root.join("b")).expect("b dir");
+        std::fs::write(root.join("a/in.txt"), "a").expect("seed a");
+        std::fs::write(root.join("b/in.txt"), "b").expect("seed b");
+        let input = json!({
+            "access_grants": [
+                {
+                    "resource": "a_store",
+                    "operations": [
+                        {"operation": "read", "globs": ["**"]}
+                    ],
+                    "store_policy": { "root": "a", "allow_read": [], "allow_write": [] }
+                },
+                {
+                    "resource": "b_store",
+                    "operations": [
+                        {"operation": "write", "globs": ["**"]}
+                    ],
+                    "store_policy": { "root": "b", "allow_read": [], "allow_write": [] }
+                }
+            ]
+        })
+        .to_string();
+        let access = turn_file_access_from_input(&input).expect("parse grants");
+        let exec = FileToolExecutor::new(&root).with_turn_file_access(access);
+
+        // `a` grants read; `b` grants only write. A read of `b/in.txt` routes to the
+        // `b_store` scope, which has no read grant — B's write grant does not leak.
+        let read_a = exec.execute(&call(TOOL_READ, json!({ "path": "a/in.txt" })));
+        let read_b = exec.execute(&call(TOOL_READ, json!({ "path": "b/in.txt" })));
+
+        assert_eq!(
+            read_a.status,
+            ToolStatus::Ok,
+            "read in store A's scope passes"
+        );
+        assert_eq!(
+            read_b.status,
+            ToolStatus::Error,
+            "read routes to store B's scope, which grants no read"
+        );
+        assert!(
+            read_b
+                .content
+                .contains("read is not granted for store `b_store`"),
+            "distinct per-store scope: {}",
+            read_b.content
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

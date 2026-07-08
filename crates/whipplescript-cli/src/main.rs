@@ -47073,6 +47073,24 @@ rule start
                 .and_then(Value::as_str),
             Some("run")
         );
+        // Q3 fix: the file-store grant carries the store's own policy snapshot so
+        // the harness can intersect the turn grant against the store's authority.
+        assert_eq!(
+            grants[0]
+                .pointer("/store_policy/root")
+                .and_then(Value::as_str),
+            Some(".")
+        );
+        assert_eq!(
+            grants[0].pointer("/store_policy/allow_read"),
+            Some(&json!(["src/**"]))
+        );
+        assert_eq!(
+            grants[0].pointer("/store_policy/allow_write"),
+            Some(&json!([]))
+        );
+        // The non-file `command` grant carries no store policy.
+        assert!(grants[1].get("store_policy").is_none());
     }
 
     #[test]

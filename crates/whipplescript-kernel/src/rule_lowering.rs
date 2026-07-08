@@ -3219,7 +3219,7 @@ pub fn parsed_effect_input_json(
     let mut input = match effect.kind.as_str() {
         "agent.tell" => json!({
             "prompt": effect.prompt.as_deref().unwrap_or_default(),
-            "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::AgentTell),
+            "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::AgentTell, &ir.file_stores),
             "turn_skills": effect_turn_skills_json(rule, effect, IrEffectKind::AgentTell),
             "rule": rule.name,
             "bindings": context_bindings_json(context),
@@ -3834,7 +3834,7 @@ pub fn parsed_effect_input_json(
             json!({
                 "target_workflow": effect.target,
                 "input": Value::Object(parse_record_fields(body, context, None, errors)),
-                "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::WorkflowInvoke),
+                "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::WorkflowInvoke, &ir.file_stores),
                 "bindings": context_bindings_json(context),
                 "rule": rule.name,
             })
@@ -3875,6 +3875,7 @@ pub fn effect_access_grants_json(
     rule: &IrRule,
     effect: &ParsedEffect,
     kind: IrEffectKind,
+    file_stores: &[IrFileStore],
 ) -> Value {
     let Some(node) = rule.metadata.effects.iter().find(|node| {
         if node.kind != kind {
@@ -3897,7 +3898,7 @@ pub fn effect_access_grants_json(
         node.access_grants
             .iter()
             .map(|grant| {
-                json!({
+                let mut value = json!({
                     "resource": grant.resource,
                     "operations": grant
                         .operations
@@ -3910,7 +3911,28 @@ pub fn effect_access_grants_json(
                             })
                         })
                         .collect::<Vec<_>>(),
-                })
+                });
+                // Q3 turn-grant ∩ store-policy fix: when the grant names a declared
+                // `file store`, embed that store's own policy snapshot (root + `allow
+                // read/write` globs) so the harness intersects the turn grant against
+                // the store's declared authority — a grant can never widen the store.
+                // Non-file grants (memory, command, …) carry no `store_policy`.
+                if let Some(store) = file_stores
+                    .iter()
+                    .find(|store| store.name == grant.resource)
+                {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert(
+                            "store_policy".to_owned(),
+                            json!({
+                                "root": store.root,
+                                "allow_read": store.read_globs,
+                                "allow_write": store.write_globs,
+                            }),
+                        );
+                    }
+                }
+                value
             })
             .collect(),
     )
