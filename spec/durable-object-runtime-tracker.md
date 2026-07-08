@@ -720,6 +720,24 @@ fixed-size `getRandom` pools). Open build work:
 - [ ] Class-B turn containers: per-turn/per-branch controller DOs;
       hibernatable-WebSocket progress channel (frame format TBD);
       diff-back on completion via the same import.
+      v1 BUILD SHAPE (recorded 2026-07-08, per the settled design —
+      container-holds-the-turn, NOT DO-drives-tools): the Class-B container
+      runs the whole owned agent turn NATIVELY (the image already carries
+      the full whip binary — harness loop, tools, provider HTTP all run
+      in-container against a scratch dir); the workflow DO opens a
+      hibernatable WebSocket to the per-turn container, receives progress
+      frames, and settles the final result through the existing
+      `settle_provider_run_result` seam (built for exactly this: outcome
+      computed elsewhere, settled without re-running). Scoped provider
+      secrets ride the turn request (P6). DR-0035 B4 re-query lands here:
+      the container outlives any one DO invocation, so reattach = re-query
+      turn state over the WS. Frame format to pin during build (JSON lines:
+      progress/tool-event/final). Locally validatable the same way as
+      Class-A (wrangler dev + Docker). Pieces: container turn server (WS
+      endpoint on `whip executor` or a sibling mode), DO WS accept +
+      hibernation wiring, settle path, per-turn container class.
+      Workspace/branch materialization joins when the versioned workspace
+      exists (scratch-dir turns are the v1 posture).
 - [ ] **Image digest = environment hash** wiring: workspace image
       declaration → digest into generator-hash ambient config; rolling
       redeploy surfaces as a warm-start epoch.
