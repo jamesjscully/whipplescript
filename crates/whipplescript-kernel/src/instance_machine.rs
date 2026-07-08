@@ -74,10 +74,11 @@ pub trait InstanceDriver {
         Ok(())
     }
 
-    /// The earliest future wake-up (unix milliseconds) the instance needs, or
-    /// `None` when nothing is scheduled. The DO shell sets its single alarm
-    /// from this when the instance parks. Default: no wake-up.
-    fn next_due_unix_ms(&mut self) -> Result<Option<i64>, StoreError> {
+    /// The earliest future wake-up (unix milliseconds) the instance needs
+    /// strictly after `now`, or `None` when nothing is scheduled — pending
+    /// timed effects plus the next clock-source occurrence. The DO shell sets
+    /// its single alarm from this when the instance parks. Default: no wake-up.
+    fn next_due_unix_ms(&mut self, _now: &str) -> Result<Option<i64>, StoreError> {
         Ok(None)
     }
 }

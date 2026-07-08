@@ -310,7 +310,7 @@ fn drive_fixpoint<D: InstanceDriver>(
             Ok(None) => {
                 // Parked: surface the earliest pending wake-up so the shell
                 // can set the DO's single alarm.
-                return match driver.next_due_unix_ms() {
+                return match driver.next_due_unix_ms(now) {
                     Ok(next_due_unix_ms) => DurableStepOutcome::Parked { next_due_unix_ms },
                     Err(error) => DurableStepOutcome::Failed(format!("{error:?}")),
                 };
@@ -410,6 +410,52 @@ mod tests {
         assert!(
             matches!(instance.step(None, after_due), DurableStepOutcome::Terminal),
             "the alarm re-entry fires the timer and completes the workflow"
+        );
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed")
+        );
+    }
+
+    /// Clock sources on the DO (P6 tail): an interval source parks with the
+    /// NEXT occurrence as the wake-up, and the alarm re-entry admits the
+    /// signal fact through the lifted clock pass.
+    #[test]
+    fn clock_source_parks_with_next_tick_and_fires_on_alarm_reentry() {
+        let source = "workflow ClockDemo\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             signal demo.tick {\n  scheduled_at time\n  observed_at time\n  occurrence_id string\n  missed_count int\n}\n\n\
+             source clock as ticker {\n  every 30s\n  missed coalesce\n\n\
+             \x20 observe as tick\n  emit demo.tick {\n    scheduled_at tick.scheduled_at\n    observed_at tick.observed_at\n    occurrence_id tick.occurrence_id\n    missed_count tick.missed_count\n  }\n}\n\n\
+             rule stop_on_tick\n  when demo.tick as tick\n=> {\n  complete result { ok 1 }\n}\n";
+        let mut instance = DurableInstance::create(
+            store().sql,
+            source,
+            "{}",
+            "local/ClockDemo",
+            DurableEffectPorts::default(),
+            &[],
+        )
+        .expect("create");
+
+        // First step (well before any tick is due relative to the store's
+        // wall-clock created_at): parks, naming the next 30s occurrence.
+        let parked = instance.step(None, TEST_NOW_MS);
+        let next_due = match parked {
+            DurableStepOutcome::Parked { next_due_unix_ms } => {
+                next_due_unix_ms.expect("an interval source names its next tick")
+            }
+            other => panic!("expected a park with a wake-up, got {other:?}"),
+        };
+
+        // The alarm fires: a `now` past the tick admits the signal fact and
+        // the rule finishes the workflow.
+        assert!(
+            matches!(
+                instance.step(None, next_due + 1_000),
+                DurableStepOutcome::Terminal
+            ),
+            "the alarm re-entry admits the clock tick and finishes"
         );
         assert_eq!(
             instance.status().expect("status").as_deref(),

@@ -630,9 +630,16 @@ linear undo chain). No phase work now.
       THE instance instead of minting a second). Secrets: the Worker
       env/secret binding path feeds provider configs (`.dev.vars` locally,
       `wrangler secret put` live) — the config plane in practice; the
-      kernel-side `Secrets`-trait read remains a refinement. Remaining:
-      clock-source recurrences (interval/calendar next-fire) in the DO
-      next-due computation; `chrono`→data-only survey.
+      kernel-side `Secrets`-trait read remains a refinement. **Clock sources LIVE on the DO 2026-07-07**: the
+      whole native clock pass (interval + calendar/at, DST-correct, missed
+      policies) lifted to `kernel::time_pass::resolve_due_clock_sources`
+      (CLI delegates) and wired into the DO's `advance_time`;
+      `next_clock_due_unix_ms` computes the next occurrence (interval math +
+      forward calendar scan) and joins the effect due-time in the alarm
+      wake-up. chrono/chrono-tz with the pinned feature set compile for
+      wasm32 (the data-only survey resolved — no clock reads in the lifted
+      code). Tested: an `every 30s` source parks with the next tick as the
+      wake-up and the alarm re-entry admits the signal fact to a terminal.
 
 ### Phase 7 — Large-object tier (designed now, built later)
 - [~] Seam landed in `whipplescript-host-do` (real, tested, native + wasm):

@@ -801,6 +801,8 @@ dependencies = [
 name = "whipplescript-kernel"
 version = "0.2.0"
 dependencies = [
+ "chrono",
+ "chrono-tz",
  "serde",
  "serde_json",
  "whipplescript-core",

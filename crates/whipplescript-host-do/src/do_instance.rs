@@ -133,21 +133,43 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
     }
 
     fn advance_time(&mut self, now: &str) -> Result<(), StoreError> {
-        // The lifted due-time pass (DR-0033 Phase 6): complete due timers,
-        // expire deadline-passed effects — the same pass the native dev loop
-        // runs, over the DO's threaded store. `now` comes from the shell.
+        // The lifted due-time passes (DR-0033 Phase 6): complete due timers,
+        // expire deadline-passed effects, and fire due clock-source
+        // occurrences as durable signal facts — the same passes the native
+        // dev loop runs, over the DO's threaded store. `now` is injected.
         whipplescript_kernel::time_pass::resolve_due_time_effects(
             &mut self.kernel,
             self.instance_id,
             now,
         )?;
+        whipplescript_kernel::time_pass::resolve_due_clock_sources(
+            &mut self.kernel,
+            self.instance_id,
+            now,
+            self.ir,
+        )?;
         Ok(())
     }
 
-    fn next_due_unix_ms(&mut self) -> Result<Option<i64>, StoreError> {
-        self.kernel
+    fn next_due_unix_ms(&mut self, now: &str) -> Result<Option<i64>, StoreError> {
+        // The earliest of: pending timed effects (creation-anchored timeouts
+        // + explicit deadlines) and the next clock-source occurrence.
+        let effect_due = self
+            .kernel
             .store()
-            .next_effect_due_epoch_ms(self.instance_id)
+            .next_effect_due_epoch_ms(self.instance_id)?;
+        let clock_due = whipplescript_kernel::time_pass::next_clock_due_unix_ms(
+            &mut self.kernel,
+            self.instance_id,
+            now,
+            self.ir,
+        )?;
+        Ok(match (effect_due, clock_due) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        })
     }
 
     fn run_effect(
