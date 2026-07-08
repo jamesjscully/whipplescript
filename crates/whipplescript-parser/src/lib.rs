@@ -365,6 +365,11 @@ pub enum AgentField {
     /// (context-assembly Phase 5). One of `summarize`, `hard_reset`, `tool_results`,
     /// `none`.
     Compaction(Ident),
+    /// `thread <mode>`: owned-harness conversation continuation across tells
+    /// (pi-conformance §4, the chat-shaped instance v1). `continue` seeds each
+    /// new tell from the agent's latest completed-turn transcript in this
+    /// instance; `fresh` (the default) starts every tell from scratch.
+    Thread(Ident),
     /// `settings <sources>`: which ambient-config sources a Delegated harness may
     /// read when assembling its own context (DR-0034 Decision 4). One of `project`,
     /// `user`, `none`. Unset means the provider's own default.
@@ -1187,6 +1192,9 @@ pub struct IrAgent {
     /// `summarize` (default), `hard_reset`, `tool_results`, or `none`. `None` uses
     /// the harness default.
     pub compaction: Option<String>,
+    /// Owned-harness thread continuation across tells (pi-conformance §4):
+    /// `continue` or `fresh`. `None` = `fresh` (every tell starts from scratch).
+    pub thread: Option<String>,
     /// Ambient-config sources a Delegated harness may read (DR-0034 Decision 4):
     /// `project`, `user`, or `none`. `None` means the provider's own default —
     /// deliberately NOT the crippled empty set.
@@ -2439,6 +2447,7 @@ fn agent_field_span(field: &AgentField) -> SourceSpan {
         | AgentField::Capabilities(_, span)
         | AgentField::Tools(_, span) => *span,
         AgentField::Compaction(strategy) => strategy.span,
+        AgentField::Thread(mode) => mode.span,
         AgentField::Settings(sources) => sources.span,
         AgentField::Unknown { span, .. } => *span,
     }
@@ -2474,6 +2483,7 @@ fn agent_field_line(field: &AgentField) -> String {
             format!("  tools [{tools}]")
         }
         AgentField::Compaction(strategy) => format!("  compaction {}", strategy.name),
+        AgentField::Thread(mode) => format!("  thread {}", mode.name),
         AgentField::Settings(sources) => format!("  settings {}", sources.name),
         AgentField::Unknown { name, .. } => format!("  {}", name.name),
     }
@@ -3110,6 +3120,12 @@ impl IrProgram {
                     .as_deref()
                     .map(|sources| format!(" settings={sources}"))
                     .unwrap_or_default();
+                // Thread mode likewise appends only when set (unset = fresh).
+                let thread = agent
+                    .thread
+                    .as_deref()
+                    .map(|mode| format!(" thread={mode}"))
+                    .unwrap_or_default();
                 // Harness class (DR-0034): Managed is the default/substrate, so only
                 // Delegated agents emit a class token — Managed agents' .ir is unchanged.
                 let class = match agent.harness_class {
@@ -3119,8 +3135,8 @@ impl IrProgram {
                 push_line(
                     &mut snapshot,
                     format!(
-                        "  agent {} harness={} provider={} profile={} capacity={} skills={} capabilities={} tools={}{}{}{}",
-                        agent.name, harness, provider, profile, capacity, skills, capabilities, tools, compaction, settings, class
+                        "  agent {} harness={} provider={} profile={} capacity={} skills={} capabilities={} tools={}{}{}{}{}",
+                        agent.name, harness, provider, profile, capacity, skills, capabilities, tools, compaction, settings, thread, class
                     ),
                 );
             }
@@ -6273,6 +6289,7 @@ fn lower_agent(
         capabilities: Vec::new(),
         tools: Vec::new(),
         compaction: None,
+        thread: None,
         settings: None,
         // Filled after the field loop, once provider/harness are resolved.
         harness_class: HarnessClass::Managed,
@@ -6331,6 +6348,7 @@ fn lower_agent(
     // Knob spans held for the class-partition check below (DR-0034 Decision 3) —
     // the class is only resolved after the field loop.
     let mut compaction_span: Option<SourceSpan> = None;
+    let mut thread_span: Option<SourceSpan> = None;
     let mut settings_span: Option<SourceSpan> = None;
 
     for field in agent.fields {
@@ -6486,6 +6504,35 @@ fn lower_agent(
                 compaction_span = Some(strategy.span);
                 lowered.compaction = Some(strategy.name);
             }
+            AgentField::Thread(mode) => {
+                const MODES: [&str; 2] = ["continue", "fresh"];
+                if lowered.thread.is_some() {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: mode.span,
+                        message: format!(
+                            "agent `{}` declares thread more than once",
+                            agent.name.name
+                        ),
+                        suggestion: Some("keep exactly one `thread` field".to_owned()),
+                    });
+                }
+                if !MODES.contains(&mode.name.as_str()) {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: mode.span,
+                        message: format!(
+                            "agent `{}` uses unknown thread mode `{}`",
+                            agent.name.name, mode.name
+                        ),
+                        suggestion: Some(
+                            "supported thread modes are `continue` and `fresh`".to_owned(),
+                        ),
+                    });
+                }
+                thread_span = Some(mode.span);
+                lowered.thread = Some(mode.name);
+            }
             AgentField::Settings(sources) => {
                 const SOURCES: [&str; 3] = ["project", "user", "none"];
                 if lowered.settings.is_some() {
@@ -6574,6 +6621,20 @@ fn lower_agent(
                     ),
                     suggestion: Some(
                         "remove `compaction` — a delegated harness compacts its own context"
+                            .to_owned(),
+                    ),
+                });
+            }
+            if let Some(span) = thread_span {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span,
+                    message: format!(
+                        "agent `{}` is delegated; `thread` is a managed-harness knob",
+                        agent.name.name
+                    ),
+                    suggestion: Some(
+                        "remove `thread` — a delegated harness owns its own conversation state"
                             .to_owned(),
                     ),
                 });
@@ -16928,6 +16989,9 @@ fn format_agent(agent: AgentDecl, formatted: &mut String) {
             AgentField::Compaction(strategy) => {
                 push_line(formatted, format!("  compaction {}", strategy.name));
             }
+            AgentField::Thread(mode) => {
+                push_line(formatted, format!("  thread {}", mode.name));
+            }
             AgentField::Settings(sources) => {
                 push_line(formatted, format!("  settings {}", sources.name));
             }
@@ -18983,6 +19047,13 @@ impl Parser<'_> {
                 "compaction" => {
                     if let Some(strategy) = self.expect_ident("compaction strategy") {
                         fields.push(AgentField::Compaction(strategy));
+                    } else {
+                        self.synchronize_to_block_item();
+                    }
+                }
+                "thread" => {
+                    if let Some(mode) = self.expect_ident("thread mode") {
+                        fields.push(AgentField::Thread(mode));
                     } else {
                         self.synchronize_to_block_item();
                     }
@@ -23303,6 +23374,47 @@ agent worker {
         let plain_ir = plain.ir.expect("ir");
         assert_eq!(plain_ir.agents[0].settings, None);
         assert!(!plain_ir.to_snapshot().contains("settings="));
+    }
+
+    #[test]
+    fn agent_thread_mode_parses_lowers_and_partitions() {
+        // `thread continue` on a Managed agent lowers into the IR.
+        let source = "workflow ChatDemo\n\noutput result Done\n\nclass Done {\n  ok int\n}\n\n\
+             agent helper {\n  provider owned\n  profile \"repo-reader\"\n  capacity 1\n  thread continue\n}\n\n\
+             rule go\n  when started\n=> {\n  tell helper as reply \"\"\"\n  Hi.\n  \"\"\"\n\n\
+             \x20 after reply succeeds {\n    complete result { ok 1 }\n  }\n}\n";
+        let compiled = compile_program(source);
+        let ir = compiled.ir.expect("thread continue compiles");
+        let agent = ir
+            .agents
+            .iter()
+            .find(|agent| agent.name == "helper")
+            .expect("agent lowered");
+        assert_eq!(agent.thread.as_deref(), Some("continue"));
+
+        // An unknown mode is a diagnostic.
+        let bad = source.replace("thread continue", "thread sometimes");
+        let compiled = compile_program(&bad);
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("unknown thread mode `sometimes`")));
+
+        // `thread` on a Delegated agent is a managed-knob partition error.
+        let delegated = source
+            .replace("provider owned", "provider codex")
+            .replace("thread continue", "thread continue");
+        let compiled = compile_program(&delegated);
+        assert!(
+            compiled.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("is delegated; `thread` is a managed-harness knob")),
+            "{:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
