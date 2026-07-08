@@ -36,6 +36,85 @@ const STREAM_CAP_BYTES: usize = 512 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
 
+/// Bounded exec slots per executor process (the pool's per-instance
+/// concurrency; pool size × this = workspace Class-A parallelism).
+const EXEC_SLOTS: usize = 4;
+
+/// Priority classes, best first: production > working > counterfactual —
+/// the compute-plane scheduling discipline (design note §6): mass
+/// regeneration must not starve live traffic of executor slots.
+const PRIORITY_CLASSES: usize = 3;
+
+fn priority_class(name: &str) -> usize {
+    match name {
+        "working" => 1,
+        "counterfactual" => 2,
+        // Unlabeled requests are live traffic.
+        _ => 0,
+    }
+}
+
+/// The admission gate implementing the verified priority discipline
+/// (models/maude/compute-priority-queue.maude): a freed slot is granted to a
+/// waiter only when no strictly higher-priority waiter exists — the [serve]
+/// rule's guard, transcribed.
+struct AdmissionGate {
+    state: std::sync::Mutex<GateState>,
+    freed: std::sync::Condvar,
+}
+
+struct GateState {
+    free_slots: usize,
+    waiting: [usize; PRIORITY_CLASSES],
+}
+
+impl AdmissionGate {
+    fn new(slots: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(GateState {
+                free_slots: slots,
+                waiting: [0; PRIORITY_CLASSES],
+            }),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Block until a slot is granted at `priority` (0 best). Mirrors the
+    /// model's guard: grant only when no higher-priority request waits.
+    fn acquire(&self, priority: usize) {
+        let mut state = self.state.lock().expect("admission gate lock");
+        state.waiting[priority] += 1;
+        loop {
+            let higher_waiting = state.waiting[..priority].iter().any(|&count| count > 0);
+            if state.free_slots > 0 && !higher_waiting {
+                state.free_slots -= 1;
+                state.waiting[priority] -= 1;
+                return;
+            }
+            state = self.freed.wait(state).expect("admission gate wait");
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("admission gate lock");
+        state.free_slots += 1;
+        drop(state);
+        self.freed.notify_all();
+    }
+
+    #[cfg(test)]
+    fn waiting_total(&self) -> usize {
+        let state = self.state.lock().expect("admission gate lock");
+        state.waiting.iter().sum()
+    }
+}
+
+/// The process-wide gate for `/exec` (Class-A) requests.
+fn exec_gate() -> &'static AdmissionGate {
+    static GATE: std::sync::OnceLock<AdmissionGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| AdmissionGate::new(EXEC_SLOTS))
+}
+
 /// Serve forever on `bind` (e.g. `127.0.0.1:8080`).
 pub fn serve(bind: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind)?;
@@ -254,7 +333,19 @@ pub fn handle_exec_request(request: &Value) -> Result<Value, (u16, String)> {
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
+    // Bounded slots with priority admission (production > working >
+    // counterfactual), per the verified compute-priority-queue model —
+    // postures ride the protocol via the request's `priority` field.
+    let priority = priority_class(
+        request
+            .get("priority")
+            .and_then(Value::as_str)
+            .unwrap_or("production"),
+    );
+    let gate = exec_gate();
+    gate.acquire(priority);
     let outcome = run_with_timeout(command, &stdin_json, Duration::from_millis(timeout_ms));
+    gate.release();
     let _ = std::fs::remove_file(&staged);
     let (exit_code, timed_out, stdout, stderr) =
         outcome.map_err(|error| (500, format!("exec failed: {error}")))?;
@@ -384,6 +475,48 @@ mod tests {
             "script_index": 1,
             "stdin": stdin,
         })
+    }
+
+    // The admission gate serves production before counterfactual when a slot
+    // frees — the [serve] guard from compute-priority-queue.maude, live.
+    #[test]
+    fn admission_gate_grants_higher_priority_first() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let gate = Arc::new(AdmissionGate::new(1));
+        // Occupy the single slot.
+        gate.acquire(0);
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        // A counterfactual waiter first, then a production waiter.
+        for &priority in &[2usize, 0usize] {
+            let waiter_gate = Arc::clone(&gate);
+            let waiter_order = Arc::clone(&order);
+            let waiter_started = Arc::clone(&started);
+            handles.push(std::thread::spawn(move || {
+                waiter_started.fetch_add(1, Ordering::SeqCst);
+                waiter_gate.acquire(priority);
+                waiter_order.lock().expect("order lock").push(priority);
+                waiter_gate.release();
+            }));
+            // Ensure registration order: the waiter must be queued inside
+            // acquire before the next one spawns.
+            while gate.waiting_total() < handles.len() {
+                std::thread::yield_now();
+            }
+        }
+        let _ = started;
+
+        // Free the slot: the production waiter must win despite arriving
+        // second; the counterfactual runs after it releases.
+        gate.release();
+        for handle in handles {
+            handle.join().expect("waiter joins");
+        }
+        assert_eq!(*order.lock().expect("order lock"), vec![0, 2]);
     }
 
     #[test]

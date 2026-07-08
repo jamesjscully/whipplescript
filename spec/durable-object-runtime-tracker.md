@@ -683,7 +683,16 @@ fixed-size `getRandom` pools). Open build work:
       proven by test), miss → NeedsHttp → settle + cache record; wired
       through DurableEffectPorts/create(exec_config_json, scripts_json) +
       index.ts (WHIP_EXECUTOR_URL) and validated through the real
-      wasm-bindgen boundary (validate.cjs exec round green). CONTAINER TIER
+      wasm-bindgen boundary (validate.cjs exec round green). PRIORITY QUEUE
+      v1 DONE 2026-07-08 at the executor level, model-first
+      (compute-priority-queue.maude — I1 no-priority-inversion + unguarded-
+      mutant bite; the model also caught that a bare AC-soup guard is
+      unsound under extension matching, hence the wrapped-state rule):
+      bounded EXEC_SLOTS admission gate serving production > working >
+      counterfactual, transcribing the verified [serve] guard; the
+      whip-executor/1 request carries `priority` (unlabeled = production);
+      senders label when postures land. Workspace-DO-brokered placement =
+      the production refinement. CONTAINER TIER
       PROVEN LOCALLY 2026-07-08 (b23c155): executor/Dockerfile
       (trixie-slim — glibc 2.39; bookworm exits 1) + [[containers]]
       ExecutorContainer (lite, max 4) + getRandom routing in performFetch
@@ -717,6 +726,13 @@ fixed-size `getRandom` pools). Open build work:
       diff-back keyed by effect id (atomic/recorded/complete; idempotent
       by Decisions 3/4); Class-A batching (several execs per manifest
       request); branch marker + scoped secrets (P6) in the request.
+      v1 SHAPE SHIPPED 2026-07-08 inside whip-executor/1 + whip-turn/1:
+      Class-A materialization = sha-pinned script bytes inline, keyed by
+      effect id, idempotent (cache first-writer-wins + registry re-attach);
+      scoped secrets ride the request (resolved env values / provider
+      config). The full pull-missing-blobs/diff-back form needs the object
+      tier + versioned workspace (P7 / un-tie P1 — later by design);
+      batching is an economics refinement gated on real contention.
 - [x] Class-B turn containers: per-turn/per-branch controller DOs;
       hibernatable-WebSocket progress channel (frame format TBD);
       diff-back on completion via the same import.
@@ -762,6 +778,15 @@ fixed-size `getRandom` pools). Open build work:
 - [ ] IFC span enforcement: default-deny egress + allowlists derived from
       the exec-grant declarations; verify counterfactual execs are
       network-denied by default on this host.
+      POSTURE 2026-07-08 (partial): the executor already enforces what whip
+      CAN see — cleaned child environment (declared env + PATH only,
+      stronger than native exec), sha-pinned bytes, no ambient secrets in
+      the container beyond the request's scoped values. Network egress
+      default-deny is a PLATFORM property (containers have outbound network
+      by default; Cloudflare per-container egress policy is the enforcement
+      point when exposed) — the design note's recorded asymmetry stands:
+      sidecar network residual contained-but-not-denied in v1; revisit at
+      production container enable.
 - [x] `whip deploy` v1: one zero-config command (wasm kernel + image +
       DO/bucket/pool provisioning + secrets; wrangler underneath, never
       surfaced).
