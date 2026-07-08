@@ -12,3 +12,5 @@ __pycache__/
 **/.whipplescript/workflows/*.sqlite
 **/.whipplescript/*.sqlite
 .whipplescript/*.sqlite
+.dev.vars
+crates/whipplescript-host-do/worker/.wrangler/

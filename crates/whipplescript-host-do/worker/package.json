@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "Cloudflare Worker + Durable Object shell for the sans-IO WhippleScript runtime (DR-0033).",
   "scripts": {
-    "build:wasm": "wasm-pack build .. --target bundler --out-dir worker/pkg --no-default-features",
+    "build:wasm": "cargo build -p whipplescript-host-do --no-default-features --target wasm32-unknown-unknown --release && wasm-bindgen ../../../target/wasm32-unknown-unknown/release/whipplescript_host_do.wasm --out-dir pkg --target bundler",
     "deploy": "npm run build:wasm && wrangler deploy",
     "dev": "npm run build:wasm && wrangler dev",
     "validate": "cargo build -p whipplescript-host-do --no-default-features --target wasm32-unknown-unknown --release && wasm-bindgen ../../../target/wasm32-unknown-unknown/release/whipplescript_host_do.wasm --out-dir pkg --target nodejs && node validate.cjs"
