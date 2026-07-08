@@ -185,12 +185,14 @@ replace git for working branches + workstreams.)*
       persistent thread = instance event log + restorable context; resumes
       across process restarts.
 - [ ] Instance fork surface (chat fork) over branches. **[v0.4 — needs Phase 1 branches.]**
-- [ ] **Pi-conformance checklist**: extraction pass over pi-mono 0.73.1
-      for harness-owned behaviors — tool ergonomics (read/edit/bash/fetch,
-      truncation, result digests), turn lifecycle, abort semantics, thread
-      continuation, stderr/error surfacing. *(System-prompt seam, skills,
-      project instructions, compaction are OWNED by
-      `context-assembly-tracker.md` — pointer, not duplicate.)*
+- [x] **Pi-conformance checklist**: extraction pass DONE 2026-07-07 →
+      **`spec/pi-conformance-checklist.md`** (pi-mono @ 351efc8; tool
+      ergonomics, turn lifecycle, abort, thread continuation, error
+      surfacing, multimodal — each with a PORT/KEEP verdict and the build
+      order). Notable KEEPs: whip's content-addressed `recall` beats pi's
+      temp files; bounded `max_steps`; no token streaming. *(System-prompt
+      seam, skills, project instructions, compaction are OWNED by
+      `context-assembly-tracker.md` — closed.)*
 - [ ] Implement the checklist deltas in the owned harness.
 - [ ] Multimodal input: image content blocks on the agent-turn (and
       coerce, where sensible) effect surface.
