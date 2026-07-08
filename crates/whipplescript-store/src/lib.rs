@@ -6804,8 +6804,32 @@ fn policy_block_on(
     }
 
     if effect.kind == "exec.command" {
-        let capabilities = explicit_required_capabilities(&effect)?;
-        return policy_block_for_capabilities(connection, &effect, &capabilities);
+        // Script hard-off Layer 2 (spec/std-script.md "Hard-off semantics"):
+        // EVERY exec.command effect requires a bound `script.*` capability.
+        // The capability form carries its `script.<name>` requirement from
+        // lowering; the raw form carries none and is held to `script.raw`.
+        // The requirement is derived HERE, at the admission gate, so a forged
+        // effect row that strips its requirements gains nothing — and the
+        // rows only exist when both seeding keys turned (the program imports
+        // std.script AND the operator-plane authority exists).
+        let mut capabilities = explicit_required_capabilities(&effect)?;
+        if !capabilities
+            .iter()
+            .any(|capability| capability.starts_with("script."))
+        {
+            capabilities.push("script.raw".to_owned());
+        }
+        let block = policy_block_for_capabilities(connection, &effect, &capabilities)?;
+        // A script-capability block IS the "scripts are disabled" state:
+        // surface the hard-off diagnostic id with the blocked reason, before
+        // any provider run.
+        return Ok(block.map(|block| match block.status {
+            "blocked_by_capability" => PolicyBlock {
+                status: block.status,
+                reason: format!("security.script_disabled: {}", block.reason),
+            },
+            _ => block,
+        }));
     }
 
     if effect.kind == "capability.call" {
@@ -13957,6 +13981,202 @@ mod tests {
                 .map(|event| event.event_type.as_str()),
             Some("effect.blocked")
         );
+    }
+
+    /// Script hard-off Layer 2, forged-IR fixture (spec/std-script.md,
+    /// models/maude/script-capability-seeding.maude): a program registered
+    /// DIRECTLY against the store — the path that bypasses the check-time
+    /// gate, exactly what forged IR does — commits a raw exec.command effect
+    /// carrying no capability requirement. The admission gate holds the raw
+    /// form to `script.raw`; nothing seeded it (no import + no operator
+    /// authority ever turned the two keys), so the effect blocks as
+    /// blocked_by_capability with the `security.script_disabled` id, is never
+    /// claimable, and no run row exists.
+    #[test]
+    fn raw_exec_without_seeded_script_capability_blocks_at_admission() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Forged", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let effects = [NewEffect {
+            effect_id: "raw-exec",
+            kind: "exec.command",
+            target: None,
+            input_json: r#"{"mode":"raw","command":"echo forged"}"#,
+            profile: None,
+            required_capabilities_json: "[]",
+            ..test_effect("raw-exec", "exec.command", "rule=go;effect=raw-exec")
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "go",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-go"),
+            })
+            .expect("rule commits");
+
+        assert!(
+            store
+                .claimable_effects(&instance.instance_id)
+                .expect("claimable list")
+                .is_empty(),
+            "an unseeded exec effect must not be claimable"
+        );
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "raw-exec",
+                run_id: "run-raw-exec",
+                provider: "exec",
+                worker_id: "whip-exec",
+                lease_id: "lease-raw-exec",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("admission blocks the run");
+        assert!(
+            matches!(&blocked, StoreError::PolicyBlocked { reason, .. }
+                if reason.contains("security.script_disabled") && reason.contains("script.raw")),
+            "got {blocked:?}"
+        );
+        assert_eq!(effect_status(&store, "raw-exec"), "blocked_by_capability");
+        assert_eq!(row_count(&store, "runs"), 0, "no provider run was started");
+    }
+
+    /// The capability form of the same property: an exec.command effect
+    /// carrying `script.<name>` blocks at admission when the row was never
+    /// seeded (unregistered manifest entry, or seeding keys never turned).
+    #[test]
+    fn capability_exec_with_unseeded_script_capability_blocks_at_admission() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Forged", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let effects = [NewEffect {
+            effect_id: "cap-exec",
+            kind: "exec.command",
+            target: None,
+            input_json: r#"{"mode":"capability","capability":"judge"}"#,
+            profile: None,
+            required_capabilities_json: r#"["script.judge"]"#,
+            ..test_effect("cap-exec", "exec.command", "rule=go;effect=cap-exec")
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "go",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-go"),
+            })
+            .expect("rule commits");
+
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "cap-exec",
+                run_id: "run-cap-exec",
+                provider: "exec",
+                worker_id: "whip-exec",
+                lease_id: "lease-cap-exec",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("admission blocks the run");
+        assert!(
+            matches!(&blocked, StoreError::PolicyBlocked { reason, .. }
+                if reason.contains("security.script_disabled") && reason.contains("script.judge")),
+            "got {blocked:?}"
+        );
+        assert_eq!(effect_status(&store, "cap-exec"), "blocked_by_capability");
+        assert_eq!(row_count(&store, "runs"), 0, "no provider run was started");
+    }
+
+    /// The positive half: once the two-key seed happened (capability schema +
+    /// per-program binding for `script.raw`), the same raw exec effect is
+    /// admitted — the gate reads the seeded rows, nothing else.
+    #[test]
+    fn raw_exec_with_seeded_script_raw_capability_is_claimable() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Granted", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        store
+            .register_capability_schema(CapabilitySchemaRegistration {
+                capability: "script.raw",
+                description: "raw exec behind the operator allowlist",
+                schema_json: "{}",
+                registered_by_package_id: None,
+            })
+            .expect("schema registers");
+        store
+            .bind_capability(CapabilityBinding {
+                binding_id: "binding-script-raw",
+                program_id: Some(&version.program_id),
+                capability: "script.raw",
+                provider: "builtin-script",
+                config_json: "{}",
+            })
+            .expect("binding registers");
+        let effects = [NewEffect {
+            effect_id: "raw-exec",
+            kind: "exec.command",
+            target: None,
+            input_json: r#"{"mode":"raw","command":"echo granted"}"#,
+            profile: None,
+            required_capabilities_json: "[]",
+            ..test_effect("raw-exec", "exec.command", "rule=go;effect=raw-exec")
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "go",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-go"),
+            })
+            .expect("rule commits");
+
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable list");
+        assert_eq!(claimable.len(), 1);
+        assert_eq!(claimable[0].effect_id, "raw-exec");
     }
 
     #[test]

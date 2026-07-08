@@ -152,6 +152,45 @@ blocks at the store admission gate as `blocked_by_capability`
 (store/lib.rs:6491-6546), surfaced with `security.script_disabled`, before
 any provider run.
 
+> **DELIVERED 2026-07-08 (S6d-6).** Model:
+> `models/maude/script-capability-seeding.maude` (two-key seed + admit rules;
+> negative fixtures prove no-seed/no-admit bite). Shipped shape:
+>
+> - **Admission gate** — `policy_block_on` (store/lib.rs) and its DO mirror
+>   `do_policy_block` (host-do/do_store.rs) hold every `exec.command` effect
+>   to a bound `script.*` capability. The requirement is DERIVED AT THE GATE:
+>   a row carrying no `script.*` entry is held to `script.raw`, so raw
+>   lowering stays capability-free (no `.ir` churn) and a forged row that
+>   strips its requirements gains nothing — strictly stronger than attaching
+>   `script.raw` at lowering, which the gate could not trust anyway. Blocks
+>   carry reason prefix `security.script_disabled:` on top of the
+>   `blocked_by_capability` status/category machinery.
+> - **Two-key seeding (native)** — `run_worker_once` (cli/main.rs) evaluates
+>   key (a) from the worker's compiled program IR (`use std.script` in
+>   `ir.uses`); only then does it register the operator script-manifest rows
+>   (`register_script_manifest_capabilities`, key b = pinned manifest entry)
+>   and, for the raw form, `register_raw_script_capability` (key b = dev
+>   profile + non-empty `WHIPPLESCRIPT_EXEC_ALLOW`; hosted never seeds
+>   `script.raw`). The allowlist keeps its glob-filter role inside the raw
+>   handler for commands that ARE admitted.
+> - **Two-key seeding (DO)** — `DurableInstance::create`
+>   (host-do/do_worker.rs) registers deploy-shipped script capabilities only
+>   when the program it compiles (the registered IR — the DO compiles what it
+>   registers) imports std.script.
+> - **Embedded manifest** — `std/manifests/script.json` in
+>   `EMBEDDED_STD_MANIFESTS`: contracts-only (library identity + the
+>   `script.raw` capability row). No constructs/grammar (`exec` stays core
+>   grammar; the manifest pipeline forbids non-`capability.call` effect
+>   contracts, so the `exec.command` contract row is deliberately absent) and
+>   no parser build.rs entry (grammar-only list). The reserved-`raw` manifest
+>   key check and the M8 static-check rewrites remain open (below).
+> - **Tests** — store: forged-IR fixture (direct registration, raw + capability
+>   form) blocks at admission with no run row; seeded `script.raw` admits.
+>   CLI e2e: both two-key negatives (import+no-authority,
+>   authority+no-import) block as `blocked_by_capability` /
+>   `security.script_disabled`; granted+imported exec completes. DO:
+>   import-conditional seeding both ways.
+
 Rationale for the pick:
 
 1. **It reuses the only gate with teeth.** `policy_block_on` at

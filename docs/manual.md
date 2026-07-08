@@ -311,9 +311,13 @@ version. Operate the inbox with `whip inbox`, `whip inbox show <item>`, and
 `result.exit_code` and `result.stdout`. It is a dev-profile escape hatch,
 deliberately constrained:
 
-- There is no source syntax to grant it. The operator allow-lists commands
-  through `WHIPPLESCRIPT_EXEC_ALLOW` (colon-separated glob prefixes such as
-  `scripts/*`); anything outside the list fails and routes to `after x fails`.
+- The program must import `std.script`, and there is no source syntax to grant
+  a command. The operator allow-lists commands through
+  `WHIPPLESCRIPT_EXEC_ALLOW` (colon-separated glob prefixes such as
+  `scripts/*`). Without the import or with no allow-list at all, the effect
+  blocks at admission (`blocked_by_capability`, `security.script_disabled`)
+  and never runs; a command outside a non-empty list fails and routes to
+  `after x fails`.
 - There is no sandbox for raw dev `exec` — a grant is a documented trust
   decision. Keep the allow-list as narrow as the workflow needs, and prefer
 	  agents, package capabilities, or child workflows when one of those fits.

@@ -201,7 +201,19 @@ impl<Sql: DoSql> DurableInstance<Sql> {
         // Register deploy-shipped script capabilities (compute plane P8),
         // verifying each body against its operator pin — fail-closed, the
         // same TOCTOU discipline the native manifest loader applies.
-        for script in scripts {
+        //
+        // Script hard-off Layer 2, seeding key (a) (spec/std-script.md "Two
+        // layers, both required"): capability rows are seeded only when the
+        // program imports std.script. The DO compiles the program it
+        // registers (above), so the compiled IR IS the registered IR — its
+        // `uses` list is the import key. Deploy-shipped scripts (key b, the
+        // operator authority) stay dormant for a program that never consented
+        // to script execution, and every exec.command effect then blocks at
+        // the store admission gate (blocked_by_capability /
+        // security.script_disabled) before any executor round.
+        let imports_std_script = ir.uses.iter().any(|use_decl| use_decl.name == "std.script");
+        let seedable_scripts = if imports_std_script { scripts } else { &[] };
+        for script in seedable_scripts {
             let actual = whipplescript_kernel::exec_http::sha256_hex(script.body.as_bytes());
             if actual != script.sha256 {
                 return Err(format!(
@@ -702,6 +714,62 @@ mod tests {
         assert_eq!(
             instance.status().expect("status").as_deref(),
             Some("completed")
+        );
+    }
+
+    /// Script hard-off Layer 2, seeding key (a) on the DO (S6d-6,
+    /// spec/std-script.md "Two layers, both required"): deploy-shipped script
+    /// capabilities register only when the program imports std.script. Same
+    /// operator scripts (key b), two programs — the importing one gets the
+    /// `script.<name>` schema/binding rows; the non-importing one (the
+    /// forged-IR analog: `exec` compiles fine outside the CLI check gate)
+    /// gets none, so its exec.command effects block at the DO admission gate.
+    #[test]
+    fn script_capabilities_seed_only_when_the_program_imports_std_script() {
+        let script_body = "read line\necho '{\"verdict\":\"pass\"}'\n";
+        let script_sha = whipplescript_kernel::exec_http::sha256_hex(script_body.as_bytes());
+        let scripts = vec![ScriptCapabilityInput {
+            name: "judge".to_owned(),
+            argv: vec!["sh".to_owned(), "{script}".to_owned()],
+            sha256: script_sha,
+            env: std::collections::BTreeMap::new(),
+            hermetic: false,
+            body: script_body.to_owned(),
+        }];
+        let body = "\n\noutput result Done\n\nclass Done {\n  ok int\n}\n\n\
+             rule go\n  when started\n=> {\n  complete result { ok 1 }\n}\n";
+        let seeded_rows = |source: String| {
+            let instance = DurableInstance::create(
+                store().sql,
+                &source,
+                "{}",
+                "local/SeedProbe",
+                DurableEffectPorts::default(),
+                &[],
+                &scripts,
+            )
+            .expect("create");
+            let kernel = instance.kernel.as_ref().expect("kernel present");
+            kernel
+                .store()
+                .sql
+                .query(
+                    "SELECT 1 FROM capability_bindings WHERE capability = 'script.judge'",
+                    &[],
+                )
+                .expect("bindings query")
+                .len()
+        };
+
+        assert_eq!(
+            seeded_rows(format!("workflow NoConsent{body}")),
+            0,
+            "no import (key a) => the operator scripts stay dormant"
+        );
+        assert_eq!(
+            seeded_rows(format!("use std.script\nworkflow Consent{body}")),
+            1,
+            "import + operator scripts => the capability row is seeded"
         );
     }
 }

@@ -40,7 +40,7 @@ for any command.
 | `WHIPPLESCRIPT_STORE` | Default store path when `--store` is omitted. |
 | `WHIPPLESCRIPT_ITEMS_STORE` | Path for the builtin work-queue tracker (defaults to `.whipplescript/items.sqlite`). |
 | `WHIPPLESCRIPT_COORDINATION_STORE` | Path for workspace-scoped lease, ledger, and counter state (defaults to `.whipplescript/coordination.sqlite`). |
-| `WHIPPLESCRIPT_EXEC_ALLOW` | Dev-profile raw `exec "<command>"` allow-list: colon-separated glob prefixes such as `scripts/*:bin/ci-*`. Commands that do not match fail without running. |
+| `WHIPPLESCRIPT_EXEC_ALLOW` | Dev-profile raw `exec "<command>"` allow-list: colon-separated glob prefixes such as `scripts/*:bin/ci-*`. Unset/empty, raw exec blocks at admission (`security.script_disabled`); commands outside a non-empty list fail without running. The program must also `use std.script`. |
 | `WHIPPLESCRIPT_EXEC_PROFILE` | `dev` (default) or `hosted`. Hosted rejects raw exec strings and requires script capabilities. |
 | `WHIPPLESCRIPT_SCRIPT_MANIFEST` | JSON manifest path for hosted script capabilities. Equivalent to `--script-manifest`. |
 | `WHIPPLESCRIPT_RUN_ID` | Run identity stamped onto items filed by an agent through `whip items add`. |
@@ -978,7 +978,7 @@ This section is a compact index of source constructs.
 | `prompt "..." [using provider] as result` | Provider-backed free-text prompt effect returning a string-shaped result. |
 | `coerce fn(...) as result` | `coerce` effect. |
 | `decide "..." -> { ... } as result` | Inline typed `coerce` effect. |
-| `exec "<command>" as result` | Dev-profile `exec.command` effect (gated by `WHIPPLESCRIPT_EXEC_ALLOW`; exposes `exit_code`, `stdout`). |
+| `exec "<command>" as result` | Dev-profile `exec.command` effect (requires `use std.script` + a non-empty `WHIPPLESCRIPT_EXEC_ALLOW`, which seed the `script.raw` capability; exposes `exit_code`, `stdout`). |
 | `exec <capability> with <record> -> Type as result` | Hosted `exec.command` effect requiring `script.<capability>`, typed JSON stdin, SHA-256 manifest verification, and typed stdout ingestion. |
 | `file item into <queue> { ... }` | `queue.file` effect. |
 | `claim <item> [as x]` | `queue.claim` effect (already-claimed is a branchable failure). |

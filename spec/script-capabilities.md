@@ -130,10 +130,22 @@ workspace, unreachable from any agent sandbox:
   profile/policy, every `exec` source form is rejected or blocked before any
   provider run. Providers and agents are not allowed to treat natural-language
   instructions, tool arguments, model output, or generic capability calls as an
-  alternate script execution channel.
+  alternate script execution channel. Two layers, both shipped
+  ([`std-script.md`](std-script.md) "Hard-off semantics"): the check-time gate
+  (`security.script_disabled` unless the program has `use std.script`) and the
+  runtime backstop — every `exec.command` effect requires a bound `script.*`
+  capability at store admission (`script.<name>` for the capability form,
+  `script.raw` for the raw form), and those rows are seeded per program only
+  when the registered IR imports `std.script` AND the operator authority
+  exists (manifest entry for `script.<name>`; dev profile + non-empty
+  `WHIPPLESCRIPT_EXEC_ALLOW` for `script.raw` — hosted never seeds
+  `script.raw`). Forging the import line is useless without the operator key;
+  an unseeded effect blocks as `blocked_by_capability` with reason
+  `security.script_disabled`, before any provider run.
 - **Check (hosted profile):** a raw `exec "string"` is a check error; a
   capability name that does not resolve in the supplied manifest is a check
-  error. Dev mode keeps raw `exec` behind the env allowlist.
+  error. Dev mode keeps raw `exec` behind the env allowlist (which is also
+  seeding key (b) for `script.raw` above).
 - **Runtime (defense in depth, since source can be compiled elsewhere):**
   the worker reads the script bytes once, verifies the hash, and executes
   the verified copy — closing the TOCTOU window between check and exec. The
@@ -175,9 +187,12 @@ workspace, unreachable from any agent sandbox:
 
 ## Tiers
 
-- **Dev (laptop loop):** raw `exec "cmd"` behind `WHIPPLESCRIPT_EXEC_ALLOW`,
-  documented honestly as a convenience gate. Iteration stays light; hosted
-  rigor must not leak into the laptop loop.
+- **Dev (laptop loop):** raw `exec "cmd"` behind `use std.script` + a
+  non-empty `WHIPPLESCRIPT_EXEC_ALLOW` (the two keys that seed `script.raw`;
+  with either missing the effect blocks at admission). The per-command glob
+  match stays a convenience filter inside the handler, documented honestly as
+  such. Iteration stays light — the dev-loop cost is one `use std.script`
+  line; hosted rigor must not leak into the laptop loop.
 - **Hosted:** manifest-only, enforced at check and at the worker. The
   platform ships a vetted standard library of script capabilities;
   the user's harness adds custom ones through the confirmed-update path.

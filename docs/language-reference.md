@@ -1230,10 +1230,13 @@ after tests succeeds as result {
 
 The output binding exposes `tests.exit_code` and `tests.stdout`.
 
-Dev-profile `exec` is gated by operator configuration only — there is no
-source syntax that grants it. The worker reads `WHIPPLESCRIPT_EXEC_ALLOW`, a
-colon-separated list of glob prefixes (for example `scripts/*:bin/ci-*`). A
-command that does not match a grant fails and routes to `after x fails`.
+Dev-profile `exec` is gated by the `use std.script` import plus operator
+configuration — there is no source syntax that grants a command. The worker
+reads `WHIPPLESCRIPT_EXEC_ALLOW`, a colon-separated list of glob prefixes (for
+example `scripts/*:bin/ci-*`). Without the import, or with no allow-list at
+all, the effect blocks at admission (`blocked_by_capability` with
+`security.script_disabled`) before any run; a command that does not match a
+grant in a non-empty list fails and routes to `after x fails`.
 There is no sandbox in the dev profile — a grant is a documented trust
 decision the operator makes deliberately, so keep the allow-list as narrow as
 the workflow needs.
@@ -1626,9 +1629,10 @@ after check fails as failure {
 ```
 
 The validator binary is supplied by the operator and granted through
-`WHIPPLESCRIPT_EXEC_ALLOW` like any dev-profile `exec`; an ungranted or
-malformed validator is a typed effect failure routed to `after check fails`,
-never a silent pass. See `examples/deterministic-validation.whip` for a runnable
+`WHIPPLESCRIPT_EXEC_ALLOW` like any dev-profile `exec` (the program imports
+`std.script`, or the effect blocks at admission); a non-matching or malformed
+validator is a typed effect failure routed to `after check fails`, never a
+silent pass. See `examples/deterministic-validation.whip` for a runnable
 end-to-end workflow. Note that an `exec` failure binding carries the reason at
 `failure.message` (not `failure.reason`, which is the field workflow-invocation
 and `coerce` failures expose).

@@ -23,14 +23,19 @@ run_whip() {
 #     no-`--input` fixture run here cannot start it.
 #   - package-memory: imports the non-`std.` `memory` package, so it needs a
 #     `whip.lock`; covered by the `dev_capability_call_*` / `check_discovers_*` tests.
-#   - exec-json-ingest: runs a raw `exec` that needs `WHIPPLESCRIPT_EXEC_ALLOW`,
-#     which this lock-free fixture run does not grant.
-#   - deterministic-validation: same — its deterministic checker is a raw `exec`
-#     gated on `WHIPPLESCRIPT_EXEC_ALLOW`, ungranted in this fixture run.
 #   - event-bridge: an `@service` workflow whose only rule fires on an external
 #     `deploy.finished` signal (injected with `whip signal`); a no-signal fixture
 #     run records nothing, so its `assert count(...) == 1` cannot hold here.
-SKIP="revision-parent-child revision-validation-approval revision-repair-planner revision-running-cancel revision-ticket-v1 revision-ticket-v2 revision-validation-approval tested-agent-turn coerce-enum subworkflow-tool-consumer package-memory exec-json-ingest deterministic-validation event-bridge"
+SKIP="revision-parent-child revision-validation-approval revision-repair-planner revision-running-cancel revision-ticket-v1 revision-ticket-v2 revision-validation-approval tested-agent-turn coerce-enum subworkflow-tool-consumer package-memory event-bridge"
+
+# Script hard-off Layer 2 (spec/std-script.md): raw `exec` seeds `script.raw`
+# only under dev profile + a non-empty WHIPPLESCRIPT_EXEC_ALLOW, and ungranted
+# exec now BLOCKS at store admission (security.script_disabled) instead of
+# failing — which would strand the failure-branch rules these examples drive.
+# This harness is the operator plane for the fixture runs, so it grants the
+# raw commands the exec-bearing examples use (circuit-breaker's failing probe,
+# the printf-based typed-ingest examples).
+export WHIPPLESCRIPT_EXEC_ALLOW="sh -c *:printf *"
 
 failures=0
 for workflow in "$ROOT"/examples/*.whip; do

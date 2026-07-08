@@ -3330,8 +3330,29 @@ fn do_policy_block<Sql: DoSql>(
         return Ok(None);
     }
     if effect.kind == "exec.command" {
-        let capabilities = explicit_required_capabilities(&effect)?;
-        return do_policy_block_for_capabilities(sql, &effect, &capabilities);
+        // Script hard-off Layer 2 (spec/std-script.md "Hard-off semantics"),
+        // mirroring `policy_block_on`: EVERY exec.command effect requires a
+        // bound `script.*` capability — `script.<name>` for the capability
+        // form (carried from lowering), `script.raw` for the raw form (which
+        // carries none). Derived at the admission gate so a forged effect row
+        // that strips its requirements gains nothing.
+        let mut capabilities = explicit_required_capabilities(&effect)?;
+        if !capabilities
+            .iter()
+            .any(|capability| capability.starts_with("script."))
+        {
+            capabilities.push("script.raw".to_owned());
+        }
+        let block = do_policy_block_for_capabilities(sql, &effect, &capabilities)?;
+        // A script-capability block IS the "scripts are disabled" state:
+        // surface the hard-off diagnostic id with the blocked reason.
+        return Ok(block.map(|block| match block.status {
+            "blocked_by_capability" => PolicyBlock {
+                status: block.status,
+                reason: format!("security.script_disabled: {}", block.reason),
+            },
+            _ => block,
+        }));
     }
     if effect.kind == "capability.call" {
         let mut capabilities = explicit_required_capabilities(&effect)?;

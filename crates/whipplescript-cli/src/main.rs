@@ -3762,6 +3762,39 @@ fn register_script_manifest_capabilities(
     Ok(())
 }
 
+/// Whether the operator granted any raw exec at all: a non-empty
+/// `WHIPPLESCRIPT_EXEC_ALLOW` allowlist (the same source `exec_command_granted`
+/// filters against). Presence is seeding key (b) for `script.raw`
+/// (spec/std-script.md "Raw `exec` demotion"); the per-command glob match stays
+/// the raw handler's convenience filter, not the boundary.
+fn exec_allowlist_present() -> bool {
+    env::var("WHIPPLESCRIPT_EXEC_ALLOW")
+        .map(|allow| allow.split(':').any(|pattern| !pattern.is_empty()))
+        .unwrap_or(false)
+}
+
+/// Seeds the `script.raw` capability row for `program_id` (script hard-off
+/// Layer 2, raw form). Callers must have verified BOTH seeding keys: the
+/// program's IR imports std.script, and the dev-profile allowlist authority
+/// exists. Hosted profiles never seed `script.raw`, so hosted raw exec blocks
+/// at store admission even from forged IR.
+fn register_raw_script_capability(store: &SqliteStore, program_id: &str) -> Result<(), StoreError> {
+    store.register_capability_schema(CapabilitySchemaRegistration {
+        capability: "script.raw",
+        description: "Run raw dev-profile exec commands behind the operator allowlist.",
+        schema_json: "{}",
+        registered_by_package_id: None,
+    })?;
+    store.bind_capability(CapabilityBinding {
+        binding_id: &format!("binding_script_raw_{}", stable_hash_hex(program_id)),
+        program_id: Some(program_id),
+        capability: "script.raw",
+        provider: "builtin-script",
+        config_json: "{}",
+    })?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ExecSurface {
     Raw,
@@ -16619,6 +16652,16 @@ const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
         "std.messaging",
         include_str!("../../../std/manifests/messaging.json"),
     ),
+    // Contracts-only: `exec` is core grammar (never manifest-authored — the
+    // package pipeline forbids `core_effect` lowering), so this manifest
+    // carries the library identity and the `script.raw` capability row shape;
+    // the `script.<name>` family is instantiated from the operator script
+    // manifest at seeding time (spec/std-script.md). Deliberately absent from
+    // the parser build.rs manifest list, which is grammar-only.
+    (
+        "std.script",
+        include_str!("../../../std/manifests/script.json"),
+    ),
 ];
 
 /// Whether `name` claims the reserved `std.*` package namespace. Std packages
@@ -21476,48 +21519,55 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
     report.timers_fired = time_report.timers_fired;
     report.deadlines_expired = time_report.deadlines_expired;
     report.terminal_events.extend(time_report.terminal_events);
+    // Compile the worker's program once (when a path is supplied): the
+    // source-driven admission passes below (clock/file/http sources, local
+    // channel inboxes) and the script hard-off import key (Layer 2,
+    // spec/std-script.md) all read the same IR.
+    let program_ir = options.program_path.as_deref().and_then(|program_path| {
+        fs::read_to_string(program_path)
+            .ok()
+            .and_then(|source_text| {
+                whipplescript_parser::compile_program_with_root(
+                    &source_text,
+                    options.root.as_deref(),
+                )
+                .ir
+            })
+    });
     // Fire due `every <duration>` clock-source occurrences (spec/std-time.md), like
     // timers a worker-boundary clock read. Only when the program declares a clock
     // source, so non-clock workflows pay nothing.
-    if let Some(program_path) = options.program_path.as_deref() {
-        if let Ok(source_text) = fs::read_to_string(program_path) {
-            let compiled = whipplescript_parser::compile_program_with_root(
-                &source_text,
-                options.root.as_deref(),
-            );
-            if let Some(ir) = compiled.ir {
-                if ir.sources.iter().any(|source| source.is_clock) {
-                    report.clock_occurrences_admitted += resolve_due_clock_sources(
-                        store_path,
-                        &options.instance_id,
-                        options.virtual_now.as_deref().unwrap_or("now"),
-                        &ir,
-                    )?;
-                }
-                // Admit new lines from `file` sources (spec/std-time.md). Only
-                // when the program declares one, so other workflows pay nothing.
-                if ir.sources.iter().any(|source| source.is_file) {
-                    report.file_lines_admitted +=
-                        resolve_due_file_sources(store_path, &options.instance_id, &ir)?;
-                }
-                // Admit new elements from `http` sources (GET a JSON array). Only
-                // when the program declares one, so other workflows pay nothing.
-                if ir.sources.iter().any(|source| source.is_http) {
-                    report.http_items_admitted +=
-                        resolve_due_http_sources(store_path, &options.instance_id, &ir)?;
-                }
-                // Admit received messages from `local` channel inboxes
-                // (spec/messaging.md, RECEIVE side). Only when the program
-                // declares a `local` channel, so other workflows pay nothing.
-                if ir
-                    .channels
-                    .iter()
-                    .any(|channel| channel.provider == "local")
-                {
-                    report.inbound_messages_admitted +=
-                        resolve_due_inbound_messages(store_path, &options.instance_id, &ir)?;
-                }
-            }
+    if let Some(ir) = program_ir.as_ref() {
+        if ir.sources.iter().any(|source| source.is_clock) {
+            report.clock_occurrences_admitted += resolve_due_clock_sources(
+                store_path,
+                &options.instance_id,
+                options.virtual_now.as_deref().unwrap_or("now"),
+                ir,
+            )?;
+        }
+        // Admit new lines from `file` sources (spec/std-time.md). Only
+        // when the program declares one, so other workflows pay nothing.
+        if ir.sources.iter().any(|source| source.is_file) {
+            report.file_lines_admitted +=
+                resolve_due_file_sources(store_path, &options.instance_id, ir)?;
+        }
+        // Admit new elements from `http` sources (GET a JSON array). Only
+        // when the program declares one, so other workflows pay nothing.
+        if ir.sources.iter().any(|source| source.is_http) {
+            report.http_items_admitted +=
+                resolve_due_http_sources(store_path, &options.instance_id, ir)?;
+        }
+        // Admit received messages from `local` channel inboxes
+        // (spec/messaging.md, RECEIVE side). Only when the program
+        // declares a `local` channel, so other workflows pay nothing.
+        if ir
+            .channels
+            .iter()
+            .any(|channel| channel.provider == "local")
+        {
+            report.inbound_messages_admitted +=
+                resolve_due_inbound_messages(store_path, &options.instance_id, ir)?;
         }
     }
     let script_manifest = load_script_manifest(options.script_manifest_path.as_deref())
@@ -21526,12 +21576,33 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
     let package_lock =
         load_package_lock(options.package_lock_path.as_deref(), &worker_source_paths)
             .map_err(StoreError::Conflict)?;
-    if let Some(manifest) = script_manifest.as_ref() {
-        let store = SqliteStore::open(store_path)?;
-        let instance = store
-            .get_instance(&options.instance_id)?
-            .ok_or_else(|| StoreError::Conflict("instance not found".to_owned()))?;
-        register_script_manifest_capabilities(&store, manifest, &instance.program_id)?;
+    // Script hard-off Layer 2 (spec/std-script.md "Two layers, both required"):
+    // `script.*` capability rows are seeded ONLY when both keys turn —
+    // (a) the program's IR imports std.script, and (b) the operator-plane
+    // authority exists: a script-manifest entry for `script.<name>`, or dev
+    // profile + a non-empty WHIPPLESCRIPT_EXEC_ALLOW for `script.raw`.
+    // Unseeded, every exec.command effect blocks at the store admission gate
+    // (blocked_by_capability / security.script_disabled) before any provider
+    // run. The import key is forgeable by construction; the operator authority
+    // is not, so forged IR yields at most execution the operator already
+    // authorized.
+    let program_imports_std_script = program_ir
+        .as_ref()
+        .is_some_and(|ir| ir.uses.iter().any(|use_decl| use_decl.name == "std.script"));
+    if program_imports_std_script {
+        let raw_exec_authority = !options.exec_profile.is_hosted() && exec_allowlist_present();
+        if script_manifest.is_some() || raw_exec_authority {
+            let store = SqliteStore::open(store_path)?;
+            let instance = store
+                .get_instance(&options.instance_id)?
+                .ok_or_else(|| StoreError::Conflict("instance not found".to_owned()))?;
+            if let Some(manifest) = script_manifest.as_ref() {
+                register_script_manifest_capabilities(&store, manifest, &instance.program_id)?;
+            }
+            if raw_exec_authority {
+                register_raw_script_capability(&store, &instance.program_id)?;
+            }
+        }
     }
     {
         let store = SqliteStore::open(store_path)?;
@@ -21685,6 +21756,18 @@ fn run_claimable_effect(
         // so a non-capacity block reaching here is a real error worth surfacing).
         Err(StoreError::CapacityBlocked { .. }) => Ok(None),
         Err(StoreError::PolicyBlocked { reason, .. }) if reason.contains("capacity exhausted") => {
+            Ok(None)
+        }
+        // Script hard-off Layer 2 (spec/std-script.md): an exec.command effect
+        // with no bound `script.*` capability blocks at admission —
+        // `start_run` has already recorded the block (blocked_by_capability,
+        // reason prefixed `security.script_disabled`) and no run row or spawn
+        // happened. Blocking is the fail-closed design state, not a worker
+        // error: the effect stays durable and visible (`whip effects` carries
+        // the reason), like every other blocked_by_capability effect.
+        Err(StoreError::PolicyBlocked { reason, .. })
+            if reason.contains("security.script_disabled") =>
+        {
             Ok(None)
         }
         Err(other) => Err(other),
@@ -33067,8 +33150,8 @@ fn compile_source_path_for_validation(
     let mut blocking = lint_workflow_liveness(&ir);
     // Script hard-off (M5 import ladder, Layer 1): `exec` is a check error unless
     // the program imports `std.script`. This is the author-facing consent surface;
-    // the load-bearing runtime backstop (import-conditional capability seeding) is
-    // Layer 2, which lands with the embedded-manifest seeding infrastructure (S6d).
+    // the load-bearing runtime backstop is Layer 2 (S6d-6): import-conditional
+    // two-key capability seeding + the store admission gate (`policy_block_on`).
     blocking.extend(check_script_hard_off(&ir));
     if !blocking.is_empty() {
         // Workflow-level diagnostics (span 0 for liveness) render against the root
@@ -33088,7 +33171,8 @@ fn compile_source_path_for_validation(
 /// `IrEffectKind::ExecCommand` — is a check error with id `security.script_disabled`
 /// unless the program contains `use std.script`. The import is the author-facing
 /// declaration that script execution is intended; without it, scripts are truly
-/// off. (Layer 2, the anti-forged-IR runtime backstop, is deferred to S6d.)
+/// off. (Layer 2, the anti-forged-IR runtime backstop, is the two-key seeding in
+/// `run_worker_once` + the `script.*` requirement at the store admission gate.)
 fn check_script_hard_off(ir: &IrProgram) -> Vec<Diagnostic> {
     if ir.uses.iter().any(|use_decl| use_decl.name == "std.script") {
         return Vec::new();

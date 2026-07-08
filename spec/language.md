@@ -1611,8 +1611,11 @@ and the inbox presents exactly those choices.
 ### `exec`
 
 Dev profile: `exec "<command>" as x` creates an `exec.command` effect gated by
-operator config (`WHIPPLESCRIPT_EXEC_ALLOW`). This is a laptop-loop convenience,
-not a security boundary.
+`use std.script` plus operator config (`WHIPPLESCRIPT_EXEC_ALLOW`): the two
+keys seed the `script.raw` capability the effect requires at store admission
+(hard-off Layer 2, [`std-script.md`](std-script.md)); with either missing the
+effect blocks as `security.script_disabled`. The per-command glob match is a
+laptop-loop convenience, not a security boundary.
 
 Hosted profile: `exec <capability> with <record> -> Type as x` creates an
 `exec.command` effect requiring `script.<capability>`. The operator manifest
