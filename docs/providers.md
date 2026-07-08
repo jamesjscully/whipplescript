@@ -351,7 +351,7 @@ package/library/provider: packages expose explicit effects; they never add
 hidden control flow or new grammar.
 
 ```whip
-use memory
+use std.memory
 
 rule fetch_context
   when WorkItem as item where item.status == "queued"
@@ -369,11 +369,14 @@ requires the package capability (`memory.query` in the example). When the
 locked package contract declares `validation: runtime_boundary`, provider
 output is checked against `output_schema` before `capability.call.succeeded` is
 derived; mismatches fail the effect instead of becoming workflow facts.
-Validate and pin package manifests before use:
+Standard-library packages such as `std.memory` ship embedded in the platform:
+the `use` import is all a workflow needs. Third-party packages must be
+validated and pinned before use (a lock may never claim a `std.*` name — the
+embedded manifest always wins):
 
 ```sh
-whip package check examples/packages/memory.json
-whip package lock --output whip.lock examples/packages/memory.json
+whip package check examples/packages/notes.json
+whip package lock --output whip.lock examples/packages/notes.json
 whip dev workflow.whip --package-lock whip.lock
 ```
 

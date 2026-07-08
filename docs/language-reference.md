@@ -15,7 +15,7 @@ assertions, patterns, events, coordination resources, harnesses, and imports.
 include "shared/review.whip"
 include "review.coerce"
 
-use memory
+use std.memory
 
 workflow Example
 
@@ -488,7 +488,7 @@ Semantics:
 ```whip
 include "schemas/common.whip"   // contributes declarations to the bundle
 include "review.coerce"           // makes coerce classes/functions available to coerce
-use memory                      // imports a package/library by name
+use std.memory                  // imports a package/library by name
 ```
 
 Packages register libraries, capabilities, providers, schemas, and optional

@@ -71,7 +71,7 @@ declare -A EXPECTED_NO_SOLUTION=(
   ["flow-namespace.maude"]=2
   ["flow-liveness.maude"]=2
   ["flow-autofail.maude"]=3
-  ["std-construct-authorization.maude"]=2
+  ["std-construct-authorization.maude"]=4
   ["turn-access-grant.maude"]=2
   ["admission.maude"]=8
   ["clock-source.maude"]=4
@@ -147,7 +147,7 @@ declare -A EXPECTED_SOLUTION=(
   ["flow-namespace.maude"]=2
   ["flow-liveness.maude"]=2
   ["flow-autofail.maude"]=3
-  ["std-construct-authorization.maude"]=2
+  ["std-construct-authorization.maude"]=3
   ["turn-access-grant.maude"]=2
   ["admission.maude"]=6
   ["clock-source.maude"]=5
@@ -380,13 +380,19 @@ PY
 echo "== generated Maude from check-report construct graph"
 (
   cd "$ROOT"
-  # Portable locks record source.path relative to the lock directory, so the
-  # manifest must live under that directory. Co-locate a copy beside the lock.
-  cp examples/packages/memory.json "$TMP_DIR/memory.json"
+  # Lock flow (third-party supply chain): std packages ship embedded and can
+  # never be lock-provided, so lock mechanics are exercised via the vendor
+  # `notes` package. Portable locks record source.path relative to the lock
+  # directory, so the manifest must live under that directory.
+  cp examples/packages/notes.json "$TMP_DIR/notes.json"
   cargo run --quiet -p whipplescript -- package lock --output "$TMP_DIR/package-lock.json" \
-    "$TMP_DIR/memory.json" >/dev/null
-  cargo run --quiet -p whipplescript -- --json check \
+    "$TMP_DIR/notes.json" >/dev/null
+  cargo run --quiet -p whipplescript -- check \
     --package-lock "$TMP_DIR/package-lock.json" \
+    examples/package-notes.whip >/dev/null
+  # The construct-graph source itself: package-memory.whip resolves its
+  # `std.memory` import from the embedded manifest — no lock needed.
+  cargo run --quiet -p whipplescript -- --json check \
     examples/package-memory.whip \
     > "$TMP_DIR/generated-construct-graph-check.json"
   python3 - "$TMP_DIR/generated-construct-graph-check.json" > "$TMP_DIR/generated-construct-graph-expected.txt" <<'PY'
@@ -2187,7 +2193,6 @@ echo "== generated Maude from compile-report artifacts"
 (
   cd "$ROOT"
   cargo run --quiet -p whipplescript -- --json compile \
-    --package-lock "$TMP_DIR/package-lock.json" \
     examples/package-memory.whip \
     > "$TMP_DIR/generated-compile-report.json"
   python3 - "$TMP_DIR/generated-compile-report.json" > "$TMP_DIR/generated-compile-construct-graph-expected.txt" <<'PY'
@@ -2461,7 +2466,6 @@ echo "== whip check --model-search includes generated artifact obligations"
 (
   cd "$ROOT"
   cargo run --quiet -p whipplescript -- --json check --model-search \
-    --package-lock "$TMP_DIR/package-lock.json" \
     examples/package-memory.whip \
     > "$TMP_DIR/generated-model-search-check.json"
 )
@@ -2605,7 +2609,6 @@ echo "== whip compile --model-search includes generated artifact obligations"
 (
   cd "$ROOT"
   cargo run --quiet -p whipplescript -- --json compile --model-search \
-    --package-lock "$TMP_DIR/package-lock.json" \
     examples/package-memory.whip \
     > "$TMP_DIR/generated-model-search-compile.json"
 )

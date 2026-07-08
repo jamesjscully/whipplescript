@@ -17,23 +17,29 @@ PY
 TMP_DIR="$(mktemp -d)"
 # A lock records its package `source.path` relative to the lock file's own
 # directory (and a portable lock forbids `..`), so the lock must live at the
-# project root for `examples/packages/memory.json` to resolve. Keep it at the root
+# project root for `examples/packages/notes.json` to resolve. Keep it at the root
 # (not in $TMP_DIR) and clean it up with the temp dir.
 LOCK_PATH="$ROOT/.artifact-differential-package-lock.json"
 trap 'rm -rf "$TMP_DIR" "$LOCK_PATH"' EXIT
 
 cargo run --quiet -p whipplescript -- package catalog \
   > "$TMP_DIR/platform-construct-catalog.json"
+# Lock mechanics run against the vendor `notes` package: std packages ship
+# embedded and can never be lock-provided.
 cargo run --quiet -p whipplescript -- package lock \
   --output "$LOCK_PATH" \
-  examples/packages/memory.json \
+  examples/packages/notes.json \
   >/dev/null
-cargo run --quiet -p whipplescript -- --json check \
+cargo run --quiet -p whipplescript -- check \
   --package-lock "$LOCK_PATH" \
+  examples/package-notes.whip >/dev/null
+# The mutated artifacts come from package-memory.whip, whose `std.memory`
+# import resolves from the embedded manifest — no lock needed (and its package
+# constructs keep the package-registry mutators meaningful).
+cargo run --quiet -p whipplescript -- --json check \
   examples/package-memory.whip \
   > "$TMP_DIR/package-memory-check.json"
 cargo run --quiet -p whipplescript -- --json compile \
-  --package-lock "$LOCK_PATH" \
   examples/package-memory.whip \
   > "$TMP_DIR/package-memory-compile.json"
 cargo run --quiet -p whipplescript -- verify-report --emit construct-graph \

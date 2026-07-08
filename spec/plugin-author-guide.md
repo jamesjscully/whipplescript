@@ -12,7 +12,9 @@ package is rejected until the platform contract changes.
 
 ## Manifest Shape
 
-See `examples/packages/memory.json` for the checked first-class package shape.
+See `examples/packages/notes.json` (third-party) and
+`examples/packages/memory.json` (the embedded `std.memory` seed) for the
+checked first-class package shape.
 
 Top-level fields:
 
@@ -38,9 +40,13 @@ Validate and pin a package manifest before using it. For one-off development,
 the low-level commands are:
 
 ```sh
-whip package check examples/packages/memory.json
-whip package lock --output whip.lock examples/packages/memory.json
+whip package check examples/packages/notes.json
+whip package lock --output whip.lock examples/packages/notes.json
 ```
+
+`package lock` and `package sync` refuse a manifest whose name claims the
+reserved `std.*` namespace: std packages ship embedded in the platform and
+cannot be provided by a package lock.
 
 For project use, the target workflow is a package set plus sync:
 
@@ -49,8 +55,8 @@ For project use, the target workflow is a package set plus sync:
   "schema": "whipplescript.package_set.v0",
   "packages": [
     {
-      "name": "memory",
-      "source": {"type": "path", "path": "examples/packages/memory.json"}
+      "name": "notes",
+      "source": {"type": "path", "path": "examples/packages/notes.json"}
     }
   ]
 }
@@ -68,8 +74,10 @@ whip dev workflow.whip
 ```
 
 The lock records each manifest source, package id, package name/version, and
-exact manifest SHA-256. A workflow that imports `use memory` resolves to the
-locked `memory` package. Runtime commands load the locked manifest into the
+exact manifest SHA-256. A workflow that imports `use notes` resolves to the
+locked `notes` package. (The reserved `std.*` namespace is the exception: std
+packages ship embedded in the platform, and a lock claiming a `std.*` name
+fails to load.) Runtime commands load the locked manifest into the
 store before provider policy checks. See
 [`package-management.md`](package-management.md) for the project package-set and
 lock discovery contract.

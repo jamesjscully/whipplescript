@@ -1,0 +1,47 @@
+# Demonstrates the external-package lock flow: `notes` is a third-party package,
+# so checking/running this workflow needs a `whip.lock` built from
+# examples/packages/notes.json (`whip package lock`). Contrast with
+# examples/package-memory.whip, whose `std.memory` import ships embedded in the
+# platform and needs no lock.
+@service
+description "Recall notes context before agent work via a locked vendor package"
+workflow PackageNotes
+
+use notes
+
+tracker backlog {
+  provider builtin
+}
+
+agent worker {
+  provider codex
+  profile "repo-writer"
+  capacity 1
+}
+
+rule recall_before_work
+  when backlog has ready issue as issue
+  when worker is available
+=> {
+  claim issue as active_claim
+
+  after active_claim succeeds {
+    call notes.query for issue as context
+  }
+
+  after context succeeds as recalled {
+    tell worker as turn """markdown
+    Use the recalled notes explicitly while working:
+
+    {{ issue.title }}
+
+    {{ recalled.count }} notes are on file.
+    """
+  }
+
+  after turn succeeds as outcome {
+    finish issue {
+      summary outcome.summary
+    }
+  }
+}

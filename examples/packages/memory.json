@@ -1,11 +1,11 @@
 {
   "schema": "whipplescript.package_manifest.v0",
-  "package_id": "package-memory",
-  "name": "memory",
+  "package_id": "std.memory",
+  "name": "std.memory",
   "version": "0.1.0",
   "libraries": [
     {
-      "id": "memory",
+      "id": "std.memory",
       "version": "0.1.0",
       "effect_contracts": [
         {

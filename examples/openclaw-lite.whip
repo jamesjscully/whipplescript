@@ -1,11 +1,12 @@
 @service
 workflow OpenClawLite
 
-# `use memory` pulls in the external `memory` package (capabilities
-# `memory.query`/`memory.write`), so this workflow requires a `whip.lock`. The
-# planner recalls prior context before planning and saves the new plan after, so
-# successive runs build on what came before instead of starting cold.
-use memory
+# `use std.memory` pulls in the embedded `std.memory` package (capabilities
+# `memory.query`/`memory.write`); std packages ship compiled into the platform,
+# so only the import is needed — no `whip.lock`. The planner recalls prior
+# context before planning and saves the new plan after, so successive runs build
+# on what came before instead of starting cold.
+use std.memory
 
 class Heartbeat {
   job string

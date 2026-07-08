@@ -136,11 +136,12 @@ verification summaries
 Source files historically imported plugin-like surfaces with the short form:
 
 ```whip
-use memory
+use notes
 ```
 
-Under the package/library split, `use memory` resolves source library surface
-through the package lock. Runtime commands then register the locked package
+Under the package/library split, `use notes` resolves source library surface
+through the package lock (embedded `std.*` packages resolve from the platform
+binary instead; a lock may never claim a `std.*` name). Runtime commands then register the locked package
 manifest into the runtime provider registry before provider policy checks.
 `use` is not how agent skills are attached and does not grant runtime authority
 by itself.

@@ -99,22 +99,23 @@ PLATFORM_CATALOG_PATH="$TMP_DIR/platform-construct-catalog.json"
 cargo run --quiet -p whipplescript -- package catalog \
   > "$PLATFORM_CATALOG_PATH"
 unset WHIPPLESCRIPT_PLATFORM_CATALOG_PATH
-# Portable locks record source.path relative to the lock directory, so the
-# manifest must live under that directory. Co-locate a copy beside the lock.
-cp examples/packages/memory.json "$TMP_DIR/memory.json"
+# Lock mechanics run against the vendor `notes` package: std packages (e.g.
+# `std.memory`) ship embedded and can never be lock-provided. Portable locks
+# record source.path relative to the lock directory, so the manifest must live
+# under that directory.
+cp examples/packages/notes.json "$TMP_DIR/notes.json"
 cargo run --quiet -p whipplescript -- package lock --output "$TMP_DIR/package-lock.json" \
-  "$TMP_DIR/memory.json"
+  "$TMP_DIR/notes.json"
+# package-memory.whip resolves `std.memory` from the embedded manifest — no lock.
 cargo run --quiet -p whipplescript -- --json check \
-  --package-lock "$TMP_DIR/package-lock.json" \
   examples/package-memory.whip \
   > "$TMP_DIR/package-memory-check.json"
 cargo run --quiet -p whipplescript -- --json check \
-  --package-lock "$TMP_DIR/package-lock.json" \
   --model-search \
   examples/package-memory.whip \
   > "$TMP_DIR/package-memory-check-model-search.json"
 cargo run --quiet -p whipplescript -- package lock \
-  examples/packages/memory.json \
+  examples/packages/notes.json \
   > "$TMP_DIR/package-lock-stdout.json"
 
 # `whip test` report: validate the committed golden example (which exercises the
@@ -4307,7 +4308,6 @@ grep -q 'platform_construct_catalog must match verifier platform catalog' \
   "$TMP_DIR/compile-verified-artifacts-stale-verifier-catalog-lowered.err"
 WHIPPLESCRIPT_PLATFORM_CATALOG_PATH="$TMP_DIR/stale-platform-construct-catalog.json" \
   cargo run --quiet -p whipplescript -- --json check \
-  --package-lock "$TMP_DIR/package-lock.json" \
   --model-search \
   examples/package-memory.whip \
   > "$TMP_DIR/package-memory-check-model-search-stale-inherited-catalog.json"

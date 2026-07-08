@@ -49,7 +49,7 @@ commands are verified by `scripts/check-docs-examples.sh`.
 
 | Example | Check command | Why it exists |
 | --- | --- | --- |
-| [`openclaw-lite.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/openclaw-lite.whip) | `whip check examples/openclaw-lite.whip --package-lock examples/openclaw-lite.lock.json` | Scheduled operations composition: heartbeat, `memory.query` recall before the planning turn, queue filing, `memory.write` save, human review. Imports the external `memory` package, so it needs the committed `whip.lock`. |
+| [`openclaw-lite.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/openclaw-lite.whip) | `whip check examples/openclaw-lite.whip` | Scheduled operations composition: heartbeat, `memory.query` recall before the planning turn, queue filing, `memory.write` save, human review. Imports the embedded `std.memory` package — no lock needed. |
 | [`autoresearch-lite.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/autoresearch-lite.whip) | `whip check examples/autoresearch-lite.whip` | Objective research loop: budgeted experiment, typed metric ingestion, keep/stop decision. |
 | [`gastown-lite.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/gastown-lite.whip) | `whip check examples/gastown-lite.whip` | Coding-agent coordination: queue filing, workspace lease, agent work, typed review, ledger record. |
 
@@ -88,11 +88,10 @@ whip --store .whipplescript/examples.sqlite \
 Useful variations:
 
 ```sh
-# stream progress as NDJSON (openclaw-lite uses the `memory` package, so pass its lock)
+# stream progress as NDJSON (openclaw-lite imports the embedded `std.memory` package — no lock needed)
 whip --store .whipplescript/examples.sqlite \
   dev examples/openclaw-lite.whip \
-  --provider fixture --until idle --stream ndjson \
-  --package-lock examples/openclaw-lite.lock.json
+  --provider fixture --until idle --stream ndjson
 
 # run an acceptance fixture end to end
 whip --store .whipplescript/accept.sqlite --json \

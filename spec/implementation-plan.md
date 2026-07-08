@@ -2648,7 +2648,7 @@ attachment strategy is a design decision to settle before implementing.
   line, with no field on that line). (Separately uncovered + noted: a narrow latent
   `use "dotted.name"` quote-drop in `format_item`, fully contained by the
   idempotency self-check — fmt refuses, never corrupts — and dormant since the
-  documented form is bare `use memory`.) **`whip lint` v0 shipped (2026-06-18):**
+  documented form is bare `use std.memory`.) **`whip lint` v0 shipped (2026-06-18):**
   `whip [--json] lint [--root <wf>] <file>` over `compile_source_path_with_root` —
   reports compile errors (a superset of `check`) and static-analysis warnings.
   Analyses (all flag declared-but-unreferenced constructs that are only usable

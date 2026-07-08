@@ -155,10 +155,10 @@ class before they can appear in a manifest.
   "schema": "whipplescript.package_lock.v0",
   "packages": [
     {
-      "package_id": "package-memory",
-      "name": "memory",
+      "package_id": "package-notes",
+      "name": "notes",
       "version": "0.1.0",
-      "manifest_path": "/abs/path/examples/packages/memory.json",
+      "source": {"type": "path", "path": "examples/packages/notes.json"},
       "manifest_sha256": "..."
     }
   ]
@@ -168,7 +168,9 @@ class before they can appear in a manifest.
 `check`, `compile`, `run`, `dev`, and `worker` reject a lock entry when the
 manifest name, version, package id, or SHA-256 no longer matches. A lock may not
 contain duplicate package ids or package names; source imports resolve through
-package name, so each locked package name is unique.
+package name, so each locked package name is unique. A lock entry may never
+claim the reserved `std.*` namespace: std packages (for example `std.memory`)
+ship embedded in the platform and cannot be provided by a package lock.
 
 ### Trace Report
 

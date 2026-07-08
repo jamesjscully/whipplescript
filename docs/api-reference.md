@@ -123,9 +123,11 @@ from the current directory upward. A project with a `whip.lock` at its root
 therefore needs no explicit path even when run from elsewhere. If several source
 files on one command line resolve to different locks, the command fails and asks
 for `--package-lock`. If no lock is given and none is discovered, any non-`std.`
-package import (for example `use memory`) or package construct use (for example
-`recall`) fails with a diagnostic that names the blockers and suggests
-`whip package sync`; pure `std.` programs are unaffected.
+package import (for example `use notes`) or third-party package construct use
+fails with a diagnostic that names the blockers and suggests
+`whip package sync`; pure `std.` programs are unaffected. A lock entry may
+never claim the reserved `std.*` namespace — std packages ship embedded in the
+platform, so loading such a lock is an error.
 Each locked manifest is pinned by a SHA-256 recomputed over the manifest bytes at
 load time, so editing a manifest after locking fails lock load with the stable
 `package_lock` error kind (in `--json` output); re-run `package lock` or
@@ -157,7 +159,7 @@ With `--exec-profile hosted`, raw `exec "..."` is a check error and named
 `exec <capability> with <record>` forms must resolve in the supplied script
 manifest.
 
-With `--package-lock`, imported package libraries such as `use memory` resolve
+With `--package-lock`, imported package libraries such as `use notes` resolve
 against the pinned package manifest and appear in `contract_registry`.
 
 JSON output is an array with one report per input path. Successful entries
@@ -932,7 +934,7 @@ This section is a compact index of source constructs.
 | Workflow | `workflow Name { ... }` or `workflow Name` | Deployable runtime boundary. |
 | Contract | `input name Type`, `output name Type`, `failure name Type` | Typed workflow input/output/failure contract. |
 | Include | `include "path.whip"` | Source bundle composition. |
-| Package/library import | `use memory` | Import package library surface by name. |
+| Package/library import | `use std.memory` | Import package library surface by name. |
 | Class | `class Name { field Type }` | Typed fact and payload schema. |
 | Enum | `enum Name { A B }` | Finite string domain. |
 | Signal | `signal deploy.finished { field Type }` | Typed external signal ingress schema. |

@@ -351,7 +351,7 @@ orchestration into shell.
 | --- | --- |
 | Split declarations across files | `include "schemas/common.whip"` |
 | Bring in coerce classes/functions | `include "review.coerce"` |
-| Import package/library surface | `use memory` |
+| Import package/library surface | `use std.memory` |
 | Reuse a rule/effect fragment at compile time | `pattern` + `apply` |
 | Sequence fixed steps with shared bindings | `flow` |
 | Pull work from a durable backlog | `queue` + `claim` |

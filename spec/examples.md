@@ -389,7 +389,7 @@ registries with package/provider capabilities:
 ```whipplescript
 workflow OpenClawLite
 
-use memory
+use std.memory
 
 class OpenClawCronTick {
   job string

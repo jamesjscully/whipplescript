@@ -4819,10 +4819,8 @@ fn dev_openclaw_lite_observes_heartbeat_and_files_work() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let example = example_path("openclaw-lite.whip");
-    // openclaw-lite imports the external `memory` package, so check/dev require
-    // the committed lock (its `source.path` resolves `packages/memory.json`
-    // relative to the lock's directory, `examples/`).
-    let lock = example_path("openclaw-lite.lock.json");
+    // openclaw-lite imports `std.memory`, which ships as an embedded std
+    // manifest — no lock is needed.
     let dev = run_json(
         bin,
         &[
@@ -4835,8 +4833,6 @@ fn dev_openclaw_lite_observes_heartbeat_and_files_work() {
             "fixture",
             "--until",
             "idle",
-            "--package-lock",
-            lock.to_str().expect("utf-8 lock path"),
         ],
     );
     let instance_id = dev
@@ -7527,13 +7523,12 @@ fn dev_capability_call_fixture_releases_agent_turn_dependency() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let workflow_path = temp_workflow_path("capability-call");
-    let lock_path = temp_workflow_path("capability-call-lock").with_extension("json");
     fs::write(
         &workflow_path,
         r#"
 workflow CapabilityCall
 
-use memory
+use std.memory
 
 class WorkItem {
   title string
@@ -7568,23 +7563,7 @@ rule recall_before_work
 "#,
     )
     .expect("workflow writes");
-    let memory_manifest =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
-    // Portable locks record `source.path` relative to the lock directory, so the
-    // manifest must live under that directory. Co-locate a copy next to the lock.
-    let manifest_copy = temp_workflow_path("capability-call-manifest").with_extension("json");
-    fs::copy(&memory_manifest, &manifest_copy).expect("copy manifest beside lock");
-    run_text(
-        bin,
-        &[
-            "package",
-            "lock",
-            "--output",
-            lock_path.to_str().expect("utf-8 lock path"),
-            manifest_copy.to_str().expect("utf-8 manifest path"),
-        ],
-    );
-
+    // `std.memory` ships embedded — no lock, no `--package-lock`.
     let dev = run_json(
         bin,
         &[
@@ -7597,8 +7576,6 @@ rule recall_before_work
             "fixture",
             "--until",
             "idle",
-            "--package-lock",
-            lock_path.to_str().expect("utf-8 lock path"),
         ],
     );
     let workers = dev
@@ -7639,7 +7616,6 @@ rule recall_before_work
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(workflow_path);
-    let _ = fs::remove_file(lock_path);
 }
 
 /// `learn ... into <pool>` then `recall <pool> ...` round-trips through the
@@ -7655,22 +7631,8 @@ fn memory_roundtrip_recalls_the_learned_item() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/memory-roundtrip.whip");
     let workflow_path = dir.join("wf.whip");
     fs::copy(&workflow_src, &workflow_path).expect("copy roundtrip example");
-    let memory_manifest =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
-    let manifest_copy = dir.join("memory.json");
-    fs::copy(&memory_manifest, &manifest_copy).expect("copy manifest beside lock");
-    let lock_path = dir.join("whip.lock");
-    run_text(
-        bin,
-        &[
-            "package",
-            "lock",
-            "--output",
-            lock_path.to_str().expect("utf-8 lock"),
-            manifest_copy.to_str().expect("utf-8 manifest"),
-        ],
-    );
 
+    // `std.memory` ships embedded, so the round-trip runs with no lock at all.
     let dev = run_json(
         bin,
         &[
@@ -7683,8 +7645,6 @@ fn memory_roundtrip_recalls_the_learned_item() {
             "fixture",
             "--until",
             "idle",
-            "--package-lock",
-            lock_path.to_str().expect("utf-8 lock"),
         ],
     );
     let instance_id = dev
@@ -7752,7 +7712,7 @@ fn memory_roundtrip_recalls_the_learned_item() {
 }
 
 /// M5 embedded-manifest payoff: the same `learn`/`recall` round-trip runs with NO
-/// `--package-lock` and no `whip.lock` anywhere. `memory` ships compiled into the
+/// `--package-lock` and no `whip.lock` anywhere. `std.memory` ships compiled into the
 /// binary, so `check` passes and `dev` executes the real file-backed provider —
 /// the recalled `MemoryContext` still carries the learned item. This is the proof
 /// that the embedded manifest removes the lock requirement for a real package.
@@ -7766,15 +7726,15 @@ fn memory_roundtrip_without_a_lock_uses_the_embedded_manifest() {
     let workflow_path = dir.join("wf.whip");
     fs::copy(&workflow_src, &workflow_path).expect("copy roundtrip example");
 
-    // `check` resolves `use memory` + the `recall`/`learn` constructs from the
-    // embedded manifest — no lock present, no `--package-lock` flag.
+    // `check` resolves `use std.memory` + the `recall`/`learn` constructs from
+    // the embedded manifest — no lock present, no `--package-lock` flag.
     let checked = Command::new(bin)
         .args(["check", workflow_path.to_str().expect("utf-8 workflow")])
         .output()
         .expect("check runs");
     assert!(
         checked.status.success(),
-        "check must pass with no lock via the embedded `memory` manifest\nstdout:\n{}\nstderr:\n{}",
+        "check must pass with no lock via the embedded `std.memory` manifest\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&checked.stdout),
         String::from_utf8_lossy(&checked.stderr)
     );
@@ -7864,7 +7824,7 @@ fn memory_pool_declaration_demo_checks_and_recalls() {
     let workflow_path = dir.join("wf.whip");
     fs::copy(&workflow_src, &workflow_path).expect("copy memory-pool demo");
 
-    // `check` resolves `use memory` from the embedded manifest (no lock) and
+    // `check` resolves `use std.memory` from the embedded manifest (no lock) and
     // renders the declared pool + its context limit in the `.ir` snapshot.
     let checked = Command::new(bin)
         .args(["check", workflow_path.to_str().expect("utf-8 workflow")])
@@ -7962,15 +7922,15 @@ fn memory_curate_dedupes_the_pool_without_a_lock() {
     let workflow_path = dir.join("wf.whip");
     fs::copy(&workflow_src, &workflow_path).expect("copy curate example");
 
-    // `check` resolves `use memory` + the `learn`/`curate`/`recall` constructs from
-    // the embedded manifest — no lock present, no `--package-lock` flag.
+    // `check` resolves `use std.memory` + the `learn`/`curate`/`recall` constructs
+    // from the embedded manifest — no lock present, no `--package-lock` flag.
     let checked = Command::new(bin)
         .args(["check", workflow_path.to_str().expect("utf-8 workflow")])
         .output()
         .expect("check runs");
     assert!(
         checked.status.success(),
-        "check must pass with no lock via the embedded `memory` manifest\nstdout:\n{}\nstderr:\n{}",
+        "check must pass with no lock via the embedded `std.memory` manifest\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&checked.stdout),
         String::from_utf8_lossy(&checked.stderr)
     );
@@ -8093,17 +8053,19 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// Write a `recall`-using `@service` workflow plus a co-located portable
+/// Write a `notes`-using `@service` workflow plus a co-located portable
 /// `whip.lock` (and its manifest copy) into `dir`, returning the workflow path.
-fn write_locked_recall_project(bin: &str, dir: &Path) -> PathBuf {
+/// The `notes` vendor package resolves only through the lock, so these projects
+/// exercise real lock discovery/mechanics.
+fn write_locked_notes_project(bin: &str, dir: &Path) -> PathBuf {
     let workflow_path = dir.join("wf.whip");
     fs::write(
         &workflow_path,
         r#"
 @service
-workflow Recall
+workflow Notes
 
-use memory
+use notes
 
 class WorkItem {
   title string
@@ -8119,7 +8081,7 @@ rule recall_before_work
   when WorkItem as item
   when worker is available
 => {
-  recall project_memory for item as context
+  call notes.query for item as context
 
   after context succeeds {
     tell worker "{{ item.title }}"
@@ -8128,10 +8090,10 @@ rule recall_before_work
 "#,
     )
     .expect("workflow writes");
-    let memory_manifest =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
-    let manifest_copy = dir.join("memory.json");
-    fs::copy(&memory_manifest, &manifest_copy).expect("copy manifest beside lock");
+    let notes_manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
+    let manifest_copy = dir.join("notes.json");
+    fs::copy(&notes_manifest, &manifest_copy).expect("copy manifest beside lock");
     run_text(
         bin,
         &[
@@ -11901,7 +11863,7 @@ fn check_discovers_lock_relative_to_workflow_file() {
     // the workflow file's directory, not just the cwd.
     let neutral_cwd = unique_temp_dir("lock-relative-cwd");
     let project_dir = unique_temp_dir("lock-relative-project");
-    let workflow_path = write_locked_recall_project(bin, &project_dir);
+    let workflow_path = write_locked_notes_project(bin, &project_dir);
 
     let output = Command::new(bin)
         .current_dir(&neutral_cwd)
@@ -11926,7 +11888,7 @@ fn check_lock_away_from_project_root_gives_actionable_hint() {
     // should say so, not just "file not found".
     let bin = env!("CARGO_BIN_EXE_whip");
     let project = unique_temp_dir("lock-hint-project");
-    let workflow = write_locked_recall_project(bin, &project);
+    let workflow = write_locked_notes_project(bin, &project);
     // Copy the generated lock into a sibling dir where `source.path` won't resolve.
     let elsewhere = unique_temp_dir("lock-hint-elsewhere");
     let misplaced = elsewhere.join("whip.lock");
@@ -11961,8 +11923,8 @@ fn check_rejects_sources_implying_different_locks() {
     let neutral_cwd = unique_temp_dir("lock-conflict-cwd");
     let project_a = unique_temp_dir("lock-conflict-a");
     let project_b = unique_temp_dir("lock-conflict-b");
-    let workflow_a = write_locked_recall_project(bin, &project_a);
-    let workflow_b = write_locked_recall_project(bin, &project_b);
+    let workflow_a = write_locked_notes_project(bin, &project_a);
+    let workflow_b = write_locked_notes_project(bin, &project_b);
 
     let output = Command::new(bin)
         .current_dir(&neutral_cwd)
@@ -12010,7 +11972,7 @@ fn check_resolves_embedded_memory_then_coexists_with_discovered_lock() {
 @service
 workflow LockDiscovery
 
-use memory
+use std.memory
 
 class WorkItem {
   title string
@@ -12046,10 +12008,10 @@ rule recall_before_work
     )
     .expect("workflow writes");
 
-    // No `whip.lock` at all: `memory` now ships as an embedded std manifest (M5),
-    // so `use memory` + `recall` resolves from the binary itself — check passes
-    // with no supply chain. (The no-lock guard for genuinely non-embedded packages
-    // is covered by `package_lock_supplies_package_import_registry`.)
+    // No `whip.lock` at all: `memory` ships as the embedded `std.memory` manifest
+    // (M5), so `use std.memory` + `recall` resolves from the binary itself — check
+    // passes with no supply chain. (The no-lock guard for genuinely non-embedded
+    // packages is covered by `package_lock_supplies_package_import_registry`.)
     let absent = Command::new(bin)
         .current_dir(&project_dir)
         .args(["check", "wf.whip"])
@@ -12064,12 +12026,14 @@ rule recall_before_work
 
     // Place a portable `whip.lock` (with its manifest co-located) in the project
     // directory and re-run check WITHOUT `--package-lock`; discovery walks up from
-    // the cwd and finds the lock. The lock and the embedded manifest must coexist
-    // (the lock wins; no duplicate-registration conflict).
-    let memory_manifest =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
-    let manifest_copy = project_dir.join("memory.json");
-    fs::copy(&memory_manifest, &manifest_copy).expect("copy manifest beside lock");
+    // the cwd and finds the lock. A lock can never claim a `std.*` name, so it
+    // supplies the unrelated `notes` package — the discovered lock and the
+    // embedded `std.memory` manifest must coexist (no duplicate-registration
+    // conflict).
+    let notes_manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
+    let manifest_copy = project_dir.join("notes.json");
+    fs::copy(&notes_manifest, &manifest_copy).expect("copy manifest beside lock");
     run_text(
         bin,
         &[
@@ -12116,7 +12080,7 @@ fn tampered_manifest_fails_lock_load_with_stable_kind() {
 @service
 workflow Tamper
 
-use memory
+use notes
 
 class WorkItem {
   title string
@@ -12132,7 +12096,7 @@ rule recall_before_work
   when WorkItem as item
   when worker is available
 => {
-  recall project_memory for item as context
+  call notes.query for item as context
 
   after context succeeds {
     tell worker "{{ item.title }}"
@@ -12141,10 +12105,10 @@ rule recall_before_work
 "#,
     )
     .expect("workflow writes");
-    let memory_manifest =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
-    let manifest_copy = project_dir.join("memory.json");
-    fs::copy(&memory_manifest, &manifest_copy).expect("copy manifest beside lock");
+    let notes_manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
+    let manifest_copy = project_dir.join("notes.json");
+    fs::copy(&notes_manifest, &manifest_copy).expect("copy manifest beside lock");
     run_text(
         bin,
         &[
@@ -12191,6 +12155,47 @@ rule recall_before_work
     );
 
     let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[test]
+fn package_lock_refuses_reserved_std_manifest() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("lock-reserved-std");
+    // A manifest claiming the reserved namespace: rename the notes example.
+    let manifest_json = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json"),
+    )
+    .expect("read notes manifest")
+    .replace("\"name\": \"notes\"", "\"name\": \"std.something\"");
+    let manifest_path = dir.join("std-something.json");
+    fs::write(&manifest_path, manifest_json).expect("write manifest");
+
+    let output = Command::new(bin)
+        .args([
+            "package",
+            "lock",
+            "--output",
+            dir.join("whip.lock").to_str().expect("utf-8 lock"),
+            manifest_path.to_str().expect("utf-8 manifest"),
+        ])
+        .output()
+        .expect("package lock runs");
+    assert!(
+        !output.status.success(),
+        "locking a std.* manifest must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("reserved std namespace")
+            && stderr.contains("cannot be provided by a package lock"),
+        "{stderr}"
+    );
+    assert!(
+        !dir.join("whip.lock").exists(),
+        "no lock file may be written for a refused manifest"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

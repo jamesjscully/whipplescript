@@ -1,29 +1,46 @@
 load ../std-construct-authorization.maude
 
---- Coverage: a standard built-in construct use is authorized with no lock (the
---- 1929 OPTION A exemption).
+--- Coverage: an embedded std construct use authorizes with NO lock when the
+--- owning package is imported (the S6d re-keyed exemption).
 search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
-  stdUse(send)
-  =>* authorized(send) RESIDUAL:Cfg .
-
---- Coverage: a third-party construct use authorizes when a lock authorizes it.
-search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
-  thirdPartyUse(recall) locked(recall)
+  embeddedUse(stdMemory, recall) imported(stdMemory)
   =>* authorized(recall) RESIDUAL:Cfg .
 
---- Bite (supply-chain lock still required): a third-party construct use with no
---- lock is never authorized. The RESIDUAL soup var means an authorization in any
---- reachable state would be a solution, so No solution proves the lock
---- requirement still bites. If [std-exempt] keyed on any use rather than only the
---- standard built-in, this would find a solution.
+--- Coverage: a third-party construct use authorizes when a lock provides its
+--- package (supply-chain path unchanged; the entry is admitted first).
 search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
-  thirdPartyUse(recall)
+  thirdPartyUse(vendorKit, fetch) lockProvides(vendorKit)
+  =>* authorized(fetch) RESIDUAL:Cfg .
+
+--- Coverage: a lock entry claiming a reserved std-namespace name reaches the
+--- refusal (the check error is a real, reachable outcome).
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  lockProvides(stdMessaging)
+  =>* lockRejected(stdMessaging) RESIDUAL:Cfg .
+
+--- Bite (import ladder): an embedded std construct use WITHOUT the owning
+--- import is never authorized -- embedded alone is not enough; `use` bites.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  embeddedUse(stdMemory, recall)
   =>* authorized(recall) RESIDUAL:Cfg .
 
---- Bite (no name-only bypass): an unknown construct the compiler does not register
---- is never authorized, even with no lock. The exemption is keyed on a recognized
---- built-in registration, so a package cannot bypass the lock by claiming the std
---- namespace without a compiler built-in behind it.
+--- Bite (supply chain): a third-party construct use with no lock is never
+--- authorized.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  thirdPartyUse(vendorKit, fetch)
+  =>* authorized(fetch) RESIDUAL:Cfg .
+
+--- Bite (no std shadowing): a lock entry claiming a std name never authorizes
+--- a use through it -- the entry is refused, so [locked-ok] cannot fire. If
+--- [lock-admit] dropped its namespace guard, this would find a solution.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  thirdPartyUse(stdMemory, bogus) lockProvides(stdMemory)
+  =>* authorized(bogus) RESIDUAL:Cfg .
+
+--- Bite (no name-only bypass): a use with no registration behind it is never
+--- authorized.
 search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
   unknownUse(bogus)
   =>* authorized(bogus) RESIDUAL:Cfg .
+
+quit .

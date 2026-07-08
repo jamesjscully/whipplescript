@@ -1,49 +1,67 @@
---- Standard-library construct lock exemption, per the 1929 OPTION A decision in
---- spec/implementation-plan.md Stage P4 messaging and spec/packages.md. A
---- construct USE -- a ConstructCapabilityCall such as recall or send -- normally
---- requires a package lock that authorizes it, so a third-party supply-chain
---- construct cannot compile without a pinned, reviewed lock. Standard-library
---- constructs such as std.messaging send are built into the compiler, not fetched
---- from a supply chain, so they are EXEMPT from the lock requirement -- but only
---- because the compiler itself registers them as built-ins. The exemption is
---- keyed on being a recognized built-in standard construct, NOT merely on a name:
---- a third-party package cannot bypass the lock by claiming the std namespace,
---- because the compiler holds no built-in registration for it.
+--- Standard-library construct authorization, S6d re-key (2026-07-08). The old
+--- model keyed the lock exemption on a compiler BUILT-IN registration (1929
+--- OPTION A). S6d replaces built-ins with EMBEDDED STD MANIFESTS: standard
+--- packages ship as package manifests compiled into the binary, so the binary
+--- is its own supply chain. The exemption is re-keyed accordingly, and the
+--- import ladder (E5) makes `use` bite for manifest-borne constructs:
 ---
---- The model abstracts each construct use to one of three dispositions: a
---- recognized standard built-in, a recognized third-party construct, or an
---- unknown construct that claims authority the compiler does not register. It
---- checks by reachability that:
----   a standard built-in use is authorized with no lock, the exemption;
----   a third-party use is authorized only when a lock authorizes it;
----   a third-party use with no lock, and an unknown construct, are never
----     authorized -- the lock requirement still bites for the supply chain, and
----     the exemption does not leak to unregistered constructs.
+---   embedded + imported : a construct registered by an embedded std manifest
+---     authorizes with NO lock, but ONLY when the program imports the owning
+---     package (import-to-authorize tier). Embedded alone is not enough.
+---   third-party + locked : a third-party package construct authorizes only
+---     when a package lock authorizes its package (supply-chain requirement,
+---     unchanged).
+---   reserved namespace : a package lock entry that claims a std-namespace
+---     name is REFUSED (check error) -- the embedded copy always wins, so a
+---     supply-chain lock can never shadow the platform's std packages. A use
+---     that would authorize through such a lock entry never authorizes.
+---   unknown : a construct with no registration behind it is never
+---     authorized -- the exemption never leaks on a name alone.
 mod WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION is
   protecting BOOL .
 
-  sorts Use Cfg .
+  sorts Pkg Use Cfg .
 
-  ops send recall bogus : -> Use [ctor] .   --- sample construct uses
+  --- Sample packages: two reserved std-namespace names and one vendor name.
+  ops stdMemory stdMessaging vendorKit : -> Pkg [ctor] .
+  --- Sample construct uses.
+  ops recall send fetch bogus : -> Use [ctor] .
 
   op none : -> Cfg [ctor] .
   op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
 
-  op stdUse : Use -> Cfg [ctor] .        --- a recognized standard built-in construct use
-  op thirdPartyUse : Use -> Cfg [ctor] . --- a recognized third-party package construct use
-  op unknownUse : Use -> Cfg [ctor] .    --- a construct the compiler does not register
-  op locked : Use -> Cfg [ctor] .        --- a package lock authorizes this use
-  op authorized : Use -> Cfg [ctor] .    --- the use is authorized to compile
+  --- Is the package name inside the reserved std namespace?
+  op isStd : Pkg -> Bool .
+  eq isStd(stdMemory) = true .
+  eq isStd(stdMessaging) = true .
+  eq isStd(vendorKit) = false .
 
+  op imported : Pkg -> Cfg [ctor] .     --- the program has `use <pkg>`
+  op embeddedUse : Pkg Use -> Cfg [ctor] . --- use registered by an embedded std manifest
+  op thirdPartyUse : Pkg Use -> Cfg [ctor] . --- use registered by a lock-provided package
+  op unknownUse : Use -> Cfg [ctor] .   --- a use with no registration behind it
+  op lockProvides : Pkg -> Cfg [ctor] . --- a package lock entry provides this package
+  op lockAdmitted : Pkg -> Cfg [ctor] . --- the lock entry passed the namespace check
+  op lockRejected : Pkg -> Cfg [ctor] . --- the lock entry was refused (reserved namespace)
+  op authorized : Use -> Cfg [ctor] .   --- the construct use is authorized to compile
+
+  var P : Pkg .
   var U : Use .
 
-  --- Standard built-in constructs are exempt from the package lock: a recognized
-  --- std construct use authorizes with no locked premise. Keyed on stdUse, so the
-  --- exemption never reaches a third-party or unknown construct.
-  rl [std-exempt] : stdUse(U) => authorized(U) .
+  --- Import ladder, import-to-authorize tier: an embedded std construct use
+  --- authorizes with no lock ONLY when the owning package is imported. The
+  --- imported premise stays in the soup (one import authorizes many uses).
+  rl [embedded-import-ok] : embeddedUse(P, U) imported(P)
+    => authorized(U) imported(P) .
 
-  --- A third-party construct use authorizes only when a package lock authorizes
-  --- it. Without locked this rule cannot fire, so an unlocked third-party use
-  --- stays unauthorized -- the supply-chain lock requirement still bites.
-  rl [locked-ok] : thirdPartyUse(U) locked(U) => authorized(U) .
+  --- Reserved namespace gate on the lock: a std-namespace claim is refused,
+  --- anything else is admitted.
+  crl [lock-admit] : lockProvides(P) => lockAdmitted(P) if isStd(P) = false .
+  crl [lock-refuse] : lockProvides(P) => lockRejected(P) if isStd(P) = true .
+
+  --- A third-party construct use authorizes only through an ADMITTED lock
+  --- entry for its package. A refused (std-shadowing) entry never admits, so
+  --- this rule can never fire for it.
+  rl [locked-ok] : thirdPartyUse(P, U) lockAdmitted(P)
+    => authorized(U) lockAdmitted(P) .
 endm

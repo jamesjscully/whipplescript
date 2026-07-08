@@ -18427,7 +18427,7 @@ impl Parser<'_> {
                 span: removed_kind.span,
                 message: format!("`use {removed_label}` is no longer supported"),
                 suggestion: Some(
-                    "write `use memory` for package libraries; attach skills with `agent { skills [...] }`"
+                    "write `use std.memory` for package libraries; attach skills with `agent { skills [...] }`"
                         .to_owned(),
                 ),
             });

@@ -80,10 +80,10 @@ The v0 project intent file is JSON:
   "schema": "whipplescript.package_set.v0",
   "packages": [
     {
-      "name": "memory",
+      "name": "notes",
       "source": {
         "type": "path",
-        "path": "examples/packages/memory.json"
+        "path": "examples/packages/notes.json"
       }
     }
   ]
@@ -135,12 +135,12 @@ sources instead of absolute manifest paths:
   "schema": "whipplescript.package_lock.v0",
   "packages": [
     {
-      "package_id": "package-memory",
-      "name": "memory",
+      "package_id": "package-notes",
+      "name": "notes",
       "version": "0.1.0",
       "source": {
         "type": "path",
-        "path": "examples/packages/memory.json"
+        "path": "examples/packages/notes.json"
       },
       "manifest_sha256": "..."
     }
@@ -162,6 +162,11 @@ Lock rules:
   lock cannot widen file access.
 - Reject duplicate `name`, duplicate `package_id`, duplicate source path, and
   ambiguous library registrations.
+- Reject — at load time and at creation time (`package lock`/`package sync`) —
+  any entry or input manifest whose `name` claims the reserved `std.*`
+  namespace (`std` or `std.` prefix). Std packages ship embedded in the
+  platform binary and cannot be provided by a package lock, so a supply-chain
+  lock can never shadow them.
 - `sync` writes a complete lock derived solely from the current package set.
   Entries are never carried over from a prior lock, so a package removed from
   `whip.packages.json` cannot persist as a stale lock entry. There is no separate
@@ -226,7 +231,9 @@ not affected by either canonical form.
 
 `std.*` packages are platform-provided and bundled with the WhippleScript binary.
 In v0 they are intentionally outside the lock's integrity scope: they do not
-appear in `whip.lock`, do not require a project lock to be imported, and their
+appear in `whip.lock` (a lock entry claiming a `std.*` name is a load error,
+and `package lock`/`package sync` refuse a `std.*`-named manifest), do not
+require a project lock to be imported, and their
 integrity is the integrity of the platform binary itself, not a per-manifest
 hash. Only non-`std.` packages selected by the package set are locked and hashed.
 Signing and manifest provenance for first- and third-party packages are deferred
@@ -269,10 +276,10 @@ With global `--json`, `sync` should emit:
   "package_lock_path": "...",
   "packages": [
     {
-      "package_id": "package-memory",
-      "name": "memory",
+      "package_id": "package-notes",
+      "name": "notes",
       "version": "0.1.0",
-      "source": {"type": "path", "path": "examples/packages/memory.json"},
+      "source": {"type": "path", "path": "examples/packages/notes.json"},
       "manifest_sha256": "..."
     }
   ],
@@ -407,7 +414,7 @@ Implementation is complete for v0 when:
 - JSON reports include enough package-set and package-lock paths to reproduce
   the run.
 - Tests cover stale lock, hash mismatch, identity mismatch, path escape,
-  duplicate package names, missing lock for `use memory`, explicit lock override,
+  duplicate package names, missing lock for `use notes`, explicit lock override,
   and successful default discovery.
 
 ## Deferred Items

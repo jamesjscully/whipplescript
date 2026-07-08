@@ -4,7 +4,7 @@ source_tags
 source_descriptions
 "Recall package memory before agent work and save context after each turn" workflow PackageMemory
 uses
-  package memory
+  package std.memory
 trackers
   tracker backlog provider=builtin
 agents

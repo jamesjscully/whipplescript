@@ -16597,14 +16597,25 @@ impl LoadedPackageLock {
 
 /// Standard-library package manifests compiled into the binary (M5 "embedded
 /// manifest"). Each entry is `(import name, manifest JSON)`; the binary is its
-/// own supply chain, so a workflow that `use`s one of these names validates and
-/// runs with no `--package-lock` at all. An explicit lock for the same name
-/// still wins — the embedded copy is only a fallback. Add more std packages by
-/// appending `(name, include_str!(..))` pairs here.
+/// own supply chain, so a workflow that `use`s one of these names (e.g.
+/// `use std.memory`) validates and runs with no `--package-lock` at all. Std
+/// packages live in the reserved `std.*` namespace: a package lock can never
+/// claim such a name (see `is_reserved_std_package_name`), so the embedded copy
+/// always wins. Add more std packages by appending `(name, include_str!(..))`
+/// pairs here.
 const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[(
-    "memory",
+    "std.memory",
     include_str!("../../../examples/packages/memory.json"),
 )];
+
+/// Whether `name` claims the reserved `std.*` package namespace. Std packages
+/// ship embedded in the platform binary (the binary is its own supply chain), so
+/// a package lock entry — or a lock/sync input manifest — claiming a `std.*`
+/// name is refused: a supply-chain lock must never be able to shadow a platform
+/// std package.
+fn is_reserved_std_package_name(name: &str) -> bool {
+    name == "std" || name.starts_with("std.")
+}
 
 /// Whether `name` is shipped as an embedded std manifest.
 fn is_embedded_std_manifest(name: &str) -> bool {
@@ -16679,7 +16690,8 @@ fn contract_registry_for_ir(
         None => {
             let mut registry = ir.contract_registry();
             // No lock at all: embedded std manifests still resolve their imported
-            // names (M5), so `use memory` + `recall` validates with no supply chain.
+            // names (M5), so `use std.memory` + `recall` validates with no supply
+            // chain.
             merge_embedded_std_manifests(&mut registry, ir, &BTreeSet::new());
             validate_construct_uses(None, ir, &registry)?;
             Ok(registry)
@@ -16707,8 +16719,9 @@ fn validate_construct_uses(
         // `models/maude/std-construct-authorization.maude`.
         //
         // EXCEPTION (M5 embedded manifest): a std package compiled into the binary
-        // (e.g. `memory`) is likewise its own supply chain, so an import of — or a
-        // construct owned by — an embedded manifest is exempt from the lock too.
+        // (e.g. `std.memory`) is likewise its own supply chain, so an import of —
+        // or a construct owned by — an embedded manifest is exempt from the lock
+        // too.
         let mut blockers = BTreeSet::new();
         for use_decl in &ir.uses {
             if use_decl.name.starts_with("std.") || is_embedded_std_manifest(&use_decl.name) {
@@ -16918,6 +16931,16 @@ fn package_lock(options: &CliOptions, args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    for manifest in &manifests {
+        if is_reserved_std_package_name(&manifest.name) {
+            eprintln!(
+                "package manifest `{}` name `{}` claims the reserved std namespace; std packages ship embedded in the platform and cannot be provided by a package lock",
+                manifest.path.display(),
+                manifest.name
+            );
+            return ExitCode::from(2);
+        }
+    }
     let registry = package_registry(&manifests);
     let diagnostics = registry.validate();
     if !diagnostics.is_empty() {
@@ -17225,6 +17248,17 @@ fn read_package_set(
                 code: "package_set.identity_mismatch",
                 message: format!(
                     "{label} expects package name `{name}` but manifest `{}` declares `{}`",
+                    resolved.display(),
+                    manifest.name
+                ),
+            });
+            continue;
+        }
+        if is_reserved_std_package_name(&manifest.name) {
+            diagnostics.push(PackageSyncDiagnostic {
+                code: "package_manifest.reserved_std_name",
+                message: format!(
+                    "{label} manifest `{}` name `{}` claims the reserved std namespace; std packages ship embedded in the platform and cannot be provided by a package lock",
                     resolved.display(),
                     manifest.name
                 ),
@@ -19569,6 +19603,12 @@ fn load_package_lock_file(path: &Path) -> Result<LoadedPackageLock, String> {
             )
         })?;
         let expected_name = required_json_string(package, "name", "package lock entry")?;
+        if is_reserved_std_package_name(&expected_name) {
+            return Err(format!(
+                "package lock `{}` entry `{expected_name}` claims the reserved std namespace; std packages ship embedded in the platform and cannot be provided by a package lock",
+                path.display()
+            ));
+        }
         let expected_version = required_json_string(package, "version", "package lock entry")?;
         let expected_package_id =
             required_json_string(package, "package_id", "package lock entry")?;
@@ -38099,12 +38139,12 @@ coerce review() -> Review {
         )
         .expect("manifest parses");
 
-        assert_eq!(manifest.package_id, "package-memory");
+        assert_eq!(manifest.package_id, "std.memory");
         assert!(manifest
             .registry
             .libraries
             .iter()
-            .any(|library| library.id == "memory" && library.version == "0.1.0"));
+            .any(|library| library.id == "std.memory" && library.version == "0.1.0"));
         let query_contract = manifest
             .registry
             .effect_contracts
@@ -38133,7 +38173,7 @@ coerce review() -> Review {
             .iter()
             .find(|form| form.id == "memory.recall")
             .expect("memory recall construct");
-        assert_eq!(recall_form.library_id, "memory");
+        assert_eq!(recall_form.library_id, "std.memory");
         assert_eq!(recall_form.construct_family, "effect_operation");
         assert_eq!(recall_form.keyword, "recall");
         assert_eq!(recall_form.scope, "rule_body");
@@ -39513,7 +39553,7 @@ coerce review() -> Review {
     #[test]
     fn package_lock_json_emits_portable_source_shape_no_absolute_path() {
         let manifest_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
         let manifest = load_package_manifest(&manifest_path).expect("manifest loads");
         let base_dir = manifest_path
             .parent()
@@ -39526,7 +39566,7 @@ coerce review() -> Review {
         assert!(entry.get("manifest_path").is_none(), "{lock_json}");
         assert_eq!(entry["source"]["type"], "path");
         let source_path = entry["source"]["path"].as_str().expect("source path");
-        assert_eq!(source_path, "memory.json");
+        assert_eq!(source_path, "notes.json");
         assert!(
             is_portable_relative_path(source_path),
             "source path must be portable: {source_path}"
@@ -39604,22 +39644,22 @@ coerce review() -> Review {
         );
     }
 
-    /// Set up a temp project containing the memory manifest and a `whip.packages.json`.
+    /// Set up a temp project containing the notes manifest and a `whip.packages.json`.
     /// Returns (temp_dir, package_set_path).
-    fn write_memory_package_set(slug: &str) -> (PathBuf, PathBuf) {
+    fn write_notes_package_set(slug: &str) -> (PathBuf, PathBuf) {
         let manifest_src =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
         let temp_dir = env::temp_dir().join(format!(
             "whipplescript-sync-{slug}-{}",
             stable_hash_hex(&manifest_src.display().to_string())
         ));
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(temp_dir.join("packages")).expect("packages dir");
-        fs::copy(&manifest_src, temp_dir.join("packages/memory.json")).expect("manifest copies");
+        fs::copy(&manifest_src, temp_dir.join("packages/notes.json")).expect("manifest copies");
         let set = json!({
             "schema": PACKAGE_SET_SCHEMA,
             "packages": [
-                {"name": "memory", "source": {"type": "path", "path": "packages/memory.json"}}
+                {"name": "notes", "source": {"type": "path", "path": "packages/notes.json"}}
             ],
         });
         let set_path = temp_dir.join("whip.packages.json");
@@ -39629,7 +39669,7 @@ coerce review() -> Review {
 
     #[test]
     fn package_sync_resolution_is_byte_identical_across_runs() {
-        let (temp_dir, set_path) = write_memory_package_set("deterministic");
+        let (temp_dir, set_path) = write_notes_package_set("deterministic");
         let lock_path = temp_dir.join("whip.lock");
 
         let first = resolve_package_sync(Some(set_path.clone()), Some(lock_path.clone()))
@@ -39647,7 +39687,7 @@ coerce review() -> Review {
             first.lock_text
         );
         assert!(
-            first.lock_text.contains("packages/memory.json"),
+            first.lock_text.contains("packages/notes.json"),
             "{}",
             first.lock_text
         );
@@ -39663,7 +39703,7 @@ coerce review() -> Review {
     #[test]
     fn package_sync_rejects_nonportable_source_path() {
         let manifest_src =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
         let temp_dir = env::temp_dir().join(format!(
             "whipplescript-sync-escape-{}",
             stable_hash_hex(&manifest_src.display().to_string())
@@ -39673,7 +39713,7 @@ coerce review() -> Review {
         let set = json!({
             "schema": PACKAGE_SET_SCHEMA,
             "packages": [
-                {"name": "memory", "source": {"type": "path", "path": "../escape.json"}}
+                {"name": "notes", "source": {"type": "path", "path": "../escape.json"}}
             ],
         });
         let set_path = temp_dir.join("whip.packages.json");
@@ -39691,19 +39731,19 @@ coerce review() -> Review {
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
-    /// Copy the `memory` example manifest into a fresh temp directory and write
+    /// Copy the `notes` example manifest into a fresh temp directory and write
     /// a portable lock alongside it. Returns the temp directory (caller cleans
     /// up), the lock path, and the parsed lock JSON so tests can mutate it.
-    fn write_portable_memory_lock(slug: &str) -> (PathBuf, PathBuf, Value) {
+    fn write_portable_notes_lock(slug: &str) -> (PathBuf, PathBuf, Value) {
         let manifest_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
         let temp_dir = env::temp_dir().join(format!(
             "whipplescript-lock-{slug}-{}",
             stable_hash_hex(&manifest_path.display().to_string())
         ));
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).expect("temp dir");
-        let copied_manifest = temp_dir.join("memory.json");
+        let copied_manifest = temp_dir.join("notes.json");
         fs::copy(&manifest_path, &copied_manifest).expect("manifest copies");
         let manifest = load_package_manifest(&copied_manifest).expect("manifest loads");
         let lock_json = package_lock_json(&[manifest], &temp_dir);
@@ -39714,12 +39754,12 @@ coerce review() -> Review {
 
     #[test]
     fn package_lock_supplies_package_import_registry() {
-        let (temp_dir, lock_path, lock_json) = write_portable_memory_lock("import-registry");
+        let (temp_dir, lock_path, lock_json) = write_portable_notes_lock("import-registry");
         // The portable lock must record a relative source, never an absolute path.
         let source_path = lock_json["packages"][0]["source"]["path"]
             .as_str()
             .expect("source path");
-        assert_eq!(source_path, "memory.json");
+        assert_eq!(source_path, "notes.json");
         assert!(lock_json["packages"][0].get("manifest_path").is_none());
         let lock = load_package_lock_file(&lock_path).expect("lock loads");
         let _ = fs::remove_dir_all(&temp_dir);
@@ -39727,7 +39767,28 @@ coerce review() -> Review {
         let source = r#"
 workflow PackageLockRegistry
 
-use memory
+use notes
+
+class Task {
+  title string
+}
+
+rule start
+  when Task as task
+=> {
+  call notes.query for task as context
+}
+"#;
+        let compiled = whipplescript_parser::compile_program(source);
+        let ir = compiled.ir.expect("source compiles");
+        // `memory` ships as the embedded `std.memory` manifest (M5), so
+        // `use std.memory` + `recall` resolves with no lock at all — no supply
+        // chain required.
+        let embedded_ir = whipplescript_parser::compile_program(
+            r#"
+workflow EmbeddedMemory
+
+use std.memory
 
 class Task {
   title string
@@ -39738,13 +39799,12 @@ rule start
 => {
   recall project_memory for task as context
 }
-"#;
-        let compiled = whipplescript_parser::compile_program(source);
-        let ir = compiled.ir.expect("source compiles");
-        // `memory` now ships as an embedded std manifest (M5), so `use memory` +
-        // `recall` resolves with no lock at all — no supply chain required.
-        let embedded = contract_registry_for_ir(None, &ir)
-            .expect("embedded `memory` manifest resolves without a lock");
+"#,
+        )
+        .ir
+        .expect("embedded source compiles");
+        let embedded = contract_registry_for_ir(None, &embedded_ir)
+            .expect("embedded `std.memory` manifest resolves without a lock");
         assert!(
             embedded.constructs.iter().any(|form| {
                 form.keyword == "recall"
@@ -39787,23 +39847,88 @@ rule start
         assert!(registry
             .libraries
             .iter()
-            .any(|library| library.id == "memory" && library.version == "0.1.0"));
+            .any(|library| library.id == "notes" && library.version == "0.1.0"));
         assert!(registry
             .effect_contracts
             .iter()
-            .any(|contract| contract.id == "memory.query"
+            .any(|contract| contract.id == "notes.query"
                 && contract.effect_kind == "capability.call"));
-        assert!(registry.constructs.iter().any(|form| {
-            form.keyword == "recall"
-                && form.lowering_target == "capability_call"
-                && form.target_capability.as_deref() == Some("memory.query")
-        }));
         assert_eq!(registry.validate(), Vec::new());
     }
 
     #[test]
+    fn package_lock_rejects_reserved_std_namespace_entries() {
+        // A supply-chain lock can never provide a `std.*` package: std packages
+        // ship embedded in the platform, and embedded always wins.
+        let (temp_dir, lock_path, mut lock_json) = write_portable_notes_lock("reserved-std");
+        let manifest_path = temp_dir.join("std.memory.json");
+        let manifest_json = fs::read_to_string(temp_dir.join("notes.json"))
+            .expect("read notes manifest")
+            .replace("\"name\": \"notes\"", "\"name\": \"std.memory\"");
+        fs::write(&manifest_path, &manifest_json).expect("write std-named manifest");
+        let entry = lock_json
+            .get_mut("packages")
+            .and_then(Value::as_array_mut)
+            .and_then(|packages| packages.first_mut())
+            .and_then(Value::as_object_mut)
+            .expect("package entry object");
+        entry.insert("name".to_owned(), Value::String("std.memory".to_owned()));
+        entry.insert(
+            "source".to_owned(),
+            json!({"type": "path", "path": "std.memory.json"}),
+        );
+        entry.insert(
+            "manifest_sha256".to_owned(),
+            Value::String(sha256_hex(manifest_json.as_bytes())),
+        );
+        fs::write(&lock_path, canonical_lock_text(&lock_json)).expect("lock writes");
+        let error = load_package_lock_file(&lock_path)
+            .expect_err("a reserved std.* lock entry must be rejected");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        assert!(
+            error.contains("entry `std.memory` claims the reserved std namespace")
+                && error.contains("cannot be provided by a package lock"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn package_sync_refuses_reserved_std_manifest_names() {
+        let (temp_dir, set_path) = write_notes_package_set("reserved-std");
+        // Point the package set at a manifest claiming the reserved namespace.
+        let manifest_path = temp_dir.join("packages/notes.json");
+        let manifest_json = fs::read_to_string(&manifest_path)
+            .expect("read notes manifest")
+            .replace("\"name\": \"notes\"", "\"name\": \"std.notes\"");
+        fs::write(&manifest_path, manifest_json).expect("write std-named manifest");
+        let set = json!({
+            "schema": PACKAGE_SET_SCHEMA,
+            "packages": [
+                {"name": "std.notes", "source": {"type": "path", "path": "packages/notes.json"}}
+            ],
+        });
+        fs::write(&set_path, canonical_lock_text(&set)).expect("set writes");
+
+        let diagnostics = resolve_package_sync(Some(set_path), Some(temp_dir.join("whip.lock")))
+            .expect_err("a reserved std.* manifest name must refuse to sync");
+        let _ = fs::remove_dir_all(&temp_dir);
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "package_manifest.reserved_std_name"
+                    && diagnostic.message.contains("reserved std namespace")
+            }),
+            "{:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.code, diagnostic.message.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn package_lock_rejects_duplicate_package_entries() {
-        let (temp_dir, lock_path, mut lock_json) = write_portable_memory_lock("duplicate-entries");
+        let (temp_dir, lock_path, mut lock_json) = write_portable_notes_lock("duplicate-entries");
         let packages = lock_json
             .get_mut("packages")
             .and_then(Value::as_array_mut)
@@ -39815,18 +39940,18 @@ rule start
         let _ = fs::remove_dir_all(&temp_dir);
 
         assert!(
-            error.contains("package_id `package-memory` more than once"),
+            error.contains("package_id `package-notes` more than once"),
             "{error}"
         );
         assert!(
-            error.contains("package name `memory` more than once"),
+            error.contains("package name `notes` more than once"),
             "{error}"
         );
     }
 
     #[test]
     fn package_lock_rejects_unknown_closed_schema_fields() {
-        let (temp_dir, lock_path, mut lock_json) = write_portable_memory_lock("unknown-fields");
+        let (temp_dir, lock_path, mut lock_json) = write_portable_notes_lock("unknown-fields");
         lock_json
             .as_object_mut()
             .expect("lock object")
@@ -39855,7 +39980,7 @@ rule start
 
     #[test]
     fn package_lock_rejects_missing_required_fields() {
-        let (temp_dir, lock_path, mut lock_json) = write_portable_memory_lock("missing-fields");
+        let (temp_dir, lock_path, mut lock_json) = write_portable_notes_lock("missing-fields");
         let package = lock_json
             .get_mut("packages")
             .and_then(Value::as_array_mut)
@@ -39881,7 +40006,7 @@ rule start
 
     #[test]
     fn package_lock_rejects_invalid_field_types_and_hash_shape() {
-        let (temp_dir, lock_path, mut lock_json) = write_portable_memory_lock("invalid-fields");
+        let (temp_dir, lock_path, mut lock_json) = write_portable_notes_lock("invalid-fields");
         let package = lock_json
             .get_mut("packages")
             .and_then(Value::as_array_mut)
@@ -39922,18 +40047,12 @@ rule start
     }
 
     fn package_memory_construct_graph_and_lowered_report_for_test() -> (Value, Value) {
-        let manifest_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
-        let manifest = load_package_manifest(&manifest_path).expect("manifest loads");
-        let lock = LoadedPackageLock {
-            path: manifest_path.with_file_name("construct-graph-test-lock.json"),
-            manifests: vec![manifest],
-        };
-
+        // `std.memory` ships embedded (M5), so the package-backed graph resolves
+        // with no lock at all.
         let source = r#"
 workflow PackageGraph
 
-use memory
+use std.memory
 
 class Task {
   title string
@@ -39947,26 +40066,18 @@ rule start
 "#;
         let compiled = whipplescript_parser::compile_program(source);
         let ir = compiled.ir.expect("source compiles");
-        let registry = lock.registry_for_ir(&ir).expect("registry resolves");
-        let graph = construct_graph_json("package-graph.whip", source, &ir, &registry, Some(&lock));
-        let lowered =
-            lowered_ir_report_json("package-graph.whip", source, &ir, &graph, Some(&lock));
+        let registry =
+            contract_registry_for_ir(None, &ir).expect("embedded std.memory registry resolves");
+        let graph = construct_graph_json("package-graph.whip", source, &ir, &registry, None);
+        let lowered = lowered_ir_report_json("package-graph.whip", source, &ir, &graph, None);
         (graph, lowered)
     }
 
     fn package_memory_dependency_construct_graph_and_lowered_report_for_test() -> (Value, Value) {
-        let manifest_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
-        let manifest = load_package_manifest(&manifest_path).expect("manifest loads");
-        let lock = LoadedPackageLock {
-            path: manifest_path.with_file_name("construct-graph-test-lock.json"),
-            manifests: vec![manifest],
-        };
-
         let source = r#"
 workflow PackageGraph
 
-use memory
+use std.memory
 
 class Task {
   title string
@@ -39984,10 +40095,10 @@ rule start
 "#;
         let compiled = whipplescript_parser::compile_program(source);
         let ir = compiled.ir.expect("source compiles");
-        let registry = lock.registry_for_ir(&ir).expect("registry resolves");
-        let graph = construct_graph_json("package-graph.whip", source, &ir, &registry, Some(&lock));
-        let lowered =
-            lowered_ir_report_json("package-graph.whip", source, &ir, &graph, Some(&lock));
+        let registry =
+            contract_registry_for_ir(None, &ir).expect("embedded std.memory registry resolves");
+        let graph = construct_graph_json("package-graph.whip", source, &ir, &registry, None);
+        let lowered = lowered_ir_report_json("package-graph.whip", source, &ir, &graph, None);
         (graph, lowered)
     }
 
@@ -42632,7 +42743,9 @@ assert count(Item where status == "done") == 1
                 .map(str::len),
             Some(64)
         );
-        assert_ne!(
+        // The graph resolves via the embedded `std.memory` manifest with no lock
+        // at all, so the lock digest is the all-zero no-lock sentinel.
+        assert_eq!(
             graph.get("package_lock_digest").and_then(Value::as_str),
             Some("0000000000000000000000000000000000000000000000000000000000000000")
         );
@@ -42643,11 +42756,11 @@ assert count(Item where status == "done") == 1
             .expect("nodes array");
         assert!(nodes.iter().any(|node| {
             node.get("node_id").and_then(Value::as_str)
-                == Some("contract:memory:memory.query:0.1.0")
+                == Some("contract:std.memory:memory.query:0.1.0")
         }));
         assert!(nodes.iter().any(|node| {
             node.get("node_id").and_then(Value::as_str)
-                == Some("contract:memory:memory.query:0.1.0")
+                == Some("contract:std.memory:memory.query:0.1.0")
                 && node
                     .get("required_capabilities")
                     .and_then(Value::as_array)
@@ -43185,7 +43298,7 @@ assert count(Item where status == "done") == 1
             .expect("node lowerings");
         assert!(node_lowerings.iter().any(|lowering| {
             lowering.get("node_id").and_then(Value::as_str)
-                == Some("contract:memory:memory.query:0.1.0")
+                == Some("contract:std.memory:memory.query:0.1.0")
                 && lowering
                     .get("produced_core_object_refs")
                     .and_then(Value::as_array)
@@ -44119,7 +44232,7 @@ assert count(Item where status == "done") == 1
             .iter_mut()
             .find(|lowering| {
                 lowering.get("node_id").and_then(Value::as_str)
-                    == Some("contract:memory:memory.query:0.1.0")
+                    == Some("contract:std.memory:memory.query:0.1.0")
             })
             .expect("contract lowering");
         contract_lowering
@@ -44148,7 +44261,7 @@ assert count(Item where status == "done") == 1
             .expect("effect core object");
         core_object.as_object_mut().expect("core object").insert(
             "owner_ref".to_owned(),
-            json!("contract:memory:memory.query:0.1.0"),
+            json!("contract:std.memory:memory.query:0.1.0"),
         );
 
         let diagnostics = validate_lowered_ir_report(&lowered, &graph);

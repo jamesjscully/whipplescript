@@ -209,7 +209,7 @@ semantics must not blur `apply` and `invoke`.
 `use` imports package/library surface by name:
 
 ```whip
-use memory
+use std.memory
 ```
 
 Packages may register library contracts, capabilities, effect providers, fact
