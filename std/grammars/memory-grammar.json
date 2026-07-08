@@ -23,7 +23,7 @@
                 "required": false,
                 "list": false,
                 "unknown_hint": "the only memory pool field is `context limit <n>`",
-                "missing_summary": ""
+                "missing_summary": "add `context limit <n>` inside the memory pool block"
               }
             ]
           }

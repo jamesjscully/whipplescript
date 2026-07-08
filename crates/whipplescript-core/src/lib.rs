@@ -58,12 +58,15 @@ pub struct ConstructField {
     pub required: bool,
 }
 
-/// A DR-0011 `effect_operation` grammar object: the single source of the
-/// construct's parse shape (`<keyword> [<connective> <slot>]* [{ payload }]?
-/// as <binding>`). Kept as plain validated strings, matching the rest of the
-/// registration data. The only shape representable in package manifests today
-/// is `effect_operation` (`CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION`);
-/// `declaration_block` is spec-defined but not yet manifest-supported.
+/// A DR-0011 grammar object: the single source of the construct's parse shape.
+/// Kept as plain validated strings, matching the rest of the registration data.
+/// Two shapes are manifest-expressible: `effect_operation`
+/// (`CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION`, `<keyword> [<connective>
+/// <slot>]* [{ payload }]? as <binding>`) and `declaration_block`
+/// (`CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK`, an order-free block of named
+/// clauses). The `shape` string discriminates: `clauses` is `Some` exactly for
+/// `declaration_block`, and `slots`/`payload`/`binding`/`target_capability`
+/// carry the `effect_operation` shape (empty/`None`/`"none"`/empty otherwise).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConstructGrammar {
     pub shape: String,
@@ -75,6 +78,11 @@ pub struct ConstructGrammar {
     /// `required` | `optional` | `none` — the trailing `as <binding>` policy.
     pub binding: String,
     pub target_capability: String,
+    /// `Some(clauses)` for a `declaration_block` shape; `None` for
+    /// `effect_operation` (the `shape` string discriminates — the design note
+    /// picked `Option` over a shape enum because `shape` already carries the
+    /// discriminant, for the smaller diff).
+    pub clauses: Option<Vec<ConstructGrammarClause>>,
 }
 
 /// One ordered grammar slot: a named value (`identifier` | `expression`),
@@ -96,19 +104,80 @@ pub struct ConstructGrammarPayloadField {
     pub required: bool,
 }
 
+/// One clause of a `declaration_block` grammar: a named value (the `name` may
+/// be multi-word), a `kind` from `CONSTRUCT_GRAMMAR_CLAUSE_KINDS`, whether it
+/// is `required`, whether it takes a `list` of values, and an optional
+/// introducing connective from `CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES`. A `flag`
+/// clause carries no value: it is never a `list` and never has a `connective`
+/// (DR-0011 amendment, mirrored in `build.rs`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstructGrammarClause {
+    pub name: String,
+    pub kind: String,
+    pub required: bool,
+    pub list: bool,
+    pub connective: Option<String>,
+}
+
 pub const CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION: &str = "effect_operation";
 pub const CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK: &str = "declaration_block";
 pub const CONSTRUCT_GRAMMAR_CONNECTIVES: &[&str] = &["from", "for", "into", "to", "via"];
 pub const CONSTRUCT_GRAMMAR_SLOT_KINDS: &[&str] = &["identifier", "expression"];
 pub const CONSTRUCT_GRAMMAR_BINDING_MODES: &[&str] = &["required", "optional", "none"];
+/// `declaration_block` clause value kinds (DR-0011 Shape 1, mirrors
+/// `build.rs`'s `CLAUSE_KINDS`).
+pub const CONSTRUCT_GRAMMAR_CLAUSE_KINDS: &[&str] = &[
+    "identifier",
+    "expression",
+    "duration",
+    "glob",
+    "schema",
+    "scalar",
+    "flag",
+];
+/// `declaration_block` clause connectives: the Shape 2 slot connectives plus
+/// `by` (ledger `partition by`). Mirrors `build.rs`'s `CLAUSE_CONNECTIVES`.
+pub const CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES: &[&str] =
+    &["from", "for", "into", "to", "via", "by"];
 
 impl ConstructGrammar {
-    /// Derive the flat `fields[]` view downstream consumers read: the ordered
-    /// slots (always required), then the payload fields with their own
-    /// required flags, then — unless the binding mode is `none` — the trailing
-    /// binding as an identifier field named `binding` (required when the mode
-    /// is `required`).
+    /// Derive the flat `fields[]` view downstream consumers read.
+    ///
+    /// For a `declaration_block` shape, each clause becomes one field: a `flag`
+    /// clause maps to an optional `boolean` field (a flag carries no value, so
+    /// it is never required); a `list` clause flattens into the `list` field
+    /// kind (carrying the clause's own required flag); any other clause maps its
+    /// value kind through `field_kind_for_clause_kind` with the clause's
+    /// required flag. A declaration_block has no trailing `as <binding>`, so no
+    /// binding field is appended.
+    ///
+    /// For an `effect_operation` shape: the ordered slots (always required),
+    /// then the payload fields with their own required flags, then — unless the
+    /// binding mode is `none` — the trailing binding as an identifier field
+    /// named `binding` (required when the mode is `required`).
     pub fn derive_fields(&self) -> Vec<ConstructField> {
+        if let Some(clauses) = &self.clauses {
+            return clauses
+                .iter()
+                .map(|clause| {
+                    let (kind, required) = if clause.kind == "flag" {
+                        ("boolean".to_owned(), false)
+                    } else if clause.list {
+                        ("list".to_owned(), clause.required)
+                    } else {
+                        (
+                            field_kind_for_clause_kind(&clause.kind).to_owned(),
+                            clause.required,
+                        )
+                    };
+                    ConstructField {
+                        name: clause.name.clone(),
+                        kind,
+                        required,
+                    }
+                })
+                .collect();
+        }
         let mut fields = Vec::new();
         for slot in &self.slots {
             fields.push(ConstructField {
@@ -132,6 +201,21 @@ impl ConstructGrammar {
             });
         }
         fields
+    }
+}
+
+/// Map a `declaration_block` clause value kind (`CONSTRUCT_GRAMMAR_CLAUSE_KINDS`
+/// minus `flag`, and excluding the list case which flattens to `list`) onto the
+/// platform `ConstructField` kind vocabulary (`PLATFORM_CONSTRUCT_CATALOG
+/// .field_kinds`): a `glob`/`scalar` is a `string`, a `schema` is a `type_ref`;
+/// `identifier`/`expression`/`duration` pass through. An unknown kind passes
+/// through unchanged so the field-kind validator reports it rather than this
+/// mapping silently coercing it.
+fn field_kind_for_clause_kind(kind: &str) -> &str {
+    match kind {
+        "glob" | "scalar" => "string",
+        "schema" => "type_ref",
+        other => other,
     }
 }
 
@@ -663,6 +747,39 @@ pub const PLATFORM_CONSTRUCT_CATALOG: PlatformConstructCatalog = PlatformConstru
             scope: CONSTRUCT_SCOPE_RULE_BODY,
             lowering_target: CONSTRUCT_LOWERING_CAPABILITY_CALL,
         },
+        // The migrating declaration-family keywords (DR-0011 decl-migration):
+        // each is a platform-reserved word whose top-level `declaration_block`
+        // construct the platform's own std grammar library is authorized to
+        // provide. These lower to `metadata_only` (no capability, no runtime
+        // authority), so the authorization is purely syntactic.
+        PlatformReservedKeywordPrivilege {
+            keyword: "tracker",
+            library_id: "std.tracker",
+            construct_family: CONSTRUCT_FAMILY_DECLARATION_BLOCK,
+            scope: "top_level",
+            lowering_target: CONSTRUCT_LOWERING_METADATA_ONLY,
+        },
+        PlatformReservedKeywordPrivilege {
+            keyword: "counter",
+            library_id: "std.coord",
+            construct_family: CONSTRUCT_FAMILY_DECLARATION_BLOCK,
+            scope: "top_level",
+            lowering_target: CONSTRUCT_LOWERING_METADATA_ONLY,
+        },
+        PlatformReservedKeywordPrivilege {
+            keyword: "lease",
+            library_id: "std.coord",
+            construct_family: CONSTRUCT_FAMILY_DECLARATION_BLOCK,
+            scope: "top_level",
+            lowering_target: CONSTRUCT_LOWERING_METADATA_ONLY,
+        },
+        PlatformReservedKeywordPrivilege {
+            keyword: "ledger",
+            library_id: "std.coord",
+            construct_family: CONSTRUCT_FAMILY_DECLARATION_BLOCK,
+            scope: "top_level",
+            lowering_target: CONSTRUCT_LOWERING_METADATA_ONLY,
+        },
     ],
 };
 
@@ -756,6 +873,7 @@ pub fn std_messaging_send_construct() -> ConstructRegistration {
             ]),
             binding: "required".to_owned(),
             target_capability: MESSAGING_SEND_CAPABILITY.to_owned(),
+            clauses: None,
         }),
         // The grammar-derived flat view (slots, payload fields, binding) —
         // written out explicitly so the transcription guard compares two
@@ -1267,6 +1385,80 @@ mod tests {
     #[test]
     fn exposes_version() {
         assert!(!version().is_empty());
+    }
+
+    #[test]
+    fn derive_fields_maps_declaration_block_clauses() {
+        // A declaration_block grammar with a flag, a connective-introduced
+        // value clause, and a list clause. Each clause becomes exactly one
+        // field; there is no trailing binding field.
+        let grammar = ConstructGrammar {
+            shape: CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK.to_owned(),
+            keyword: "ledger".to_owned(),
+            slots: Vec::new(),
+            payload: None,
+            binding: "none".to_owned(),
+            target_capability: String::new(),
+            clauses: Some(vec![
+                ConstructGrammarClause {
+                    name: "shared".to_owned(),
+                    kind: "flag".to_owned(),
+                    required: false,
+                    list: false,
+                    connective: None,
+                },
+                ConstructGrammarClause {
+                    name: "partition".to_owned(),
+                    kind: "identifier".to_owned(),
+                    required: true,
+                    list: false,
+                    connective: Some("by".to_owned()),
+                },
+                ConstructGrammarClause {
+                    name: "allow read".to_owned(),
+                    kind: "glob".to_owned(),
+                    required: false,
+                    list: true,
+                    connective: None,
+                },
+            ]),
+        };
+
+        let fields = grammar.derive_fields();
+        assert_eq!(
+            fields,
+            vec![
+                // A flag maps to an optional boolean (it carries no value).
+                ConstructField {
+                    name: "shared".to_owned(),
+                    kind: "boolean".to_owned(),
+                    required: false,
+                },
+                // A value clause maps its kind through the field vocabulary and
+                // keeps its own required flag; the connective is not a field.
+                ConstructField {
+                    name: "partition".to_owned(),
+                    kind: "identifier".to_owned(),
+                    required: true,
+                },
+                // A list clause flattens into the `list` field kind.
+                ConstructField {
+                    name: "allow read".to_owned(),
+                    kind: "list".to_owned(),
+                    required: false,
+                },
+            ]
+        );
+
+        // Bite: every derived kind is in the platform field-kind vocabulary, so
+        // the manifest consistency check accepts a grammar-only construct.
+        for field in &fields {
+            assert!(
+                PLATFORM_CONSTRUCT_CATALOG.contains_field_kind(&field.kind),
+                "derived field kind `{}` must be a platform field kind",
+                field.kind
+            );
+        }
     }
 
     #[test]

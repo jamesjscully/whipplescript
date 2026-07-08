@@ -10,16 +10,18 @@ use std::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use whipplescript_core::{
-    ConstructField, ConstructGrammar, ConstructGrammarPayloadField, ConstructGrammarSlot,
-    ConstructInterface, ConstructRegistration, ConstructTargetCapabilityPolicy, ContractRegistry,
-    EffectContract, LibraryRegistration, PlatformConstructLowering, Severity,
-    TypedOutputValidation, CONSTRUCT_FAMILY_EFFECT_OPERATION, CONSTRUCT_GRAMMAR_BINDING_MODES,
-    CONSTRUCT_GRAMMAR_CONNECTIVES, CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK,
-    CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION, CONSTRUCT_GRAMMAR_SLOT_KINDS,
-    CONSTRUCT_INTERFACE_CAPABILITY, CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE,
-    CONSTRUCT_INTERFACE_EFFECT_HANDLE, CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME,
-    CONSTRUCT_LOWERING_CAPABILITY_CALL, CONSTRUCT_LOWERING_METADATA_ONLY,
-    CORE_CAPABILITY_CALL_CONSTRUCT_ID, PLATFORM_CONSTRUCT_CATALOG,
+    ConstructField, ConstructGrammar, ConstructGrammarClause, ConstructGrammarPayloadField,
+    ConstructGrammarSlot, ConstructInterface, ConstructRegistration,
+    ConstructTargetCapabilityPolicy, ContractRegistry, EffectContract, LibraryRegistration,
+    PlatformConstructLowering, Severity, TypedOutputValidation, CONSTRUCT_FAMILY_EFFECT_OPERATION,
+    CONSTRUCT_GRAMMAR_BINDING_MODES, CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES,
+    CONSTRUCT_GRAMMAR_CLAUSE_KINDS, CONSTRUCT_GRAMMAR_CONNECTIVES,
+    CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK, CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION,
+    CONSTRUCT_GRAMMAR_SLOT_KINDS, CONSTRUCT_INTERFACE_CAPABILITY,
+    CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE, CONSTRUCT_INTERFACE_EFFECT_HANDLE,
+    CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME, CONSTRUCT_LOWERING_CAPABILITY_CALL,
+    CONSTRUCT_LOWERING_METADATA_ONLY, CORE_CAPABILITY_CALL_CONSTRUCT_ID,
+    PLATFORM_CONSTRUCT_CATALOG,
 };
 #[cfg(feature = "claude")]
 use whipplescript_kernel::claude_agent_sdk::{
@@ -18480,6 +18482,15 @@ fn validate_manifest_construct_grammar_shape(
     label: &str,
     problems: &mut Vec<String>,
 ) {
+    // The `shape` string discriminates the two manifest-expressible grammar
+    // shapes; a `declaration_block` grammar carries `clauses[]` in place of the
+    // `effect_operation` `slots`/`payload`/`binding`/`target_capability`.
+    if grammar.get("shape").and_then(Value::as_str)
+        == Some(CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK)
+    {
+        validate_manifest_declaration_grammar_shape(grammar, label, problems);
+        return;
+    }
     validate_manifest_object_fields(
         grammar,
         label,
@@ -18560,6 +18571,66 @@ fn validate_manifest_construct_grammar_shape(
             );
         }
     }
+}
+
+/// Closed-shape validation for a `declaration_block` grammar object (the
+/// order-free analog of the `effect_operation` branch above): `shape` /
+/// `keyword` strings and a `clauses[]` array, each clause an object with
+/// `name`/`kind`/`required`/`list`/`unknown_hint`/`missing_summary` and an
+/// optional nullable `connective`. Vocabulary and amendment-rule checks
+/// (`kind` in the clause vocab, a `flag` carrying no value) live in
+/// `package_declaration_grammar`; this only pins the JSON shape.
+fn validate_manifest_declaration_grammar_shape(
+    grammar: &Value,
+    label: &str,
+    problems: &mut Vec<String>,
+) {
+    validate_manifest_object_fields(grammar, label, &["shape", "keyword", "clauses"], problems);
+    validate_manifest_required_fields(grammar, label, &["shape", "keyword", "clauses"], problems);
+    validate_manifest_string_fields(grammar, label, &["shape", "keyword"], problems);
+    validate_manifest_array_objects(
+        grammar,
+        label,
+        "clauses",
+        problems,
+        |clause, label, problems| {
+            validate_manifest_object_fields(
+                clause,
+                &label,
+                &[
+                    "name",
+                    "kind",
+                    "required",
+                    "list",
+                    "connective",
+                    "unknown_hint",
+                    "missing_summary",
+                ],
+                problems,
+            );
+            validate_manifest_required_fields(
+                clause,
+                &label,
+                &[
+                    "name",
+                    "kind",
+                    "required",
+                    "list",
+                    "unknown_hint",
+                    "missing_summary",
+                ],
+                problems,
+            );
+            validate_manifest_string_fields(
+                clause,
+                &label,
+                &["name", "kind", "unknown_hint", "missing_summary"],
+                problems,
+            );
+            validate_manifest_nullable_string_fields(clause, &label, &["connective"], problems);
+            validate_manifest_bool_fields(clause, &label, &["required", "list"], problems);
+        },
+    );
 }
 
 fn validate_manifest_object_fields(
@@ -19243,9 +19314,10 @@ fn package_construct(
 }
 
 /// Parse and validate a construct's DR-0011 `grammar` object
-/// (spec/construct-grammar.md "Shape 2 — effect_operation"). Only the
-/// `effect_operation` shape is manifest-expressible today; `declaration_block`
-/// is spec-defined but gets an explicit not-yet-supported error. Slot kinds,
+/// (spec/construct-grammar.md). Both manifest shapes are supported: an
+/// `effect_operation` (Shape 2, `<keyword> [<connective> <slot>]* [{ payload }]?
+/// as <binding>`) is parsed here; a `declaration_block` (Shape 1, an order-free
+/// clause block) is delegated to `package_declaration_grammar`. Slot kinds,
 /// connectives, and binding modes are validated against the core vocabulary,
 /// and `grammar.keyword` / `grammar.target_capability` must transcribe the
 /// construct's own values.
@@ -19261,9 +19333,7 @@ fn package_construct_grammar(
     let shape = required_json_string(value, "shape", &owner)
         .map_err(|message| format!("{message} {in_path}"))?;
     if shape == CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK {
-        return Err(format!(
-            "{owner} shape `{CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK}` is not yet supported in package manifests {in_path}"
-        ));
+        return package_declaration_grammar(value, &owner, &in_path, shape, construct_keyword);
     }
     if shape != CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION {
         return Err(format!(
@@ -19367,6 +19437,110 @@ fn package_construct_grammar(
         payload,
         binding,
         target_capability,
+        clauses: None,
+    })
+}
+
+/// Parse and validate a construct's DR-0011 `declaration_block` grammar object
+/// (Shape 1, spec/construct-grammar.md). The order-free analog of the
+/// `effect_operation` body in `package_construct_grammar`: `grammar.keyword`
+/// must transcribe the construct keyword, and each `clauses[]` entry carries a
+/// `name` (may be multi-word), a `kind` from `CONSTRUCT_GRAMMAR_CLAUSE_KINDS`,
+/// `required`/`list` flags, an optional `connective` from
+/// `CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES`, plus `unknown_hint`/`missing_summary`
+/// diagnostics. Enforces the 2026-07-08 amendment rules (a `flag` carries no
+/// value: `list == false` and no connective; `list` is only for a value kind) —
+/// the same rules `build.rs` applies to the compiled-in decl table. The
+/// resulting `ConstructGrammar` carries `slots`/`payload`/`binding` empty and
+/// `clauses: Some(..)`, so `derive_fields` takes the declaration_block path.
+fn package_declaration_grammar(
+    value: &Value,
+    owner: &str,
+    in_path: &str,
+    shape: String,
+    construct_keyword: &str,
+) -> Result<ConstructGrammar, String> {
+    let keyword = required_json_string(value, "keyword", owner)
+        .map_err(|message| format!("{message} {in_path}"))?;
+    if keyword != construct_keyword {
+        return Err(format!(
+            "{owner} keyword `{keyword}` does not match the construct keyword `{construct_keyword}` {in_path}"
+        ));
+    }
+    let mut clauses = Vec::new();
+    for (index, clause) in value
+        .get("clauses")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{owner} must have a `clauses` array {in_path}"))?
+        .iter()
+        .enumerate()
+    {
+        let clause_owner = format!("{owner} clauses[{index}]");
+        let name = required_json_string(clause, "name", &clause_owner)
+            .map_err(|message| format!("{message} {in_path}"))?;
+        let kind = required_json_string(clause, "kind", &clause_owner)
+            .map_err(|message| format!("{message} {in_path}"))?;
+        if !CONSTRUCT_GRAMMAR_CLAUSE_KINDS.contains(&kind.as_str()) {
+            return Err(format!(
+                "{clause_owner} uses unsupported kind `{kind}`; expected one of {} {in_path}",
+                quoted_platform_values(CONSTRUCT_GRAMMAR_CLAUSE_KINDS.iter().copied())
+            ));
+        }
+        let connective = optional_json_string(clause, "connective");
+        if let Some(connective) = connective.as_deref() {
+            if !CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES.contains(&connective) {
+                return Err(format!(
+                    "{clause_owner} uses unsupported connective `{connective}`; expected one of {} {in_path}",
+                    quoted_platform_values(CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES.iter().copied())
+                ));
+            }
+        }
+        let required = clause
+            .get("required")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| format!("{clause_owner} must have a bool `required` {in_path}"))?;
+        let list = clause
+            .get("list")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| format!("{clause_owner} must have a bool `list` {in_path}"))?;
+        // Amendment rule: a `flag` carries no value, so it can be neither a
+        // list nor connective-introduced; `list` is only meaningful for a value
+        // kind. Mirrors `build.rs`'s `emit_declaration_row`.
+        if kind == "flag" {
+            if list {
+                return Err(format!(
+                    "{clause_owner} is a `flag` and cannot set `list: true` (a flag carries no value) {in_path}"
+                ));
+            }
+            if connective.is_some() {
+                return Err(format!(
+                    "{clause_owner} is a `flag` and cannot carry a connective (a flag carries no value) {in_path}"
+                ));
+            }
+        }
+        // `unknown_hint`/`missing_summary` are validation diagnostics, required
+        // on every clause (closed-shape check pins their presence; parsed here
+        // to keep the fail-fast contract) but not carried on the grammar node.
+        required_json_string(clause, "unknown_hint", &clause_owner)
+            .map_err(|message| format!("{message} {in_path}"))?;
+        required_json_string(clause, "missing_summary", &clause_owner)
+            .map_err(|message| format!("{message} {in_path}"))?;
+        clauses.push(ConstructGrammarClause {
+            name,
+            kind,
+            required,
+            list,
+            connective,
+        });
+    }
+    Ok(ConstructGrammar {
+        shape,
+        keyword,
+        slots: Vec::new(),
+        payload: None,
+        binding: "none".to_owned(),
+        target_capability: String::new(),
+        clauses: Some(clauses),
     })
 }
 
@@ -40154,6 +40328,216 @@ coerce review() -> Review {
             error.contains("platform catalog authorization for library `memory`"),
             "{error}"
         );
+    }
+
+    /// A `declaration_block` grammar-only manifest with a single clause, for the
+    /// decl-grammar validator tests. `clause` is the raw JSON of one clause; the
+    /// library uses the non-reserved keyword `widget` so no privilege is needed.
+    fn declaration_grammar_manifest(clause: &str) -> String {
+        format!(
+            r#"{{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "gadget",
+  "name": "gadget",
+  "version": "0.1.0",
+  "libraries": [
+    {{
+      "id": "gadget",
+      "constructs": [
+        {{
+          "id": "gadget.widget",
+          "construct_family": "declaration_block",
+          "keyword": "widget",
+          "scope": "top_level",
+          "grammar": {{
+            "shape": "declaration_block",
+            "keyword": "widget",
+            "clauses": [{clause}]
+          }}
+        }}
+      ]
+    }}
+  ]
+}}"#
+        )
+    }
+
+    #[test]
+    fn package_manifest_accepts_declaration_block_grammar() {
+        // A flag clause, a connective-introduced value clause, and a list
+        // clause. The default `metadata_only` lowering is declaration_block-
+        // compatible, so no capabilities or effect contracts are required.
+        let manifest = package_manifest_from_json(
+            Path::new("gadget-grammar.json"),
+            declaration_grammar_manifest(
+                r#"
+              {"name": "shared", "kind": "flag", "required": false, "list": false,
+               "unknown_hint": "no such field", "missing_summary": "add a field"},
+              {"name": "partition", "kind": "identifier", "required": true, "list": false,
+               "connective": "by", "unknown_hint": "no such field", "missing_summary": "add a field"},
+              {"name": "allow read", "kind": "glob", "required": false, "list": true,
+               "unknown_hint": "no such field", "missing_summary": "add a field"}
+            "#,
+            ),
+        )
+        .expect("declaration_block grammar manifest should validate");
+
+        let form = manifest
+            .registry
+            .constructs
+            .iter()
+            .find(|form| form.id == "gadget.widget")
+            .expect("gadget.widget construct");
+        assert_eq!(form.construct_family, "declaration_block");
+        let grammar = form
+            .grammar
+            .as_ref()
+            .expect("grammar carried on the registration");
+        assert_eq!(grammar.shape, CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK);
+        let clauses = grammar
+            .clauses
+            .as_ref()
+            .expect("declaration_block grammar carries clauses");
+        assert_eq!(clauses.len(), 3);
+        assert_eq!(clauses[1].connective.as_deref(), Some("by"));
+        // The derived flat `fields[]` view: flag -> optional boolean, value
+        // clause -> its own kind, list clause -> the `list` field kind.
+        assert_eq!(
+            form.fields,
+            vec![
+                ConstructField {
+                    name: "shared".to_owned(),
+                    kind: "boolean".to_owned(),
+                    required: false,
+                },
+                ConstructField {
+                    name: "partition".to_owned(),
+                    kind: "identifier".to_owned(),
+                    required: true,
+                },
+                ConstructField {
+                    name: "allow read".to_owned(),
+                    kind: "list".to_owned(),
+                    required: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn package_manifest_rejects_declaration_flag_with_list() {
+        let error = package_manifest_from_json(
+            Path::new("gadget-grammar.json"),
+            declaration_grammar_manifest(
+                r#"{"name": "shared", "kind": "flag", "required": false, "list": true,
+                    "unknown_hint": "h", "missing_summary": "s"}"#,
+            ),
+        )
+        .expect_err("a flag clause cannot be a list");
+        assert!(
+            error.contains("is a `flag` and cannot set `list: true`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn package_manifest_rejects_declaration_flag_with_connective() {
+        let error = package_manifest_from_json(
+            Path::new("gadget-grammar.json"),
+            declaration_grammar_manifest(
+                r#"{"name": "shared", "kind": "flag", "required": false, "list": false,
+                    "connective": "by", "unknown_hint": "h", "missing_summary": "s"}"#,
+            ),
+        )
+        .expect_err("a flag clause cannot carry a connective");
+        assert!(
+            error.contains("is a `flag` and cannot carry a connective"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn package_manifest_rejects_declaration_unknown_clause_kind() {
+        let error = package_manifest_from_json(
+            Path::new("gadget-grammar.json"),
+            declaration_grammar_manifest(
+                r#"{"name": "x", "kind": "mystery", "required": true, "list": false,
+                    "unknown_hint": "h", "missing_summary": "s"}"#,
+            ),
+        )
+        .expect_err("an unknown clause kind is rejected");
+        assert!(error.contains("uses unsupported kind `mystery`"), "{error}");
+    }
+
+    #[test]
+    fn package_manifest_rejects_declaration_unknown_connective() {
+        let error = package_manifest_from_json(
+            Path::new("gadget-grammar.json"),
+            declaration_grammar_manifest(
+                r#"{"name": "x", "kind": "identifier", "required": true, "list": false,
+                    "connective": "beside", "unknown_hint": "h", "missing_summary": "s"}"#,
+            ),
+        )
+        .expect_err("an unknown connective is rejected");
+        assert!(
+            error.contains("uses unsupported connective `beside`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn package_manifest_rejects_declaration_unknown_clause_key() {
+        let error = package_manifest_from_json(
+            Path::new("gadget-grammar.json"),
+            declaration_grammar_manifest(
+                r#"{"name": "x", "kind": "identifier", "required": true, "list": false,
+                    "unknown_hint": "h", "missing_summary": "s", "extra": true}"#,
+            ),
+        )
+        .expect_err("an unknown clause key is rejected");
+        assert!(error.contains("field `extra` is not allowed"), "{error}");
+    }
+
+    #[test]
+    fn package_check_accepts_std_grammar_manifests() {
+        // The five grammar-only std manifests (read by `build.rs` for the parse
+        // table) are now fully-checkable first-class package manifests: each
+        // passes `whip package check` (parse + consistency + registry
+        // diagnostics) now that `declaration_block` is a supported shape.
+        let sources = [
+            (
+                "std/grammars/tracker.json",
+                include_str!("../../../std/grammars/tracker.json"),
+            ),
+            (
+                "std/grammars/coord.json",
+                include_str!("../../../std/grammars/coord.json"),
+            ),
+            (
+                "std/grammars/files.json",
+                include_str!("../../../std/grammars/files.json"),
+            ),
+            (
+                "std/grammars/messaging-grammar.json",
+                include_str!("../../../std/grammars/messaging-grammar.json"),
+            ),
+            (
+                "std/grammars/memory-grammar.json",
+                include_str!("../../../std/grammars/memory-grammar.json"),
+            ),
+        ];
+        for (label, json) in sources {
+            let manifest = package_manifest_from_json(Path::new(label), json.to_owned())
+                .unwrap_or_else(|error| {
+                    panic!("std grammar manifest `{label}` must validate: {error}")
+                });
+            let registry = package_registry(std::slice::from_ref(&manifest));
+            let diagnostics = registry.validate();
+            assert!(
+                diagnostics.is_empty(),
+                "std grammar manifest `{label}` must pass package check: {diagnostics:?}"
+            );
+        }
     }
 
     #[test]
