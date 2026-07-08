@@ -174,6 +174,10 @@ pub struct BrokeredTurnContext<'a> {
     pub effect_id: &'a str,
     pub agent: &'a str,
     pub profile: Option<&'a str>,
+    /// `agent { thread continue }` (pi-conformance §4): seed this turn from the
+    /// agent's latest completed-turn transcript in this instance, appending the
+    /// new user message — the chat-shaped continuation. `false` = fresh turn.
+    pub thread_continue: bool,
 }
 
 /// Evidence kind + shape-only metadata for one in-turn observation. Per DR-0024
@@ -278,7 +282,18 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         // Resume-from-projection (slice 6): if a prior interrupted run left a
         // persisted transcript for this effect, continue from it; otherwise start
         // fresh. The loop persists the transcript after each step via `checkpoint`.
-        let resume_from = self.load_brokered_transcript(ctx.instance_id, ctx.effect_id);
+        let mut resume_from = self.load_brokered_transcript(ctx.instance_id, ctx.effect_id);
+        // Thread continuation (pi-conformance §4): a fresh tell on a
+        // `thread continue` agent seeds from the agent's latest COMPLETED turn
+        // in this instance and appends the new user message. Same-effect crash
+        // recovery above takes priority (it already contains this turn).
+        if resume_from.is_empty() && ctx.thread_continue {
+            let mut thread = self.load_agent_thread_transcript(ctx.instance_id, ctx.agent);
+            if !thread.is_empty() {
+                thread.push(crate::harness_loop::ChatMessage::User(input.user.clone()));
+                resume_from = thread;
+            }
+        }
 
         // Context-assembly Phase 1 (Decision 5): record one `context.bundle`
         // evidence row per assembled bundle (source, version, hash) before the
@@ -475,6 +490,35 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         })?;
 
         Ok(terminal)
+    }
+
+    /// The agent's conversation thread: the final transcript of its latest
+    /// COMPLETED turn in this instance (pi-conformance §4). The completed-turn
+    /// fact carries the agent name and effect id; the transcript events carry
+    /// the conversation — the last checkpoint of a completed turn includes the
+    /// final assistant reply. Empty when the agent has no completed turn yet.
+    fn load_agent_thread_transcript(
+        &self,
+        instance_id: &str,
+        agent: &str,
+    ) -> Vec<crate::harness_loop::ChatMessage> {
+        let Ok(events) = self.store.list_events(instance_id) else {
+            return Vec::new();
+        };
+        let latest_completed_effect = events.iter().rev().find_map(|event| {
+            if event.event_type != "agent.turn.completed" {
+                return None;
+            }
+            let payload = serde_json::from_str::<Value>(&event.payload_json).ok()?;
+            if payload.get("agent").and_then(Value::as_str) != Some(agent) {
+                return None;
+            }
+            Some(payload.get("effect_id")?.as_str()?.to_owned())
+        });
+        match latest_completed_effect {
+            Some(effect_id) => self.load_brokered_transcript(instance_id, &effect_id),
+            None => Vec::new(),
+        }
     }
 
     /// Load the latest persisted brokered-turn transcript for an effect, for
@@ -7529,5 +7573,92 @@ rule wait
                 && diagnostic.event_id.is_some()
                 && diagnostic.run_id.as_deref() == Some("run-tell")
         }));
+    }
+
+    /// Thread continuation (pi-conformance §4): the agent's latest completed
+    /// turn — including the final assistant reply the machine now persists —
+    /// seeds the next tell, with the new user message appended.
+    #[test]
+    fn thread_transcript_loads_latest_completed_turn_for_the_agent() {
+        use crate::harness_loop::ChatMessage;
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let compiled = whipplescript_parser::compile_program(
+            "workflow ThreadDemo\n\noutput result Done\n\nclass Done {\n  ok int\n}\n\n\
+             rule go\n  when started\n=> {\n  complete result { ok 1 }\n}\n",
+        );
+        let program = compiled.ir.expect("compiles");
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &program.workflow,
+                    source_hash: "s",
+                    ir_hash: "i",
+                    compiler_version: "test",
+                },
+                &program,
+            )
+            .expect("version");
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/ThreadDemo",
+                    effective_authority_json: "{}",
+                },
+            )
+            .expect("instance");
+
+        // Synthesize a completed turn: the transcript checkpoints + the
+        // completed fact event, exactly the shapes the runner records.
+        let transcript = crate::harness_loop::chat_messages_to_json(&[
+            ChatMessage::System("sys".to_owned()),
+            ChatMessage::User("first question".to_owned()),
+            ChatMessage::Assistant {
+                text: "first answer".to_owned(),
+                tool_calls: Vec::new(),
+            },
+        ]);
+        kernel
+            .store()
+            .append_event(NewEvent {
+                instance_id: &instance_id,
+                event_type: "agent.turn.brokered.transcript",
+                payload_json: &json!({ "effect_id": "effect-1", "messages": transcript })
+                    .to_string(),
+                source: "kernel",
+                causation_id: None,
+                correlation_id: Some("effect-1"),
+                idempotency_key: Some("t1"),
+            })
+            .expect("transcript event");
+        kernel
+            .store()
+            .append_event(NewEvent {
+                instance_id: &instance_id,
+                event_type: "agent.turn.completed",
+                payload_json: &json!({
+                    "effect_id": "effect-1",
+                    "agent": "helper",
+                    "status": "completed",
+                })
+                .to_string(),
+                source: "kernel",
+                causation_id: None,
+                correlation_id: Some("effect-1"),
+                idempotency_key: Some("f1"),
+            })
+            .expect("completed fact event");
+
+        let thread = kernel.load_agent_thread_transcript(&instance_id, "helper");
+        assert_eq!(thread.len(), 3, "system + user + final assistant");
+        assert!(
+            matches!(&thread[2], ChatMessage::Assistant { text, .. } if text == "first answer")
+        );
+        // A different agent has no thread.
+        assert!(kernel
+            .load_agent_thread_transcript(&instance_id, "other")
+            .is_empty());
     }
 }
