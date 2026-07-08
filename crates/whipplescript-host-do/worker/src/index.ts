@@ -45,6 +45,12 @@ export interface Env {
   // go as whip-executor/1 HTTP rounds. Unset = exec effects error. URLs on
   // this host are routed to the EXECUTOR container pool, not the network.
   WHIP_EXECUTOR_URL?: string;
+  // Environment component of the delta-kernel content key: the executor
+  // image identity (image digest = environment hash, §5 of the compute-plane
+  // note). `whip deploy` computes it from the Dockerfile + whip binary and
+  // injects it, so a toolchain bump is a visible warm-start epoch that rolls
+  // the cache. Unset = the "do-v0" default epoch.
+  WHIP_COMPUTE_ENV_HASH?: string;
   EXECUTOR: DurableObjectNamespace<ExecutorContainer>;
 }
 
@@ -246,6 +252,7 @@ export class WorkflowInstance implements DurableObject {
     const execConfig = this.env.WHIP_EXECUTOR_URL
       ? JSON.stringify({
           base_url: this.env.WHIP_EXECUTOR_URL,
+          environment_epoch: this.env.WHIP_COMPUTE_ENV_HASH,
           env: {
             ...(this.env.ANTHROPIC_API_KEY ? { ANTHROPIC_API_KEY: this.env.ANTHROPIC_API_KEY } : {}),
             ...(this.env.OPENAI_API_KEY ? { OPENAI_API_KEY: this.env.OPENAI_API_KEY } : {}),

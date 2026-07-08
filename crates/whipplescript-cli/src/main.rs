@@ -377,6 +377,7 @@ fn deploy_steps(
     plan: &DeployPlan,
     node_modules_present: bool,
     secret_values: &[(&str, String)],
+    executor_present: bool,
 ) -> Vec<DeployStep> {
     let mut steps = Vec::new();
     if !plan.skip_build && !node_modules_present {
@@ -392,6 +393,14 @@ fn deploy_steps(
             label: "build wasm kernel",
             program: "npm",
             args: vec!["run".to_owned(), "build:wasm".to_owned()],
+            stdin_value: None,
+        });
+    }
+    if !plan.skip_build && executor_present {
+        steps.push(DeployStep {
+            label: "stage executor binary",
+            program: "npm",
+            args: vec!["run".to_owned(), "build:executor".to_owned()],
             stdin_value: None,
         });
     }
@@ -465,11 +474,33 @@ fn deploy_command(options: &CliOptions) -> ExitCode {
         }
     }
     let node_modules_present = plan.worker_dir.join("node_modules").is_dir();
-    let steps = deploy_steps(&plan, node_modules_present, &secret_values);
-    for step in &steps {
+    let executor_present = plan.worker_dir.join("executor/Dockerfile").is_file();
+    let steps = deploy_steps(
+        &plan,
+        node_modules_present,
+        &secret_values,
+        executor_present,
+    );
+    let last_index = steps.len().saturating_sub(1);
+    for (index, step) in steps.iter().enumerate() {
         println!("deploy: {} ...", step.label);
         let mut command = Command::new(step.program);
         command.args(&step.args).current_dir(&plan.worker_dir);
+        // Image digest = environment hash (compute plane P8): the executor
+        // image identity — Dockerfile + the staged whip binary — becomes the
+        // delta-kernel cache's environment epoch, injected at deploy so a
+        // toolchain bump is a visible warm-start epoch that rolls the cache.
+        // Computed here, after the staging step has run.
+        if index == last_index && executor_present {
+            if let Some(epoch) = executor_environment_hash(&plan.worker_dir) {
+                command.arg("--var");
+                command.arg(format!("WHIP_COMPUTE_ENV_HASH:{epoch}"));
+            } else {
+                println!(
+                    "note: executor binary not staged; deploying without an environment epoch"
+                );
+            }
+        }
         let status = if let Some(stdin_value) = &step.stdin_value {
             command.stdin(Stdio::piped());
             match command.spawn() {
@@ -541,6 +572,18 @@ fn executor_command(options: &CliOptions) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The executor image identity: sha256 over the Dockerfile and the staged
+/// whip binary. This IS the environment hash the delta-kernel cache keys on
+/// (image digest = environment hash, compute-plane note §5) — any change to
+/// either rolls every cached result.
+fn executor_environment_hash(worker_dir: &Path) -> Option<String> {
+    let dockerfile = fs::read(worker_dir.join("executor/Dockerfile")).ok()?;
+    let binary = fs::read(worker_dir.join("executor/whip")).ok()?;
+    let mut material = dockerfile;
+    material.extend_from_slice(&binary);
+    Some(whipplescript_kernel::exec_http::sha256_hex(&material))
 }
 
 /// Locate `tool` on PATH (portable `which`).
@@ -47331,18 +47374,19 @@ workflow Child {
             set_secrets: true,
         };
         let secrets = vec![("ANTHROPIC_API_KEY", "sk-test".to_owned())];
-        let steps = deploy_steps(&plan, false, &secrets);
+        let steps = deploy_steps(&plan, false, &secrets, true);
         let labels = steps.iter().map(|step| step.label).collect::<Vec<_>>();
         assert_eq!(
             labels,
             vec![
                 "install worker dependencies",
                 "build wasm kernel",
+                "stage executor binary",
                 "set provider secret",
                 "deploy to Cloudflare",
             ]
         );
-        let secret_step = &steps[2];
+        let secret_step = &steps[3];
         assert_eq!(secret_step.program, "wrangler");
         assert_eq!(
             secret_step.args,
@@ -47350,7 +47394,7 @@ workflow Child {
         );
         assert_eq!(secret_step.stdin_value.as_deref(), Some("sk-test"));
         assert_eq!(
-            steps[3].args,
+            steps[4].args,
             vec!["deploy", "--name", "staging"],
             "secret value must never appear in deploy argv"
         );
@@ -47364,7 +47408,7 @@ workflow Child {
             skip_build: false,
             set_secrets: true,
         };
-        let steps = deploy_steps(&dry, true, &secrets);
+        let steps = deploy_steps(&dry, true, &secrets, false);
         let labels = steps.iter().map(|step| step.label).collect::<Vec<_>>();
         assert_eq!(
             labels,
@@ -47380,7 +47424,7 @@ workflow Child {
             skip_build: true,
             set_secrets: false,
         };
-        let steps = deploy_steps(&quick, false, &[]);
+        let steps = deploy_steps(&quick, false, &[], true);
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].args, vec!["deploy"]);
     }
