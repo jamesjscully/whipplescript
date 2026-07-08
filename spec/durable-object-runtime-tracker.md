@@ -271,7 +271,7 @@ linear undo chain). No phase work now.
       (Decision 4) layers on later (Phase 7) behind this same seam; the
       small-file-inline path is the native default.
 
-### Phase 5 — DO host crate + TS shell (the wasm target) — in-repo scope COMPLETE 2026-07-03; only the Cloudflare `wrangler deploy` (5d) remains
+### Phase 5 — DO host crate + TS shell (the wasm target) — COMPLETE incl. live edge 2026-07-07 (deployed: whipplescript-runtime.jamesjscully.workers.dev; effect-free + coerce-over-mock + timer workflows validated under wrangler dev/workerd, effect-free + timer + AUTONOMOUS ALARM validated on the real edge via wrangler tail). Remaining seams: DO ToolExecutor (async-tool-over-sidecar, = compute-plane Class-B), provider secrets on the edge (`wrangler secret put ANTHROPIC_API_KEY`, mechanism validated via .dev.vars locally)
 > **Status (2026-07-03):** every in-repo chunk is built and live-validated —
 > 5a store traits on `DoSqliteStore`, 5b all effect families (10 store-only +
 > coerce suspend/resume + eviction-safe agent turn), 5c `DoInstanceDriver` +
