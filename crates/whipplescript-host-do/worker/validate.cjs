@@ -44,7 +44,7 @@ function testEffectFree() {
   ].join("\n");
   const bridge = freshInstanceEnv([]);
   const inst = WasmDurableInstance.create(bridge, source, "{}", "local/MinimalNoop", undefined, undefined);
-  const outcome = JSON.parse(inst.step(undefined));
+  const outcome = JSON.parse(inst.step(undefined, Date.now()));
   assert.strictEqual(outcome.kind, "terminal", `effect-free: ${JSON.stringify(outcome)}`);
   assert.strictEqual(inst.status(), "completed");
   console.log("PASS  effect-free workflow -> completed (one step)");
@@ -74,7 +74,7 @@ function testCoerceSuspendResume() {
   const inst = WasmDurableInstance.create(bridge, source, "{}", "local/CoerceScore", coerceConfig, undefined);
 
   // First step: the coerce effect suspends on `fetch`.
-  const first = JSON.parse(inst.step(undefined));
+  const first = JSON.parse(inst.step(undefined, Date.now()));
   assert.strictEqual(first.kind, "needs_http", `coerce step1: ${JSON.stringify(first)}`);
   assert.ok(first.request.url.includes("anthropic"), "request targets the provider");
 
@@ -86,7 +86,7 @@ function testCoerceSuspendResume() {
       usage: { input_tokens: 1, output_tokens: 1 },
     },
   });
-  const second = JSON.parse(inst.step(response));
+  const second = JSON.parse(inst.step(response, Date.now()));
   assert.strictEqual(second.kind, "terminal", `coerce step2: ${JSON.stringify(second)}`);
   assert.strictEqual(inst.status(), "completed");
   console.log("PASS  coerce workflow -> needs_http -> (fetch) -> terminal (two steps)");
@@ -118,7 +118,7 @@ function testAgentSuspendResume() {
   const inst = WasmDurableInstance.create(bridge, source, "{}", "local/AgentDemo", undefined, agentConfig);
 
   // First step: the agent turn's first model call suspends on `fetch`.
-  const first = JSON.parse(inst.step(undefined));
+  const first = JSON.parse(inst.step(undefined, Date.now()));
   assert.strictEqual(first.kind, "needs_http", `agent step1: ${JSON.stringify(first)}`);
   assert.ok(first.request.url.endsWith("/v1/messages"), "request targets the messages endpoint");
 
@@ -130,7 +130,7 @@ function testAgentSuspendResume() {
       usage: { input_tokens: 1, output_tokens: 1 },
     },
   });
-  const second = JSON.parse(inst.step(response));
+  const second = JSON.parse(inst.step(response, Date.now()));
   assert.strictEqual(second.kind, "terminal", `agent step2: ${JSON.stringify(second)}`);
   assert.strictEqual(inst.status(), "completed");
   console.log("PASS  agent workflow -> needs_http -> (fetch) -> terminal (two steps)");

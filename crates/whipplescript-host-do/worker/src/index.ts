@@ -105,7 +105,7 @@ function makeBridge(sql: SqlStorage) {
 type StepOutcome =
   | { kind: "needs_http"; request: { url: string; headers: [string, string][]; body: unknown } }
   | { kind: "terminal" }
-  | { kind: "parked" }
+  | { kind: "parked"; next_due_unix_ms: number | null }
   | { kind: "failed"; message: string };
 
 // Perform one suspended HTTP round and marshal the result back for `step`.
@@ -127,6 +127,12 @@ async function performFetch(req: {
   }
 }
 
+interface Bootstrap {
+  program: string;
+  input: string;
+  principal: string;
+}
+
 export class WorkflowInstance implements DurableObject {
   constructor(
     private ctx: DurableObjectState,
@@ -137,12 +143,39 @@ export class WorkflowInstance implements DurableObject {
   // suspension or terminal. Subsequent external events / alarms re-enter and drive
   // further; the durable state is entirely in DO SQLite.
   async fetch(request: Request): Promise<Response> {
-    const { program, input, principal } = (await request.json()) as {
-      program: string;
-      input: string;
-      principal: string;
-    };
+    const { program, input, principal } = (await request.json()) as Partial<Bootstrap>;
+    let bootstrap: Bootstrap | undefined;
+    if (program) {
+      bootstrap = {
+        program,
+        input: input ?? "{}",
+        principal: principal ?? "local/Workflow",
+      };
+      // Persisted so an alarm (or a body-less poke) can rehydrate the wasm
+      // instance without the caller resupplying the program.
+      await this.ctx.storage.put("bootstrap", bootstrap);
+    } else {
+      bootstrap = await this.ctx.storage.get<Bootstrap>("bootstrap");
+    }
+    if (!bootstrap) {
+      return Response.json({ error: "no program: POST { program, input, principal } first" }, { status: 400 });
+    }
+    const result = await this.drive(bootstrap);
+    return Response.json(result);
+  }
 
+  // The DO's single wake-up (DR-0033 Phase 6): a parked instance with pending
+  // timers/deadlines scheduled this; re-enter and drive — the due-time pass
+  // fires the timers, the rule pass sees the facts, and the run continues.
+  async alarm(): Promise<void> {
+    const bootstrap = await this.ctx.storage.get<Bootstrap>("bootstrap");
+    if (bootstrap) {
+      const result = await this.drive(bootstrap);
+      console.log(`alarm fired: drove instance to ${result.status} (${result.outcome})`);
+    }
+  }
+
+  private async drive(bootstrap: Bootstrap): Promise<{ status: string; outcome: string }> {
     ensureSchema(this.ctx.storage.sql);
     const bridge = makeBridge(this.ctx.storage.sql);
     // Provider creds from DO secrets (optional; store-only workflows omit both).
@@ -162,24 +195,31 @@ export class WorkflowInstance implements DurableObject {
     const agentConfig = anthropicConfig("claude-3-5-sonnet-latest", 4096);
     const instance = WasmDurableInstance.create(
       bridge,
-      program,
-      input ?? "{}",
-      principal ?? "local/Workflow",
+      bootstrap.program,
+      bootstrap.input,
+      bootstrap.principal,
       coerceConfig,
       agentConfig,
     );
 
-    // The sans-IO loop: step -> maybe fetch -> step, until a terminal. Each `fetch`
-    // is one provider round; the core parses the response and continues (or, on the
-    // final round, settles). A production shell persists after each round so the
-    // object can hibernate; here we run the loop within one request for clarity.
+    // The sans-IO loop: step -> maybe fetch -> step, until a terminal or a park.
+    // Each `fetch` is one provider round; the core parses the response and
+    // continues (or, on the final round, settles). A production shell persists
+    // after each round so the object can hibernate; here we run the loop within
+    // one request for clarity.
     let responseJson: string | undefined = undefined;
     for (;;) {
-      const outcome = JSON.parse(instance.step(responseJson)) as StepOutcome;
-      if (outcome.kind !== "needs_http") {
-        return Response.json({ status: instance.status(), outcome: outcome.kind });
+      const outcome = JSON.parse(instance.step(responseJson, Date.now())) as StepOutcome;
+      if (outcome.kind === "needs_http") {
+        responseJson = await performFetch(outcome.request);
+        continue;
       }
-      responseJson = await performFetch(outcome.request);
+      if (outcome.kind === "parked" && outcome.next_due_unix_ms != null) {
+        // The instance holds pending timers/deadlines: schedule the DO's
+        // single alarm at the earliest one (the Alarms seam, live).
+        await this.ctx.storage.setAlarm(outcome.next_due_unix_ms);
+      }
+      return { status: instance.status(), outcome: outcome.kind };
     }
   }
 }

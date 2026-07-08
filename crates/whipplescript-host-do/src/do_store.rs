@@ -65,6 +65,36 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         Self { sql }
     }
 
+    /// The earliest future due instant (unix milliseconds) across this
+    /// instance's pending timed effects — creation-anchored `timeout_seconds`
+    /// deadlines and explicit `$.deadline_at` instants (DR-0033 Phase 6). The
+    /// DO shell sets its single wake-up alarm from this when the instance
+    /// parks; `None` means nothing is scheduled.
+    pub fn next_effect_due_epoch_ms(&self, instance_id: &str) -> StoreResult<Option<i64>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT MIN(due_epoch) FROM ( \
+                   SELECT (CAST(strftime('%s', created_at) AS INTEGER) + timeout_seconds) \
+                     AS due_epoch FROM effects \
+                    WHERE instance_id = ?1 AND timeout_seconds IS NOT NULL \
+                      AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
+                   UNION ALL \
+                   SELECT CAST(strftime('%s', json_extract(input_json, '$.deadline_at')) \
+                     AS INTEGER) FROM effects \
+                    WHERE instance_id = ?1 \
+                      AND json_extract(input_json, '$.deadline_at') IS NOT NULL \
+                      AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
+                 )",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .first()
+            .and_then(|row| as_opt_i64(&row[0]))
+            .map(|epoch_seconds| epoch_seconds * 1000))
+    }
+
     /// Records an effect-cancellation request (idempotent replay + open-request
     /// guard), its `effect.cancellation_requested` event, and the evidence with its
     /// link fan-out (event / effect / revision / active runs). Shared by

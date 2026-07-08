@@ -146,7 +146,10 @@ fn outcome_to_json(outcome: &DurableStepOutcome) -> String {
             },
         }),
         DurableStepOutcome::Terminal => serde_json::json!({ "kind": "terminal" }),
-        DurableStepOutcome::Parked => serde_json::json!({ "kind": "parked" }),
+        DurableStepOutcome::Parked { next_due_unix_ms } => serde_json::json!({
+            "kind": "parked",
+            "next_due_unix_ms": next_due_unix_ms,
+        }),
         DurableStepOutcome::Failed(message) => {
             serde_json::json!({ "kind": "failed", "message": message })
         }
@@ -264,10 +267,19 @@ impl WasmDurableInstance {
 
     /// Advance the instance one HTTP round. Pass `undefined`/`null` on the first
     /// call, then the previous `needs_http` request's `fetch` result as JSON.
+    /// `now_unix_ms` is the host's clock (`Date.now()`), injected so the core
+    /// never reads wall time (DR-0033 Phase 6 — timers/deadlines resolve
+    /// against it, and `parked.next_due_unix_ms` names the next wake-up).
     /// Returns the next `DurableStepOutcome` as JSON.
-    pub fn step(&mut self, response_json: Option<String>) -> Result<String, JsValue> {
+    pub fn step(
+        &mut self,
+        response_json: Option<String>,
+        now_unix_ms: f64,
+    ) -> Result<String, JsValue> {
         let incoming = parse_incoming(response_json)?;
-        Ok(outcome_to_json(&self.inner.step(incoming)))
+        Ok(outcome_to_json(
+            &self.inner.step(incoming, now_unix_ms as i64),
+        ))
     }
 
     /// The instance's durable status (`"running"` / `"completed"` / …).

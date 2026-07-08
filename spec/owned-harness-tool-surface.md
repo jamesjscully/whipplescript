@@ -170,10 +170,14 @@ update_todo               tracker capability; status-specific
   an **egress** (flow-checked like `send`), the result is a **low-integrity
   ingress** (taint source, like an inbound message). A capability grantable via
   `with access to` — the first real customer of the workflow authority model (a
-  subagent gets web search only if delegated it). Settled in shape; **gated on
-  the broader network-tool policy discussion** (open, per Jack). Draft design
-  for that discussion: [`web-tools-design-note.md`](web-tools-design-note.md)
-  (fetchkit as the default engine; search-provider fork open).
+  subagent gets web search only if delegated it). Settled in shape; the
+  network-tool policy discussion's *search* half is drafted with core
+  decisions settled (Jack 2026-07-07):
+  [`web-search-tool-design-note.md`](web-search-tool-design-note.md)
+  (SearchProvider trait; Brave first, Exa/Tavily deferred; zero-config
+  floor = model-provider-native search; scraping rejected). The web
+  *fetch* tool is the remaining open gap (a fetchkit-based draft was
+  withdrawn 2026-07-07 — fetch-only, no search, Jack dropped it).
 - **remaining runtime-governance policy extensions** (from encapsulation
   Phase 4b; canonical home for this item): the live owned harness binds tool
   exposure and execution to turn grants, profile/registry capabilities, known

@@ -72,13 +72,13 @@ use whipplescript_parser::{
 };
 use whipplescript_store::{
     ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, ClaimableEffect, DerivedFact,
-    DiagnosticRecord, DiagnosticView, EffectCancellation, EffectCancellationRequest,
-    EffectCompletion, EffectView, EventView, EvidenceLink, EvidenceLinkView, EvidenceRecord,
-    EvidenceView, FactView, HumanAnswer, InboxItemView, InstanceView, NewEvent, NewFact,
-    NewInboxItem, NewInstanceAuthority, NewWorkflowInvocation, ProviderValidationEvidence,
-    RetryEffect, RevisionActivation, RevisionCancellationImpact, RevisionCandidate,
-    RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RunStart, RunView, RuntimeStore,
-    SqliteStore, StatusView, StoreError, WorkflowInvocationView, WorkflowRevisionView,
+    DiagnosticRecord, DiagnosticView, EffectCancellation, EffectCompletion, EffectView, EventView,
+    EvidenceLink, EvidenceLinkView, EvidenceRecord, EvidenceView, FactView, HumanAnswer,
+    InboxItemView, InstanceView, NewEvent, NewFact, NewInboxItem, NewInstanceAuthority,
+    NewWorkflowInvocation, ProviderValidationEvidence, RetryEffect, RevisionActivation,
+    RevisionCancellationImpact, RevisionCandidate, RevisionCompatibilityDiagnostic,
+    RevisionCompatibilityReport, RunStart, RunView, RuntimeStore, SqliteStore, StatusView,
+    StoreError, WorkflowInvocationView, WorkflowRevisionView,
 };
 // File-effect byte I/O routes through the FileStore seam (DR-0033 Phase 4); the
 // native backing is `std::fs`.
@@ -21091,12 +21091,7 @@ fn items_store_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".whipplescript/items.sqlite"))
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct TimePassReport {
-    timers_fired: usize,
-    deadlines_expired: usize,
-    terminal_events: Vec<String>,
-}
+use whipplescript_kernel::time_pass::TimePassReport;
 
 /// Selects which due clock occurrences become durable signal facts under the
 /// source's missed-occurrence policy (spec/std-time.md). Each entry is a
@@ -21714,168 +21709,11 @@ fn resolve_due_time_effects(
     instance_id: &str,
     now: &str,
 ) -> Result<TimePassReport, StoreError> {
-    let mut report = TimePassReport::default();
+    // Lifted into the kernel (DR-0033 Phase 6) so the DO host runs the same
+    // pass over its threaded store; the CLI opens the store once and delegates.
     let store = SqliteStore::open(store_path)?;
-    let due = store.due_time_effects(instance_id, now)?;
-    drop(store);
-    for effect in due {
-        // A `lease.acquire … wait <duration>` carries a creation-anchored
-        // `timeout_seconds` purely to bound its contention retry, so it surfaces
-        // here once the wait elapses. Its terminal is `contended` (give up), not a
-        // timeout/expiry — the coordination handler on the effect pass owns that
-        // completion, so leave it for the handler rather than expiring it here.
-        if effect.kind == "lease.acquire" {
-            continue;
-        }
-        if effect.kind == "timer.wait" {
-            let run_id = idempotency_key(&[instance_id, &effect.effect_id, "timer-run"]);
-            let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "timer-lease"]);
-            let store = SqliteStore::open(store_path)?;
-            let mut kernel = RuntimeKernel::new(store);
-            kernel.start_run(RunStart {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "timer",
-                worker_id: "whip-timer",
-                lease_id: &lease_id,
-                lease_expires_at: "2030-01-01T00:00:00Z",
-                metadata_json: &json!({
-                    "duration_seconds": effect.timeout_seconds,
-                })
-                .to_string(),
-            })?;
-            let terminal = kernel.complete_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "timer",
-                worker_id: "whip-timer",
-                status: "completed",
-                exit_code: Some(0),
-                summary: Some("timer fired"),
-                metadata_json: &json!({
-                    "duration_seconds": effect.timeout_seconds,
-                })
-                .to_string(),
-                idempotency_key: Some(&idempotency_key(&[
-                    instance_id,
-                    &effect.effect_id,
-                    "timer-terminal",
-                ])),
-            })?;
-            let value_json = json!({
-                "effect_id": effect.effect_id,
-                "run_id": run_id,
-                "status": "completed",
-                "fired": true,
-                "duration_seconds": effect.timeout_seconds,
-            })
-            .to_string();
-            kernel.derive_fact(
-                instance_id,
-                "timer.fired",
-                &effect.effect_id,
-                &value_json,
-                Some(&terminal.event_id),
-                Some(&idempotency_key(&[
-                    instance_id,
-                    &effect.effect_id,
-                    "timer.fired",
-                ])),
-            )?;
-            report.timers_fired += 1;
-            report.terminal_events.push(terminal.event_id);
-            continue;
-        }
-        // Deadline expiry: running effects time out at the run level and get
-        // a cancellation request; never-run effects expire directly.
-        let store = SqliteStore::open(store_path)?;
-        let running_run = store
-            .list_runs(instance_id)?
-            .into_iter()
-            .find(|run| run.effect_id == effect.effect_id && run.status == "running");
-        drop(store);
-        let terminal_event_id = match running_run {
-            Some(run) => {
-                let store = SqliteStore::open(store_path)?;
-                let mut kernel = RuntimeKernel::new(store);
-                let terminal = kernel.timeout_run(EffectCompletion {
-                    instance_id,
-                    effect_id: &effect.effect_id,
-                    run_id: &run.run_id,
-                    provider: &run.provider,
-                    worker_id: &run.worker_id,
-                    status: "timed_out",
-                    exit_code: None,
-                    summary: Some("deadline exceeded"),
-                    metadata_json: &json!({
-                        "timeout_seconds": effect.timeout_seconds,
-                        "reason": "deadline exceeded",
-                    })
-                    .to_string(),
-                    idempotency_key: Some(&idempotency_key(&[
-                        instance_id,
-                        &effect.effect_id,
-                        "deadline-terminal",
-                    ])),
-                })?;
-                let store = kernel.into_store();
-                let mut store = store;
-                let _ = store.request_effect_cancellation(EffectCancellationRequest {
-                    instance_id,
-                    effect_id: &effect.effect_id,
-                    revision_id: None,
-                    reason: Some("deadline exceeded"),
-                    requested_by: "deadline",
-                    causation_event_id: Some(&terminal.event_id),
-                    idempotency_key: Some(&idempotency_key(&[
-                        instance_id,
-                        &effect.effect_id,
-                        "deadline-cancel-request",
-                    ])),
-                });
-                terminal.event_id
-            }
-            None => {
-                let mut store = SqliteStore::open(store_path)?;
-                let terminal = store.expire_effect(
-                    instance_id,
-                    &effect.effect_id,
-                    Some(&idempotency_key(&[
-                        instance_id,
-                        &effect.effect_id,
-                        "deadline-terminal",
-                    ])),
-                )?;
-                terminal.event_id
-            }
-        };
-        let store = SqliteStore::open(store_path)?;
-        let mut kernel = RuntimeKernel::new(store);
-        let value_json = json!({
-            "effect_id": effect.effect_id,
-            "status": "timed_out",
-            "reason": "deadline exceeded",
-            "timeout_seconds": effect.timeout_seconds,
-        })
-        .to_string();
-        kernel.derive_fact(
-            instance_id,
-            "effect.timed_out",
-            &effect.effect_id,
-            &value_json,
-            Some(&terminal_event_id),
-            Some(&idempotency_key(&[
-                instance_id,
-                &effect.effect_id,
-                "effect.timed_out",
-            ])),
-        )?;
-        report.deadlines_expired += 1;
-        report.terminal_events.push(terminal_event_id);
-    }
-    Ok(report)
+    let mut kernel = RuntimeKernel::new(store);
+    whipplescript_kernel::time_pass::resolve_due_time_effects(&mut kernel, instance_id, now)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

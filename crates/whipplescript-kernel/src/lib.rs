@@ -22,6 +22,7 @@ pub mod provider;
 pub mod rule_lowering;
 pub mod rule_pass;
 pub mod sansio;
+pub mod time_pass;
 pub mod trace;
 
 use artifact_manifest::{

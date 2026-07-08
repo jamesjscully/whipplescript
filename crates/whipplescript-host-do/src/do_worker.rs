@@ -37,9 +37,39 @@ pub enum DurableStepOutcome {
     /// The instance reached a workflow terminal (absorbing).
     Terminal,
     /// Quiescent but not terminal — parked awaiting external input / an alarm.
-    Parked,
+    /// When the instance holds pending timed effects, `next_due_unix_ms` is
+    /// the earliest wake-up it needs; the shell sets the DO alarm from it
+    /// (DR-0033 Phase 6).
+    Parked { next_due_unix_ms: Option<i64> },
     /// A store error aborted the pass (surfaced, not swallowed).
     Failed(String),
+}
+
+/// Unix milliseconds → ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`), dependency-free
+/// so it builds for wasm (Howard Hinnant's days-from-civil, inverted). The DO
+/// shell passes `Date.now()`; the store's `strftime`-based clock queries all
+/// consume this shape.
+pub fn unix_ms_to_iso8601(unix_ms: i64) -> String {
+    let secs = unix_ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
+    // civil-from-days (era-based, valid for the whole i64 day range).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 /// A no-op file store for instances whose workflows touch no file effects. A live
@@ -109,9 +139,11 @@ pub struct DurableInstance<Sql: DoSql> {
 }
 
 impl<Sql: DoSql> DurableInstance<Sql> {
-    /// Compile `program_source`, then create + start a fresh instance in the DO
-    /// store with `input_json` as its input. The worker calls this once when the
-    /// object is first addressed; `step` drives it thereafter.
+    /// Compile `program_source`, then get-or-create THE instance in the DO
+    /// store (a Durable Object holds exactly one workflow instance). The first
+    /// call creates + starts it; any later call — an alarm wake-up, a poke, an
+    /// isolate-eviction rehydration — reattaches to the existing durable state
+    /// instead of minting a second instance.
     pub fn create(
         sql: Sql,
         program_source: &str,
@@ -134,24 +166,37 @@ impl<Sql: DoSql> DurableInstance<Sql> {
                 &ir,
             )
             .map_err(|error| format!("{error:?}"))?;
-        let instance_id = kernel
-            .create_instance_with_authority(
-                &version,
-                input_json,
-                NewInstanceAuthority {
-                    workflow_principal,
-                    effective_authority_json: "{}",
-                },
-            )
-            .map_err(|error| format!("{error:?}"))?;
-        kernel
-            .ingest_external_event(
-                &instance_id,
-                "external.started",
-                input_json,
-                Some("started"),
-            )
-            .map_err(|error| format!("{error:?}"))?;
+        let existing = kernel
+            .store()
+            .list_instances()
+            .map_err(|error| format!("{error:?}"))?
+            .into_iter()
+            .next()
+            .map(|instance| instance.instance_id);
+        let instance_id = match existing {
+            Some(instance_id) => instance_id,
+            None => {
+                let instance_id = kernel
+                    .create_instance_with_authority(
+                        &version,
+                        input_json,
+                        NewInstanceAuthority {
+                            workflow_principal,
+                            effective_authority_json: "{}",
+                        },
+                    )
+                    .map_err(|error| format!("{error:?}"))?;
+                kernel
+                    .ingest_external_event(
+                        &instance_id,
+                        "external.started",
+                        input_json,
+                        Some("started"),
+                    )
+                    .map_err(|error| format!("{error:?}"))?;
+                instance_id
+            }
+        };
         Ok(Self {
             kernel: Some(kernel),
             ir,
@@ -168,11 +213,14 @@ impl<Sql: DoSql> DurableInstance<Sql> {
 
     /// Advance the instance until it next needs an HTTP round or settles. `incoming`
     /// is the response to the request the previous `step` returned (`None` on the
-    /// first call). This is the `InstanceStepMachine` fixpoint with the in-flight
+    /// first call); `now_unix_ms` is the host's clock instant (the DO shell passes
+    /// `Date.now()`) — injected so the core never reads wall time (DR-0033
+    /// Phase 6). This is the `InstanceStepMachine` fixpoint with the in-flight
     /// effect held in `self`.
     pub fn step(
         &mut self,
         incoming: Option<Result<HttpResponse, TransportError>>,
+        now_unix_ms: i64,
     ) -> DurableStepOutcome {
         // Borrow disjoint fields: the driver takes the kernel by value and the effect
         // seams + program by reference, while `in_flight` is threaded separately.
@@ -192,7 +240,8 @@ impl<Sql: DoSql> DurableInstance<Sql> {
             instance_id: &self.instance_id,
         };
 
-        let outcome = drive_fixpoint(&mut driver, &mut self.in_flight, incoming);
+        let now = unix_ms_to_iso8601(now_unix_ms);
+        let outcome = drive_fixpoint(&mut driver, &mut self.in_flight, incoming, &now);
         self.kernel = Some(driver.kernel);
         outcome
     }
@@ -219,6 +268,7 @@ fn drive_fixpoint<D: InstanceDriver>(
     driver: &mut D,
     in_flight: &mut Option<ClaimableEffect>,
     incoming: Option<Result<HttpResponse, TransportError>>,
+    now: &str,
 ) -> DurableStepOutcome {
     // Resume an effect suspended on an HTTP round with the host's response.
     if let Some(effect) = in_flight.take() {
@@ -232,6 +282,13 @@ fn drive_fixpoint<D: InstanceDriver>(
         }
     }
 
+    // The due-time pass first (DR-0033 Phase 6): an alarm-driven re-entry
+    // completes its due timers / expires deadlines before the rule pass, so
+    // the rules see the fired facts this same step.
+    if let Err(error) = driver.advance_time(now) {
+        return DurableStepOutcome::Failed(format!("{error:?}"));
+    }
+
     loop {
         match driver.advance_rules() {
             Ok(true) => return DurableStepOutcome::Terminal,
@@ -240,7 +297,14 @@ fn drive_fixpoint<D: InstanceDriver>(
         }
         let ready = match driver.next_ready_effect() {
             Ok(Some(effect)) => effect,
-            Ok(None) => return DurableStepOutcome::Parked,
+            Ok(None) => {
+                // Parked: surface the earliest pending wake-up so the shell
+                // can set the DO's single alarm.
+                return match driver.next_due_unix_ms() {
+                    Ok(next_due_unix_ms) => DurableStepOutcome::Parked { next_due_unix_ms },
+                    Err(error) => DurableStepOutcome::Failed(format!("{error:?}")),
+                };
+            }
             Err(error) => return DurableStepOutcome::Failed(format!("{error:?}")),
         };
         match driver.run_effect(&ready, None) {
@@ -257,6 +321,9 @@ fn drive_fixpoint<D: InstanceDriver>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixed injected clock for deterministic tests (2026-01-01T00:00:00Z).
+    const TEST_NOW_MS: i64 = 1_767_225_600_000;
     use crate::do_store::test_support::store;
 
     /// The worker-shell loop over an effect-free workflow: `create`, then `step`
@@ -277,8 +344,60 @@ mod tests {
         )
         .expect("create");
         assert!(
-            matches!(instance.step(None), DurableStepOutcome::Terminal),
+            matches!(
+                instance.step(None, TEST_NOW_MS),
+                DurableStepOutcome::Terminal
+            ),
             "the worker drives the instance to its terminal in one step"
+        );
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed")
+        );
+    }
+
+    /// The alarm cycle (DR-0033 Phase 6): a timer workflow PARKS with the
+    /// timer's due instant surfaced as `next_due_unix_ms` (the shell sets the
+    /// DO alarm from it), and the alarm's re-entry `step` — a later injected
+    /// `now` — runs the due-time pass, fires the timer, and completes.
+    #[test]
+    fn timer_workflow_parks_with_next_due_then_alarm_reentry_completes() {
+        let source = "workflow TimerDemo\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             rule go\n  when started\n=> {\n\
+             \x20 timer 2s as pause\n\n\
+             \x20 after pause succeeds {\n    complete result { ok 1 }\n  }\n}\n";
+        let mut instance = DurableInstance::create(
+            store().sql,
+            source,
+            "{}",
+            "local/TimerDemo",
+            DurableEffectPorts::default(),
+        )
+        .expect("create");
+
+        // First step: the timer is pending and not yet due — the instance
+        // parks and names its wake-up (creation-anchored, so within 2s of the
+        // store's clock; assert presence and sanity, not the exact instant).
+        let parked = instance.step(None, TEST_NOW_MS);
+        let next_due = match parked {
+            DurableStepOutcome::Parked { next_due_unix_ms } => {
+                next_due_unix_ms.expect("a pending timer names its wake-up")
+            }
+            other => panic!("expected a park with a wake-up, got {other:?}"),
+        };
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("running")
+        );
+
+        // The alarm fires: re-enter with a `now` past the due instant. The
+        // due-time pass completes the timer, the rule pass sees it, and the
+        // workflow completes — no external poller involved.
+        let after_due = next_due + 1_000;
+        assert!(
+            matches!(instance.step(None, after_due), DurableStepOutcome::Terminal),
+            "the alarm re-entry fires the timer and completes the workflow"
         );
         assert_eq!(
             instance.status().expect("status").as_deref(),
@@ -329,7 +448,7 @@ mod tests {
                 .expect("create");
 
         // First step: the coerce effect suspends on `fetch`.
-        let request = match instance.step(None) {
+        let request = match instance.step(None, TEST_NOW_MS) {
             DurableStepOutcome::NeedsHttp(request) => request,
             other => panic!("expected NeedsHttp, got {other:?}"),
         };
@@ -348,7 +467,7 @@ mod tests {
         };
         assert!(
             matches!(
-                instance.step(Some(Ok(response))),
+                instance.step(Some(Ok(response)), TEST_NOW_MS),
                 DurableStepOutcome::Terminal
             ),
             "the resume settles the coerce and reaches the terminal"
@@ -410,7 +529,7 @@ mod tests {
 
         // First step: the agent turn's first model call suspends on `fetch`, and the
         // request is the real Anthropic messages call the model client built.
-        let request = match instance.step(None) {
+        let request = match instance.step(None, TEST_NOW_MS) {
             DurableStepOutcome::NeedsHttp(request) => request,
             other => panic!("expected NeedsHttp, got {other:?}"),
         };
@@ -437,7 +556,7 @@ mod tests {
         };
         assert!(
             matches!(
-                instance.step(Some(Ok(response))),
+                instance.step(Some(Ok(response)), TEST_NOW_MS),
                 DurableStepOutcome::Terminal
             ),
             "the resume parses the final reply, settles the turn, and reaches the terminal"

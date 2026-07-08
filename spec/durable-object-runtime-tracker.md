@@ -616,10 +616,23 @@ linear undo chain). No phase work now.
       due time here instead of an external poller; the Worker `alarm()` handler
       steps the instance) and `Secrets` trait (config/credentials plane, no
       dotfiles). Tested (`alarms_hold_one_wakeup_and_secrets_resolve_config`).
-- [ ] Wire them into the runtime: clock-source + timer effects call `Alarms`;
-      provider credential resolution reads `Secrets`; `chrono` std → data-only
-      `chrono-tz`; `Instant` → injected virtual clock. *(Needs the live DO alarm
-      API + Worker secrets binding.)*
+- [~] Wire them into the runtime — **timers/deadlines LIVE 2026-07-07**: the
+      native dev loop's due-time pass lifted to `kernel::time_pass` (CLI
+      delegates; behavior parity via the full control_plane suite);
+      `InstanceDriver` gains `advance_time(now)`/`next_due_unix_ms` (injected
+      clock — the core never reads wall time); `DoSqliteStore` computes the
+      earliest pending due instant; `Parked{next_due_unix_ms}` rides the wasm
+      step JSON; the worker shell persists a bootstrap, sets
+      `ctx.storage.setAlarm` on park, and its `alarm()` handler re-enters —
+      **validated autonomously under wrangler dev/workerd** (timer workflow
+      parks → real DO alarm fires untouched → due-time pass + rule pass →
+      completed). `DurableInstance::create` is now get-or-create (rehydrates
+      THE instance instead of minting a second). Secrets: the Worker
+      env/secret binding path feeds provider configs (`.dev.vars` locally,
+      `wrangler secret put` live) — the config plane in practice; the
+      kernel-side `Secrets`-trait read remains a refinement. Remaining:
+      clock-source recurrences (interval/calendar next-fire) in the DO
+      next-due computation; `chrono`→data-only survey.
 
 ### Phase 7 — Large-object tier (designed now, built later)
 - [~] Seam landed in `whipplescript-host-do` (real, tested, native + wasm):

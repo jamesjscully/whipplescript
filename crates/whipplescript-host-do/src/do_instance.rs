@@ -129,6 +129,24 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
             .next())
     }
 
+    fn advance_time(&mut self, now: &str) -> Result<(), StoreError> {
+        // The lifted due-time pass (DR-0033 Phase 6): complete due timers,
+        // expire deadline-passed effects — the same pass the native dev loop
+        // runs, over the DO's threaded store. `now` comes from the shell.
+        whipplescript_kernel::time_pass::resolve_due_time_effects(
+            &mut self.kernel,
+            self.instance_id,
+            now,
+        )?;
+        Ok(())
+    }
+
+    fn next_due_unix_ms(&mut self) -> Result<Option<i64>, StoreError> {
+        self.kernel
+            .store()
+            .next_effect_due_epoch_ms(self.instance_id)
+    }
+
     fn run_effect(
         &mut self,
         effect: &ClaimableEffect,

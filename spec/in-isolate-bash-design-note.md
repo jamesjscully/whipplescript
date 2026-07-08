@@ -83,8 +83,9 @@ stable threat IDs). Spike evidence:
   date, escalation signal. The interpreter core is fully wasm-portable;
   the unknown-unknown gap is exactly a clock shim plus tokio feature
   gating — mechanical.
-- **Size**: composite cdylib of `whipplescript-host-do` + bashkit +
-  fetchkit's converter, size-optimized (opt-z, LTO, strip, cgu=1):
+- **Size**: composite cdylib of `whipplescript-host-do` + bashkit
+  (plus a ~32 KB-gz html-converter probe, since dropped), size-optimized
+  (opt-z, LTO, strip, cgu=1):
   **3.15 MB raw / 1.03 MB gzipped** — ~10% of the 10 MB compressed
   Workers limit (kernel alone under the same profile: 460 KB gz).
   Size is a non-issue. Note the workspace's default release profile has
@@ -193,7 +194,7 @@ follow-on that the DR-0024 deferral anticipated.
 6. **Network posture**: v1 = no network in the interpreter (`curl` →
    not-found/escalation); later fork: a custom `curl` builtin over the
    `NeedsHttp` effect (would make in-isolate curl governed, recorded, and
-   cache-keyed — same machinery as the web tools note).
+   cache-keyed).
 7. **Feature set**: which bashkit features on (`jq` likely yes; `python`/
    `typescript`/`sqlite`/`ssh` off in v1 — each is its own authority
    discussion).
