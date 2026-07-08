@@ -1002,14 +1002,31 @@ required; unknown clause name is an error.
 > - `list: true` — the clause value is a `[ ... ]` list of its `kind`
 >   (file store `allow read` glob lists). A bare single value where a list
 >   is declared is a parse error.
+> - **Clause connective** — a clause value may be introduced by a
+>   connective, drawn from the SAME vocabulary as Shape 2 slots
+>   (`from`, `for`, `into`, `to`, `via`) plus `by` (ledger
+>   `partition by <tenant>`). This unifies the connective concept across
+>   both shapes rather than faking it with a compound name. Like a Shape 2
+>   slot connective, it is **mandatory**: a connective clause supplied
+>   without its connective is a parse error (M2, 2026-07-08 — this replaces
+>   the old lenient parser that accepted a missing `by` with a warning).
 >
-> With these, `tracker`, `channel`, `counter`, `lease`, `ledger`,
-> `memory pool`, and `file store` are Shape-1-expressible; `harness`,
-> `agent`, `signal`, `source`, and `coerce` remain **core-grammar
-> exceptions** (colon headers, header modifiers, dotted-name/schema bodies,
-> nested emit blocks, function forms — structural misfits the falsifier
-> exists to keep out). Modeled in construct-grammar.maude (flagKind,
-> listOf(K); coverage + flag-given-value and single-where-list bites).
+> With these, all seven declaration-family constructs — `tracker`,
+> `channel`, `counter`, `lease`, `ledger`, `memory pool`, `file store` —
+> are Shape-1-expressible and migrate data-driven; NO declaration-family
+> construct is a hand-parsed exception. `harness`, `agent`, `signal`,
+> `source`, and `coerce` remain **core-grammar exceptions** (colon
+> headers, header modifiers, dotted-name/schema bodies, nested emit
+> blocks, function forms — structural misfits the falsifier exists to keep
+> out). Modeled in construct-grammar.maude (flagKind, listOf(K), the
+> `byConn` connective on `clauseVal`; coverage + flag-given-value,
+> single-where-list, and missing-connective bites).
+>
+> `context limit` and `allow read`/`allow write` stay multi-word *names*
+> (compound noun / verb+sub-selector); only `partition by` is
+> connective-shaped. The connective addition is deliberately bounded — it
+> shares an existing Shape 2 concept, so the two-shape model gains no new
+> idea and the falsifier still bites.
 
 ### Shape 2 — `effect_operation`
 

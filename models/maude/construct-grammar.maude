@@ -343,6 +343,7 @@ mod WHIPPLESCRIPT-CONSTRUCT-GRAMMAR is
     recallMissingConn sendUnknownField sendMissingText recallNoBinding
     mysteryUse
     leaseDecl fileStoreDecl leaseFlagValued fileStoreSingleGlob
+    ledgerDecl ledgerMissingBy
     : -> ConstructId .
 
   --- The two grammar shapes plus a sentinel for a statement whose
@@ -365,8 +366,12 @@ mod WHIPPLESCRIPT-CONSTRUCT-GRAMMAR is
   op listOf : PKind -> PKind .
 
   --- The fixed connective vocabulary (a required word consumed before a
-  --- slot), plus `noConn` for a leading slot with no connective.
-  ops fromConn forConn intoConn toConn viaConn noConn : -> PConn .
+  --- slot value OR a clause value), plus `noConn` for a leading slot / a
+  --- plain clause with no connective. `byConn` was added by the decl-family
+  --- migration (M2, 2026-07-08): connectives are now ONE concept shared by
+  --- both shapes -- Shape 2 slots (`recall <pool> for <query>`) and Shape 1
+  --- clauses (`ledger X { entry E partition by <tenant> ... }`).
+  ops fromConn forConn intoConn toConn viaConn byConn noConn : -> PConn .
 
   --- The trailing `as <binding>` mode.
   ops bindRequired bindOptional bindNone : -> PBind .
@@ -378,6 +383,7 @@ mod WHIPPLESCRIPT-CONSTRUCT-GRAMMAR is
     textField markdownField threadIdField bogusField
     providerName retainName
     sharedName ttlName keyName rootName allowReadName
+    entryName partitionName
     : -> PName .
 
   --- effect_operation slot spec list: ordered `slot(name, kind, conn)`.
@@ -401,10 +407,15 @@ mod WHIPPLESCRIPT-CONSTRUCT-GRAMMAR is
   op withPayload : PFieldSet PFieldSet -> PPayload .
 
   --- declaration_block clause spec/value sets: order-free `clauseVal`
-  --- pairs of (name, kind).
+  --- triples of name, connective, kind. The connective is `noConn` for a
+  --- plain clause such as `provider <p>`, or a fixed word for a connective
+  --- clause such as `partition by <tenant>` = clauseVal(partition, byConn,
+  --- identifier). A provided clause matches a spec clause only when all
+  --- three agree, so a missing/wrong connective cannot parse -- the same
+  --- bite Shape 2 slots have.
   sorts PClauseVal PClauseValSet .
   subsort PClauseVal < PClauseValSet .
-  op clauseVal : PName PKind -> PClauseVal .
+  op clauseVal : PName PConn PKind -> PClauseVal .
   op noClauseVals : -> PClauseValSet .
   op _&_ : PClauseValSet PClauseValSet -> PClauseValSet [assoc comm id: noClauseVals] .
 
@@ -547,12 +558,12 @@ mod WHIPPLESCRIPT-CONSTRUCT-GRAMMAR is
     => dbClauses(C, CV, RQ, OPTc) .
 
   rl [db-clause-required] :
-    dbClauses(C, (clauseVal(N, Kd) & PRc), (clauseVal(N, Kd) & RRc), OPTc)
+    dbClauses(C, (clauseVal(N, Cn, Kd) & PRc), (clauseVal(N, Cn, Kd) & RRc), OPTc)
     => dbClauses(C, PRc, RRc, OPTc) .
 
   rl [db-clause-optional] :
-    dbClauses(C, (clauseVal(N, Kd) & PRc), RRc, (clauseVal(N, Kd) & OPTc))
-    => dbClauses(C, PRc, RRc, (clauseVal(N, Kd) & OPTc)) .
+    dbClauses(C, (clauseVal(N, Cn, Kd) & PRc), RRc, (clauseVal(N, Cn, Kd) & OPTc))
+    => dbClauses(C, PRc, RRc, (clauseVal(N, Cn, Kd) & OPTc)) .
 
   --- Clauses are well-formed only when every provided clause matched an
   --- allowed spec (none unknown) and every required clause was present.

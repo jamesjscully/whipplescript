@@ -291,11 +291,12 @@ search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
   beginParse(poolDecl)
   grammarShape(poolDecl, declBlock)
   grammarDeclBlock(poolDecl, identifierKind,
-    clauseVal(providerName, identifierKind),
-    clauseVal(retainName, durationKind))
+    clauseVal(providerName, noConn, identifierKind),
+    clauseVal(retainName, noConn, durationKind))
   stmt(poolDecl,
     nameT(identifierKind) ;
-    clausesT(clauseVal(providerName, identifierKind) & clauseVal(retainName, durationKind)))
+    clausesT(clauseVal(providerName, noConn, identifierKind)
+      & clauseVal(retainName, noConn, durationKind)))
   =>*
   parsedUse(poolDecl) Rest:Cfg .
 
@@ -409,12 +410,13 @@ search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
   beginParse(leaseDecl)
   grammarShape(leaseDecl, declBlock)
   grammarDeclBlock(leaseDecl, identifierKind,
-    (clauseVal(keyName, identifierKind) & clauseVal(ttlName, durationKind)),
-    clauseVal(sharedName, flagKind))
+    (clauseVal(keyName, noConn, identifierKind) & clauseVal(ttlName, noConn, durationKind)),
+    clauseVal(sharedName, noConn, flagKind))
   stmt(leaseDecl,
     nameT(identifierKind) ;
-    clausesT(clauseVal(keyName, identifierKind) & clauseVal(ttlName, durationKind)
-      & clauseVal(sharedName, flagKind)))
+    clausesT(clauseVal(keyName, noConn, identifierKind)
+      & clauseVal(ttlName, noConn, durationKind)
+      & clauseVal(sharedName, noConn, flagKind)))
   =>*
   parsedUse(leaseDecl) Rest:Cfg .
 
@@ -425,14 +427,31 @@ search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
   beginParse(fileStoreDecl)
   grammarShape(fileStoreDecl, declBlock)
   grammarDeclBlock(fileStoreDecl, identifierKind,
-    clauseVal(rootName, scalarKind),
-    clauseVal(allowReadName, listOf(globKind)))
+    clauseVal(rootName, noConn, scalarKind),
+    clauseVal(allowReadName, noConn, listOf(globKind)))
   stmt(fileStoreDecl,
     nameT(identifierKind) ;
-    clausesT(clauseVal(rootName, scalarKind)
-      & clauseVal(allowReadName, listOf(globKind))))
+    clausesT(clauseVal(rootName, noConn, scalarKind)
+      & clauseVal(allowReadName, noConn, listOf(globKind))))
   =>*
   parsedUse(fileStoreDecl) Rest:Cfg .
+
+--- COVERAGE (M2 connective clause): a ledger-like declaration_block with a
+--- required `entry` clause and a required `partition by <ident>` connective
+--- clause parses -- the connective is ONE concept shared with Shape 2 slots.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(ledgerDecl)
+  grammarShape(ledgerDecl, declBlock)
+  grammarDeclBlock(ledgerDecl, identifierKind,
+    (clauseVal(entryName, noConn, identifierKind)
+      & clauseVal(partitionName, byConn, identifierKind)),
+    noClauseVals)
+  stmt(ledgerDecl,
+    nameT(identifierKind) ;
+    clausesT(clauseVal(entryName, noConn, identifierKind)
+      & clauseVal(partitionName, byConn, identifierKind)))
+  =>*
+  parsedUse(ledgerDecl) Rest:Cfg .
 
 --- BITE (amendment, flag given a value): a flag clause supplied WITH a
 --- value does not match the flagKind spec, so the clause block never
@@ -441,12 +460,12 @@ search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
   beginParse(leaseFlagValued)
   grammarShape(leaseFlagValued, declBlock)
   grammarDeclBlock(leaseFlagValued, identifierKind,
-    clauseVal(keyName, identifierKind),
-    clauseVal(sharedName, flagKind))
+    clauseVal(keyName, noConn, identifierKind),
+    clauseVal(sharedName, noConn, flagKind))
   stmt(leaseFlagValued,
     nameT(identifierKind) ;
-    clausesT(clauseVal(keyName, identifierKind)
-      & clauseVal(sharedName, scalarKind)))
+    clausesT(clauseVal(keyName, noConn, identifierKind)
+      & clauseVal(sharedName, noConn, scalarKind)))
   =>*
   parsedUse(leaseFlagValued) Rest:Cfg .
 
@@ -457,11 +476,32 @@ search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
   beginParse(fileStoreSingleGlob)
   grammarShape(fileStoreSingleGlob, declBlock)
   grammarDeclBlock(fileStoreSingleGlob, identifierKind,
-    clauseVal(rootName, scalarKind),
-    clauseVal(allowReadName, listOf(globKind)))
+    clauseVal(rootName, noConn, scalarKind),
+    clauseVal(allowReadName, noConn, listOf(globKind)))
   stmt(fileStoreSingleGlob,
     nameT(identifierKind) ;
-    clausesT(clauseVal(rootName, scalarKind)
-      & clauseVal(allowReadName, globKind)))
+    clausesT(clauseVal(rootName, noConn, scalarKind)
+      & clauseVal(allowReadName, noConn, globKind)))
   =>*
   parsedUse(fileStoreSingleGlob) Rest:Cfg .
+
+--- BITE (M2 connective missing): a connective clause supplied WITHOUT its
+--- connective cannot parse. `partition <tenant>` (no `by`) is
+--- clauseVal(partition, noConn, ident), which does not match the spec's
+--- clauseVal(partition, byConn, ident) -- so the required clause is never
+--- satisfied. This is the behavior change: the old parser accepted a
+--- missing `by` with a warning; the connective is now mandatory, matching
+--- Shape 2 (`recall pool query` without `for` is likewise a parse error).
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(ledgerMissingBy)
+  grammarShape(ledgerMissingBy, declBlock)
+  grammarDeclBlock(ledgerMissingBy, identifierKind,
+    (clauseVal(entryName, noConn, identifierKind)
+      & clauseVal(partitionName, byConn, identifierKind)),
+    noClauseVals)
+  stmt(ledgerMissingBy,
+    nameT(identifierKind) ;
+    clausesT(clauseVal(entryName, noConn, identifierKind)
+      & clauseVal(partitionName, noConn, identifierKind)))
+  =>*
+  parsedUse(ledgerMissingBy) Rest:Cfg .
