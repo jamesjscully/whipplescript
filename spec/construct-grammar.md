@@ -989,6 +989,28 @@ Clause `kind` ∈ {`identifier`, `expression`, `duration`, `glob`, `schema`,
 `scalar`} (the fixed clause vocabulary). Order-free clauses, each optional or
 required; unknown clause name is an error.
 
+> **AMENDED 2026-07-08 (decl-family migration, Jack-ratified).** The
+> decl-family inventory showed the six-kind vocabulary covers only 2 of 12
+> shipped declarations, while five more miss it on vocabulary details rather
+> than structure. Shape 1 therefore gains, without adding any new shape:
+>
+> - `kind: "flag"` — a bare presence clause carrying no value (lease/counter
+>   `shared`). Supplying a value to a flag clause is a parse error.
+> - **Multi-word clause names** — a clause `name` may be a fixed phrase of
+>   identifier words consumed in sequence (`partition by`, `context limit`,
+>   `allow read`).
+> - `list: true` — the clause value is a `[ ... ]` list of its `kind`
+>   (file store `allow read` glob lists). A bare single value where a list
+>   is declared is a parse error.
+>
+> With these, `tracker`, `channel`, `counter`, `lease`, `ledger`,
+> `memory pool`, and `file store` are Shape-1-expressible; `harness`,
+> `agent`, `signal`, `source`, and `coerce` remain **core-grammar
+> exceptions** (colon headers, header modifiers, dotted-name/schema bodies,
+> nested emit blocks, function forms — structural misfits the falsifier
+> exists to keep out). Modeled in construct-grammar.maude (flagKind,
+> listOf(K); coverage + flag-given-value and single-where-list bites).
+
 ### Shape 2 — `effect_operation`
 
 `<keyword> [<connective> <slot>]* [{ <payload-field>* }]? as <binding>` — a

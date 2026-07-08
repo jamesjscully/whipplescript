@@ -396,3 +396,72 @@ search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
   stmt(mysteryUse, valT(identifierKind))
   =>*
   parsedUse(mysteryUse) Rest:Cfg .
+
+--- --------------------------------------------------------------------
+--- DR-0011 amendment (2026-07-08, decl-family migration): flag clauses,
+--- list-valued clauses, multi-word clause names (a PName constant stands
+--- for the phrase; tokenization is Rust-level).
+--- --------------------------------------------------------------------
+
+--- COVERAGE (amendment, flag): a lease-like declaration_block with a bare
+--- `shared` flag clause plus required `key`/`ttl` clauses parses.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(leaseDecl)
+  grammarShape(leaseDecl, declBlock)
+  grammarDeclBlock(leaseDecl, identifierKind,
+    (clauseVal(keyName, identifierKind) & clauseVal(ttlName, durationKind)),
+    clauseVal(sharedName, flagKind))
+  stmt(leaseDecl,
+    nameT(identifierKind) ;
+    clausesT(clauseVal(keyName, identifierKind) & clauseVal(ttlName, durationKind)
+      & clauseVal(sharedName, flagKind)))
+  =>*
+  parsedUse(leaseDecl) Rest:Cfg .
+
+--- COVERAGE (amendment, list + multi-word name): a file-store-like
+--- declaration_block with a required `root` clause and an optional
+--- list-valued `allow read` glob clause parses.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(fileStoreDecl)
+  grammarShape(fileStoreDecl, declBlock)
+  grammarDeclBlock(fileStoreDecl, identifierKind,
+    clauseVal(rootName, scalarKind),
+    clauseVal(allowReadName, listOf(globKind)))
+  stmt(fileStoreDecl,
+    nameT(identifierKind) ;
+    clausesT(clauseVal(rootName, scalarKind)
+      & clauseVal(allowReadName, listOf(globKind))))
+  =>*
+  parsedUse(fileStoreDecl) Rest:Cfg .
+
+--- BITE (amendment, flag given a value): a flag clause supplied WITH a
+--- value does not match the flagKind spec, so the clause block never
+--- completes -- `shared 3` is a parse error, not a lenient accept.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(leaseFlagValued)
+  grammarShape(leaseFlagValued, declBlock)
+  grammarDeclBlock(leaseFlagValued, identifierKind,
+    clauseVal(keyName, identifierKind),
+    clauseVal(sharedName, flagKind))
+  stmt(leaseFlagValued,
+    nameT(identifierKind) ;
+    clausesT(clauseVal(keyName, identifierKind)
+      & clauseVal(sharedName, scalarKind)))
+  =>*
+  parsedUse(leaseFlagValued) Rest:Cfg .
+
+--- BITE (amendment, single where list required): a single glob supplied to
+--- a list-valued clause does not match listOf(glob), so the block never
+--- completes -- the list marker is enforced, not decorative.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(fileStoreSingleGlob)
+  grammarShape(fileStoreSingleGlob, declBlock)
+  grammarDeclBlock(fileStoreSingleGlob, identifierKind,
+    clauseVal(rootName, scalarKind),
+    clauseVal(allowReadName, listOf(globKind)))
+  stmt(fileStoreSingleGlob,
+    nameT(identifierKind) ;
+    clausesT(clauseVal(rootName, scalarKind)
+      & clauseVal(allowReadName, globKind)))
+  =>*
+  parsedUse(fileStoreSingleGlob) Rest:Cfg .

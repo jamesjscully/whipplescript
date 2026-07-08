@@ -342,6 +342,7 @@ mod WHIPPLESCRIPT-CONSTRUCT-GRAMMAR is
     recallUse sendUse poolDecl
     recallMissingConn sendUnknownField sendMissingText recallNoBinding
     mysteryUse
+    leaseDecl fileStoreDecl leaseFlagValued fileStoreSingleGlob
     : -> ConstructId .
 
   --- The two grammar shapes plus a sentinel for a statement whose
@@ -349,10 +350,19 @@ mod WHIPPLESCRIPT-CONSTRUCT-GRAMMAR is
   sorts PShape PKind PConn PBind .
   ops declBlock effectOp noShape : -> PShape .
 
-  --- The core-owned field/clause/slot kind vocabulary.
+  --- The core-owned field/clause/slot kind vocabulary. The 2026-07-08
+  --- DR-0011 amendment (decl-family migration) adds two members beyond the
+  --- original six: `flagKind` -- a bare presence clause carrying no value,
+  --- e.g. lease/counter `shared` -- and `listOf(K)` -- a list-valued clause,
+  --- e.g. file store `allow read [..globs..]`. Multi-word clause names
+  --- such as "partition by", "context limit", "allow read" are
+  --- representational at this level: a PName constant stands for the whole
+  --- phrase, and the tokenization detail lives in the Rust parser.
   ops
     identifierKind expressionKind durationKind globKind schemaKind scalarKind
+    flagKind
     : -> PKind .
+  op listOf : PKind -> PKind .
 
   --- The fixed connective vocabulary (a required word consumed before a
   --- slot), plus `noConn` for a leading slot with no connective.
@@ -367,6 +377,7 @@ mod WHIPPLESCRIPT-CONSTRUCT-GRAMMAR is
     poolName queryName channelName
     textField markdownField threadIdField bogusField
     providerName retainName
+    sharedName ttlName keyName rootName allowReadName
     : -> PName .
 
   --- effect_operation slot spec list: ordered `slot(name, kind, conn)`.
