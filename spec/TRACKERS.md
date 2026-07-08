@@ -69,7 +69,7 @@ yet a registered tracker (pre-ADR research notes).
 | `spec/workflow-composition-transition-tracker.md` | active | Migrating to the workflow-composition model (invoke/subworkflows) | 2026-06-30 | v0.2 |
 | `spec/workflow-encapsulation-implementation-tracker.md` | closed | v1 workflow-encapsulation + invocation-authorization theorem — all phases shipped 2026-07-02; open remnants re-homed to owned-harness-tool-surface.md | 2026-07-02 |
 | `spec/durable-object-runtime-tracker.md` | active | Sans-IO async refactor + Cloudflare Durable Object host binding (run whip in a wasm isolate) | 2026-07-01 | v0.3 |
-| `spec/context-assembly-tracker.md` | active | Owned-harness context assembly (mirror pi): system-prompt seam, skills registry/catalogue, project-instructions, and pluggable cache-aware compaction | 2026-07-04 | v0.3 |
+| `spec/context-assembly-tracker.md` | closed | Owned-harness context assembly (mirror pi): system-prompt seam, skills registry/catalogue, project-instructions, and pluggable cache-aware compaction | 2026-07-04 | v0.3 |
 | `spec/untie-substrate-readiness-tracker.md` | active | Whip-side capabilities for the un-tie substrate replacement (canonical build home for the versioned workspace + workspace API + conversational runtime + policy/auth + store seam) | 2026-07-04 | v0.3–v0.4 |
 | `spec/decision-records/language-ergonomics-tracker.md` | active | v2 language-surface ergonomics decisions + build-out; **canonical home** for the small-language-follow-ups (see dedup) — Part B reconciled 2026-07-01; B1g closed 2026-07-02, only B1a-refactor / `consume`-removal remain | 2026-07-02 | v0.2 (B1a→v0.3) |
 | `spec/decision-records/standard-package-design-tracker.md` | active | Open design todos for the standard packages | 2026-06-30 | v0.2 |

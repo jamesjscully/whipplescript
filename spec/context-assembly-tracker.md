@@ -8,7 +8,7 @@ subsystem on top of it. The observable behaviour mirrors **pi**
 also draws on **Codex** (`github.com/openai/codex`, `codex-rs`). This file holds
 only what is *not yet true in the repo*. Reality lives in code + git + gates.
 
-Registered in `spec/TRACKERS.md` (status: active).
+Registered in `spec/TRACKERS.md` (status: **closed 2026-07-07** — all 30 boxes done; the owned harness has the full pi-mirrored context layer: seam, skills control plane, project instructions on native AND the DO, cache-aware compaction with three strategies + the selection surface, and turn-scoped skill pins).
 
 Supersedes the skills sections of `spec/skills.md` and the "Skills And Context"
 section of `spec/agent-harness.md` as the *build* plan (those remain the prose
