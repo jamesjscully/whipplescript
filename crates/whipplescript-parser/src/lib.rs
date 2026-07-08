@@ -13453,21 +13453,13 @@ fn validate_coordination_discipline(
 ) {
     let mut acquires = Vec::new();
     let mut consumes = Vec::new();
-    collect_coordination_effects(statements, &mut acquires, &mut consumes);
+    let mut claims = Vec::new();
+    collect_coordination_effects(statements, &mut acquires, &mut consumes, &mut claims);
 
     // A `renew <binding>` renews a lease acquired in the same rule: its binding
     // must name an `acquire ... as <binding>` here. Renew resolves the acquire's
     // recorded resource/key at runtime, so an unknown binding renews nothing —
     // catch the typo at `whip check`. (Scoped to `renew`, which is new.)
-    //
-    // NOT extended to `release`: its releasable referent is genuinely broad —
-    // verified against the corpus + the rule-body matrix test, `release <x>`
-    // legitimately names an `acquire ... as <x>` lease, a `claim <x> as ...`
-    // *queue* (the queue name, not the claim's `as` binding), OR a work item
-    // bound by `when <queue> has ready <x> as <x>` and released without a
-    // same-rule claim. A faithful check must admit all three forms (and only
-    // those), which the naive acquire∪claim model does not — both a queue-name
-    // and a when-bound-item version false-positive. Left as a designed follow-on.
     let renewable: BTreeSet<&str> = acquires.iter().map(|(b, _, _)| b.as_str()).collect();
     for_each_body(statements, &mut |stmt| {
         if let body::BodyStmt::Effect(effect) = stmt {
@@ -13485,6 +13477,47 @@ fn validate_coordination_discipline(
                         ),
                         suggestion: Some(format!(
                             "`renew {acquire_binding}` must name a lease acquired in this rule with `acquire ... as {acquire_binding}`"
+                        )),
+                    });
+                }
+            }
+        }
+    });
+
+    // A `release <x>` names ONE OF THREE legitimate referents (spec/coordination.md,
+    // verified against the corpus + the rule-body matrix test):
+    //   (1) an `acquire ... as <x>` LEASE binding acquired in this rule;
+    //   (2) a `claim <x> as ...` — the *item* being claimed (the `TrackerClaim.item`,
+    //       NOT the claim's `as` binding);
+    //   (3) a `when <queue> has ready <x> as <x>` WORK-ITEM binding, released
+    //       without a same-rule claim.
+    // A naive `acquire ∪ claim-binding` model false-positives forms (2) and (3);
+    // admit exactly these three and flag a `release <x>` that matches none as a
+    // genuinely-unbound release. Scoped per-rule like the `renew` check above.
+    let work_items: Vec<String> = rule
+        .whens
+        .iter()
+        .filter_map(|when| when_has_ready_binding(&when.text))
+        .collect();
+    let releasable: BTreeSet<&str> = acquires
+        .iter()
+        .map(|(b, _, _)| b.as_str())
+        .chain(claims.iter().map(|(item, _)| item.as_str()))
+        .chain(work_items.iter().map(String::as_str))
+        .collect();
+    for_each_body(statements, &mut |stmt| {
+        if let body::BodyStmt::Effect(effect) = stmt {
+            if let body::BodyEffectKind::TrackerRelease { item } = &effect.kind {
+                if !releasable.contains(item.as_str()) {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: effect.span,
+                        message: format!(
+                            "rule `{}` releases unbound coordination item `{}`",
+                            rule.name.name, item
+                        ),
+                        suggestion: Some(format!(
+                            "`release {item}` must name a lease acquired here (`acquire ... as {item}`), an item claimed here (`claim {item} as ...`), or a work item bound by a `when <queue> has ready ... as {item}` reaction"
                         )),
                     });
                 }
@@ -13564,6 +13597,7 @@ fn collect_coordination_effects(
     statements: &[body::BodyStmt],
     acquires: &mut Vec<(String, bool, SourceSpan)>,
     consumes: &mut Vec<(String, SourceSpan)>,
+    claims: &mut Vec<(String, SourceSpan)>,
 ) {
     for_each_body(statements, &mut |stmt| {
         if let body::BodyStmt::Effect(effect) = stmt {
@@ -13578,10 +13612,31 @@ fn collect_coordination_effects(
                         consumes.push((binding.clone(), effect.span));
                     }
                 }
+                // A `claim <item> as <lease>` makes `<item>` releasable: the
+                // releasable referent is the *item* being claimed (the
+                // `TrackerClaim.item`), not the claim's `as` binding.
+                body::BodyEffectKind::TrackerClaim { item } => {
+                    claims.push((item.clone(), effect.span));
+                }
                 _ => {}
             }
         }
     });
+}
+
+/// The work-item binding of a `when <queue> has ready <item> as <binding>`
+/// reaction: the `as <binding>` names a claimable/releasable work item pulled
+/// off the queue (spec/coordination.md). Returns `None` for every other `when`
+/// pattern (plain fact binds are not releasable). Guards (`where ...`) are
+/// stripped first so the pattern words line up.
+fn when_has_ready_binding(when: &str) -> Option<String> {
+    let (pattern, _) = split_when_guard(when);
+    let mut words = pattern.split_whitespace();
+    let _queue = words.next()?;
+    if words.next() == Some("has") && words.next() == Some("ready") {
+        return binding_after_as(pattern);
+    }
+    None
 }
 
 fn collect_after_predicates(
@@ -24755,6 +24810,99 @@ rule grab
                 .iter()
                 .any(|d| d.message.contains("renews unknown lease")),
             "renewing an acquired lease must not be flagged"
+        );
+    }
+
+    #[test]
+    fn release_of_each_bound_coordination_form_is_accepted() {
+        // A `release <x>` legitimately names ONE OF THREE referents
+        // (spec/coordination.md): (1) an `acquire ... as <x>` lease binding,
+        // (2) a `claim <x> as ...` item, or (3) a `when <queue> has ready ... as
+        // <x>` work-item binding. All three must pass `whip check`; the naive
+        // acquire∪claim-binding model false-positives (2) and (3).
+        let source = "\
+workflow ReleaseForms
+class Ticket { id string }
+class Done { ok string }
+lease slot { key Ticket slots 1 ttl 60s }
+tracker backlog { provider builtin }
+agent worker { provider fixture profile \"repo-writer\" capacity 1 }
+output result Done
+rule work
+  when backlog has ready issue as issue
+  when worker is available
+=> {
+  acquire slot for issue.id until ttl as held
+  claim issue as active_claim
+  after active_claim succeeds {
+    release held
+    release issue
+    complete result { ok \"done\" }
+  }
+  after active_claim fails {
+    release held
+    complete result { ok \"gave-up\" }
+  }
+}
+";
+        let messages: Vec<String> = compile_program(source)
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("releases unbound coordination item")),
+            "no bound release form must be flagged, got {messages:?}"
+        );
+    }
+
+    #[test]
+    fn release_of_unbound_coordination_item_is_flagged_statically() {
+        // `release <x>` where `<x>` matches none of the three legitimate
+        // referents (no acquire binding, no claim item, no when-has-ready
+        // work-item binding) is a genuinely-unbound release: caught at
+        // `whip check` rather than releasing nothing at runtime.
+        let source = "\
+workflow ReleaseTypo
+class Done { ok string }
+tracker backlog { provider builtin }
+agent worker { provider fixture profile \"repo-writer\" capacity 1 }
+output result Done
+rule work
+  when backlog has ready issue as issue
+  when worker is available
+=> {
+  claim issue as active_claim
+  after active_claim succeeds {
+    release nonexistent
+    complete result { ok \"done\" }
+  }
+  after active_claim fails {
+    complete result { ok \"gave-up\" }
+  }
+}
+";
+        let messages: Vec<String> = compile_program(source)
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("releases unbound coordination item `nonexistent`")),
+            "expected the unbound-release diagnostic, got {messages:?}"
+        );
+        // Releasing the actually-bound work item (`issue`) must not be flagged.
+        let ok = source.replace("release nonexistent", "release issue");
+        assert!(
+            !compile_program(&ok)
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("releases unbound coordination item")),
+            "releasing a bound work item must not be flagged"
         );
     }
 
