@@ -839,7 +839,7 @@ pub fn std_messaging_send_construct() -> ConstructRegistration {
     ConstructRegistration {
         id: MESSAGING_SEND_CAPABILITY.to_owned(),
         library_id: "std.messaging".to_owned(),
-        version: "v0".to_owned(),
+        version: "0.1.0".to_owned(),
         construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION.to_owned(),
         keyword: "send".to_owned(),
         scope: CONSTRUCT_SCOPE_RULE_BODY.to_owned(),
@@ -932,7 +932,7 @@ pub fn std_messaging_send_effect_contract() -> EffectContract {
     EffectContract {
         id: MESSAGING_SEND_CAPABILITY.to_owned(),
         library_id: "std.messaging".to_owned(),
-        version: "v0".to_owned(),
+        version: "0.1.0".to_owned(),
         effect_kind: "capability.call".to_owned(),
         source_forms: vec!["send".to_owned()],
         // JSON-fragment schemas (the package-manifest-expressible form; keys

@@ -3400,7 +3400,7 @@ fn register_standard_library(libraries: &mut BTreeMap<String, LibraryRegistratio
         .entry(id.to_owned())
         .or_insert_with(|| LibraryRegistration {
             id: id.to_owned(),
-            version: "v0".to_owned(),
+            version: "0.1.0".to_owned(),
             standard: true,
         });
 }
@@ -3500,7 +3500,7 @@ fn effect_contract_for_kind(
             TypedOutputValidation::RuntimeBoundary,
         ),
         IrEffectKind::CapabilityCall => (
-            "std.exec",
+            "std.script",
             strings(&["call"]),
             Some("capability.call.input"),
             Some("capability.call.output"),
@@ -3530,7 +3530,7 @@ fn effect_contract_for_kind(
             TypedOutputValidation::RuntimeBoundary,
         ),
         IrEffectKind::TimerWait => (
-            "std.schedule",
+            "std.time",
             strings(&["timer"]),
             Some("timer.wait.input"),
             Some("TimerElapsed"),
@@ -3540,7 +3540,7 @@ fn effect_contract_for_kind(
             TypedOutputValidation::None,
         ),
         IrEffectKind::ExecCommand => (
-            "std.exec",
+            "std.script",
             strings(&["exec"]),
             Some("exec.command.input"),
             Some("exec.command.output"),
@@ -3686,7 +3686,7 @@ fn effect_contract_for_kind(
     EffectContract {
         id: effect_kind.clone(),
         library_id: library_id.to_owned(),
-        version: "v0".to_owned(),
+        version: "0.1.0".to_owned(),
         effect_kind,
         source_forms,
         input_schema: input_schema.map(str::to_owned),

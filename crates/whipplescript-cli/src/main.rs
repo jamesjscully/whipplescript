@@ -5053,7 +5053,7 @@ fn construct_graph_json_with_digests(
             };
             let contract_version = contract
                 .map(|contract| contract.version.as_str())
-                .unwrap_or("v0");
+                .unwrap_or("0.1.0");
             let owner = contract
                 .map(|contract| contract.library_id.as_str())
                 .unwrap_or("core");
@@ -40926,9 +40926,8 @@ rule start
         // The embedded `std.messaging` manifest must transcribe the core
         // reference data (`std_messaging_send_construct` /
         // `std_messaging_send_effect_contract`) field-for-field, so the two can
-        // never drift while both exist. The only sanctioned difference is the
-        // version: the core data carries the old builtin's `v0`, the manifest
-        // carries the package version.
+        // never drift while both exist. Both now share the `0.1.0` package
+        // version, so the comparison is a full field-for-field equality.
         let manifest = embedded_std_manifests()
             .into_iter()
             .find(|manifest| manifest.name == "std.messaging")
@@ -40940,8 +40939,7 @@ rule start
             .iter()
             .find(|form| form.keyword == "send")
             .expect("manifest registers the send construct");
-        let mut expected_construct = whipplescript_core::std_messaging_send_construct();
-        expected_construct.version = manifest.version.clone();
+        let expected_construct = whipplescript_core::std_messaging_send_construct();
         assert_eq!(construct, &expected_construct);
 
         let contract = manifest
@@ -40950,8 +40948,7 @@ rule start
             .iter()
             .find(|contract| contract.id == "messaging.send")
             .expect("manifest registers the messaging.send effect contract");
-        let mut expected_contract = whipplescript_core::std_messaging_send_effect_contract();
-        expected_contract.version = manifest.version.clone();
+        let expected_contract = whipplescript_core::std_messaging_send_effect_contract();
         assert_eq!(contract, &expected_contract);
     }
 
