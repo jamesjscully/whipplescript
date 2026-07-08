@@ -186,8 +186,57 @@ function testExecSuspendResume() {
   console.log("PASS  exec workflow -> needs_http (whip-executor/1) -> terminal (two steps)");
 }
 
+
+// 5) A Class-B AGENT workflow (compute plane P8): with a turn container
+//    configured, the agent turn dispatches WHOLE to the container as one
+//    blocking whip-turn/1 round and the outcome settles to a terminal.
+function testTurnContainerAgent() {
+  const source = [
+    "workflow AgentDemo", "", "output result Done", "",
+    "class Done {", "  ok int", "}", "",
+    "agent helper {", "  provider owned", '  profile "repo-reader"', "  capacity 1", "}", "",
+    "rule go", "  when started", "=> {", '  tell helper as reply """', "  Do the thing.", '  """', "",
+    "  after reply succeeds {", "    complete result { ok 1 }", "  }", "",
+    "  after reply fails {", "    complete result { ok 0 }", "  }", "}",
+  ].join("\n");
+  const seed = [
+    "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('agent.tell', 'Run an agent turn.', '{}')",
+    "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+    "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+    "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
+  ];
+  const bridge = freshInstanceEnv(seed);
+  const turnConfig = JSON.stringify({ base_url: "http://turn", provider: { provider: "fixture" } });
+  const inst = WasmDurableInstance.create(
+    bridge, source, "{}", "local/AgentDemo",
+    undefined, undefined, undefined, undefined, undefined, turnConfig,
+  );
+
+  // First step: the whole turn dispatches to the per-turn container.
+  const first = JSON.parse(inst.step(undefined, Date.now()));
+  assert.strictEqual(first.kind, "needs_http", `turn step1: ${JSON.stringify(first)}`);
+  assert.ok(first.request.url.endsWith("/turn"), "request targets the turn container");
+  assert.strictEqual(first.request.body.protocol, "whip-turn/1");
+  assert.strictEqual(first.request.body.tools, "file");
+  const turnId = first.request.body.turn_id;
+
+  // The shell performs the (blocking) container round; feed the outcome back.
+  const response = JSON.stringify({
+    status: 200,
+    body: {
+      protocol: "whip-turn/1", turn_id: turnId, resumed: false,
+      outcome: { status: "completed", summary: "container did the thing", steps: 2, usage: { output_tokens: 3 } },
+    },
+  });
+  const second = JSON.parse(inst.step(response, Date.now()));
+  assert.strictEqual(second.kind, "terminal", `turn step2: ${JSON.stringify(second)}`);
+  assert.strictEqual(inst.status(), "completed");
+  console.log("PASS  agent workflow -> whip-turn/1 container round -> terminal (two steps)");
+}
+
 testEffectFree();
 testCoerceSuspendResume();
 testAgentSuspendResume();
 testExecSuspendResume();
+testTurnContainerAgent();
 console.log("\nALL PASS: the wasm DO runtime drives real workflows over real SQLite through the wasm-bindgen boundary.");

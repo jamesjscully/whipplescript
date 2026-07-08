@@ -717,9 +717,27 @@ fixed-size `getRandom` pools). Open build work:
       diff-back keyed by effect id (atomic/recorded/complete; idempotent
       by Decisions 3/4); Class-A batching (several execs per manifest
       request); branch marker + scoped secrets (P6) in the request.
-- [ ] Class-B turn containers: per-turn/per-branch controller DOs;
+- [x] Class-B turn containers: per-turn/per-branch controller DOs;
       hibernatable-WebSocket progress channel (frame format TBD);
       diff-back on completion via the same import.
+      v1 DONE 2026-07-08, LIVE-PROVEN under wrangler dev + Docker: an agent
+      turn ran WHOLE inside a real per-turn container (fixture model, real
+      turn machinery + FileToolExecutor scratch dir) and settled `completed`
+      through the workflow DO; the unreachable-provider case settles as a
+      clean failed turn (both observed live). Shape: container-holds-the-
+      turn — `whip executor` speaks whip-turn/1 (GET /turn WS streaming
+      with progress frames + retained finals + {resume} re-attach = DR-0035
+      B4 re-query, RFC 6455 hand-rolled; POST /turn = the blocking form the
+      DO uses in v1); the DO agent arm with a TurnContainerConfig dispatches
+      one round to the per-turn container (idFromName over the turn id,
+      1:1) and settles via settle_provider_run_result; dispatch is
+      idempotent (duplicate start re-attaches), so eviction mid-await
+      recovers. Wired: DurableEffectPorts.turn → create(turn_config_json) →
+      index.ts WHIP_TURN_URL sentinel routing. Residuals: the DO consuming
+      the WS PROGRESS stream while hibernating (v1 blocks on POST /turn —
+      the day-one WS exists container-side); workspace/branch
+      materialization + diff-back join the versioned workspace (scratch-dir
+      turns are the v1 posture by design).
       v1 BUILD SHAPE (recorded 2026-07-08, per the settled design —
       container-holds-the-turn, NOT DO-drives-tools): the Class-B container
       runs the whole owned agent turn NATIVELY (the image already carries

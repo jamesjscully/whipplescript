@@ -37,7 +37,8 @@ use whipplescript_kernel::exec_http::{
 };
 use whipplescript_kernel::harness_loop::{
     provider_result_from_brokered_turn, BrokeredTurnInput, BrokeredTurnMachine,
-    BrokeredTurnSnapshot, ChatMessage, HttpModelClient, NoopCompactor, ToolExecutor,
+    BrokeredTurnOutcome, BrokeredTurnSnapshot, ChatMessage, HttpModelClient, NoopCompactor,
+    ToolExecutor, TurnStatus,
 };
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::rule_lowering::json_from_str;
@@ -81,6 +82,18 @@ pub struct ExecutorSidecarConfig {
     pub timeout_ms: Option<u64>,
 }
 
+/// Projected Class-B turn-container wiring (compute plane P8): when present,
+/// agent turns run WHOLE inside a per-turn container over `whip-turn/1`
+/// (v1 = the blocking `POST /turn` form; the shell routes the sentinel host
+/// to a per-turn container instance). `provider` is the provider-config JSON
+/// forwarded verbatim to the container ({"provider":"fixture"} runs
+/// credential-free).
+pub struct TurnContainerConfig {
+    pub base_url: String,
+    pub provider: serde_json::Value,
+    pub max_steps: u64,
+}
+
 /// Drives a workflow instance's rule pass + effect discovery on the durable object.
 pub struct DoInstanceDriver<'a, Sql: DoSql> {
     /// One held kernel over the DO's SQLite (backs runtime + coordination +
@@ -102,6 +115,9 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     /// Executor-sidecar wiring for Class-A exec effects (compute plane P8), or
     /// `None` if no sidecar is configured (an `exec.command` then errors).
     pub exec: Option<&'a ExecutorSidecarConfig>,
+    /// Class-B turn-container wiring: when present, agent turns run whole in
+    /// a per-turn container instead of the in-DO brokered machine.
+    pub turn: Option<&'a TurnContainerConfig>,
     pub ir: &'a IrProgram,
     pub instance_id: &'a str,
 }
@@ -234,6 +250,133 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
             // BrokeredTurnMachine one provider call, persisting its snapshot so an
             // eviction between fetches loses nothing (snapshot/restore); on the final
             // reply the outcome settles through the shared kernel seam.
+            // Class-B (compute plane P8): with a turn container configured,
+            // the WHOLE agent turn runs in a per-turn container — one
+            // blocking whip-turn/1 round; dispatch is idempotent (a re-sent
+            // start re-attaches to the same turn in the container registry),
+            // so an eviction mid-await recovers by re-entering this arm.
+            "agent.tell" if self.turn.is_some() => {
+                let cfg = self.turn.expect("guarded by arm pattern");
+                let input = json_from_str(&effect.input_json);
+                let prompt = input
+                    .get("prompt")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "agent-run"]);
+                let lease_id =
+                    idempotency_key(&[self.instance_id, &effect.effect_id, "agent-lease"]);
+                match incoming {
+                    None => {
+                        self.kernel.start_run(RunStart {
+                            instance_id: self.instance_id,
+                            effect_id: &effect.effect_id,
+                            run_id: &run_id,
+                            provider: "agent",
+                            worker_id: "whip-turn-container",
+                            lease_id: &lease_id,
+                            lease_expires_at: "2030-01-01T00:00:00Z",
+                            metadata_json: r#"{"class":"B"}"#,
+                        })?;
+                        let request = whipplescript_kernel::sansio::HttpRequest {
+                            url: format!("{}/turn", cfg.base_url.trim_end_matches('/')),
+                            headers: vec![(
+                                "content-type".to_owned(),
+                                "application/json".to_owned(),
+                            )],
+                            body: serde_json::json!({
+                                "protocol": "whip-turn/1",
+                                "turn_id": effect.effect_id,
+                                "provider": cfg.provider,
+                                "user": prompt,
+                                "tools": "file",
+                                "max_steps": cfg.max_steps,
+                            }),
+                        };
+                        return Ok(EffectStep::NeedsHttp(request));
+                    }
+                    Some(resumed) => {
+                        let outcome = match resumed {
+                            Ok(response) if response.status == 200 => {
+                                let outcome = response
+                                    .body
+                                    .get("outcome")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                let status = match outcome
+                                    .get("status")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("failed")
+                                {
+                                    "completed" => TurnStatus::Completed,
+                                    "timed_out" => TurnStatus::TimedOut,
+                                    "cancelled" => TurnStatus::Cancelled,
+                                    _ => TurnStatus::Failed,
+                                };
+                                BrokeredTurnOutcome {
+                                    status,
+                                    summary: outcome
+                                        .get("summary")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                    steps: outcome
+                                        .get("steps")
+                                        .and_then(|value| value.as_u64())
+                                        .unwrap_or(0)
+                                        as usize,
+                                    observations: Vec::new(),
+                                    usage: outcome
+                                        .get("usage")
+                                        .cloned()
+                                        .unwrap_or_else(|| serde_json::json!({})),
+                                }
+                            }
+                            Ok(response) => BrokeredTurnOutcome {
+                                status: TurnStatus::Failed,
+                                summary: format!(
+                                    "turn container returned status {}: {}",
+                                    response.status,
+                                    response
+                                        .body
+                                        .get("error")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or("no detail")
+                                ),
+                                steps: 0,
+                                observations: Vec::new(),
+                                usage: serde_json::json!({}),
+                            },
+                            Err(transport) => BrokeredTurnOutcome {
+                                status: TurnStatus::Failed,
+                                summary: format!("turn container transport error: {transport:?}"),
+                                steps: 0,
+                                observations: Vec::new(),
+                                usage: serde_json::json!({}),
+                            },
+                        };
+                        let result = provider_result_from_brokered_turn(&outcome);
+                        let execution = AgentTurnExecution {
+                            instance_id: self.instance_id,
+                            effect_id: &effect.effect_id,
+                            run_id: &run_id,
+                            provider: "agent",
+                            worker_id: "whip-turn-container",
+                            lease_id: &lease_id,
+                            lease_expires_at: "2030-01-01T00:00:00Z",
+                            agent: "agent",
+                            profile: None,
+                            input_json: &effect.input_json,
+                            skill_names: &[],
+                        };
+                        self.kernel.settle_provider_run_result(
+                            execution,
+                            r#"{"class":"B"}"#,
+                            &result,
+                        )?
+                    }
+                }
+            }
             "agent.tell" => {
                 let model = self.agent_model.ok_or_else(|| {
                     StoreError::Conflict(
@@ -810,6 +953,7 @@ mod tests {
             agent_model: None,
             agent_tools: &NoTools,
             exec: None,
+            turn: None,
             ir: &ir,
             instance_id: &instance_id,
         };
@@ -967,6 +1111,7 @@ mod tests {
             agent_model: None,
             agent_tools: &NoTools,
             exec: Some(&exec_cfg),
+            turn: None,
             ir: &ir,
             instance_id: &instance_id,
         };
@@ -1131,6 +1276,7 @@ mod tests {
             agent_model: None,
             agent_tools: &NoTools,
             exec: None,
+            turn: None,
             ir: &ir,
             instance_id: &instance_id,
         };
@@ -1242,6 +1388,7 @@ mod tests {
             agent_model: Some(&model),
             agent_tools: &NoTools,
             exec: None,
+            turn: None,
             ir: &ir,
             instance_id: &instance_id,
         };
@@ -1366,6 +1513,7 @@ mod tests {
             agent_model: Some(&model),
             agent_tools: &NoTools,
             exec: None,
+            turn: None,
             ir: &ir,
             instance_id: &instance_id,
         };
@@ -1415,5 +1563,134 @@ mod tests {
                 body: serde_json::json!({}),
             }))
         }
+    }
+
+    /// A canned Class-B turn container: asserts the whip-turn/1 start
+    /// request shape and answers the blocking form's final outcome.
+    struct TurnContainerHost;
+    impl HostDriver for TurnContainerHost {
+        fn fulfill(&self, request: &IoRequest) -> IoResult {
+            let IoRequest::Http(request) = request;
+            assert!(request.url.ends_with("/turn"), "{}", request.url);
+            assert_eq!(request.body["protocol"], serde_json::json!("whip-turn/1"));
+            assert_eq!(request.body["tools"], serde_json::json!("file"));
+            assert_eq!(
+                request.body["provider"]["provider"],
+                serde_json::json!("fixture")
+            );
+            let turn_id = request.body["turn_id"]
+                .as_str()
+                .expect("turn_id")
+                .to_owned();
+            IoResult::Http(Ok(HttpResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "protocol": "whip-turn/1",
+                    "turn_id": turn_id,
+                    "resumed": false,
+                    "outcome": {
+                        "status": "completed",
+                        "summary": "container turn complete",
+                        "steps": 2,
+                        "usage": {"input_tokens": 5, "output_tokens": 7},
+                    },
+                }),
+            }))
+        }
+    }
+
+    // Class-B (compute plane P8): with a turn container configured, the agent
+    // turn dispatches WHOLE to the per-turn container over whip-turn/1 and the
+    // delivered outcome settles through settle_provider_run_result.
+    #[test]
+    fn do_instance_driver_runs_an_agent_turn_in_a_turn_container() {
+        let source = "workflow AgentDemo\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             agent helper {\n  provider owned\n  profile \"repo-reader\"\n  capacity 1\n}\n\n\
+             rule go\n  when started\n=> {\n  tell helper as reply \"\"\"\n  Do the thing.\n  \"\"\"\n\n\
+             \x20 after reply succeeds {\n    complete result { ok 1 }\n  }\n\n\
+             \x20 after reply fails {\n    complete result { ok 0 }\n  }\n}\n";
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("agent program compiles");
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('agent.tell', 'Run an agent turn.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+            "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) \
+             VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed agent provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: "src-turn",
+                    ir_hash: "ir-turn",
+                    compiler_version: "test",
+                },
+                &ir,
+            )
+            .expect("program version");
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/AgentDemo",
+                    effective_authority_json: "{}",
+                },
+            )
+            .expect("instance");
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .expect("start event");
+
+        let turn_cfg = TurnContainerConfig {
+            base_url: "http://turn".to_owned(),
+            provider: serde_json::json!({"provider": "fixture"}),
+            max_steps: 8,
+        };
+        let driver = DoInstanceDriver {
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            // No in-DO model configured: the container owns the turn.
+            agent_model: None,
+            agent_tools: &NoTools,
+            exec: None,
+            turn: Some(&turn_cfg),
+            ir: &ir,
+            instance_id: &instance_id,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &TurnContainerHost);
+        assert!(
+            matches!(outcome, InstanceOutcome::Terminal),
+            "the container turn settles to a terminal: {outcome:?}"
+        );
+        let driver = machine.into_driver();
+        let status = driver
+            .kernel
+            .store()
+            .status(&instance_id)
+            .expect("status")
+            .expect("instance row");
+        assert_eq!(status.instance.status, "completed");
+
+        // The settle carries the container's outcome (summary + usage) on the
+        // run, and the worker id marks the Class-B path.
+        let runs = driver.kernel.store().list_runs(&instance_id).expect("runs");
+        let run = runs
+            .iter()
+            .find(|run| run.worker_id == "whip-turn-container")
+            .expect("class-B run row");
+        assert_eq!(run.status, "completed");
     }
 }

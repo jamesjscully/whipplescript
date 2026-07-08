@@ -39,6 +39,9 @@ new_sqlite_classes = ["ExecutorContainer"]
 # Sentinel host for the executor pool: exec NeedsHttp rounds whose URL
 # targets this host are routed to a container stub, not the public network.
 WHIP_EXECUTOR_URL = "http://executor"
+# Sentinel host for Class-B turn containers: agent turns run whole in a
+# per-turn container (idFromName over the turn id) over whip-turn/1.
+WHIP_TURN_URL = "http://turn"
 
 # The wasm module built from the #[wasm_bindgen] surface (crate whipplescript-host-do).
 # `wasm-pack build --target bundler` emits worker/pkg/*; the bundler inlines the .wasm.

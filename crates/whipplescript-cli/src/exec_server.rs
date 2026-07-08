@@ -117,6 +117,15 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
             },
             Err(error) => (400, json!({"error": format!("invalid JSON body: {error}")})),
         },
+        // Class-B blocking form: run (or re-attach to) a whole agent turn and
+        // answer with its final outcome. The WS form on GET /turn streams.
+        ("POST", "/turn") => match serde_json::from_slice::<Value>(&body) {
+            Ok(request) => match crate::turn_server::handle_turn_http(&request) {
+                Ok(response) => (200, response),
+                Err((status, message)) => (status, json!({"error": message})),
+            },
+            Err(error) => (400, json!({"error": format!("invalid JSON body: {error}")})),
+        },
         _ => (
             404,
             json!({"error": "unknown route; POST /exec or GET /healthz"}),

@@ -25,7 +25,9 @@ use whipplescript_parser::IrProgram;
 use whipplescript_store::files::FileStore;
 use whipplescript_store::{ClaimableEffect, NewInstanceAuthority, RuntimeStore, StoreError};
 
-use crate::do_instance::{CoerceProviderConfig, DoInstanceDriver, ExecutorSidecarConfig};
+use crate::do_instance::{
+    CoerceProviderConfig, DoInstanceDriver, ExecutorSidecarConfig, TurnContainerConfig,
+};
 use crate::do_store::{DoSql, DoSqliteStore};
 
 /// What one [`DurableInstance::step`] yields back to the worker shell.
@@ -124,6 +126,8 @@ pub struct DurableEffectPorts {
     pub agent_tools: Option<Box<dyn ToolExecutor>>,
     /// Executor-sidecar wiring for Class-A exec effects (compute plane P8).
     pub exec: Option<ExecutorSidecarConfig>,
+    /// Class-B turn-container wiring (agent turns run whole in a container).
+    pub turn: Option<TurnContainerConfig>,
 }
 
 /// One operator-pinned script capability shipped with the deploy (compute
@@ -152,6 +156,7 @@ pub struct DurableInstance<Sql: DoSql> {
     agent_model: Option<Box<dyn HttpModelClient>>,
     agent_tools: Box<dyn ToolExecutor>,
     exec: Option<ExecutorSidecarConfig>,
+    turn: Option<TurnContainerConfig>,
 }
 
 impl<Sql: DoSql> DurableInstance<Sql> {
@@ -287,6 +292,7 @@ impl<Sql: DoSql> DurableInstance<Sql> {
                 .agent_tools
                 .unwrap_or_else(|| Box::new(NoToolExecutor)),
             exec: ports.exec,
+            turn: ports.turn,
         })
     }
 
@@ -316,6 +322,7 @@ impl<Sql: DoSql> DurableInstance<Sql> {
             agent_model: self.agent_model.as_deref(),
             agent_tools: self.agent_tools.as_ref(),
             exec: self.exec.as_ref(),
+            turn: self.turn.as_ref(),
             ir: &self.ir,
             instance_id: &self.instance_id,
         };

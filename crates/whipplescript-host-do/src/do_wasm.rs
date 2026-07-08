@@ -23,7 +23,7 @@ use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_model::MessagesApiClient;
 use whipplescript_kernel::sansio::{HttpResponse, TransportError};
 
-use crate::do_instance::{CoerceProviderConfig, ExecutorSidecarConfig};
+use crate::do_instance::{CoerceProviderConfig, ExecutorSidecarConfig, TurnContainerConfig};
 use crate::do_store::DoSql;
 use crate::do_worker::{
     DurableEffectPorts, DurableInstance, DurableStepOutcome, ScriptCapabilityInput,
@@ -284,6 +284,26 @@ fn parse_scripts(json: &str) -> Result<Vec<ScriptCapabilityInput>, String> {
         .collect()
 }
 
+/// Parse the Class-B turn-container config JSON (compute plane P8).
+fn parse_turn_config(json: &str) -> Result<TurnContainerConfig, String> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    Ok(TurnContainerConfig {
+        base_url: value
+            .get("base_url")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("turn config needs base_url")?
+            .to_owned(),
+        provider: value
+            .get("provider")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"provider": "fixture"})),
+        max_steps: value
+            .get("max_steps")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(30),
+    })
+}
+
 /// The durable-object instance as the Worker shell sees it.
 #[wasm_bindgen]
 pub struct WasmDurableInstance {
@@ -316,6 +336,7 @@ impl WasmDurableInstance {
         project_context_json: Option<String>,
         exec_config_json: Option<String>,
         scripts_json: Option<String>,
+        turn_config_json: Option<String>,
     ) -> Result<WasmDurableInstance, JsValue> {
         // Deploy-shipped project instructions: `[{"path": ..., "content": ...}]`
         // in injection order (context-assembly Phase 3 item 4).
@@ -350,6 +371,10 @@ impl WasmDurableInstance {
             Some(json) => parse_scripts(&json).map_err(|e| JsValue::from_str(&e))?,
             None => Vec::new(),
         };
+        let turn = match turn_config_json {
+            Some(json) => Some(parse_turn_config(&json).map_err(|e| JsValue::from_str(&e))?),
+            None => None,
+        };
         let inner = DurableInstance::create(
             JsDoSql { bridge },
             program,
@@ -359,6 +384,7 @@ impl WasmDurableInstance {
                 coerce,
                 agent_model,
                 exec,
+                turn,
                 ..DurableEffectPorts::default()
             },
             &project_context,

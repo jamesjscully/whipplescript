@@ -51,6 +51,11 @@ export interface Env {
   // injects it, so a toolchain bump is a visible warm-start epoch that rolls
   // the cache. Unset = the "do-v0" default epoch.
   WHIP_COMPUTE_ENV_HASH?: string;
+  // Class-B turn containers (compute plane P8): agent turns run whole in a
+  // per-turn container over whip-turn/1. URLs on this sentinel host route to
+  // a per-turn container instance (idFromName over the turn id) — the 1:1
+  // container-per-turn pattern. Unset = agent turns use the in-DO machine.
+  WHIP_TURN_URL?: string;
   EXECUTOR: DurableObjectNamespace<ExecutorContainer>;
 }
 
@@ -152,13 +157,24 @@ async function performFetch(
       body: JSON.stringify(req.body),
     };
     const executorHost = env?.WHIP_EXECUTOR_URL;
-    const resp =
-      executorHost && req.url.startsWith(executorHost)
-        ? await (await getRandom(env.EXECUTOR, EXECUTOR_POOL_SIZE)).fetch(req.url, init)
-        : await fetch(req.url, init);
+    const turnHost = env?.WHIP_TURN_URL;
+    let resp: Response;
+    if (turnHost && req.url.startsWith(turnHost)) {
+      // Class-B: a per-turn container (1:1), addressed by the turn id in the
+      // whip-turn/1 request body. The blocking POST /turn answers with the
+      // final outcome; a re-sent start re-attaches idempotently.
+      const turnId = String((req.body as { turn_id?: string })?.turn_id ?? "turn");
+      const container = env.EXECUTOR.get(env.EXECUTOR.idFromName(`turn-${turnId}`));
+      resp = await container.fetch(req.url, init);
+    } else if (executorHost && req.url.startsWith(executorHost)) {
+      resp = await (await getRandom(env.EXECUTOR, EXECUTOR_POOL_SIZE)).fetch(req.url, init);
+    } else {
+      resp = await fetch(req.url, init);
+    }
     return JSON.stringify({ status: resp.status, body: await resp.json() });
   } catch (error) {
     // The core maps `{"error": ...}` to a TransportError terminal.
+    console.log(`performFetch failed for ${req.url}: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
     return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
   }
 }
@@ -259,6 +275,22 @@ export class WorkflowInstance implements DurableObject {
           },
         })
       : undefined;
+    // Class-B turn containers: forward the provider config into the container
+    // (the container runs the model calls itself); fixture when no key is set.
+    const turnConfig = this.env.WHIP_TURN_URL
+      ? JSON.stringify({
+          base_url: this.env.WHIP_TURN_URL,
+          provider: this.env.ANTHROPIC_API_KEY
+            ? {
+                provider: "anthropic",
+                base_url: this.env.WHIP_PROVIDER_BASE_URL ?? "https://api.anthropic.com",
+                api_key: this.env.ANTHROPIC_API_KEY,
+                model: "claude-3-5-sonnet-latest",
+                max_tokens: 4096,
+              }
+            : { provider: "fixture" },
+        })
+      : undefined;
     const instance = WasmDurableInstance.create(
       bridge,
       bootstrap.program,
@@ -269,6 +301,7 @@ export class WorkflowInstance implements DurableObject {
       bootstrap.project_context ? JSON.stringify(bootstrap.project_context) : undefined,
       execConfig,
       bootstrap.scripts ? JSON.stringify(bootstrap.scripts) : undefined,
+      turnConfig,
     );
 
     // The sans-IO loop: step -> maybe fetch -> step, until a terminal or a park.

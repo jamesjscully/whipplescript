@@ -147,40 +147,43 @@ pub fn handle_turn_websocket(mut stream: TcpStream, websocket_key: &str) -> std:
         .and_then(Value::as_str)
         .unwrap_or("turn")
         .to_owned();
+    let (receiver, final_frame, resumed) = start_or_attach(&turn_id, &request);
+    write_text_frame(
+        &mut stream,
+        &json!({"kind": "accepted", "turn_id": turn_id, "resumed": resumed}).to_string(),
+    )?;
+    if let Some(frame) = final_frame {
+        write_text_frame(&mut stream, &frame)?;
+        return write_close_frame(&mut stream);
+    }
+    pump_frames(stream, receiver)
+}
+
+/// Start the turn (spawning its thread) or attach to an existing one — a
+/// duplicate start is an implicit re-attach, which is what makes turn
+/// dispatch idempotent under at-least-once delivery (DR-0033 Decision 3):
+/// a workflow DO evicted mid-await simply re-sends the start and lands back
+/// on the same turn.
+fn start_or_attach(turn_id: &str, request: &Value) -> (Receiver<String>, Option<String>, bool) {
     {
         let mut registry = registry().lock().expect("turn registry lock");
-        if registry.contains_key(&turn_id) {
+        if registry.contains_key(turn_id) {
             drop(registry);
-            // Duplicate start = implicit re-attach (idempotent under
-            // at-least-once delivery, DR-0033 Decision 3).
             let (receiver, final_frame) =
-                subscribe(&turn_id).expect("turn present after contains_key");
-            write_text_frame(
-                &mut stream,
-                &json!({"kind": "accepted", "turn_id": turn_id, "resumed": true}).to_string(),
-            )?;
-            if let Some(frame) = final_frame {
-                write_text_frame(&mut stream, &frame)?;
-                return write_close_frame(&mut stream);
-            }
-            return pump_frames(stream, receiver);
+                subscribe(turn_id).expect("turn present after contains_key");
+            return (receiver, final_frame, true);
         }
         registry.insert(
-            turn_id.clone(),
+            turn_id.to_owned(),
             TurnState {
                 subscribers: Vec::new(),
                 final_frame: None,
             },
         );
     }
-    let (receiver, _) = subscribe(&turn_id).expect("turn just registered");
-    write_text_frame(
-        &mut stream,
-        &json!({"kind": "accepted", "turn_id": turn_id, "resumed": false}).to_string(),
-    )?;
-
+    let (receiver, _) = subscribe(turn_id).expect("turn just registered");
     let run_request = request.clone();
-    let run_turn_id = turn_id.clone();
+    let run_turn_id = turn_id.to_owned();
     std::thread::spawn(move || {
         let outcome = run_turn(&run_turn_id, &run_request);
         let frame = json!({
@@ -196,7 +199,42 @@ pub fn handle_turn_websocket(mut stream: TcpStream, websocket_key: &str) -> std:
         .to_string();
         publish(&run_turn_id, &frame, true);
     });
-    pump_frames(stream, receiver)
+    (receiver, None, false)
+}
+
+/// The blocking HTTP form of the turn channel (`POST /turn`): start or
+/// attach, wait for the final frame, answer with the outcome. This is the
+/// v1 transport the workflow DO's per-turn controller uses — the WebSocket
+/// form above carries progress streaming and explicit re-query; hibernating
+/// progress consumption by the workflow DO is a recorded follow-on.
+pub fn handle_turn_http(request: &Value) -> Result<Value, (u16, String)> {
+    if request.get("protocol").and_then(Value::as_str) != Some(TURN_PROTOCOL) {
+        return Err((400, format!("expected protocol `{TURN_PROTOCOL}`")));
+    }
+    let turn_id = request
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .ok_or((400, "turn_id is required".to_owned()))?
+        .to_owned();
+    let (receiver, final_frame, resumed) = start_or_attach(&turn_id, request);
+    let final_frame = match final_frame {
+        Some(frame) => frame,
+        None => loop {
+            match receiver.recv() {
+                Ok(frame) if frame.contains("\"kind\":\"final\"") => break frame,
+                Ok(_) => continue,
+                Err(_) => return Err((500, "turn ended without a final frame".to_owned())),
+            }
+        },
+    };
+    let frame: Value = serde_json::from_str(&final_frame)
+        .map_err(|error| (500, format!("final frame did not decode: {error}")))?;
+    Ok(json!({
+        "protocol": TURN_PROTOCOL,
+        "turn_id": turn_id,
+        "resumed": resumed,
+        "outcome": frame.get("outcome").cloned().unwrap_or(Value::Null),
+    }))
 }
 
 /// Forward published frames to the socket until the final frame (or the
