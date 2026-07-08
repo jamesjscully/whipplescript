@@ -89,6 +89,7 @@ use whipplescript_store::native_stores::NativeStores;
 
 mod auth;
 mod coerce_runtime;
+mod exec_server;
 mod gov;
 mod harness_tools;
 mod ifc;
@@ -208,6 +209,7 @@ fn main() -> ExitCode {
         Some("recover") => recover(&options),
         Some("auth") => auth_command(&options),
         Some("deploy") => deploy_command(&options),
+        Some("executor") => executor_command(&options),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             ExitCode::SUCCESS
@@ -510,6 +512,36 @@ fn deploy_command(options: &CliOptions) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `whip executor` (compute plane P8): the Class-A exec sidecar. Containers
+/// run this as their entrypoint with `--bind 0.0.0.0:8080`; the default bind
+/// is loopback-only for local runs.
+fn executor_command(options: &CliOptions) -> ExitCode {
+    let mut bind = "127.0.0.1:8080".to_owned();
+    let mut iter = options.args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--bind" => match iter.next() {
+                Some(value) => bind = value.clone(),
+                None => {
+                    eprintln!("--bind requires an addr:port");
+                    return ExitCode::from(2);
+                }
+            },
+            other => {
+                eprintln!("unknown executor argument `{other}`");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    match exec_server::serve(&bind) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("executor failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Locate `tool` on PATH (portable `which`).
 fn which_on_path(tool: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
@@ -580,6 +612,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "skill" => "usage: whip [--store path] [--json] skill <list | validate <SKILL.md|dir> | install <SKILL.md|dir>>",
         "auth" => "usage: whip auth <status | set <openai|anthropic> <key>>",
         "deploy" => "usage: whip deploy [--worker-dir <path>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]",
+        "executor" => "usage: whip executor [--bind <addr:port>]   (Class-A exec sidecar; default 127.0.0.1:8080)",
         "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--from <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
         _ => return None,
     })
