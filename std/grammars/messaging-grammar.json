@@ -1,0 +1,50 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.messaging",
+  "name": "std.messaging",
+  "version": "v0",
+  "libraries": [
+    {
+      "id": "std.messaging",
+      "version": "v0",
+      "constructs": [
+        {
+          "id": "messaging.channel",
+          "construct_family": "declaration_block",
+          "keyword": "channel",
+          "scope": "top_level",
+          "grammar": {
+            "shape": "declaration_block",
+            "keyword": "channel",
+            "clauses": [
+              {
+                "name": "provider",
+                "kind": "identifier",
+                "required": true,
+                "list": false,
+                "unknown_hint": "channel fields are `provider`, `workspace`, and `destination`",
+                "missing_summary": "add `provider <name>` inside the channel block"
+              },
+              {
+                "name": "workspace",
+                "kind": "identifier",
+                "required": false,
+                "list": false,
+                "unknown_hint": "channel fields are `provider`, `workspace`, and `destination`",
+                "missing_summary": "add `provider <name>` inside the channel block"
+              },
+              {
+                "name": "destination",
+                "kind": "scalar",
+                "required": false,
+                "list": false,
+                "unknown_hint": "channel fields are `provider`, `workspace`, and `destination`",
+                "missing_summary": "add `provider <name>` inside the channel block"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

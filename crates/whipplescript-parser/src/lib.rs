@@ -17839,6 +17839,81 @@ fn lex_string(source: &str, start: usize) -> (Token, usize, Option<Diagnostic>) 
     )
 }
 
+/// The value kind of a `declaration_block` clause (Shape 1, DR-0011 amended
+/// 2026-07-08 with `Duration`/`Glob`/`Schema`/`Scalar`/`Flag`). The order-free
+/// analog of `body::SlotKind` for top-level declarations. A `Flag` clause is a
+/// bare presence clause carrying no value.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+enum ClauseKind {
+    Identifier,
+    Expression,
+    Duration,
+    Glob,
+    Schema,
+    Scalar,
+    Flag,
+}
+
+/// The typed AST node a migrated declaration lowers to — the one hand-written
+/// seam of the otherwise data-driven Shape 1 pipeline. `effect_operation`
+/// lowers to a uniform node, but the seven decls each build a distinct typed
+/// node, so a future dispatch slice switches on this. Unused in D2.0 beyond
+/// being carried in the spec.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+enum DeclAstKind {
+    Tracker,
+    Channel,
+    Counter,
+    Lease,
+    Ledger,
+    MemoryPool,
+    FileStore,
+}
+
+/// One order-free clause of a `declaration_block` construct: a named value
+/// (`words` = the build-time-split clause-name tokens; single-word names are a
+/// one-element slice), an optional `connective` consumed before the value
+/// (`Some("by")` for ledger `partition by`; shares Shape 2's vocabulary plus
+/// `by`), a value `kind`, and whether it is `required` and/or a `[ ... ]`
+/// `list`. The two carried diagnostic strings (`unknown_hint`,
+/// `missing_summary`) let a later dispatch slice reproduce the hand parser's
+/// messages. The order-free analog of `body::EffectSlotSpec`.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+struct ClauseSpec {
+    name: &'static str,
+    words: &'static [&'static str],
+    connective: Option<&'static str>,
+    kind: ClauseKind,
+    required: bool,
+    list: bool,
+    unknown_hint: &'static str,
+    missing_summary: &'static str,
+}
+
+/// The full grammar of one `declaration_block` construct (Shape 1). `keyword`
+/// is the full head phrase (`"memory pool"`/`"file store"`); `keyword_words`
+/// is its whitespace-split tokens (head-word dispatch reads `keyword_words[0]`).
+/// `ast_kind` is the hand-written builder seam.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+struct DeclarationBlockSpec {
+    keyword: &'static str,
+    keyword_words: &'static [&'static str],
+    ast_kind: DeclAstKind,
+    clauses: &'static [ClauseSpec],
+}
+
+// The table itself is generated at build time from the grammar-only manifests
+// (std/grammars/*.json) by build.rs, mirroring `EFFECT_OPERATION_GRAMMAR`: each
+// declaration_block construct's DR-0011 `grammar` object transcribes into one
+// `DeclarationBlockSpec` row, so the manifests are the single source of parse
+// grammar and the table can never drift from them. D2.0 builds the table and
+// unit-tests it; nothing dispatches through it yet.
+include!(concat!(env!("OUT_DIR"), "/declaration_block_grammar.rs"));
+
 struct Parser<'a> {
     source: &'a str,
     tokens: Vec<Token>,
@@ -18318,6 +18393,23 @@ impl Parser<'_> {
         } else {
             None
         }
+    }
+
+    /// Peek (without consuming) the `declaration_block` grammar whose keyword
+    /// head word matches the current token. Head-word dispatch only
+    /// (`keyword_words[0]`, NOT a 2-token peek — a 2-token peek mis-routes a
+    /// malformed `file <x>` to the wrong diagnostic; tail validation belongs in
+    /// the per-decl parser). The exact analog of `body::effect_operation_spec`.
+    /// D2.0 scaffolding: not wired into `parse_declaration_item` yet.
+    #[allow(dead_code)]
+    fn declaration_block_spec_at(&self) -> Option<&'static DeclarationBlockSpec> {
+        let head = match self.peek().map(|token| &token.kind) {
+            Some(TokenKind::Ident(value)) => value.as_str(),
+            _ => return None,
+        };
+        DECLARATION_BLOCK_GRAMMAR
+            .iter()
+            .find(|spec| spec.keyword_words.first() == Some(&head))
     }
 
     fn parse_pattern(&mut self) -> Option<PatternDecl> {
@@ -21014,6 +21106,89 @@ mod tests {
     #[test]
     fn parser_scaffold_links_to_core() {
         assert_eq!(parser_stage(), "stage-0-skeleton");
+    }
+
+    #[test]
+    fn declaration_block_grammar_table_is_complete() {
+        // Drift canary for the build.rs-generated DECLARATION_BLOCK_GRAMMAR
+        // table (D2.0 scaffolding). The table exists and is validated here; no
+        // dispatch consumes it yet.
+        let keywords: Vec<&str> = DECLARATION_BLOCK_GRAMMAR
+            .iter()
+            .map(|spec| spec.keyword)
+            .collect();
+        assert_eq!(
+            keywords.len(),
+            7,
+            "expected exactly 7 declaration_block specs"
+        );
+        for expected in [
+            "tracker",
+            "channel",
+            "counter",
+            "lease",
+            "ledger",
+            "file store",
+            "memory pool",
+        ] {
+            assert!(
+                keywords.contains(&expected),
+                "missing declaration_block keyword `{expected}`; got {keywords:?}"
+            );
+        }
+
+        let find = |keyword: &str| -> &DeclarationBlockSpec {
+            DECLARATION_BLOCK_GRAMMAR
+                .iter()
+                .find(|spec| spec.keyword == keyword)
+                .unwrap_or_else(|| panic!("no spec for `{keyword}`"))
+        };
+        let clause = |keyword: &str, name: &str| -> &ClauseSpec {
+            find(keyword)
+                .clauses
+                .iter()
+                .find(|clause| clause.name == name)
+                .unwrap_or_else(|| panic!("no clause `{name}` on `{keyword}`"))
+        };
+
+        // Multi-word keywords split into two words; single-word into one.
+        assert_eq!(find("memory pool").keyword_words, &["memory", "pool"]);
+        assert_eq!(find("file store").keyword_words, &["file", "store"]);
+        assert_eq!(find("tracker").keyword_words, &["tracker"]);
+
+        // ledger `partition by` is the M2 connective clause.
+        assert_eq!(clause("ledger", "partition").connective, Some("by"));
+
+        // lease `shared` is a flag (no value).
+        assert!(matches!(clause("lease", "shared").kind, ClauseKind::Flag));
+        assert!(!clause("lease", "shared").list);
+        assert_eq!(clause("lease", "shared").connective, None);
+
+        // file-store `allow read`/`allow write` are multi-word glob lists.
+        for (name, words) in [
+            ("allow read", ["allow", "read"]),
+            ("allow write", ["allow", "write"]),
+        ] {
+            let allow = clause("file store", name);
+            assert!(allow.list, "`{name}` must be list:true");
+            assert_eq!(allow.words, words);
+            assert!(matches!(allow.kind, ClauseKind::Glob));
+        }
+
+        // Exercise the head-word peek so the scaffolding method is live.
+        let mut parser = Parser {
+            source: "memory pool p { }",
+            tokens: lex("memory pool p { }").tokens,
+            pos: 0,
+            diagnostics: Vec::new(),
+        };
+        let spec = parser
+            .declaration_block_spec_at()
+            .expect("head word `memory` must resolve to the memory pool spec");
+        assert_eq!(spec.keyword, "memory pool");
+        // It only peeks — position is unchanged.
+        assert_eq!(parser.pos, 0);
+        parser.diagnostics.clear();
     }
 
     const SEND_PROGRAM: &str = r##"

@@ -39627,6 +39627,69 @@ coerce review() -> Review {
     }
 
     #[test]
+    fn std_manifests_all_embedded() {
+        // Blocker B1 door mirror: `scripts/artifact_admission.py`
+        // (`embedded_std_construct_identities`) globs `std/manifests/*.json`
+        // indiscriminately and treats every construct it finds as embedded-std
+        // (door-privileged). The Rust authority instead reads only
+        // `EMBEDDED_STD_MANIFESTS`. If a construct-bearing manifest that is NOT
+        // embedded ever lands under `std/manifests/`, Python would privilege it
+        // (fail-open) while Rust would not — re-opening the gap the
+        // grammar-only-manifests-live-in-std/grammars decision closed. This
+        // test fails the build the moment such a manifest appears, forcing it
+        // into `std/grammars/` (build.rs-only, un-globbed) or into the embedded
+        // set. Keep the two sources in lockstep.
+        let manifests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../std/manifests");
+        let entries = std::fs::read_dir(&manifests_dir)
+            .expect("std/manifests directory must exist and be readable");
+        let embedded_names: std::collections::HashSet<&str> = EMBEDDED_STD_MANIFESTS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        let mut checked = 0usize;
+        for entry in entries {
+            let path = entry.expect("std/manifests entry must be readable").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("could not read `{}`: {error}", path.display()));
+            let manifest: serde_json::Value = serde_json::from_str(&raw)
+                .unwrap_or_else(|error| panic!("`{}` is not valid JSON: {error}", path.display()));
+            let has_construct = manifest
+                .get("libraries")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|library| {
+                    library
+                        .get("constructs")
+                        .and_then(serde_json::Value::as_array)
+                })
+                .any(|constructs| !constructs.is_empty());
+            if !has_construct {
+                continue;
+            }
+            let name = manifest
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("`{}` is missing a top-level `name`", path.display()));
+            assert!(
+                embedded_names.contains(name),
+                "construct-bearing std manifest `{}` (name `{name}`) is under std/manifests/ but not in \
+                 EMBEDDED_STD_MANIFESTS; either embed it (and update the parser build.rs list + the \
+                 Python door) or move it to std/grammars/ (grammar-only, build.rs-read, un-globbed by the door)",
+                path.display()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "expected at least one construct-bearing manifest under std/manifests/"
+        );
+    }
+
+    #[test]
     fn registry_construct_embedded_std_copy_requires_full_identity() {
         // The report-registry layer keys on registration identity with an
         // embedded std construct; any drifted field breaks the match.
