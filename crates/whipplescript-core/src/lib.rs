@@ -38,6 +38,12 @@ pub struct ConstructRegistration {
     pub construct_family: String,
     pub keyword: String,
     pub scope: String,
+    /// The DR-0011 grammar object, when the manifest declares one
+    /// (spec/construct-grammar.md "Two-Shape Meta-Grammar"). `fields` is then
+    /// derived from it (`ConstructGrammar::derive_fields`) rather than read
+    /// from the manifest. `None` for constructs registered without a grammar
+    /// (legacy flat `fields[]` manifests, artifact round-trips).
+    pub grammar: Option<ConstructGrammar>,
     pub fields: Vec<ConstructField>,
     pub requires: Vec<ConstructInterface>,
     pub provides: Vec<ConstructInterface>,
@@ -50,6 +56,83 @@ pub struct ConstructField {
     pub name: String,
     pub kind: String,
     pub required: bool,
+}
+
+/// A DR-0011 `effect_operation` grammar object: the single source of the
+/// construct's parse shape (`<keyword> [<connective> <slot>]* [{ payload }]?
+/// as <binding>`). Kept as plain validated strings, matching the rest of the
+/// registration data. The only shape representable in package manifests today
+/// is `effect_operation` (`CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION`);
+/// `declaration_block` is spec-defined but not yet manifest-supported.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstructGrammar {
+    pub shape: String,
+    pub keyword: String,
+    pub slots: Vec<ConstructGrammarSlot>,
+    /// `None` = no payload block; `Some(fields)` = a `{ ... }` block of named
+    /// expression fields.
+    pub payload: Option<Vec<ConstructGrammarPayloadField>>,
+    /// `required` | `optional` | `none` — the trailing `as <binding>` policy.
+    pub binding: String,
+    pub target_capability: String,
+}
+
+/// One ordered grammar slot: a named value (`identifier` | `expression`),
+/// optionally introduced by a fixed connective word from
+/// `CONSTRUCT_GRAMMAR_CONNECTIVES`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstructGrammarSlot {
+    pub name: String,
+    pub kind: String,
+    pub connective: Option<String>,
+}
+
+/// One field inside the optional payload block: a named expression, required
+/// or not.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstructGrammarPayloadField {
+    pub name: String,
+    pub kind: String,
+    pub required: bool,
+}
+
+pub const CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION: &str = "effect_operation";
+pub const CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK: &str = "declaration_block";
+pub const CONSTRUCT_GRAMMAR_CONNECTIVES: &[&str] = &["from", "for", "into", "to", "via"];
+pub const CONSTRUCT_GRAMMAR_SLOT_KINDS: &[&str] = &["identifier", "expression"];
+pub const CONSTRUCT_GRAMMAR_BINDING_MODES: &[&str] = &["required", "optional", "none"];
+
+impl ConstructGrammar {
+    /// Derive the flat `fields[]` view downstream consumers read: the ordered
+    /// slots (always required), then the payload fields with their own
+    /// required flags, then — unless the binding mode is `none` — the trailing
+    /// binding as an identifier field named `binding` (required when the mode
+    /// is `required`).
+    pub fn derive_fields(&self) -> Vec<ConstructField> {
+        let mut fields = Vec::new();
+        for slot in &self.slots {
+            fields.push(ConstructField {
+                name: slot.name.clone(),
+                kind: slot.kind.clone(),
+                required: true,
+            });
+        }
+        for field in self.payload.iter().flatten() {
+            fields.push(ConstructField {
+                name: field.name.clone(),
+                kind: field.kind.clone(),
+                required: field.required,
+            });
+        }
+        if self.binding != "none" {
+            fields.push(ConstructField {
+                name: "binding".to_owned(),
+                kind: "identifier".to_owned(),
+                required: self.binding == "required",
+            });
+        }
+        fields
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -624,7 +707,7 @@ pub struct ContractRegistryDiagnostic {
 // std packages ship as data compiled into the binary rather than as scattered
 // per-package builtin functions. The `std_*` functions below are the reference
 // data for `std.messaging` (`send`): the shipped registration now comes from the
-// embedded `examples/packages/messaging.json` manifest (S6d-3), and a CLI guard
+// embedded `std/manifests/messaging.json` manifest (S6d-3), and a CLI guard
 // test asserts the manifest transcribes these functions field-for-field so the
 // two can never drift while both exist. The schema strings are the JSON-fragment
 // form the package-manifest validator accepts (named schema references are not
@@ -643,6 +726,40 @@ pub fn std_messaging_send_construct() -> ConstructRegistration {
         construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION.to_owned(),
         keyword: "send".to_owned(),
         scope: CONSTRUCT_SCOPE_RULE_BODY.to_owned(),
+        // The DR-0011 grammar: `send via <channel> { text <expr> [markdown
+        // <expr>] [thread_id <expr>] } as <binding>`. This is the reference
+        // value the embedded manifest's `grammar` object must transcribe.
+        grammar: Some(ConstructGrammar {
+            shape: CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION.to_owned(),
+            keyword: "send".to_owned(),
+            slots: vec![ConstructGrammarSlot {
+                name: "channel".to_owned(),
+                kind: "identifier".to_owned(),
+                connective: Some("via".to_owned()),
+            }],
+            payload: Some(vec![
+                ConstructGrammarPayloadField {
+                    name: "text".to_owned(),
+                    kind: "expression".to_owned(),
+                    required: true,
+                },
+                ConstructGrammarPayloadField {
+                    name: "markdown".to_owned(),
+                    kind: "expression".to_owned(),
+                    required: false,
+                },
+                ConstructGrammarPayloadField {
+                    name: "thread_id".to_owned(),
+                    kind: "expression".to_owned(),
+                    required: false,
+                },
+            ]),
+            binding: "required".to_owned(),
+            target_capability: MESSAGING_SEND_CAPABILITY.to_owned(),
+        }),
+        // The grammar-derived flat view (slots, payload fields, binding) —
+        // written out explicitly so the transcription guard compares two
+        // independent spellings.
         fields: vec![
             ConstructField {
                 name: "channel".to_owned(),
@@ -652,6 +769,21 @@ pub fn std_messaging_send_construct() -> ConstructRegistration {
             ConstructField {
                 name: "text".to_owned(),
                 kind: "expression".to_owned(),
+                required: true,
+            },
+            ConstructField {
+                name: "markdown".to_owned(),
+                kind: "expression".to_owned(),
+                required: false,
+            },
+            ConstructField {
+                name: "thread_id".to_owned(),
+                kind: "expression".to_owned(),
+                required: false,
+            },
+            ConstructField {
+                name: "binding".to_owned(),
+                kind: "identifier".to_owned(),
                 required: true,
             },
         ],
@@ -1290,6 +1422,7 @@ mod tests {
                     construct_family: "declaration_block".to_owned(),
                     keyword: "coerce".to_owned(),
                     scope: "top_level".to_owned(),
+                    grammar: None,
                     fields: vec![ConstructField {
                         name: "name".to_owned(),
                         kind: "identifier".to_owned(),
@@ -1307,6 +1440,7 @@ mod tests {
                     construct_family: String::new(),
                     keyword: "coerce".to_owned(),
                     scope: "top_level".to_owned(),
+                    grammar: None,
                     fields: vec![
                         ConstructField {
                             name: "name".to_owned(),

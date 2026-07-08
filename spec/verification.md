@@ -468,7 +468,7 @@ IR-obligation artifact, and graph source evidence still fails against the
 source-derived span.
 
 The standalone formal gate also runs the package-contract bridge. It generates
-`whip package check --json examples/packages/memory.json`, admits the embedded
+`whip package check --json std/manifests/memory.json`, admits the embedded
 `package_contract` only after schema, digest, platform-catalog, and empty
 diagnostic checks, then proves package effect-contract acceptance and
 capability-call declaration source lowering against `package-contract.maude`.

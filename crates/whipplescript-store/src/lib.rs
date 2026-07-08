@@ -14450,9 +14450,9 @@ mod tests {
             })
             .expect("instance creates");
         let package_id = store
-            .register_package_manifest(include_str!("../../../examples/packages/memory.json"))
+            .register_package_manifest(include_str!("../../../std/manifests/memory.json"))
             .expect("package manifest loads");
-        assert_eq!(package_id, "package-memory");
+        assert_eq!(package_id, "std.memory");
 
         let effects = [NewEffect {
             timeout_seconds: None,

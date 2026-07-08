@@ -64,23 +64,17 @@
           "construct_family": "effect_operation",
           "keyword": "recall",
           "scope": "rule_body",
-          "fields": [
-            {
-              "name": "pool",
-              "kind": "identifier",
-              "required": true
-            },
-            {
-              "name": "query",
-              "kind": "expression",
-              "required": true
-            },
-            {
-              "name": "binding",
-              "kind": "identifier",
-              "required": true
-            }
-          ],
+          "grammar": {
+            "shape": "effect_operation",
+            "keyword": "recall",
+            "slots": [
+              { "name": "pool", "kind": "identifier" },
+              { "name": "query", "kind": "expression", "connective": "for" }
+            ],
+            "payload": null,
+            "binding": "required",
+            "target_capability": "memory.query"
+          },
           "requires": [
             {
               "kind": "Capability",
@@ -101,28 +95,21 @@
           "construct_family": "effect_operation",
           "keyword": "learn",
           "scope": "rule_body",
-          "fields": [
-            {
-              "name": "source",
-              "kind": "expression",
-              "required": true
+          "grammar": {
+            "shape": "effect_operation",
+            "keyword": "learn",
+            "slots": [
+              { "name": "source", "kind": "expression", "connective": "from" },
+              { "name": "pool", "kind": "identifier", "connective": "into" }
+            ],
+            "payload": {
+              "fields": [
+                { "name": "note", "kind": "expression", "required": false }
+              ]
             },
-            {
-              "name": "pool",
-              "kind": "identifier",
-              "required": true
-            },
-            {
-              "name": "note",
-              "kind": "expression",
-              "required": false
-            },
-            {
-              "name": "binding",
-              "kind": "identifier",
-              "required": true
-            }
-          ],
+            "binding": "required",
+            "target_capability": "memory.write"
+          },
           "requires": [
             {
               "kind": "Capability",
@@ -143,23 +130,20 @@
           "construct_family": "effect_operation",
           "keyword": "curate",
           "scope": "rule_body",
-          "fields": [
-            {
-              "name": "pool",
-              "kind": "identifier",
-              "required": true
+          "grammar": {
+            "shape": "effect_operation",
+            "keyword": "curate",
+            "slots": [
+              { "name": "pool", "kind": "identifier" }
+            ],
+            "payload": {
+              "fields": [
+                { "name": "reason", "kind": "expression", "required": false }
+              ]
             },
-            {
-              "name": "reason",
-              "kind": "expression",
-              "required": false
-            },
-            {
-              "name": "binding",
-              "kind": "identifier",
-              "required": true
-            }
-          ],
+            "binding": "required",
+            "target_capability": "memory.curate"
+          },
           "requires": [
             {
               "kind": "Capability",

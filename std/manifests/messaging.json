@@ -33,18 +33,22 @@
           "construct_family": "effect_operation",
           "keyword": "send",
           "scope": "rule_body",
-          "fields": [
-            {
-              "name": "channel",
-              "kind": "identifier",
-              "required": true
+          "grammar": {
+            "shape": "effect_operation",
+            "keyword": "send",
+            "slots": [
+              { "name": "channel", "kind": "identifier", "connective": "via" }
+            ],
+            "payload": {
+              "fields": [
+                { "name": "text", "kind": "expression", "required": true },
+                { "name": "markdown", "kind": "expression", "required": false },
+                { "name": "thread_id", "kind": "expression", "required": false }
+              ]
             },
-            {
-              "name": "text",
-              "kind": "expression",
-              "required": true
-            }
-          ],
+            "binding": "required",
+            "target_capability": "messaging.send"
+          },
           "requires": [
             {
               "kind": "Capability",

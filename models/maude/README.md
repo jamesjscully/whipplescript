@@ -181,7 +181,7 @@ lifecycle obligations, and verifies the platform lowering classes satisfy
 `lowering-class-lifecycle.maude` static-safety and authority-profile rules. That
 catalog check does not prove emitted core-object outputs; output compatibility
 is checked later from concrete lowered IR inventory. The script then generates a
-package check report for `examples/packages/memory.json`, converts the emitted
+package check report for `std/manifests/memory.json`, converts the emitted
 `package_contract` artifact into bounded Maude obligations, and verifies package
 effect-contract acceptance plus executable capability-call declaration lowering
 against `package-contract.maude`. It also converts the same package contract's

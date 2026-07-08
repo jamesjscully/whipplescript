@@ -93,7 +93,7 @@ cargo run --quiet -p whipplescript -- --store "$TMP_HUMAN_ACCEPT_STORE" --json a
   examples/human-review.accept.json \
   > "$TMP_DIR/human-acceptance.json"
 cargo run --quiet -p whipplescript -- --json package check \
-  examples/packages/memory.json \
+  std/manifests/memory.json \
   > "$TMP_DIR/package-check.json"
 PLATFORM_CATALOG_PATH="$TMP_DIR/platform-construct-catalog.json"
 cargo run --quiet -p whipplescript -- package catalog \
@@ -2190,7 +2190,7 @@ pairs = [
     ("spec/report-schemas/acceptance_report_v0.schema.json", tmp_dir / "acceptance.json"),
     ("spec/report-schemas/acceptance_fixture_v0.schema.json", Path("examples/human-review.accept.json")),
     ("spec/report-schemas/acceptance_report_v0.schema.json", tmp_dir / "human-acceptance.json"),
-    ("spec/report-schemas/package_manifest_v0.schema.json", Path("examples/packages/memory.json")),
+    ("spec/report-schemas/package_manifest_v0.schema.json", Path("std/manifests/memory.json")),
     ("spec/report-schemas/package_check_v0.schema.json", tmp_dir / "package-check.json"),
     ("spec/report-schemas/platform_construct_catalog_v0.schema.json", tmp_dir / "platform-construct-catalog.json"),
     ("spec/report-schemas/package_lock_v0.schema.json", tmp_dir / "package-lock.json"),
@@ -2219,7 +2219,7 @@ print("validated verified artifact bundle schema rejects empty embedded artifact
 
 package_manifest_schema = json.loads(Path("spec/report-schemas/package_manifest_v0.schema.json").read_text())
 package_manifest_validator = Draft202012Validator(package_manifest_schema)
-package_manifest = json.loads(Path("examples/packages/memory.json").read_text())
+package_manifest = json.loads(Path("std/manifests/memory.json").read_text())
 assert_schema_rejects(
     package_manifest_validator,
     with_duplicate_array_member(

@@ -291,7 +291,7 @@ echo "== generated Maude from package contract"
 (
   cd "$ROOT"
   cargo run --quiet -p whipplescript -- package check --json \
-    examples/packages/memory.json \
+    std/manifests/memory.json \
     > "$TMP_DIR/generated-package-check.json"
   python3 - "$TMP_DIR/generated-package-check.json" > "$TMP_DIR/generated-package-contract-expected.txt" <<'PY'
 import json

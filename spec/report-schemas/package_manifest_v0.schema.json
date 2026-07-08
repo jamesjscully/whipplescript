@@ -136,6 +136,9 @@
         "scope": {
           "enum": ["top_level", "rule_body", "workflow_body", "expression"]
         },
+        "grammar": {
+          "$ref": "#/$defs/constructGrammar"
+        },
         "fields": {
           "type": "array",
           "uniqueItems": true,
@@ -163,6 +166,89 @@
         "target_capability": {
           "type": "string",
           "minLength": 1
+        }
+      }
+    },
+    "constructGrammar": {
+      "comment": "DR-0011 grammar object (spec/construct-grammar.md, Two-Shape Meta-Grammar). When present, the construct's flat fields[] are derived from it and may not also be declared. Only effect_operation is manifest-expressible today; declaration_block is spec-defined but not yet supported.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["shape", "keyword", "slots", "binding", "target_capability"],
+      "properties": {
+        "shape": {
+          "enum": ["effect_operation"]
+        },
+        "keyword": {
+          "type": "string",
+          "minLength": 1
+        },
+        "slots": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/constructGrammarSlot"
+          }
+        },
+        "payload": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/constructGrammarPayload" }
+          ]
+        },
+        "binding": {
+          "enum": ["required", "optional", "none"]
+        },
+        "target_capability": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "constructGrammarSlot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "enum": ["identifier", "expression"]
+        },
+        "connective": {
+          "enum": ["from", "for", "into", "to", "via"]
+        }
+      }
+    },
+    "constructGrammarPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fields"],
+      "properties": {
+        "fields": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/constructGrammarPayloadField"
+          }
+        }
+      }
+    },
+    "constructGrammarPayloadField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "enum": ["expression"]
+        },
+        "required": {
+          "type": "boolean"
         }
       }
     },

@@ -51,7 +51,16 @@ multi-root workspace package graphs
 package manifest
   A `whipplescript.package_manifest.v0` JSON file describing one package's
   libraries, capabilities, providers, profiles, bindings, and construct
-  contracts.
+  contracts. A construct declares its parse shape as a DR-0011 `grammar`
+  object (spec/construct-grammar.md "Two-Shape Meta-Grammar": ordered slots
+  with optional connectives from {`from`, `for`, `into`, `to`, `via`}, an
+  optional payload block, a binding mode, and the target capability) —
+  `grammar` replaces the older flat `fields[]` array, and the flat view is
+  now derived from it (slots, then payload fields, then the binding).
+  Declaring both is rejected; `fields[]` alone remains accepted for
+  grammar-less constructs. Only `effect_operation` grammars are
+  manifest-expressible today, and only the embedded std manifests
+  (`std/manifests/`) feed the parser's grammar table.
 
 package set
   A project intent file named `whip.packages.json`. It lists the package sources

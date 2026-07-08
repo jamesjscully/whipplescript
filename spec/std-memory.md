@@ -19,7 +19,7 @@ or grant.
 
 std.memory is also **the package-mechanism worked example**: it is the only
 inventory row that already exists as a real manifest
-(examples/packages/memory.json, exercised at cli/main.rs:36212-36255 and
+(std/manifests/memory.json, exercised at cli/main.rs:36212-36255 and
 examples/package-memory.whip), and it is the constitution's **forcing case for
 the CapabilityProvider seam** (M2): `capability.call` today settles via a
 fabricated fixture value (kernel/effect_handlers.rs:1883-1887), and fixture +
@@ -175,7 +175,7 @@ binding's `config_json`.
 
 ## Manifest (M5)
 
-The embedded std.memory manifest evolves examples/packages/memory.json —
+The embedded std.memory manifest evolves std/manifests/memory.json —
 validated by the same pipeline as third-party manifests, catalog-privileged:
 
 - identity: `package_id`/`name` → **`std.memory`** (E1; currently
@@ -374,11 +374,11 @@ Each independently gateable under the per-piece review discipline.
    `memory.write`, `memory.curate` — E1 keeps query/write; the
    `memory.recall/learn/keep/forget` id list is superseded (keep/forget ids
    return with their lifecycle, named then).
-2. **DR-0008 "Workflow-Managed Recall" + examples/packages/memory.json
+2. **DR-0008 "Workflow-Managed Recall" + std/manifests/memory.json
    `source_forms` + construct-grammar.md worked example**: recall's canonical
    form is the shipped `recall <pool> for <query> as <binding>` (no `from`) —
    closes the naming drift recorded in the state survey.
-3. **examples/packages/memory.json identity**: `package-memory`/`memory` →
+3. **std/manifests/memory.json identity**: `package-memory`/`memory` →
    `std.memory`; the file becomes the embedded-manifest seed (M5, slice MEM-7).
 4. **spec/capability-registry.md turn-grant vocabulary**: add memory-pool grant
    ops (`recall`, `learn`) beside the tracker/file/command rows (:103-111).

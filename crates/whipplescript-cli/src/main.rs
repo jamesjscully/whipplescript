@@ -10,13 +10,16 @@ use std::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use whipplescript_core::{
-    ConstructField, ConstructInterface, ConstructRegistration, ConstructTargetCapabilityPolicy,
-    ContractRegistry, EffectContract, LibraryRegistration, PlatformConstructLowering, Severity,
-    TypedOutputValidation, CONSTRUCT_FAMILY_EFFECT_OPERATION, CONSTRUCT_INTERFACE_CAPABILITY,
-    CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE, CONSTRUCT_INTERFACE_EFFECT_HANDLE,
-    CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME, CONSTRUCT_LOWERING_CAPABILITY_CALL,
-    CONSTRUCT_LOWERING_METADATA_ONLY, CORE_CAPABILITY_CALL_CONSTRUCT_ID,
-    PLATFORM_CONSTRUCT_CATALOG,
+    ConstructField, ConstructGrammar, ConstructGrammarPayloadField, ConstructGrammarSlot,
+    ConstructInterface, ConstructRegistration, ConstructTargetCapabilityPolicy, ContractRegistry,
+    EffectContract, LibraryRegistration, PlatformConstructLowering, Severity,
+    TypedOutputValidation, CONSTRUCT_FAMILY_EFFECT_OPERATION, CONSTRUCT_GRAMMAR_BINDING_MODES,
+    CONSTRUCT_GRAMMAR_CONNECTIVES, CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK,
+    CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION, CONSTRUCT_GRAMMAR_SLOT_KINDS,
+    CONSTRUCT_INTERFACE_CAPABILITY, CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE,
+    CONSTRUCT_INTERFACE_EFFECT_HANDLE, CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME,
+    CONSTRUCT_LOWERING_CAPABILITY_CALL, CONSTRUCT_LOWERING_METADATA_ONLY,
+    CORE_CAPABILITY_CALL_CONSTRUCT_ID, PLATFORM_CONSTRUCT_CATALOG,
 };
 #[cfg(feature = "claude")]
 use whipplescript_kernel::claude_agent_sdk::{
@@ -4022,6 +4025,10 @@ fn contract_registry_from_artifact_json(
                 .to_owned(),
                 keyword: required_json_str(construct, "keyword", &construct_label)?.to_owned(),
                 scope: required_json_str(construct, "scope", &construct_label)?.to_owned(),
+                // Contract-registry artifacts carry the derived `fields[]`
+                // view only; the grammar object stays a manifest-side input
+                // (nothing downstream of the artifact boundary parses by it).
+                grammar: None,
                 fields,
                 requires: contract_registry_interfaces_from_json(
                     construct,
@@ -16606,11 +16613,11 @@ impl LoadedPackageLock {
 const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
     (
         "std.memory",
-        include_str!("../../../examples/packages/memory.json"),
+        include_str!("../../../std/manifests/memory.json"),
     ),
     (
         "std.messaging",
-        include_str!("../../../examples/packages/messaging.json"),
+        include_str!("../../../std/manifests/messaging.json"),
     ),
 ];
 
@@ -18103,6 +18110,7 @@ fn validate_package_manifest_closed_shape(path: &Path, value: &Value) -> Result<
                             "construct_family",
                             "keyword",
                             "scope",
+                            "grammar",
                             "fields",
                             "requires",
                             "provides",
@@ -18157,6 +18165,13 @@ fn validate_package_manifest_closed_shape(path: &Path, value: &Value) -> Result<
                             validate_manifest_bool_fields(field, &label, &["required"], problems);
                         },
                     );
+                    if let Some(grammar) = construct.get("grammar") {
+                        validate_manifest_construct_grammar_shape(
+                            grammar,
+                            &format!("{label}.grammar"),
+                            problems,
+                        );
+                    }
                     for direction in ["requires", "provides"] {
                         validate_manifest_array_objects(
                             construct,
@@ -18326,6 +18341,98 @@ fn validate_package_manifest_closed_shape(path: &Path, value: &Value) -> Result<
             path.display(),
             problems.join("\n- ")
         ))
+    }
+}
+
+/// Structural (closed-shape) validation of a construct's DR-0011 `grammar`
+/// object: allowed/required keys and JSON types only. Value vocabulary (shape,
+/// slot kinds, connectives, binding modes, keyword/target_capability
+/// transcription) is enforced when the grammar is parsed
+/// (`package_construct_grammar`).
+fn validate_manifest_construct_grammar_shape(
+    grammar: &Value,
+    label: &str,
+    problems: &mut Vec<String>,
+) {
+    validate_manifest_object_fields(
+        grammar,
+        label,
+        &[
+            "shape",
+            "keyword",
+            "slots",
+            "payload",
+            "binding",
+            "target_capability",
+        ],
+        problems,
+    );
+    validate_manifest_required_fields(
+        grammar,
+        label,
+        &["shape", "keyword", "slots", "binding", "target_capability"],
+        problems,
+    );
+    validate_manifest_string_fields(
+        grammar,
+        label,
+        &["shape", "keyword", "binding", "target_capability"],
+        problems,
+    );
+    validate_manifest_array_objects(
+        grammar,
+        label,
+        "slots",
+        problems,
+        |slot, label, problems| {
+            validate_manifest_object_fields(
+                slot,
+                &label,
+                &["name", "kind", "connective"],
+                problems,
+            );
+            validate_manifest_required_fields(slot, &label, &["name", "kind"], problems);
+            validate_manifest_string_fields(
+                slot,
+                &label,
+                &["name", "kind", "connective"],
+                problems,
+            );
+        },
+    );
+    match grammar.get("payload") {
+        None | Some(Value::Null) => {}
+        Some(payload) => {
+            validate_manifest_object_fields(
+                payload,
+                &format!("{label}.payload"),
+                &["fields"],
+                problems,
+            );
+            validate_manifest_required_fields(
+                payload,
+                &format!("{label}.payload"),
+                &["fields"],
+                problems,
+            );
+            validate_manifest_array_objects(
+                payload,
+                &format!("{label}.payload"),
+                "fields",
+                problems,
+                |field, label, problems| {
+                    validate_manifest_object_fields(
+                        field,
+                        &label,
+                        &["name", "kind", "required"],
+                        problems,
+                    );
+                    validate_manifest_required_fields(field, &label, &["name", "kind"], problems);
+                    validate_manifest_string_fields(field, &label, &["name", "kind"], problems);
+                    validate_manifest_bool_fields(field, &label, &["required"], problems);
+                },
+            );
+        }
     }
 }
 
@@ -18963,13 +19070,33 @@ fn package_construct(
     let lowering_target = optional_json_string(value, "lowering_target")
         .unwrap_or_else(|| CONSTRUCT_LOWERING_METADATA_ONLY.to_owned());
     let target_capability = optional_json_string(value, "target_capability");
-    let fields = value
-        .get("fields")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|field| package_construct_field(path, field, &id))
-        .collect::<Result<Vec<_>, _>>()?;
+    let grammar = value
+        .get("grammar")
+        .map(|grammar| {
+            package_construct_grammar(path, grammar, &id, &keyword, target_capability.as_deref())
+        })
+        .transpose()?;
+    // The flat `fields[]` view is derived from the grammar when one is
+    // declared (DR-0011: the grammar is the single source of the construct's
+    // shape); a construct spelling both is ambiguous and rejected.
+    let fields = match &grammar {
+        Some(grammar) => {
+            if value.get("fields").is_some() {
+                return Err(format!(
+                    "construct `{id}` declares both `fields` and `grammar` in `{}`; `fields` is derived from `grammar`",
+                    path.display()
+                ));
+            }
+            grammar.derive_fields()
+        }
+        None => value
+            .get("fields")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|field| package_construct_field(path, field, &id))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     let requires = package_construct_interfaces(path, value, "requires", &id)?;
     let provides = package_construct_interfaces(path, value, "provides", &id)?;
 
@@ -18980,10 +19107,139 @@ fn package_construct(
         construct_family,
         keyword,
         scope,
+        grammar,
         fields,
         requires,
         provides,
         lowering_target,
+        target_capability,
+    })
+}
+
+/// Parse and validate a construct's DR-0011 `grammar` object
+/// (spec/construct-grammar.md "Shape 2 — effect_operation"). Only the
+/// `effect_operation` shape is manifest-expressible today; `declaration_block`
+/// is spec-defined but gets an explicit not-yet-supported error. Slot kinds,
+/// connectives, and binding modes are validated against the core vocabulary,
+/// and `grammar.keyword` / `grammar.target_capability` must transcribe the
+/// construct's own values.
+fn package_construct_grammar(
+    path: &Path,
+    value: &Value,
+    form_id: &str,
+    construct_keyword: &str,
+    construct_target_capability: Option<&str>,
+) -> Result<ConstructGrammar, String> {
+    let owner = format!("construct `{form_id}` grammar");
+    let in_path = format!("in `{}`", path.display());
+    let shape = required_json_string(value, "shape", &owner)
+        .map_err(|message| format!("{message} {in_path}"))?;
+    if shape == CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK {
+        return Err(format!(
+            "{owner} shape `{CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK}` is not yet supported in package manifests {in_path}"
+        ));
+    }
+    if shape != CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION {
+        return Err(format!(
+            "{owner} uses unsupported shape `{shape}`; expected `{CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION}` {in_path}"
+        ));
+    }
+    let keyword = required_json_string(value, "keyword", &owner)
+        .map_err(|message| format!("{message} {in_path}"))?;
+    if keyword != construct_keyword {
+        return Err(format!(
+            "{owner} keyword `{keyword}` does not match the construct keyword `{construct_keyword}` {in_path}"
+        ));
+    }
+    let mut slots = Vec::new();
+    for (index, slot) in value
+        .get("slots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{owner} must have a `slots` array {in_path}"))?
+        .iter()
+        .enumerate()
+    {
+        let slot_owner = format!("{owner} slots[{index}]");
+        let name = required_json_string(slot, "name", &slot_owner)
+            .map_err(|message| format!("{message} {in_path}"))?;
+        let kind = required_json_string(slot, "kind", &slot_owner)
+            .map_err(|message| format!("{message} {in_path}"))?;
+        if !CONSTRUCT_GRAMMAR_SLOT_KINDS.contains(&kind.as_str()) {
+            return Err(format!(
+                "{slot_owner} uses unsupported kind `{kind}`; expected one of {} {in_path}",
+                quoted_platform_values(CONSTRUCT_GRAMMAR_SLOT_KINDS.iter().copied())
+            ));
+        }
+        let connective = optional_json_string(slot, "connective");
+        if let Some(connective) = connective.as_deref() {
+            if !CONSTRUCT_GRAMMAR_CONNECTIVES.contains(&connective) {
+                return Err(format!(
+                    "{slot_owner} uses unsupported connective `{connective}`; expected one of {} {in_path}",
+                    quoted_platform_values(CONSTRUCT_GRAMMAR_CONNECTIVES.iter().copied())
+                ));
+            }
+        }
+        slots.push(ConstructGrammarSlot {
+            name,
+            kind,
+            connective,
+        });
+    }
+    let payload = match value.get("payload") {
+        None | Some(Value::Null) => None,
+        Some(payload) => {
+            let mut fields = Vec::new();
+            for (index, field) in payload
+                .get("fields")
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("{owner} payload must have a `fields` array {in_path}"))?
+                .iter()
+                .enumerate()
+            {
+                let field_owner = format!("{owner} payload.fields[{index}]");
+                let name = required_json_string(field, "name", &field_owner)
+                    .map_err(|message| format!("{message} {in_path}"))?;
+                let kind = required_json_string(field, "kind", &field_owner)
+                    .map_err(|message| format!("{message} {in_path}"))?;
+                if kind != "expression" {
+                    return Err(format!(
+                        "{field_owner} uses unsupported kind `{kind}`; payload fields are `expression` {in_path}"
+                    ));
+                }
+                fields.push(ConstructGrammarPayloadField {
+                    name,
+                    kind,
+                    required: field
+                        .get("required")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                });
+            }
+            Some(fields)
+        }
+    };
+    let binding = required_json_string(value, "binding", &owner)
+        .map_err(|message| format!("{message} {in_path}"))?;
+    if !CONSTRUCT_GRAMMAR_BINDING_MODES.contains(&binding.as_str()) {
+        return Err(format!(
+            "{owner} uses unsupported binding `{binding}`; expected one of {} {in_path}",
+            quoted_platform_values(CONSTRUCT_GRAMMAR_BINDING_MODES.iter().copied())
+        ));
+    }
+    let target_capability = required_json_string(value, "target_capability", &owner)
+        .map_err(|message| format!("{message} {in_path}"))?;
+    if construct_target_capability != Some(target_capability.as_str()) {
+        return Err(format!(
+            "{owner} target_capability `{target_capability}` does not match the construct target_capability `{}` {in_path}",
+            construct_target_capability.unwrap_or("<none>")
+        ));
+    }
+    Ok(ConstructGrammar {
+        shape,
+        keyword,
+        slots,
+        payload,
+        binding,
         target_capability,
     })
 }
@@ -38129,7 +38385,7 @@ coerce review() -> Review {
     fn package_manifest_accepts_first_class_library_shape() {
         let manifest = package_manifest_from_json(
             Path::new("memory.json"),
-            include_str!("../../../examples/packages/memory.json").to_owned(),
+            include_str!("../../../std/manifests/memory.json").to_owned(),
         )
         .expect("manifest parses");
 

@@ -204,8 +204,8 @@ The CLI now accepts first-class package manifests with separated `libraries`,
 `capabilities`, `providers`, `profiles`, and `bindings`:
 
 ```sh
-whip package check examples/packages/memory.json
-whip package lock --output whip.lock examples/packages/memory.json
+whip package check std/manifests/memory.json
+whip package lock --output whip.lock std/manifests/memory.json
 whip --json compile --package-lock whip.lock examples/package-memory.whip
 ```
 

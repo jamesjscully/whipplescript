@@ -1075,17 +1075,23 @@ why `recall`/`send` are hardcoded at body.rs:1069-1070 — the parser cannot see
 package's grammar at parse time. So a data-driven parser needs its grammar
 specs available *during* parsing, and there are two roads:
 
-- **Option A (recommended): read grammar from the embedded std manifests.**
-  Per M5, std packages ship as manifests compiled into the binary, so their
-  `grammar` specs ARE available at parse time (no lock resolution needed). The
-  body parser consults a parse-time table built from the embedded std manifests
-  and parses the two shapes generically; `parse_recall`/`parse_send` are
-  deleted. A new *std* construct then costs a manifest grammar entry, not a
-  parser function — the M1 win, for every package in scope (all std). This
-  **couples S6c with S6d**: the embedded-manifest grammar table (S6d) is the
-  input the parser (S6c) reads, so S6d's grammar-carrying manifests land with —
-  or just before — the S6c parser. Third-party (lock-provided) constructs keep
-  the current hardcoded-or-unsupported path.
+- **Option A (recommended — DELIVERED 2026-07-08, S6d-4): read grammar from
+  the embedded std manifests.** Per M5, std packages ship as manifests compiled
+  into the binary, so their `grammar` specs ARE available at parse time (no
+  lock resolution needed). The body parser consults a parse-time table built
+  from the embedded std manifests and parses the two shapes generically;
+  `parse_recall`/`parse_send` are deleted. A new *std* construct then costs a
+  manifest grammar entry, not a parser function — the M1 win, for every package
+  in scope (all std). This **coupled S6c with S6d**: the embedded-manifest
+  grammar table (S6d) is the input the parser (S6c) reads. As built: the
+  canonical std manifests live in `std/manifests/` and carry the `grammar`
+  object per construct; `crates/whipplescript-parser/build.rs` validates them
+  and generates the parser's `EFFECT_OPERATION_GRAMMAR` table at build time
+  (the hand-written table is deleted — the manifests are the single source of
+  grammar, and a malformed manifest fails the build naming the manifest and
+  problem). The flat `fields[]` view is now *derived* from the grammar at
+  manifest parse time. Third-party (lock-provided) constructs keep the current
+  hardcoded-or-unsupported path.
 - **Option B (deferred, no demand): thread the resolved lock registry into
   the parser.** Enables *third-party* data-driven parsing, but requires
   resolving the lock before/around parsing (a two-pass or a new
@@ -1096,8 +1102,9 @@ specs available *during* parsing, and there are two roads:
 Recommendation: build Option A (std grammar from embedded manifests) as S6c,
 sequenced with S6d; register Option B as the third-party follow-on. This keeps
 S6c tractable and demand-driven while still deleting the hardcoded std parsers.
-This is a significant architecture call within the M1-ruled build — flagged for
-review before the S6c/S6d code lands.
+This was a significant architecture call within the M1-ruled build — ratified,
+and Option A is now built (S6d-4, 2026-07-08). Option B stays the deferred
+third-party follow-on.
 
 ### Authorability door (S6, from the coherence pass)
 

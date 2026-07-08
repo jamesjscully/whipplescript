@@ -13,7 +13,7 @@ package is rejected until the platform contract changes.
 ## Manifest Shape
 
 See `examples/packages/notes.json` (third-party) and
-`examples/packages/memory.json` (the embedded `std.memory` seed) for the
+`std/manifests/memory.json` (the embedded `std.memory` seed) for the
 checked first-class package shape.
 
 Top-level fields:
@@ -162,20 +162,31 @@ matching `capability.call` effect contract:
   "id": "memory.recall",
   "keyword": "recall",
   "scope": "rule_body",
-  "fields": [
-    {"name": "pool", "kind": "identifier", "required": true},
-    {"name": "query", "kind": "expression", "required": true},
-    {"name": "binding", "kind": "identifier", "required": true}
-  ],
+  "grammar": {
+    "shape": "effect_operation",
+    "keyword": "recall",
+    "slots": [
+      {"name": "pool", "kind": "identifier"},
+      {"name": "query", "kind": "expression", "connective": "for"}
+    ],
+    "payload": null,
+    "binding": "required",
+    "target_capability": "memory.recall"
+  },
   "lowering_target": "capability_call",
   "target_capability": "memory.recall"
 }
 ```
 
+The `grammar` object (spec/construct-grammar.md, DR-0011) is the construct's
+parse shape; the older flat `fields[]` array is now derived from it (slots,
+then payload fields, then the binding) and may not be declared alongside it.
+Grammar-less constructs may still declare `fields[]` directly.
+
 With a package lock that imports `memory`, the source form is valid:
 
 ```whip
-recall from project_memory for item as context
+recall project_memory for item as context
 ```
 
 The compiler records construct-use metadata but lowers the executable work to

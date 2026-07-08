@@ -2199,7 +2199,7 @@ Goal: port standard packages in dependency order, one lowering class at a time.
     spec/messaging.md. Full gate green.
   **SUPERSEDED 2026-07-08 (S6d-3, import ladder):** `send` migrated from the
   ambient parser builtin to the embedded `std.messaging` manifest
-  (`examples/packages/messaging.json`): `use std.messaging` authorizes it with
+  (`std/manifests/messaging.json`): `use std.messaging` authorizes it with
   no lock; the parser builtin block and `construct_use_is_standard_builtin`
   were deleted, leaving `construct_use_is_embedded_std` as the single no-lock
   exemption, and an unauthorized `send` now gets an "add `use std.messaging`"
