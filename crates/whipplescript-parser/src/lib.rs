@@ -23400,9 +23400,7 @@ agent worker {
             .contains("unknown thread mode `sometimes`")));
 
         // `thread` on a Delegated agent is a managed-knob partition error.
-        let delegated = source
-            .replace("provider owned", "provider codex")
-            .replace("thread continue", "thread continue");
+        let delegated = source.replace("provider owned", "provider codex");
         let compiled = compile_program(&delegated);
         assert!(
             compiled.diagnostics.iter().any(|diagnostic| diagnostic

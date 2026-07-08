@@ -407,10 +407,19 @@ fn openai_input(messages: &[ChatMessage]) -> Vec<Value> {
             }
             ChatMessage::ToolResults(results) => {
                 for result in results {
+                    // The Responses `function_call_output` item has no error flag
+                    // (unlike Anthropic's `tool_result.is_error`), so a failed tool
+                    // call is marked in-band: prefix the output text so the model
+                    // sees the failure (pi-conformance §5).
+                    let output = if result.is_error {
+                        format!("error: {}", result.content)
+                    } else {
+                        result.content.clone()
+                    };
                     out.push(json!({
                         "type": "function_call_output",
                         "call_id": result.tool_call_id,
-                        "output": result.content,
+                        "output": output,
                     }));
                 }
             }
@@ -685,6 +694,29 @@ mod tests {
                     && i["call_id"] == json!("call_1"))
         );
         assert_eq!(req.body["tools"][0]["type"], json!("function"));
+    }
+
+    #[test]
+    fn openai_tool_result_error_is_marked_in_the_output_text() {
+        // The Responses wire has no is_error field, so the failure marker rides
+        // in-band; a successful result stays verbatim (pi-conformance §5).
+        let messages = vec![ChatMessage::ToolResults(vec![
+            ToolResultMsg {
+                tool_call_id: "call_ok".into(),
+                tool_name: "read".into(),
+                content: "hello".into(),
+                is_error: false,
+            },
+            ToolResultMsg {
+                tool_call_id: "call_err".into(),
+                tool_name: "read".into(),
+                content: "read of `x` failed".into(),
+                is_error: true,
+            },
+        ])];
+        let input = openai_input(&messages);
+        assert_eq!(input[0]["output"], json!("hello"));
+        assert_eq!(input[1]["output"], json!("error: read of `x` failed"));
     }
 
     #[test]

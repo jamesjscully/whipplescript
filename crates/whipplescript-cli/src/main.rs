@@ -62,13 +62,12 @@ use whipplescript_kernel::{
 };
 use whipplescript_parser::{
     format_program, format_program_preserving_comments, harness_class, lex_comments,
-    parse_expression, BinaryOp, CalendarPattern, DependencyPredicate as IrDependencyPredicate,
-    Diagnostic, EffectStatus as TestEffectStatus, ExpectTarget, Expr, ExprLiteral, ExprObjectField,
+    parse_expression, BinaryOp, DependencyPredicate as IrDependencyPredicate, Diagnostic,
+    EffectStatus as TestEffectStatus, ExpectTarget, Expr, ExprLiteral, ExprObjectField,
     FormatOutput, GivenClause, HarnessClass, IrConstructUse, IrEffectDependency, IrEffectKind,
     IrEffectNode, IrInclude, IrPrimitiveType, IrProgram, IrProjectionRead, IrRule, IrSchema,
-    IrSource, IrTest, IrType, IrWorkflowContract, IrWorkflowContractKind, Item, MissedPolicy,
-    ProjQueryKind, QueryKind, Recurrence, RuleStatus, RunKind, SourceSpan, SourceValue,
-    StubPayload, TestClause, TestField, TimeOfDay, UnaryOp, Weekday,
+    IrTest, IrType, IrWorkflowContract, IrWorkflowContractKind, Item, ProjQueryKind, QueryKind,
+    RuleStatus, RunKind, SourceSpan, StubPayload, TestClause, TestField, UnaryOp,
 };
 use whipplescript_store::{
     ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, ClaimableEffect, DerivedFact,
@@ -21091,9 +21090,11 @@ fn items_store_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".whipplescript/items.sqlite"))
 }
 
-use whipplescript_kernel::time_pass::{
-    clock_emit_payload, due_calendar_occurrences, select_clock_occurrences, TimePassReport,
-};
+use whipplescript_kernel::time_pass::{clock_emit_payload, TimePassReport};
+#[cfg(test)]
+use whipplescript_kernel::time_pass::{due_calendar_occurrences, select_clock_occurrences};
+#[cfg(test)]
+use whipplescript_parser::{CalendarPattern, MissedPolicy, TimeOfDay, Weekday};
 
 /// Selects which due clock occurrences become durable signal facts under the
 /// source's missed-occurrence policy (spec/std-time.md). Each entry is a

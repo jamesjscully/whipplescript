@@ -7,9 +7,9 @@
 //! loop drives; tool calls are stream events (evidence), never durable effects
 //! (DR-0024, spec/owned-harness-loop-contract.md).
 //!
-//! Slice 1 keeps the search/list tools std-only and deliberately simple
-//! (substring grep, glob `find`, plain `ls`); gitignore-awareness and regex are
-//! later refinements. `bash` and the budget/lease envelope are later slices.
+//! The search/list tools stay deliberately simple (regex `grep` with a literal
+//! fallback, glob `find`, plain `ls`); gitignore-awareness is a later
+//! refinement. `bash` and the budget/lease envelope are later slices.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -105,6 +105,14 @@ pub fn tracker_tool_specs() -> Vec<ToolSpec> {
 const DEFAULT_MAX_BYTES: usize = 50_000;
 /// Bound on files visited by `find`/`grep` so a huge tree cannot stall a turn.
 const MAX_FILES_WALKED: usize = 5_000;
+/// Default line window for `read` when no explicit `limit` is given
+/// (pi-conformance §1: line-based head truncation with continuation notices).
+const DEFAULT_READ_LINE_LIMIT: usize = 2_000;
+/// Cap on a single emitted `grep` line (pi-conformance §1).
+const GREP_MAX_LINE_CHARS: usize = 500;
+/// How many leading bytes of a file are sniffed for a NUL byte to refuse
+/// reading binary content as text (pi-conformance §1 binary guard).
+const BINARY_SNIFF_BYTES: usize = 8_192;
 
 #[cfg(test)]
 fn file_tool_specs_for_profile(profile: Option<&str>) -> Vec<ToolSpec> {
@@ -116,7 +124,9 @@ fn file_tool_specs_for_policy(policy: &HarnessProfilePolicy) -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: TOOL_READ.into(),
-            description: "Read a file's text. Optional 1-based line offset and limit.".into(),
+            description: "Read a file's text. Optional 1-based line offset and limit; a long \
+                          file is windowed with a continuation notice."
+                .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -169,13 +179,16 @@ fn file_tool_specs_for_policy(policy: &HarnessProfilePolicy) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: TOOL_GREP.into(),
-            description: "Search file contents for a substring; returns path:line:text.".into(),
+            description: "Search file contents for a regex (invalid patterns fall back to a \
+                          literal substring); returns path:line:text."
+                .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string" },
+                    "pattern": { "type": "string", "description": "regex; an invalid regex is searched literally" },
                     "path": { "type": "string", "description": "subdir to search, default root" },
                     "ignoreCase": { "type": "boolean" },
+                    "context": { "type": "integer", "description": "lines of context before/after each match, default 0" },
                     "limit": { "type": "integer" }
                 },
                 "required": ["pattern"],
@@ -942,17 +955,22 @@ impl FileToolExecutor {
         if let Some(body) = self.skill_bodies.get(path) {
             let offset = usize_arg(args, "offset");
             let limit = usize_arg(args, "limit");
-            // Full content; `execute` applies the single capture-time cap.
-            return Ok(slice_lines(body, offset, limit));
+            // Same line window as a filesystem read; `execute` applies the single
+            // capture-time byte cap afterwards.
+            return read_line_window(body, offset, limit);
         }
         if let Some(reason) = self.policy(path, "read") {
             return Err(reason);
         }
-        let content = std::fs::read_to_string(self.root.join(path))
-            .map_err(|e| format!("read of `{path}` failed: {e}"))?;
+        let full = self.root.join(path);
+        refuse_binary_read(path, &full)?;
+        let content =
+            std::fs::read_to_string(&full).map_err(|e| format!("read of `{path}` failed: {e}"))?;
         let offset = usize_arg(args, "offset");
         let limit = usize_arg(args, "limit");
-        Ok(slice_lines(&content, offset, limit))
+        // Line window + continuation notices (pi-conformance §1); the 50KB byte
+        // cap + recall footer in `execute` still applies after the window.
+        read_line_window(&content, offset, limit)
     }
 
     fn write(&self, args: &Value) -> Result<String, String> {
@@ -978,17 +996,33 @@ impl FileToolExecutor {
         if let Some(reason) = self.policy(path, "write") {
             return Err(reason);
         }
-        let edits = args
-            .get("edits")
-            .and_then(Value::as_array)
+        let edits_value = edits_argument(args)?;
+        let edits = edits_value
+            .as_array()
             .ok_or_else(|| "`edits` must be an array".to_string())?;
         let full = self.root.join(path);
         let mut content =
             std::fs::read_to_string(&full).map_err(|e| format!("read of `{path}` failed: {e}"))?;
+        // A UTF-8 BOM is invisible in the model's view of the file (read strips
+        // nothing, but the model never types one): strip it before matching so an
+        // edit anchored at the file start applies, and restore it on write so the
+        // file keeps its encoding marker (pi-conformance §1).
+        const BOM: &str = "\u{feff}";
+        let had_bom = content.starts_with(BOM);
+        if had_bom {
+            content = content[BOM.len()..].to_string();
+        }
+        // Regions already rewritten, in current-content coordinates (with the edit
+        // index that produced them). A later edit whose match intersects one is
+        // editing an earlier edit's output — almost always a model mistake.
+        let mut replaced: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
         let mut applied = 0usize;
         for (index, edit) in edits.iter().enumerate() {
             let old = str_arg(edit, "oldText")?;
             let new = str_arg(edit, "newText")?;
+            if old.is_empty() {
+                return Err(format!("edit {index}: oldText must not be empty"));
+            }
             let matches = content.matches(old).count();
             if matches == 0 {
                 return Err(format!("edit {index}: oldText not found in `{path}`"));
@@ -998,10 +1032,36 @@ impl FileToolExecutor {
                     "edit {index}: oldText matches {matches} times in `{path}`; make it unique"
                 ));
             }
-            content = content.replacen(old, new, 1);
+            let start = content
+                .find(old)
+                .ok_or_else(|| format!("edit {index}: oldText not found in `{path}`"))?;
+            let end = start + old.len();
+            for (earlier, region) in &replaced {
+                if start < region.end && region.start < end {
+                    return Err(format!(
+                        "edit {earlier} and edit {index} overlap in `{path}`; merge them \
+                         into one edit or target disjoint regions"
+                    ));
+                }
+            }
+            content.replace_range(start..end, new);
+            // Shift the recorded regions that sit after the splice point.
+            let delta = new.len() as isize - old.len() as isize;
+            for (_, region) in replaced.iter_mut() {
+                if region.start >= end {
+                    region.start = (region.start as isize + delta) as usize;
+                    region.end = (region.end as isize + delta) as usize;
+                }
+            }
+            replaced.push((index, start..start + new.len()));
             applied += 1;
         }
-        std::fs::write(&full, &content).map_err(|e| format!("write of `{path}` failed: {e}"))?;
+        let output = if had_bom {
+            format!("{BOM}{content}")
+        } else {
+            content
+        };
+        std::fs::write(&full, &output).map_err(|e| format!("write of `{path}` failed: {e}"))?;
         Ok(format!("applied {applied} edit(s) to {path}"))
     }
 
@@ -1062,33 +1122,45 @@ impl FileToolExecutor {
             .get("ignoreCase")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let needle = if ignore_case {
-            pattern.to_lowercase()
-        } else {
-            pattern.to_string()
-        };
         let limit = usize_arg(args, "limit").unwrap_or(100);
+        let context = usize_arg(args, "context").unwrap_or(0);
+        let matcher = GrepMatcher::new(pattern, ignore_case);
         let mut hits: Vec<String> = Vec::new();
+        let mut matches_found = 0usize;
         let root = self.root.clone();
         let mut walked = 0usize;
         walk(&root, &root.join(base), &mut walked, &mut |rel| {
-            if hits.len() >= limit {
+            if matches_found >= limit {
                 return;
             }
             let Ok(content) = std::fs::read_to_string(root.join(rel)) else {
                 return;
             };
-            for (lineno, line) in content.lines().enumerate() {
-                let haystack = if ignore_case {
-                    line.to_lowercase()
+            let lines: Vec<&str> = content.lines().collect();
+            // Match pass first so a context line that is itself a match keeps
+            // the match (`:`) format even past the match limit.
+            let matched: Vec<bool> = lines.iter().map(|line| matcher.is_match(line)).collect();
+            // The match limit counts matches; context lines ride along free.
+            // Overlapping context windows are merged (each line emitted once).
+            let mut emit: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+            for (index, &hit) in matched.iter().enumerate() {
+                if !hit {
+                    continue;
+                }
+                if matches_found >= limit {
+                    break;
+                }
+                matches_found += 1;
+                let from = index.saturating_sub(context);
+                let to = (index + context).min(lines.len().saturating_sub(1));
+                emit.extend(from..=to);
+            }
+            for index in emit {
+                let line = cap_grep_line(lines[index]);
+                if matched[index] {
+                    hits.push(format!("{rel}:{}:{line}", index + 1));
                 } else {
-                    line.to_string()
-                };
-                if haystack.contains(&needle) {
-                    hits.push(format!("{rel}:{}:{line}", lineno + 1));
-                    if hits.len() >= limit {
-                        break;
-                    }
+                    hits.push(format!("{rel}-{}-{line}", index + 1));
                 }
             }
         });
@@ -1847,6 +1919,152 @@ fn usize_arg(args: &Value, key: &str) -> Option<usize> {
     args.get(key)
         .and_then(Value::as_u64)
         .map(|value| value as usize)
+}
+
+/// Resolve the `edits` argument with pi's tolerance (pi-conformance §1): a real
+/// array, an array double-encoded as a JSON string (some models serialize the
+/// nested value), or the legacy single-edit shape with top-level
+/// `oldText`/`newText` strings.
+fn edits_argument(args: &Value) -> Result<Value, String> {
+    match args.get("edits") {
+        Some(Value::Array(items)) => Ok(Value::Array(items.clone())),
+        Some(Value::String(raw)) => {
+            let parsed: Value = serde_json::from_str(raw)
+                .map_err(|e| format!("`edits` is a string but not valid JSON: {e}"))?;
+            if parsed.is_array() {
+                Ok(parsed)
+            } else {
+                Err("`edits` must be an array".to_string())
+            }
+        }
+        Some(_) => Err("`edits` must be an array".to_string()),
+        None => match (
+            optional_str_arg(args, "oldText"),
+            optional_str_arg(args, "newText"),
+        ) {
+            (Some(old), Some(new)) => Ok(json!([{ "oldText": old, "newText": new }])),
+            _ => Err("`edits` must be an array".to_string()),
+        },
+    }
+}
+
+/// Pattern matcher for `grep`: a real regex when the pattern compiles, else a
+/// literal substring. An invalid regex is deliberately NOT an error — pi users
+/// paste literal code fragments (`foo(`, `a[0]`) as patterns and expect a
+/// lenient literal search, so compile failure degrades to substring matching.
+enum GrepMatcher {
+    Regex(regex::Regex),
+    Literal { needle: String, ignore_case: bool },
+}
+
+impl GrepMatcher {
+    fn new(pattern: &str, ignore_case: bool) -> Self {
+        match regex::RegexBuilder::new(pattern)
+            .case_insensitive(ignore_case)
+            .build()
+        {
+            Ok(re) => GrepMatcher::Regex(re),
+            Err(_) => GrepMatcher::Literal {
+                needle: if ignore_case {
+                    pattern.to_lowercase()
+                } else {
+                    pattern.to_string()
+                },
+                ignore_case,
+            },
+        }
+    }
+
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            GrepMatcher::Regex(re) => re.is_match(line),
+            GrepMatcher::Literal {
+                needle,
+                ignore_case,
+            } => {
+                if *ignore_case {
+                    line.to_lowercase().contains(needle)
+                } else {
+                    line.contains(needle)
+                }
+            }
+        }
+    }
+}
+
+/// Cap a single grep output line at [`GREP_MAX_LINE_CHARS`] characters
+/// (char-boundary safe), marking the cut.
+fn cap_grep_line(line: &str) -> String {
+    match line.char_indices().nth(GREP_MAX_LINE_CHARS) {
+        Some((byte_index, _)) => format!("{}... [truncated]", &line[..byte_index]),
+        None => line.to_string(),
+    }
+}
+
+/// Sniff the leading [`BINARY_SNIFF_BYTES`] bytes for a NUL and refuse the read
+/// when one is found (pi-conformance §1 binary guard): text files virtually
+/// never contain NUL, so this catches images/archives/executables with a clean
+/// error before `read_to_string` surfaces a raw UTF-8 failure.
+fn refuse_binary_read(path: &str, full: &Path) -> Result<(), String> {
+    use std::io::Read as _;
+    let mut file =
+        std::fs::File::open(full).map_err(|e| format!("read of `{path}` failed: {e}"))?;
+    let mut head = [0u8; BINARY_SNIFF_BYTES];
+    let mut filled = 0usize;
+    while filled < head.len() {
+        match file.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("read of `{path}` failed: {e}")),
+        }
+    }
+    if head[..filled].contains(&0) {
+        return Err(format!("cannot read binary file `{path}` as text"));
+    }
+    Ok(())
+}
+
+/// Apply the `read` line window (pi-conformance §1): a 1-based `offset`, an
+/// explicit `limit`, or the default [`DEFAULT_READ_LINE_LIMIT`]-line window.
+/// Head truncation appends a continuation notice carrying the next offset; an
+/// offset past the end of the file is an error.
+fn read_line_window(
+    content: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<String, String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    if let Some(requested) = offset {
+        if requested > total {
+            return Err(format!(
+                "Offset {requested} is beyond end of file ({total} lines total)"
+            ));
+        }
+    }
+    let start = offset.unwrap_or(1).max(1) - 1;
+    let window = limit.unwrap_or(DEFAULT_READ_LINE_LIMIT);
+    let end = (start + window).min(total);
+    let mut out = lines[start..end].join("\n");
+    let remaining = total - end;
+    if remaining > 0 {
+        if limit.is_some() {
+            // The caller's explicit limit stopped early.
+            out.push_str(&format!(
+                "\n[{remaining} more lines in file. Use offset={} to continue.]",
+                end + 1
+            ));
+        } else {
+            // The default window head-truncated the file.
+            out.push_str(&format!(
+                "\n[Showing lines {}-{end} of {total}. Use offset={} to continue.]",
+                start + 1,
+                end + 1
+            ));
+        }
+    }
+    Ok(out)
 }
 
 /// Apply a 1-based line offset and a line limit to file content.
@@ -3080,7 +3298,12 @@ mod tests {
             json!({ "path": "big.txt", "content": big.clone() }),
         ));
 
-        let r = exec.execute(&call(TOOL_READ, json!({ "path": "big.txt" })));
+        // An explicit limit covering the whole file bypasses the default line
+        // window, so the byte cap (+ capture) is what bounds the output here.
+        let r = exec.execute(&call(
+            TOOL_READ,
+            json!({ "path": "big.txt", "limit": 9000 }),
+        ));
         assert_eq!(r.status, ToolStatus::Ok);
         assert!(
             r.content.len() <= DEFAULT_MAX_BYTES + 512,
@@ -3200,6 +3423,277 @@ mod tests {
         ));
         assert_eq!(miss.status, ToolStatus::Error);
         assert!(miss.content.contains("not found"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_default_window_truncates_with_continuation_notice() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        let content: String = (1..=2100).map(|i| format!("line {i}\n")).collect();
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "long.txt", "content": content }),
+        ));
+        let r = exec.execute(&call(TOOL_READ, json!({ "path": "long.txt" })));
+        assert_eq!(r.status, ToolStatus::Ok);
+        assert!(r.content.starts_with("line 1\n"));
+        assert!(r.content.contains("line 2000"));
+        assert!(!r.content.contains("line 2001\n"), "window is 2000 lines");
+        assert!(r
+            .content
+            .ends_with("\n[Showing lines 1-2000 of 2100. Use offset=2001 to continue.]"));
+        // Continuing from the notice's offset yields the tail with no notice.
+        let rest = exec.execute(&call(
+            TOOL_READ,
+            json!({ "path": "long.txt", "offset": 2001 }),
+        ));
+        assert_eq!(rest.status, ToolStatus::Ok);
+        assert!(rest.content.starts_with("line 2001\n"));
+        assert!(rest.content.ends_with("line 2100"));
+        assert!(!rest.content.contains("[Showing lines"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_explicit_limit_reports_remaining_lines() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        let content: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "l.txt", "content": content }),
+        ));
+        let r = exec.execute(&call(TOOL_READ, json!({ "path": "l.txt", "limit": 5 })));
+        assert_eq!(r.status, ToolStatus::Ok);
+        assert!(r.content.starts_with("line 1\n"));
+        assert!(r
+            .content
+            .ends_with("line 5\n[95 more lines in file. Use offset=6 to continue.]"));
+        // offset + limit reaching EOF exactly carries no notice.
+        let tail = exec.execute(&call(
+            TOOL_READ,
+            json!({ "path": "l.txt", "offset": 96, "limit": 5 }),
+        ));
+        assert_eq!(tail.content, "line 96\nline 97\nline 98\nline 99\nline 100");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_offset_beyond_eof_is_an_error() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "s.txt", "content": "one\ntwo\nthree\n" }),
+        ));
+        let r = exec.execute(&call(TOOL_READ, json!({ "path": "s.txt", "offset": 7 })));
+        assert_eq!(r.status, ToolStatus::Error);
+        assert_eq!(r.content, "Offset 7 is beyond end of file (3 lines total)");
+        // The last line is still addressable.
+        let last = exec.execute(&call(TOOL_READ, json!({ "path": "s.txt", "offset": 3 })));
+        assert_eq!(last.status, ToolStatus::Ok);
+        assert_eq!(last.content, "three");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_refuses_a_binary_file() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        std::fs::write(root.join("blob.bin"), b"PNG\x00\x01\x02 not text")
+            .expect("write binary fixture");
+        let r = exec.execute(&call(TOOL_READ, json!({ "path": "blob.bin" })));
+        assert_eq!(r.status, ToolStatus::Error);
+        assert_eq!(r.content, "cannot read binary file `blob.bin` as text");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn grep_matches_regex_patterns() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "src/a.rs", "content": "fn main() {}\nlet x = 1;\nFN SHOUT() {}" }),
+        ));
+        let g = exec.execute(&call(TOOL_GREP, json!({ "pattern": "fn \\w+\\(" })));
+        assert_eq!(g.status, ToolStatus::Ok);
+        assert!(g.content.contains("src/a.rs:1:fn main() {}"));
+        assert!(!g.content.contains("SHOUT"));
+        // ignoreCase applies to the compiled regex too.
+        let ci = exec.execute(&call(
+            TOOL_GREP,
+            json!({ "pattern": "fn \\w+\\(", "ignoreCase": true }),
+        ));
+        assert!(ci.content.contains("src/a.rs:3:FN SHOUT() {}"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn grep_invalid_regex_falls_back_to_literal_substring() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "a.rs", "content": "call main(x)\nother line" }),
+        ));
+        // `main(` is an invalid regex (unclosed group); pi leniency treats it as
+        // a literal substring instead of erroring.
+        let g = exec.execute(&call(TOOL_GREP, json!({ "pattern": "main(" })));
+        assert_eq!(g.status, ToolStatus::Ok);
+        assert_eq!(g.content, "a.rs:1:call main(x)");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn grep_context_lines_carry_dash_format() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "c.txt", "content": "one\ntwo\nMATCH\nfour\nfive" }),
+        ));
+        let g = exec.execute(&call(
+            TOOL_GREP,
+            json!({ "pattern": "MATCH", "context": 1 }),
+        ));
+        assert_eq!(g.status, ToolStatus::Ok);
+        assert_eq!(g.content, "c.txt-2-two\nc.txt:3:MATCH\nc.txt-4-four");
+        // Overlapping context windows merge: adjacent matches emit each line once.
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "c.txt", "content": "one\nMATCH a\nMATCH b\nfour" }),
+        ));
+        let merged = exec.execute(&call(
+            TOOL_GREP,
+            json!({ "pattern": "MATCH", "context": 1 }),
+        ));
+        assert_eq!(
+            merged.content,
+            "c.txt-1-one\nc.txt:2:MATCH a\nc.txt:3:MATCH b\nc.txt-4-four"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn grep_caps_long_lines() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        let long_line = format!("needle {}", "x".repeat(700));
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "wide.txt", "content": long_line }),
+        ));
+        let g = exec.execute(&call(TOOL_GREP, json!({ "pattern": "needle" })));
+        assert_eq!(g.status, ToolStatus::Ok);
+        assert!(g.content.ends_with("... [truncated]"));
+        // path:line: prefix + 500 kept chars + the marker; the 700-char tail is cut.
+        assert!(!g.content.contains(&"x".repeat(600)));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn edit_accepts_edits_as_a_json_encoded_string() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "f.txt", "content": "abc" }),
+        ));
+        // Some models double-encode the nested array; tolerated.
+        let r = exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "f.txt", "edits": "[{\"oldText\": \"abc\", \"newText\": \"xyz\"}]" }),
+        ));
+        assert_eq!(r.status, ToolStatus::Ok);
+        let read = exec.execute(&call(TOOL_READ, json!({ "path": "f.txt" })));
+        assert_eq!(read.content, "xyz");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn edit_accepts_legacy_top_level_old_new_text() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "f.txt", "content": "abc" }),
+        ));
+        let r = exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "f.txt", "oldText": "abc", "newText": "xyz" }),
+        ));
+        assert_eq!(r.status, ToolStatus::Ok);
+        let read = exec.execute(&call(TOOL_READ, json!({ "path": "f.txt" })));
+        assert_eq!(read.content, "xyz");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn edit_preserves_a_leading_bom() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        std::fs::write(root.join("bom.txt"), "\u{feff}hello world").expect("write BOM fixture");
+        let r = exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "bom.txt", "edits": [{ "oldText": "hello world", "newText": "goodbye" }] }),
+        ));
+        assert_eq!(r.status, ToolStatus::Ok);
+        let raw = std::fs::read_to_string(root.join("bom.txt")).expect("read BOM fixture back");
+        assert_eq!(raw, "\u{feff}goodbye", "BOM restored on write");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn edit_overlapping_edits_are_rejected() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "f.txt", "content": "alpha beta gamma" }),
+        ));
+        // Edit 1's match falls inside the region edit 0 rewrote.
+        let r = exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "f.txt", "edits": [
+                { "oldText": "alpha beta", "newText": "alpha beta" },
+                { "oldText": "beta gamma", "newText": "BETA gamma" }
+            ] }),
+        ));
+        assert_eq!(r.status, ToolStatus::Error);
+        assert_eq!(
+            r.content,
+            "edit 0 and edit 1 overlap in `f.txt`; merge them into one edit or target disjoint regions"
+        );
+        // Disjoint edits still apply even when an earlier edit shifts offsets.
+        let ok = exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "f.txt", "edits": [
+                { "oldText": "alpha", "newText": "a-much-longer-alpha" },
+                { "oldText": "gamma", "newText": "GAMMA" }
+            ] }),
+        ));
+        assert_eq!(ok.status, ToolStatus::Ok);
+        let read = exec.execute(&call(TOOL_READ, json!({ "path": "f.txt" })));
+        assert_eq!(read.content, "a-much-longer-alpha beta GAMMA");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn edit_empty_oldtext_is_rejected() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "f.txt", "content": "abc" }),
+        ));
+        let r = exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "f.txt", "edits": [{ "oldText": "", "newText": "x" }] }),
+        ));
+        assert_eq!(r.status, ToolStatus::Error);
+        assert_eq!(r.content, "edit 0: oldText must not be empty");
         std::fs::remove_dir_all(&root).ok();
     }
 
