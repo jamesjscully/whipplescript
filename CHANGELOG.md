@@ -3,10 +3,60 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
-> 0.2 is the language, standard packages, and native runtime. Cloud deployment +
-> the owned harness (0.3) and the experimentation/evals + versioned-workspace work
-> (0.4) are tracked separately and are **not** part of 0.2. Native provider support
-> is validated for **Codex and Claude**; the Pi native provider is deferred.
+> 0.3 adds cloud deployment (the Cloudflare Durable Object runtime) and the owned
+> harness. The experimentation/evals + versioned-workspace work (0.4) is tracked
+> separately and is **not** part of 0.3. Native provider support is validated for
+> **Codex and Claude**; the Pi native provider is deferred.
+
+## [0.3.0] — 2026-07-09
+
+WhippleScript is a small scripting language for AI to orchestrate AI. This release
+takes the language onto the edge: the same durable, replayable rule/effect kernel
+now runs unchanged in a Cloudflare Durable Object, and the owned agent harness
+gains its context layer and a restore-to-a-prior-point capability.
+
+### Cloud runtime — Cloudflare Durable Object
+- A sans-IO refactor lets the whole evaluation core (parser, kernel, rule/flow
+  engine, effect ledger) run inside a single-threaded wasm isolate, where the
+  only async primitive is `fetch`: every HTTP-bearing effect (`coerce`, agent
+  turns) is a resumable step machine that suspends on a request and resumes on
+  the response, so an instance survives isolate eviction with no lost work.
+- Durable-object host binding: the same instance scheduler runs over the DO's
+  synchronous SQLite (a full port of the runtime/coordination/work-item stores),
+  with alarms for timers/deadlines and secrets for provider credentials.
+- `whip deploy` — one-command edge deploy of a workflow to a Worker + DO.
+- **Feature parity with the native runtime**: `file.*` effects run over a
+  DO-owned file plane; `whip checkpoint` / `whip restore` work as operator
+  commands on a deployed instance; and an agent turn runs a real in-isolate tool
+  set (read/write/edit/ls/find/grep/recall + the work-tracker todos) against the
+  DO's own storage — no filesystem, no subprocess.
+- A Class-A compute plane for real toolchains (`whip executor` sidecar over a
+  `whip-executor/1` wire) and a Class-B per-turn container path are built and
+  live-proven; enabling them in production is a follow-on configuration step.
+
+### Owned agent harness — the context layer
+- The owned harness gains a pi-mirrored context layer: a system-prompt assembler,
+  a skills control plane (discover-all + model-driven read; skill bodies stored
+  content-addressed; skills never grant authority), deploy-shipped project
+  instructions (`AGENTS.md` / `CLAUDE.md` discovery, injected verbatim), and
+  turn-scoped skill pins.
+- Cache-aware conversation compaction: a pluggable `Compactor` with three
+  strategies, designed so the assembled prefix stays append-only between
+  compactions (the model-provider prompt cache is never needlessly busted) and a
+  compaction summary is recorded once and reused on replay.
+
+### Restorable context — checkpoint / restore
+- `whip checkpoint` / `whip restore`: rewind an agent's work — its files, its
+  transcript, and the instance's event-log position — to a prior point as one
+  consistent, coherence-checked cut. File history is captured content-addressed,
+  so restore reverts to exact prior bytes; a restore refuses rather than applying
+  a partial (dangling) cut, and auto-checkpoints the current head first so the
+  undo is itself undoable.
+
+### Reliability
+- Every provider request now carries a stable per-effect `Idempotency-Key`
+  (resume-stable, not fingerprint-derived), so an at-least-once retry after an
+  eviction mid-request is de-duplicated by providers that honor it.
 
 ## [0.2.0] — 2026-07-06
 

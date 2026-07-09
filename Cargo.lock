@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -833,14 +833,14 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "whipplescript-host-do"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -853,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-kernel"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-parser"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "whipplescript-core",
@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
  "serde_json",

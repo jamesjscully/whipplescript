@@ -86,6 +86,45 @@ automatable from inside the build.
 Deferred past 0.2 (not blockers): macOS Developer ID signing + notarization,
 Windows Authenticode, WinGet/Scoop/Chocolatey, release provenance attestations.
 
+## v0.3.0 Cut Runbook
+
+0.3 = cloud (Durable Object runtime) + owned harness. Scope decisions (Jack,
+2026-07-09): **publish via the public mirror + crates.io**; **skip Homebrew**;
+ship **containers-disabled** (the Class-A/B compute plane is built + locally
+live-proven — enabling it in production is a follow-on once Cloudflare Containers
+billing + image push are done, and is tracked as v0.4 in the DO runtime tracker).
+Web search/fetch tools and the deferred DO `[~]` residuals were moved to v0.4.
+
+1. **Version + gate.** Workspace bumped `0.2.0 → 0.3.0` (all crates + path-dep
+   pins + `Cargo.lock`); IR goldens unchanged. Full readiness gate
+   (`WHIPPLESCRIPT_RELEASE_READINESS_FULL=1`) green — note the toolchain bump to
+   rustc/clippy 1.95.0 newly flagged one pre-existing `let-else` under
+   `-D warnings` (fixed, 8f80248). Set the CHANGELOG date.
+
+2. **Tag → `main` → GitHub Release.** As with 0.2, a tag push is the only path
+   that builds the platform archives. If `-src` GitHub Actions billing is still
+   broken, publish via the **public mirror** (free CI) exactly as 0.2 did — and
+   the mirror publish **MUST preserve the grafted infra files** (the 5
+   release-infra files + the ~9 curated-tree files enumerated in the release-plan
+   memory), or mirror CI/releases break.
+
+3. **Publish to crates.io in dependency order — 5 crates, first-time publishes**
+   (host-do is the DO host, not a CLI dep — skipped):
+   `cargo publish -p whipplescript-core`
+   `cargo publish -p whipplescript-parser`
+   `cargo publish -p whipplescript-store`
+   `cargo publish -p whipplescript-kernel`
+   `cargo publish -p whipplescript`
+   Prereqs (maintainer): verified crates.io email; an API token with the
+   `publish-new` scope (`cargo login`); the 5 crate names available/owned. Heads
+   up — crates.io throttles *new* crates (burst ~5, then ~1/10min); 5 = the burst,
+   so no stall is expected, but the last one may need a moment.
+
+4. **Post-publish smoke.**
+   `cargo install --git https://github.com/jamesjscully/whipplescript --tag v0.3.0 --locked -p whipplescript`
+   then `whip --version` (0.3.0) · `whip doctor --json` ·
+   `whip check examples/minimal-noop.whip`.
+
 ## Native Provider Release Gate
 
 For a release that advertises usable native Codex, Claude, and Pi providers,
