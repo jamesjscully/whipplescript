@@ -143,9 +143,11 @@ function testAgentSuspendResume() {
 //    RESUMES it to a terminal -- and the delta-kernel cache entry is recorded.
 function testExecSuspendResume() {
   const source = [
-    "workflow ExecJudge", "", "output result Verdict", "",
+    "workflow ExecJudge", "", "use std.script", "", "output result Verdict", "",
+    "class CheckInput {", "  n int", "}", "",
     "class Verdict {", "  ok int", "}", "",
-    "rule go", "  when started", "=> {", "  exec judge with input as check", "",
+    "rule seed", "  when started", "=> {", "  record CheckInput { n 1 }", "}", "",
+    "rule go", "  when CheckInput as request", "=> {", "  exec judge with request as check", "",
     "  after check succeeds {", "    complete result { ok 1 }", "  }", "",
     "  after check fails {", "    complete result { ok 0 }", "  }", "}",
   ].join("\n");
