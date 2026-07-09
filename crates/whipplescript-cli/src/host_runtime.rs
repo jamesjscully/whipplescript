@@ -123,6 +123,7 @@ pub trait PackageResolver {
 pub enum ModelProvider {
     OpenAi,
     Anthropic,
+    Codex,
 }
 
 /// Ephemeral provider material. Its `Debug` implementation is deliberately
@@ -134,6 +135,8 @@ pub struct ResolvedProviderBinding {
     base_url: String,
     max_tokens: u64,
     timeout: Duration,
+    codex_account_id: Option<String>,
+    codex_session_id: Option<String>,
 }
 
 impl ResolvedProviderBinding {
@@ -152,6 +155,30 @@ impl ResolvedProviderBinding {
             base_url: base_url.into(),
             max_tokens,
             timeout,
+            codex_account_id: None,
+            codex_session_id: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_codex(
+        access_token: impl Into<String>,
+        account_id: impl Into<String>,
+        session_id: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        max_tokens: u64,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            provider: ModelProvider::Codex,
+            api_key: access_token.into(),
+            model: model.into(),
+            base_url: base_url.into(),
+            max_tokens,
+            timeout,
+            codex_account_id: Some(account_id.into()),
+            codex_session_id: Some(session_id.into()),
         }
     }
 
@@ -163,6 +190,14 @@ impl ResolvedProviderBinding {
         {
             return Err(HostRuntimeError::Resolver(
                 "provider binding is incomplete".to_owned(),
+            ));
+        }
+        if self.provider == ModelProvider::Codex
+            && (self.codex_account_id.as_deref().is_none_or(str::is_empty)
+                || self.codex_session_id.as_deref().is_none_or(str::is_empty))
+        {
+            return Err(HostRuntimeError::Resolver(
+                "Codex provider binding has no account/session identity".to_owned(),
             ));
         }
         Ok(())
@@ -179,6 +214,11 @@ impl fmt::Debug for ResolvedProviderBinding {
             .field("base_url", &self.base_url)
             .field("max_tokens", &self.max_tokens)
             .field("timeout", &self.timeout)
+            .field("codex_account_id", &self.codex_account_id)
+            .field(
+                "codex_session_id",
+                &self.codex_session_id.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -1081,18 +1121,33 @@ impl GovernedHostRuntime {
             admitted_resources: &command.resources,
             resolver: resources,
         };
-        let provider = match binding.provider {
-            ModelProvider::OpenAi => CoerceProvider::OpenAi,
-            ModelProvider::Anthropic => CoerceProvider::Anthropic,
+        let client = match binding.provider {
+            ModelProvider::OpenAi => MessagesApiClient::new(
+                CoerceProvider::OpenAi,
+                binding.api_key,
+                binding.model,
+                binding.base_url,
+                binding.max_tokens,
+                Some(command.command_id.clone()),
+            ),
+            ModelProvider::Anthropic => MessagesApiClient::new(
+                CoerceProvider::Anthropic,
+                binding.api_key,
+                binding.model,
+                binding.base_url,
+                binding.max_tokens,
+                Some(command.command_id.clone()),
+            ),
+            ModelProvider::Codex => MessagesApiClient::new_codex(
+                binding.api_key,
+                binding.codex_account_id.unwrap_or_default(),
+                binding.codex_session_id.unwrap_or_default(),
+                binding.model,
+                binding.base_url,
+                binding.max_tokens,
+                Some(command.command_id.clone()),
+            ),
         };
-        let client = MessagesApiClient::new(
-            provider,
-            binding.api_key,
-            binding.model,
-            binding.base_url,
-            binding.max_tokens,
-            Some(command.command_id.clone()),
-        );
         let input = BrokeredTurnInput {
             system: package.system_prompt,
             user: command.input.text.clone(),
@@ -1605,11 +1660,48 @@ impl HostDriver for NativeHttpDriver {
                 return IoResult::Http(Err(error));
             }
         };
-        IoResult::Http(Ok(HttpResponse {
-            status: response.status(),
-            body: response.into_json::<Value>().unwrap_or(Value::Null),
-        }))
+        let expects_sse = request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("accept") && value == "text/event-stream"
+        });
+        let status = response.status();
+        let body = if expects_sse {
+            assemble_responses_sse(&response.into_string().unwrap_or_default())
+        } else {
+            response.into_json::<Value>().unwrap_or(Value::Null)
+        };
+        IoResult::Http(Ok(HttpResponse { status, body }))
     }
+}
+
+fn assemble_responses_sse(raw: &str) -> Value {
+    let mut completed: Option<Value> = None;
+    let mut deltas = String::new();
+    for line in raw.lines() {
+        let Some(payload) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.completed") => completed = event.get("response").cloned(),
+            Some("response.output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    deltas.push_str(delta);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut response = completed.unwrap_or_else(|| json!({}));
+    if !deltas.is_empty() {
+        response["output_text"] = Value::String(deltas);
+    }
+    response
 }
 
 #[derive(Debug)]
@@ -2299,5 +2391,18 @@ workflow Fingerprint {
         )
         .expect("package compiles");
         assert_ne!(original.source_hash, more_steps.source_hash);
+    }
+
+    #[test]
+    fn codex_sse_assembly_preserves_calls_and_text_deltas() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"{}\"}],\"usage\":{\"input_tokens\":3}}}\n",
+            "data: [DONE]\n",
+        );
+        let response = assemble_responses_sse(raw);
+        assert_eq!(response["output_text"], "done");
+        assert_eq!(response["output"][0]["call_id"], "c1");
+        assert_eq!(response["usage"]["input_tokens"], 3);
     }
 }

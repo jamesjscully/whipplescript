@@ -36,6 +36,7 @@ principals and never contain the resource body.
 | `TurnExecution::output` / `LabeledTurnOutput` | WhippleScript-folded assistant/tool projection carrying the turn's IFC join label; hosts never inspect the runtime store or recreate transcript folding. |
 | `PackageResolver` | Resolve immutable WhippleScript package bytes/IR and its package-declared tool schemas. |
 | `SecretResolver` | Resolve provider credentials ephemerally, after policy admission. |
+| `ResolvedProviderBinding::new_codex(...)` | Host-resolved short-lived Codex material; WhippleScript owns the Codex request/SSE wire but never credential acquisition, refresh, lookup, or persistence. |
 | `ResourceResolver` | Resolve image bytes and execute package-declared tools against only the resource refs admitted for the turn. |
 | `NativeWorkspaceResolver` / `native_workspace_tool_specs` | WhippleScript-owned native file capability: confined, symlink-refusing read/write/edit/grep/find/list operations with host-supplied read-only subtrees. |
 
