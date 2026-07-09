@@ -418,4 +418,40 @@ impl WasmDurableInstance {
             .map(|status| status.unwrap_or_default())
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))
     }
+
+    /// Capture a restorable checkpoint (P3 — the DO operator command). Returns
+    /// the checkpoint report as JSON, or a JS error if the instance is not
+    /// quiescent.
+    pub fn checkpoint(&mut self, cut_id: &str) -> Result<String, JsValue> {
+        let report = self
+            .inner
+            .checkpoint(cut_id)
+            .map_err(|error| JsValue::from_str(&error))?;
+        Ok(serde_json::json!({
+            "cut_id": report.cut_id,
+            "sequence": report.sequence,
+            "manifest_hash": report.manifest_hash,
+            "file_count": report.file_count,
+        })
+        .to_string())
+    }
+
+    /// Restore the three planes to a prior checkpoint (P3 — the DO operator
+    /// command). Returns the restore report as JSON, or a JS error on refusal /
+    /// failure (a refusal mutates nothing).
+    pub fn restore(&mut self, cut_id: &str) -> Result<String, JsValue> {
+        let report = self
+            .inner
+            .restore(cut_id)
+            .map_err(|error| JsValue::from_str(&error))?;
+        Ok(serde_json::json!({
+            "cut_id": report.cut_id,
+            "restored_to_sequence": report.restored_to_sequence,
+            "marker_sequence": report.marker_sequence,
+            "files_written": report.files_written,
+            "files_removed": report.files_removed,
+            "auto_checkpoint": report.auto_checkpoint,
+        })
+        .to_string())
+    }
 }

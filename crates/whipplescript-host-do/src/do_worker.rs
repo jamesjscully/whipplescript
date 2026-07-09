@@ -20,10 +20,13 @@ use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_loop::{HttpModelClient, ToolExecutor};
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::sansio::{HttpRequest, HttpResponse, TransportError};
-use whipplescript_kernel::{ProgramVersionInput, RuntimeKernel};
+use whipplescript_kernel::{idempotency_key, ProgramVersionInput, RuntimeKernel};
 use whipplescript_parser::IrProgram;
 use whipplescript_store::files::FileStore;
-use whipplescript_store::{ClaimableEffect, NewInstanceAuthority, RuntimeStore, StoreError};
+use whipplescript_store::{
+    CheckpointCapture, ClaimableEffect, NewInstanceAuthority, RestoreDecision, RuntimeStore,
+    StoreError,
+};
 
 use crate::do_instance::{
     CoerceProviderConfig, DoInstanceDriver, ExecutorSidecarConfig, TurnContainerConfig,
@@ -350,6 +353,131 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
     pub fn coerce_provider(&self) -> Option<CoerceProvider> {
         self.coerce.as_ref().map(|config| config.provider)
     }
+
+    /// Capture a restorable consistent-cut checkpoint (DO parity P3 — the
+    /// operator-command counterpart to the CLI `whip checkpoint`). Refuses if an
+    /// effect is mid-run.
+    pub fn checkpoint(&mut self, cut_id: &str) -> Result<DoCheckpointReport, String> {
+        let instance_id = self.instance_id.clone();
+        let key = idempotency_key(&[&instance_id, cut_id, "checkpoint"]);
+        let kernel = self.kernel.as_mut().ok_or("instance kernel consumed")?;
+        let captured = kernel
+            .store_mut()
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: &instance_id,
+                cut_id,
+                transcript_ref: None,
+                idempotency_key: Some(&key),
+            })
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(DoCheckpointReport {
+            cut_id: captured.cut_id,
+            sequence: captured.sequence,
+            manifest_hash: captured.manifest_hash,
+            file_count: captured.file_count,
+        })
+    }
+
+    /// Restore the three planes to a prior checkpoint (DO parity P3 — the
+    /// operator-command counterpart to the CLI `whip restore`). Same order:
+    /// (1) `plan_restore` — the whole coherence check up front; a refusal mutates
+    /// nothing; (2) auto-checkpoint the current head as `auto-before-<cut>` so
+    /// the restore is itself undoable; (3) apply the full file reconcile — write
+    /// every manifest path back to its cut content, remove post-cut mediated
+    /// files — through this instance's `FileStore` (the DO file plane, P1);
+    /// (4) `commit_restore` so the instance + transcript planes fold to the cut.
+    pub fn restore(&mut self, cut_id: &str) -> Result<DoRestoreReport, String> {
+        let instance_id = self.instance_id.clone();
+        // 1) Plan (read-only). A refusal is returned as an error with no mutation.
+        let plan = {
+            let kernel = self.kernel.as_ref().ok_or("instance kernel consumed")?;
+            match kernel
+                .store()
+                .plan_restore(&instance_id, cut_id)
+                .map_err(|error| format!("{error:?}"))?
+            {
+                RestoreDecision::Ready(plan) => plan,
+                RestoreDecision::Refused { reason } => {
+                    return Err(format!("restore refused: {reason}"))
+                }
+            }
+        };
+        // 2) Auto-checkpoint the current head so this restore is itself undoable.
+        let auto_cut_id = format!("auto-before-{cut_id}");
+        {
+            let auto_key = idempotency_key(&[&instance_id, &auto_cut_id, "checkpoint"]);
+            let kernel = self.kernel.as_mut().ok_or("instance kernel consumed")?;
+            kernel
+                .store_mut()
+                .capture_checkpoint(CheckpointCapture {
+                    instance_id: &instance_id,
+                    cut_id: &auto_cut_id,
+                    transcript_ref: None,
+                    idempotency_key: Some(&auto_key),
+                })
+                .map_err(|error| format!("auto-checkpoint before restore: {error:?}"))?;
+        }
+        // 3) Apply the file reconcile through the DO file plane. Every content
+        //    hash was verified present in step 1, so writes cannot fail for
+        //    missing bytes.
+        for (path, body) in &plan.writes {
+            let target = std::path::Path::new(path);
+            if let Some(parent) = target.parent() {
+                self.files
+                    .create_dir_all(parent)
+                    .map_err(|error| format!("restore: create parent of `{path}`: {error}"))?;
+            }
+            self.files
+                .write(target, body.as_bytes())
+                .map_err(|error| format!("restore: write `{path}`: {error}"))?;
+        }
+        for path in &plan.removes {
+            self.files
+                .remove(std::path::Path::new(path))
+                .map_err(|error| format!("restore: remove `{path}`: {error}"))?;
+        }
+        // 4) Commit: the marker + marker-aware rebuild fold the instance and
+        //    transcript planes to the cut.
+        let commit_key = idempotency_key(&[&instance_id, cut_id, "restore"]);
+        let marker = {
+            let kernel = self.kernel.as_mut().ok_or("instance kernel consumed")?;
+            kernel
+                .store_mut()
+                .commit_restore(
+                    &instance_id,
+                    plan.restored_to_sequence,
+                    cut_id,
+                    Some(&commit_key),
+                )
+                .map_err(|error| format!("commit restore: {error:?}"))?
+        };
+        Ok(DoRestoreReport {
+            cut_id: cut_id.to_owned(),
+            restored_to_sequence: plan.restored_to_sequence,
+            marker_sequence: marker.sequence,
+            files_written: plan.writes.len(),
+            files_removed: plan.removes.len(),
+            auto_checkpoint: auto_cut_id,
+        })
+    }
+}
+
+/// The outcome of a DO checkpoint (P3), for the worker to marshal to JSON.
+pub struct DoCheckpointReport {
+    pub cut_id: String,
+    pub sequence: i64,
+    pub manifest_hash: String,
+    pub file_count: usize,
+}
+
+/// The outcome of a DO restore (P3), for the worker to marshal to JSON.
+pub struct DoRestoreReport {
+    pub cut_id: String,
+    pub restored_to_sequence: i64,
+    pub marker_sequence: i64,
+    pub files_written: usize,
+    pub files_removed: usize,
+    pub auto_checkpoint: String,
 }
 
 /// The `InstanceStepMachine` fixpoint, factored out so it can borrow `in_flight`

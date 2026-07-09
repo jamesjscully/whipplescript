@@ -267,10 +267,54 @@ function testFileWrite() {
   console.log("PASS  file-write workflow -> terminal (in-isolate) + bytes in DO SQLite");
 }
 
+// 7) CHECKPOINT + RESTORE on the DO (P3): a file-write workflow writes note.md;
+//    an operator checkpoint captures the cut; the file plane is then tampered;
+//    restore reverts it to the cut content and reports the auto-checkpoint that
+//    makes the restore undoable. An unknown cut refuses (throws), mutating
+//    nothing.
+function testCheckpointRestore() {
+  const source = [
+    "workflow FileRestore", "", "output result Done", "",
+    "class Done {", "  status string", "}", "",
+    'file store out_files {', '  root "/ws"', "}", "",
+    "rule pick", "  when started", "=> {",
+    '  write text to out_files at "note.md" {', '    body "V1"', "    mode create", "  } as written", "",
+    "  after written succeeds as result {", '    complete result { status "wrote" }', "  }", "}",
+  ].join("\n");
+  const { bridge, db } = freshInstanceEnv([]);
+  const inst = WasmDurableInstance.create(bridge, source, "{}", "local/FileRestore", undefined, undefined, undefined);
+  assert.strictEqual(JSON.parse(inst.step(undefined, Date.now())).kind, "terminal");
+  assert.strictEqual(db.prepare("SELECT content FROM files WHERE key = ?").get("/ws/note.md").content, "V1");
+
+  // Operator checkpoint.
+  const cp = JSON.parse(inst.checkpoint("cut-1"));
+  assert.strictEqual(cp.cut_id, "cut-1");
+  assert.strictEqual(cp.file_count, 1, `checkpoint: ${JSON.stringify(cp)}`);
+
+  // Tamper the file plane (drift away from the cut).
+  db.exec("UPDATE files SET content = 'TAMPERED' WHERE key = '/ws/note.md'");
+  assert.strictEqual(db.prepare("SELECT content FROM files WHERE key = ?").get("/ws/note.md").content, "TAMPERED");
+
+  // Restore: note.md reverts to V1, and the restore is itself undoable.
+  const r = JSON.parse(inst.restore("cut-1"));
+  assert.strictEqual(r.files_written, 1, `restore: ${JSON.stringify(r)}`);
+  assert.strictEqual(r.auto_checkpoint, "auto-before-cut-1");
+  assert.strictEqual(
+    db.prepare("SELECT content FROM files WHERE key = ?").get("/ws/note.md").content,
+    "V1",
+    "the DO file plane reverted to the checkpoint content",
+  );
+
+  // An unknown cut refuses (throws), with no mutation.
+  assert.throws(() => inst.restore("no-such-cut"), /refused/);
+  console.log("PASS  checkpoint + restore reverts the DO file plane");
+}
+
 testEffectFree();
 testCoerceSuspendResume();
 testAgentSuspendResume();
 testExecSuspendResume();
 testTurnContainerAgent();
 testFileWrite();
+testCheckpointRestore();
 console.log("\nALL PASS: the wasm DO runtime drives real workflows over real SQLite through the wasm-bindgen boundary.");

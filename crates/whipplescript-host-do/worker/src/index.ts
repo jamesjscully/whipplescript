@@ -210,8 +210,34 @@ export class WorkflowInstance implements DurableObject {
   // suspension or terminal. Subsequent external events / alarms re-enter and drive
   // further; the durable state is entirely in DO SQLite.
   async fetch(request: Request): Promise<Response> {
-    const { program, input, principal, project_context, scripts } =
-      (await request.json()) as Partial<Bootstrap>;
+    const body = (await request.json()) as Partial<Bootstrap> & {
+      command?: string;
+      cut_id?: string;
+    };
+    // Operator commands (P3): checkpoint / restore an existing instance. The
+    // worker's only verb dispatch — everything else is the start/poke bootstrap.
+    if (body.command === "checkpoint" || body.command === "restore") {
+      const existing = await this.ctx.storage.get<Bootstrap>("bootstrap");
+      if (!existing) {
+        return Response.json({ error: "no instance to command" }, { status: 400 });
+      }
+      if (!body.cut_id) {
+        return Response.json({ error: `${body.command} requires cut_id` }, { status: 400 });
+      }
+      const instance = this.makeInstance(existing);
+      try {
+        const report =
+          body.command === "checkpoint"
+            ? instance.checkpoint(body.cut_id)
+            : instance.restore(body.cut_id);
+        return new Response(report, { headers: { "content-type": "application/json" } });
+      } catch (error) {
+        // A refusal (unknown cut / dangling manifest) or non-quiescent
+        // checkpoint mutates nothing and returns a 400.
+        return Response.json({ error: String(error) }, { status: 400 });
+      }
+    }
+    const { program, input, principal, project_context, scripts } = body;
     let bootstrap: Bootstrap | undefined;
     if (program) {
       bootstrap = {
@@ -245,7 +271,10 @@ export class WorkflowInstance implements DurableObject {
     }
   }
 
-  private async drive(bootstrap: Bootstrap): Promise<{ status: string; outcome: string }> {
+  // Build (get-or-create) the wasm instance from the persisted bootstrap, wiring
+  // the effect ports from DO secrets/bindings. Shared by `drive` (the step loop)
+  // and the operator command path (checkpoint/restore).
+  private makeInstance(bootstrap: Bootstrap): WasmDurableInstance {
     ensureSchema(this.ctx.storage.sql);
     const bridge = makeBridge(this.ctx.storage.sql);
     // Provider creds from DO secrets (optional; store-only workflows omit both).
@@ -291,7 +320,7 @@ export class WorkflowInstance implements DurableObject {
             : { provider: "fixture" },
         })
       : undefined;
-    const instance = WasmDurableInstance.create(
+    return WasmDurableInstance.create(
       bridge,
       bootstrap.program,
       bootstrap.input,
@@ -303,6 +332,10 @@ export class WorkflowInstance implements DurableObject {
       bootstrap.scripts ? JSON.stringify(bootstrap.scripts) : undefined,
       turnConfig,
     );
+  }
+
+  private async drive(bootstrap: Bootstrap): Promise<{ status: string; outcome: string }> {
+    const instance = this.makeInstance(bootstrap);
 
     // The sans-IO loop: step -> maybe fetch -> step, until a terminal or a park.
     // Each `fetch` is one provider round; the core parses the response and
