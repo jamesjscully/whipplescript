@@ -235,8 +235,9 @@ The verbs are `file item into <queue> { ... }`, `claim`, `release`, and
 `finish`. A losing `claim` is a normal branchable failure, not an error, so a
 contended queue stays correct without locks in source.
 
-Operate the backlog from the CLI with `whip items add`, `whip items list`, and
-`whip items show`. The builtin tracker is workspace-scoped and issues ids like
+Operate the backlog from the CLI with `whip issue new`, `whip issue list`,
+`whip issue show`, and the lifecycle verbs `ready`/`claim`/`renew`/`release`/
+`finish` (plus `dep add`). The builtin tracker is workspace-scoped and issues ids like
 `WS-1`; items an agent files mid-turn carry run-identity provenance. Full
 syntax is in the [language reference](language-reference.md#work-queues).
 

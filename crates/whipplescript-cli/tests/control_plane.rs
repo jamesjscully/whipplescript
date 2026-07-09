@@ -6744,25 +6744,175 @@ rule grab
     let _ = fs::remove_file(workflow_path);
 }
 
-/// Read the workspace-scoped builtin tracker via `whip --json items` (reads only
-/// `WHIPPLESCRIPT_ITEMS_STORE`, not the run store).
+/// Read the workspace-scoped builtin tracker via `whip --json issue list` (reads
+/// only `WHIPPLESCRIPT_ITEMS_STORE`, not the run store).
 fn tracker_items(bin: &str, items_path: &Path) -> Vec<Value> {
     let output = Command::new(bin)
         .env("WHIPPLESCRIPT_ITEMS_STORE", items_path)
-        .args(["--json", "items"])
+        .args(["--json", "issue", "list"])
         .output()
-        .expect("items runs");
+        .expect("issue list runs");
     assert!(
         output.status.success(),
-        "items failed: {}",
+        "issue list failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let text = String::from_utf8(output.stdout).expect("items stdout is utf-8");
+    let text = String::from_utf8(output.stdout).expect("issue list stdout is utf-8");
     serde_json::from_str::<Value>(&text)
-        .expect("items json")
+        .expect("issue list json")
         .as_array()
-        .expect("items json array")
+        .expect("issue list json array")
         .clone()
+}
+
+fn issue_ok(out: &std::process::Output) {
+    assert!(
+        out.status.success(),
+        "issue command failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn issue_json(out: std::process::Output) -> Value {
+    issue_ok(&out);
+    serde_json::from_slice(&out.stdout).expect("issue json output")
+}
+
+/// T5: the `whip issue` CLI drives the whole A+blockers lifecycle over the real
+/// event-sourced provider (file -> ready -> claim -> renew -> release -> finish),
+/// including CLI-vs-CLI claim contention and non-holder renew rejection.
+#[test]
+fn issue_cli_lifecycle() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let items_path = temp_store_path();
+    let run = |args: &[&str]| -> std::process::Output {
+        Command::new(bin)
+            .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
+            .args(args)
+            .output()
+            .expect("whip issue runs")
+    };
+
+    // file: the mutating command returns the full row (no show round-trip).
+    let filed = issue_json(run(&[
+        "--json",
+        "issue",
+        "new",
+        "--queue",
+        "backlog",
+        "--title",
+        "fix login",
+        "--actor",
+        "agent:a",
+    ]));
+    let id = filed["id"].as_str().expect("filed id").to_owned();
+    assert_eq!(filed["status"], "open");
+    assert_eq!(filed["filed_by"], "agent:a");
+
+    // ready: the fresh open issue projects as ready.
+    let ready = issue_json(run(&["--json", "issue", "ready", "backlog"]));
+    let ready = ready.as_array().expect("ready array");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0]["id"], filed["id"]);
+
+    // claim: full row back, status overlays `in_progress`, claimant = actor.
+    let claimed = issue_json(run(&[
+        "--json", "issue", "claim", &id, "--actor", "agent:a",
+    ]));
+    assert_eq!(claimed["claimed_by"], "agent:a");
+    assert_eq!(claimed["status"], "in_progress");
+
+    // a leased issue is no longer ready.
+    let leased_ready = issue_json(run(&["--json", "issue", "ready", "backlog"]));
+    assert!(leased_ready.as_array().expect("array").is_empty());
+
+    // contention: a second actor cannot claim the held issue.
+    let contended = run(&["issue", "claim", &id, "--actor", "agent:b"]);
+    assert!(!contended.status.success());
+    assert!(String::from_utf8_lossy(&contended.stderr).contains("already claimed by agent:a"));
+
+    // renew: holder heartbeat succeeds; a non-holder is rejected as not-held.
+    issue_ok(&run(&[
+        "--json", "issue", "renew", &id, "--actor", "agent:a",
+    ]));
+    let bad_renew = run(&["issue", "renew", &id, "--actor", "agent:b"]);
+    assert!(!bad_renew.status.success());
+    assert!(String::from_utf8_lossy(&bad_renew.stderr).contains("no active claim"));
+
+    // release: the issue re-projects as ready.
+    issue_ok(&run(&["--json", "issue", "release", &id]));
+    let reready = issue_json(run(&["--json", "issue", "ready", "backlog"]));
+    assert_eq!(reready.as_array().expect("array").len(), 1);
+
+    // finish: durable `closed`, excluded from ready.
+    let finished = issue_json(run(&[
+        "--json",
+        "issue",
+        "finish",
+        &id,
+        "--summary",
+        "done",
+    ]));
+    assert_eq!(finished["status"], "closed");
+    let done_ready = issue_json(run(&["--json", "issue", "ready", "backlog"]));
+    assert!(done_ready.as_array().expect("array").is_empty());
+
+    let _ = fs::remove_file(&items_path);
+}
+
+/// T5: `whip issue dep add <blocked> depends-on <blocker>` records a blocks edge
+/// that gates readiness — the blocked issue is not ready until the blocker
+/// closes.
+#[test]
+fn issue_cli_dep_add_gates_readiness() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let items_path = temp_store_path();
+    let run = |args: &[&str]| -> std::process::Output {
+        Command::new(bin)
+            .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
+            .args(args)
+            .output()
+            .expect("whip issue runs")
+    };
+
+    let blocker = issue_json(run(&[
+        "--json", "issue", "new", "--queue", "backlog", "--title", "blocker",
+    ]));
+    let blocked = issue_json(run(&[
+        "--json", "issue", "new", "--queue", "backlog", "--title", "blocked",
+    ]));
+    let blocker_id = blocker["id"].as_str().expect("blocker id").to_owned();
+    let blocked_id = blocked["id"].as_str().expect("blocked id").to_owned();
+
+    // both issues are ready before the dependency.
+    let before = issue_json(run(&["--json", "issue", "ready", "backlog"]));
+    assert_eq!(before.as_array().expect("array").len(), 2);
+
+    // blocked depends-on blocker => blocker blocks blocked.
+    issue_ok(&run(&[
+        "--json",
+        "issue",
+        "dep",
+        "add",
+        &blocked_id,
+        "depends-on",
+        &blocker_id,
+    ]));
+
+    // now only the blocker is ready; the blocked issue is gated.
+    let gated = issue_json(run(&["--json", "issue", "ready", "backlog"]));
+    let gated = gated.as_array().expect("array");
+    assert_eq!(gated.len(), 1);
+    assert_eq!(gated[0]["id"], blocker["id"]);
+
+    // closing the blocker frees the blocked issue.
+    issue_ok(&run(&["--json", "issue", "finish", &blocker_id]));
+    let freed = issue_json(run(&["--json", "issue", "ready", "backlog"]));
+    let freed = freed.as_array().expect("array");
+    assert_eq!(freed.len(), 1);
+    assert_eq!(freed[0]["id"], blocked["id"]);
+
+    let _ = fs::remove_file(&items_path);
 }
 
 /// Holder-lifetime cleanup of pending human asks on cancel: a cancelled

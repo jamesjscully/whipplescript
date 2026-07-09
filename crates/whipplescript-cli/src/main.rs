@@ -206,7 +206,7 @@ fn main() -> ExitCode {
         Some("leases") => coordination_list(&options, "leases"),
         Some("ledger") => coordination_list(&options, "ledger"),
         Some("counters") => coordination_list(&options, "counters"),
-        Some("items") => items(&options),
+        Some("issue") => issue(&options),
         Some("evidence") => evidence(&options),
         Some("diagnostics") => diagnostics(&options),
         Some("trace") => trace(&options),
@@ -611,7 +611,7 @@ fn print_usage() {
     println!("usage: whip [--store path] [--json] <command> [args]");
     println!("commands: package, check, compile, verify-report, run, revise, step, worker, dev, accept, instances, status, log, facts, effects, runs");
     println!(
-        "          artifacts, inbox, signal, items, leases, ledger, counters, evidence, diagnostics, trace"
+        "          artifacts, inbox, signal, issue, leases, ledger, counters, evidence, diagnostics, trace"
     );
     println!("          otel-export, pause, resume, cancel, retry, recover, doctor, deploy");
     println!("run `whip <command> --help` or `whip help <command>` for command usage");
@@ -647,7 +647,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "leases" => "usage: whip leases [<resource>]",
         "ledger" => "usage: whip ledger [<ledger>] [--partition <value>]",
         "counters" => "usage: whip counters [<counter>]",
-        "items" => "usage: whip items [list [--queue Q] [--status S]|add --queue Q --title T [--body B] [--label L]...|show <id>]",
+        "issue" => ISSUE_USAGE,
         "evidence" => "usage: whip evidence <instance>",
         "diagnostics" => "usage: whip diagnostics [--grouped] <instance>",
         "trace" => "usage: whip trace <instance> [--check]",
@@ -28724,68 +28724,102 @@ fn artifacts(options: &CliOptions) -> ExitCode {
     }
 }
 
-fn items(options: &CliOptions) -> ExitCode {
-    use whipplescript_store::items::WorkItemStore;
-    let usage = "usage: whip items [list [--queue Q] [--status S]|add --queue Q --title T [--body B] [--label L]...|show <id>]";
+const ISSUE_USAGE: &str = "usage: whip issue <\
+new --queue Q --title T [--body B] [--label L]... [--actor A]|\
+list [--queue Q] [--status S]|\
+show <id>|\
+ready <queue> [--limit N]|\
+claim <id> [--actor A]|\
+renew <id> [--actor A]|\
+release <id>|\
+finish <id> [--summary S]|complete <id> [--summary S]|\
+fail <id> [--actor A]|\
+dep add <blocked> [depends-on] <blocker>|\
+rebuild>";
+
+/// Run-identity provenance stamp: anything filed/claimed from inside a turn is
+/// attributed to the exact turn that produced it ("two doors, one stamp").
+fn run_identity_stamp() -> Option<String> {
+    let stamp = ["WHIPPLESCRIPT_RUN_ID", "WHIPPLESCRIPT_INSTANCE_ID"]
+        .iter()
+        .filter_map(|name| env::var(name).ok().map(|value| format!("{name}={value}")))
+        .collect::<Vec<_>>()
+        .join(",");
+    (!stamp.is_empty()).then_some(stamp)
+}
+
+/// Actor identity for a mutating verb: `--actor` override, else the run-identity
+/// stamp, else `cli` for a direct human at a shell.
+fn issue_actor(explicit: Option<String>) -> String {
+    explicit
+        .or_else(run_identity_stamp)
+        .unwrap_or_else(|| "cli".to_owned())
+}
+
+/// The value following `--name` in `args`, if present.
+fn flag_value(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|arg| arg == name)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+}
+
+/// Emit the full issue row after a mutation (DR-0002 "CLI Requirements": no
+/// show-after-claim round trip). Human mode prints a one-line confirmation.
+fn emit_issue_row(
+    store: &whipplescript_store::items::WorkItemStore,
+    id: &str,
+    note: &str,
+    json_mode: bool,
+) -> ExitCode {
+    match store.get_item(id) {
+        Ok(Some(item)) => {
+            if json_mode {
+                emit_json(work_item_to_json(&item))
+            } else {
+                println!(
+                    "{} {note} [{}]{}",
+                    item.id,
+                    item.status,
+                    item.claimed_by
+                        .as_deref()
+                        .map(|c| format!(" (claimed by {c})"))
+                        .unwrap_or_default()
+                );
+                ExitCode::SUCCESS
+            }
+        }
+        Ok(None) => {
+            eprintln!("issue `{id}` was not found");
+            ExitCode::FAILURE
+        }
+        Err(error) => report_store_error("failed to load issue", error),
+    }
+}
+
+fn issue(options: &CliOptions) -> ExitCode {
+    use whipplescript_store::items::{ClaimOutcome, RenewOutcome, WorkItemStore};
+    let usage = ISSUE_USAGE;
     let args = &options.args;
     let command = args.first().map(String::as_str).unwrap_or("list");
-    let store = match WorkItemStore::open(items_store_path()) {
+    let mut store = match WorkItemStore::open(items_store_path()) {
         Ok(store) => store,
         Err(error) => return report_store_error("failed to open items store", error),
     };
     match command {
-        "list" => {
-            let mut queue = None;
-            let mut status = None;
-            let mut iter = args.iter().skip(1);
-            while let Some(arg) = iter.next() {
-                match arg.as_str() {
-                    "--queue" => queue = iter.next().cloned(),
-                    "--status" => status = iter.next().cloned(),
-                    _ => {
-                        eprintln!("{usage}");
-                        return ExitCode::from(2);
-                    }
-                }
-            }
-            let listed = match store.list_items(queue.as_deref(), status.as_deref()) {
-                Ok(items) => items,
-                Err(error) => return report_store_error("failed to list items", error),
-            };
-            if options.json {
-                return emit_json(Value::Array(
-                    listed.iter().map(work_item_to_json).collect::<Vec<_>>(),
-                ));
-            }
-            if listed.is_empty() {
-                println!("no items");
-            }
-            for item in listed {
-                println!(
-                    "{} [{}] queue={} {}{}",
-                    item.id,
-                    item.status,
-                    item.queue,
-                    item.title,
-                    item.claimed_by
-                        .as_deref()
-                        .map(|claimed| format!(" (claimed by {claimed})"))
-                        .unwrap_or_default()
-                );
-            }
-            ExitCode::SUCCESS
-        }
-        "add" => {
+        "new" | "add" => {
             let mut queue = None;
             let mut title = None;
             let mut item_body = String::new();
             let mut labels = Vec::new();
+            let mut actor = None;
             let mut iter = args.iter().skip(1);
             while let Some(arg) = iter.next() {
                 match arg.as_str() {
                     "--queue" => queue = iter.next().cloned(),
                     "--title" => title = iter.next().cloned(),
                     "--body" => item_body = iter.next().cloned().unwrap_or_default(),
+                    "--actor" => actor = iter.next().cloned(),
                     "--label" => {
                         if let Some(label) = iter.next() {
                             labels.push(label.clone());
@@ -28801,15 +28835,7 @@ fn items(options: &CliOptions) -> ExitCode {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             };
-            // Run-identity provenance: anything filed from inside a turn is
-            // attributed to the exact turn that produced it.
-            let filed_by = ["WHIPPLESCRIPT_RUN_ID", "WHIPPLESCRIPT_INSTANCE_ID"]
-                .iter()
-                .filter_map(|name| env::var(name).ok().map(|value| format!("{name}={value}")))
-                .collect::<Vec<_>>()
-                .join(",");
-            let filed_by = (!filed_by.is_empty()).then_some(filed_by);
-            let mut store = store;
+            let filed_by = actor.or_else(run_identity_stamp);
             match store.file_item(
                 &queue,
                 &title,
@@ -28826,8 +28852,49 @@ fn items(options: &CliOptions) -> ExitCode {
                         ExitCode::SUCCESS
                     }
                 }
-                Err(error) => report_store_error("failed to file item", error),
+                Err(error) => report_store_error("failed to file issue", error),
             }
+        }
+        "list" => {
+            let mut queue = None;
+            let mut status = None;
+            let mut iter = args.iter().skip(1);
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--queue" => queue = iter.next().cloned(),
+                    "--status" => status = iter.next().cloned(),
+                    _ => {
+                        eprintln!("{usage}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let listed = match store.list_items(queue.as_deref(), status.as_deref()) {
+                Ok(items) => items,
+                Err(error) => return report_store_error("failed to list issues", error),
+            };
+            if options.json {
+                return emit_json(Value::Array(
+                    listed.iter().map(work_item_to_json).collect::<Vec<_>>(),
+                ));
+            }
+            if listed.is_empty() {
+                println!("no issues");
+            }
+            for item in listed {
+                println!(
+                    "{} [{}] queue={} {}{}",
+                    item.id,
+                    item.status,
+                    item.queue,
+                    item.title,
+                    item.claimed_by
+                        .as_deref()
+                        .map(|claimed| format!(" (claimed by {claimed})"))
+                        .unwrap_or_default()
+                );
+            }
+            ExitCode::SUCCESS
         }
         "show" => {
             let Some(id) = args.get(1) else {
@@ -28857,12 +28924,167 @@ fn items(options: &CliOptions) -> ExitCode {
                     }
                 }
                 Ok(None) => {
-                    eprintln!("item `{id}` was not found");
+                    eprintln!("issue `{id}` was not found");
                     ExitCode::FAILURE
                 }
-                Err(error) => report_store_error("failed to load item", error),
+                Err(error) => report_store_error("failed to load issue", error),
             }
         }
+        "ready" => {
+            let Some(queue) = args.get(1).filter(|q| !q.starts_with('-')) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let mut limit = None;
+            let mut iter = args.iter().skip(2);
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--limit" => limit = iter.next().and_then(|v| v.parse::<usize>().ok()),
+                    _ => {
+                        eprintln!("{usage}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let mut ready = match store.ready_items(queue) {
+                Ok(items) => items,
+                Err(error) => return report_store_error("failed to list ready issues", error),
+            };
+            if let Some(limit) = limit {
+                ready.truncate(limit);
+            }
+            if options.json {
+                return emit_json(Value::Array(
+                    ready.iter().map(work_item_to_json).collect::<Vec<_>>(),
+                ));
+            }
+            if ready.is_empty() {
+                println!("no ready issues");
+            }
+            for item in ready {
+                println!("{} [{}] {}", item.id, item.status, item.title);
+            }
+            ExitCode::SUCCESS
+        }
+        "claim" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let actor = issue_actor(flag_value(args, "--actor"));
+            match store.claim_item(id, &actor) {
+                Ok(ClaimOutcome::Claimed) => emit_issue_row(&store, id, "claimed", options.json),
+                Ok(ClaimOutcome::AlreadyClaimed { holder }) => {
+                    eprintln!("issue `{id}` is already claimed by {holder}");
+                    ExitCode::FAILURE
+                }
+                Ok(ClaimOutcome::NotFound) => {
+                    eprintln!("issue `{id}` was not found");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to claim issue", error),
+            }
+        }
+        "renew" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let actor = issue_actor(flag_value(args, "--actor"));
+            // v1 renew is a holder heartbeat (no `--ttl`; the TTL mechanism is
+            // T3-gated). `expires = None` re-affirms the lease unchanged.
+            match store.renew_claim(id, &actor, None) {
+                Ok(RenewOutcome::Renewed { .. }) => {
+                    emit_issue_row(&store, id, "renewed", options.json)
+                }
+                Ok(RenewOutcome::NotHeld) => {
+                    eprintln!("actor `{actor}` holds no active claim on `{id}`");
+                    ExitCode::FAILURE
+                }
+                Ok(RenewOutcome::NotMonotonic) => {
+                    eprintln!("renew would move the lease deadline backward");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to renew claim", error),
+            }
+        }
+        "release" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.release_item(id) {
+                Ok(true) => emit_issue_row(&store, id, "released", options.json),
+                Ok(false) => {
+                    eprintln!("issue `{id}` had no active claim to release");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to release claim", error),
+            }
+        }
+        "finish" | "complete" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let summary = flag_value(args, "--summary");
+            match store.finish_item(id, summary.as_deref()) {
+                Ok(true) => emit_issue_row(&store, id, "finished", options.json),
+                Ok(false) => {
+                    eprintln!("issue `{id}` is not open (cannot finish)");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to finish issue", error),
+            }
+        }
+        "fail" => {
+            // v1 `fail` releases the actor's lease so the issue re-projects as
+            // ready (the ADR `fail --release` behavior). A durable failure
+            // status is deferred to the event-sourced rebuild's op set.
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.release_item(id) {
+                Ok(true) => emit_issue_row(&store, id, "failed (claim released)", options.json),
+                Ok(false) => {
+                    eprintln!("issue `{id}` had no active claim to fail");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to fail issue", error),
+            }
+        }
+        "dep" => {
+            // `dep add <blocked> [depends-on] <blocker>`: blocker blocks blocked.
+            if args.get(1).map(String::as_str) != Some("add") {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+            let rest = args
+                .iter()
+                .skip(2)
+                .filter(|token| token.as_str() != "depends-on")
+                .collect::<Vec<_>>();
+            let (Some(blocked), Some(blocker)) = (rest.first(), rest.get(1)) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.add_blocks(blocker, blocked) {
+                Ok(()) => emit_issue_row(&store, blocked, "gated by dependency", options.json),
+                Err(error) => report_store_error("failed to add dependency", error),
+            }
+        }
+        "rebuild" => match store.rebuild_projection() {
+            Ok(()) => {
+                if options.json {
+                    emit_json(json!({"rebuilt": true}))
+                } else {
+                    println!("projection rebuilt from the event log");
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(error) => report_store_error("failed to rebuild projection", error),
+        },
         _ => {
             eprintln!("{usage}");
             ExitCode::from(2)

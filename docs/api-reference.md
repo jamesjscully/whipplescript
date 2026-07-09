@@ -43,7 +43,7 @@ for any command.
 | `WHIPPLESCRIPT_EXEC_ALLOW` | Dev-profile raw `exec "<command>"` allow-list: colon-separated glob prefixes such as `scripts/*:bin/ci-*`. Unset/empty, raw exec blocks at admission (`security.script_disabled`); commands outside a non-empty list fail without running. The program must also `use std.script`. |
 | `WHIPPLESCRIPT_EXEC_PROFILE` | `dev` (default) or `hosted`. Hosted rejects raw exec strings and requires script capabilities. |
 | `WHIPPLESCRIPT_SCRIPT_MANIFEST` | JSON manifest path for hosted script capabilities. Equivalent to `--script-manifest`. |
-| `WHIPPLESCRIPT_RUN_ID` | Run identity stamped onto items filed by an agent through `whip items add`. |
+| `WHIPPLESCRIPT_RUN_ID` | Run identity stamped onto items filed by an agent through `whip issue new`. |
 | `WHIPPLESCRIPT_PROVIDER_CONFIGS` | Colon-separated provider binding config paths for the worker. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP endpoint for `otel-export` (defaults to `http://localhost:4318`). |
 | `OTEL_SERVICE_NAME` | Service name attached to exported OpenTelemetry resource spans. |
@@ -828,22 +828,37 @@ Exit behavior:
 | `1` | Store, source, or payload validation failed. |
 | `2` | CLI usage error. |
 
-### Items commands
+### Issue commands
 
 ```sh
-whip items add --queue <Q> --title <T> [--body <B>] [--label <L>]
-whip items list [--queue <Q>] [--status <S>]
-whip items show <id>
+whip issue new --queue <Q> --title <T> [--body <B>] [--label <L>] [--actor <A>]
+whip issue list [--queue <Q>] [--status <S>]
+whip issue show <id>
+whip issue ready <queue> [--limit <N>]
+whip issue claim <id> [--actor <A>]
+whip issue renew <id> [--actor <A>]
+whip issue release <id>
+whip issue finish <id> [--summary <S>]   # alias: complete
+whip issue fail <id> [--actor <A>]
+whip issue dep add <blocked> depends-on <blocker>
+whip issue rebuild
 ```
 
-Items commands operate the builtin work-queue tracker (see
+Issue commands operate the builtin work-queue tracker (see
 [work queues](language-reference.md#work-queues)). The builtin tracker is
 workspace-scoped, stores items in `.whipplescript/items.sqlite` (override with
 `WHIPPLESCRIPT_ITEMS_STORE`), and issues sequential ids `WS-1`, `WS-2`, and so
-on. `--status` filters on the item status categories `open`, `in_progress`,
-`done`, and `cancelled`. When an agent files an item mid-turn through
-`whip items add`, the new item carries run-identity provenance taken from the
-`WHIPPLESCRIPT_RUN_ID` environment variable.
+on. `--status` filters on the status categories `open`, `in_progress`,
+`closed`, `canceled`, and `archived`. Every mutating command returns the full
+issue row (JSON with `--json`), so an agent never needs a follow-up `show`.
+Claims are local runtime leases split from durable status: a plain `claim`
+overlays `in_progress` and re-projects the issue as not-ready without a durable
+write; `release`, `renew` (holder-only heartbeat), and terminal auto-release
+manage the lease. `dep add` records a `blocks` edge (the blocked issue is gated
+until the blocker closes). Actor identity defaults to the run-identity stamp
+(`WHIPPLESCRIPT_RUN_ID` / `WHIPPLESCRIPT_INSTANCE_ID`) and is overridable with
+`--actor`, so an item an agent files or claims mid-turn carries run-identity
+provenance.
 
 ### Coordination inspection
 

@@ -386,6 +386,27 @@ impl WorkItemStore {
         Ok(true)
     }
 
+    /// Records a `blocks(from -> to)` edge: `from` blocks `to`, so `to` is not
+    /// ready until `from` closes (`tracker-readiness.maude`). Appends a
+    /// `relation.added` event and folds it into `tracker_relations` in one
+    /// transaction; idempotent via `INSERT OR IGNORE`. The `whip issue dep add`
+    /// door (blocked depends-on blocker => `add_blocks(blocker, blocked)`).
+    pub fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let payload = json!({"from": from, "to": to, "kind": "blocks"});
+        tx_append_event(&tx, Some(to), "relation.added", &payload, None, &now)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO tracker_relations (from_issue, to_issue, kind, dep_kind) \
+             VALUES (?1, ?2, 'blocks', NULL)",
+            params![from, to],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Rebuilds the disposable projections (`tracker_issues`,
     /// `tracker_relations`, `tracker_leases`) by folding the append-only event
     /// log from empty (`tracker-projection.maude` determinism). A rebuild
@@ -779,6 +800,10 @@ pub trait WorkItems {
     fn release_claims_for_holder(&mut self, holder: &str) -> StoreResult<usize>;
 
     fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> StoreResult<bool>;
+
+    /// Records a `blocks(from -> to)` edge (`to` is gated until `from` closes).
+    /// The relation source-verbs' A+blockers seam; `from` blocks `to`.
+    fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()>;
 }
 
 #[cfg(feature = "native")]
@@ -832,6 +857,10 @@ impl WorkItems for WorkItemStore {
 
     fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> StoreResult<bool> {
         self.finish_item(item_id, summary)
+    }
+
+    fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()> {
+        self.add_blocks(from, to)
     }
 }
 
@@ -1243,24 +1272,6 @@ mod tests {
     // -- test-only projection helpers -------------------------------------
 
     impl WorkItemStore {
-        /// Records a `blocks` edge (readiness input); exercised by tests and the
-        /// relations fold. Kept test-scoped until the relation source verbs land.
-        fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()> {
-            let tx = self
-                .connection
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let now = tx_now(&tx)?;
-            let payload = json!({"from": from, "to": to, "kind": "blocks"});
-            tx_append_event(&tx, Some(to), "relation.added", &payload, None, &now)?;
-            tx.execute(
-                "INSERT OR IGNORE INTO tracker_relations (from_issue, to_issue, kind, dep_kind) \
-                 VALUES (?1, ?2, 'blocks', NULL)",
-                params![from, to],
-            )?;
-            tx.commit()?;
-            Ok(())
-        }
-
         /// A stable string snapshot of the three projection tables, for the
         /// rebuild-determinism assertion.
         fn dump_projection(&self) -> StoreResult<String> {

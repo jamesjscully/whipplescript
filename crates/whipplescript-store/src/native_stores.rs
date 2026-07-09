@@ -706,6 +706,10 @@ impl WorkItems for NativeStores {
     fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> StoreResult<bool> {
         self.items.finish_item(item_id, summary)
     }
+
+    fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()> {
+        self.items.add_blocks(from, to)
+    }
 }
 
 #[cfg(test)]

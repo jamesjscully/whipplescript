@@ -6936,6 +6936,22 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         do_release_active_lease(&self.sql, item_id, &now)?;
         Ok(true)
     }
+
+    fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()> {
+        // `from` blocks `to`: append `relation.added` and fold into
+        // `tracker_relations` (mirror of the native `add_blocks` door).
+        let now = do_now(&self.sql)?;
+        let payload = serde_json::json!({"from": from, "to": to, "kind": "blocks"});
+        do_tracker_append(&self.sql, Some(to), "relation.added", &payload, None, &now)?;
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO tracker_relations (from_issue, to_issue, kind, dep_kind) \
+                 VALUES (?1, ?2, 'blocks', NULL)",
+                &[text(from), text(to)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
 }
 
 // -- Coordination over DoSql (DR-0033 chunk 5a) -----------------------------

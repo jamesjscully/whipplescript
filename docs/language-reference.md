@@ -1166,9 +1166,15 @@ including an operator `whip cancel` — the runtime returns the still-held item 
 Operators and agents manage items from the CLI:
 
 ```sh
-whip items add --queue backlog --title "Fix login" [--body "..."] [--label bug]
-whip items list [--queue backlog] [--status open]
-whip items show WS-1
+whip issue new --queue backlog --title "Fix login" [--body "..."] [--label bug]
+whip issue list [--queue backlog] [--status open]
+whip issue show WS-1
+whip issue ready backlog [--limit 5]
+whip issue claim WS-1 [--actor agent:a]
+whip issue renew WS-1 [--actor agent:a]
+whip issue release WS-1
+whip issue finish WS-1 [--summary "done"]
+whip issue dep add WS-2 depends-on WS-1
 ```
 
 When an agent files an item mid-turn through the CLI, the runtime stamps it

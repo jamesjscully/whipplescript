@@ -23,7 +23,7 @@ marker.
 - Sequential `flow` blocks, which lower to ordinary rules visible in
   `whip check`.
 - Work queues with the `builtin` tracker (`queue`, `file`/`claim`/`release`/
-  `finish`, `when <queue> has ready item`) and the `whip items` command family.
+  `finish`, `when <queue> has ready item`) and the `whip issue` command family.
 - Time effects: `timeout` clauses, `timer`, and `cancel`, fired on worker
   passes.
 - Inline `decide` decisions, `case` over string-literal unions, the general
