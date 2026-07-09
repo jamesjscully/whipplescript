@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod json;
+
 /// Current implementation stage for the active redesign.
 pub const IMPLEMENTATION_STAGE: &str = "stage-0-skeleton";
 

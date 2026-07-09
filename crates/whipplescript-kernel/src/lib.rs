@@ -18,6 +18,7 @@ pub mod instance_machine;
 pub mod loft;
 pub mod lowering;
 pub mod native_lifecycle;
+pub mod package_registry;
 pub mod pi_rpc;
 pub mod provider;
 pub mod rule_lowering;

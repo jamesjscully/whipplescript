@@ -834,6 +834,9 @@ dependencies = [
 [[package]]
 name = "whipplescript-core"
 version = "0.2.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "whipplescript-host-do"
