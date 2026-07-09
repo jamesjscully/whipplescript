@@ -18,6 +18,8 @@ pub struct PolicyEpochRef {
     pub epoch: u64,
     pub envelope_hash: String,
     pub signer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
 }
 
 impl PolicyEpochRef {
@@ -35,6 +37,7 @@ impl PolicyEpochRef {
             epoch,
             envelope_hash: attestation.envelope_hash.clone(),
             signer: attestation.signer.clone(),
+            key_id: attestation.key_id.clone(),
         })
     }
 
@@ -43,7 +46,11 @@ impl PolicyEpochRef {
             return Err(ProtocolError::Invalid("policy epoch must be nonzero"));
         }
         nonempty("policy envelope hash", &self.envelope_hash)?;
-        nonempty("policy signer", &self.signer)
+        nonempty("policy signer", &self.signer)?;
+        if let Some(key_id) = &self.key_id {
+            nonempty("policy attestation key id", key_id)?;
+        }
+        Ok(())
     }
 }
 

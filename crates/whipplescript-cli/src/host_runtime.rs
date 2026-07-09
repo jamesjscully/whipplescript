@@ -215,6 +215,28 @@ impl GovernedHostRuntime {
     ) -> Result<Self, HostRuntimeError> {
         let envelope = VerifiedEnvelope::verify_signed_text(signed_envelope)
             .map_err(HostRuntimeError::PolicyRejected)?;
+        Self::open_verified(store_path, epoch, envelope)
+    }
+
+    /// Open an embedding runtime under an externally signed governance
+    /// envelope. The verifier is an explicit capability held by the governance
+    /// authority; no process-global admin flag participates.
+    pub fn open_with_verifier<V: crate::gov::GovernanceAttestationVerifier + ?Sized>(
+        store_path: impl AsRef<Path>,
+        epoch: u64,
+        signed_envelope: &str,
+        verifier: &V,
+    ) -> Result<Self, HostRuntimeError> {
+        let envelope = VerifiedEnvelope::verify_signed_text_with(signed_envelope, verifier)
+            .map_err(HostRuntimeError::PolicyRejected)?;
+        Self::open_verified(store_path, epoch, envelope)
+    }
+
+    fn open_verified(
+        store_path: impl AsRef<Path>,
+        epoch: u64,
+        envelope: VerifiedEnvelope,
+    ) -> Result<Self, HostRuntimeError> {
         let policy = PolicyEpochRef::from_verified(epoch, &envelope)?;
         let store = SqliteStore::open(store_path).map_err(HostRuntimeError::Store)?;
         Ok(Self {

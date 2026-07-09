@@ -984,6 +984,28 @@ impl VerifiedEnvelope {
         Self::verify_text(text)
     }
 
+    /// Verify an embedding host's cryptographically signed governance envelope
+    /// through its pinned trust-root verifier. The legacy root-only/hash
+    /// attestation is deliberately refused on this path.
+    pub fn verify_signed_text_with<V: crate::gov::GovernanceAttestationVerifier + ?Sized>(
+        text: &str,
+        verifier: &V,
+    ) -> Result<Self, String> {
+        if !text.contains("\"attestation\"") {
+            return Err("governance envelope is not signed (no attestation)".to_owned());
+        }
+        let attestation = crate::gov::SignedEnvelope::verify_attestation_with(text, verifier)?;
+        let envelope = if text.trim_start().starts_with('{') {
+            Envelope::from_json(text)
+        } else {
+            Envelope::from_dsl(text)
+        }?;
+        Ok(Self {
+            envelope,
+            attestation: Some(attestation),
+        })
+    }
+
     /// The verified attestation identity, absent only for explicit unsigned-dev
     /// envelopes accepted by [`verify_text`](Self::verify_text).
     pub fn attestation(&self) -> Option<&crate::gov::VerifiedAttestation> {
