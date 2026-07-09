@@ -8,6 +8,7 @@
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -255,6 +256,74 @@ pub trait ResourceResolver {
     ) -> Result<String, String>;
 }
 
+/// Host realization request for a command that WhippleScript has already
+/// parsed and admitted. The host may further restrict it (for example with an
+/// OS sandbox), but must not widen the command or timeout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedCommand {
+    pub command: String,
+    pub workspace_root: PathBuf,
+    pub read_only_paths: Vec<PathBuf>,
+    pub timeout: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandExecutionOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+}
+
+pub trait CommandExecutor: Send + Sync {
+    fn execute(&self, command: &AdmittedCommand) -> Result<CommandExecutionOutput, String>;
+}
+
+/// WhippleScript-owned command admission policy. `allowed_prefixes = None` is
+/// an explicit host grant for any simple command; `Some([])` is deny-all.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeCommandPolicy {
+    allowed_prefixes: Option<Vec<String>>,
+    max_timeout: Duration,
+}
+
+impl NativeCommandPolicy {
+    pub fn allow_any(max_timeout: Duration) -> Self {
+        Self {
+            allowed_prefixes: None,
+            max_timeout,
+        }
+    }
+
+    pub fn allow_prefixes(
+        prefixes: impl IntoIterator<Item = String>,
+        max_timeout: Duration,
+    ) -> Self {
+        Self {
+            allowed_prefixes: Some(
+                prefixes
+                    .into_iter()
+                    .map(|prefix| prefix.trim().to_owned())
+                    .filter(|prefix| !prefix.is_empty())
+                    .collect(),
+            ),
+            max_timeout,
+        }
+    }
+
+    fn admits(&self, command: &str) -> bool {
+        let Some(prefixes) = &self.allowed_prefixes else {
+            return true;
+        };
+        let command = command.trim();
+        prefixes.iter().any(|prefix| {
+            command == prefix
+                || command
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+        })
+    }
+}
+
 /// WhippleScript-owned native implementation of the workspace capability used
 /// by embedding desktop hosts. GaugeDesk supplies only the root and any
 /// read-only subtrees; WhippleScript parses tool arguments, confines paths,
@@ -263,6 +332,7 @@ pub struct NativeWorkspaceResolver {
     root: PathBuf,
     read_only: Vec<PathBuf>,
     max_output_bytes: usize,
+    command: Option<(NativeCommandPolicy, Arc<dyn CommandExecutor>)>,
 }
 
 impl NativeWorkspaceResolver {
@@ -278,6 +348,7 @@ impl NativeWorkspaceResolver {
             root,
             read_only: Vec::new(),
             max_output_bytes: 50_000,
+            command: None,
         })
     }
 
@@ -287,6 +358,15 @@ impl NativeWorkspaceResolver {
             .map(|path| normalize_relative(&path))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(self)
+    }
+
+    pub fn command_execution(
+        mut self,
+        policy: NativeCommandPolicy,
+        executor: Arc<dyn CommandExecutor>,
+    ) -> Self {
+        self.command = Some((policy, executor));
+        self
     }
 
     fn resolve(&self, path: &str, write: bool) -> Result<PathBuf, String> {
@@ -451,6 +531,53 @@ impl NativeWorkspaceResolver {
         })?;
         Ok(self.cap(matches.join("\n")))
     }
+
+    fn bash(&self, arguments: &Value) -> Result<String, String> {
+        let (policy, executor) = self
+            .command
+            .as_ref()
+            .ok_or_else(|| "command execution is not configured for this workspace".to_owned())?;
+        let command = string_argument(arguments, "command")?.trim();
+        if command.is_empty() {
+            return Err("command must not be empty".to_owned());
+        }
+        if !policy.admits(command) {
+            return Err(format!(
+                "command refused by the admitted allow-list: `{command}`"
+            ));
+        }
+        validate_simple_command(command, &self.read_only)?;
+        let requested = Duration::from_secs(
+            arguments
+                .get("timeout")
+                .and_then(Value::as_u64)
+                .unwrap_or(30),
+        );
+        if requested.is_zero() || requested > policy.max_timeout {
+            return Err(format!(
+                "command timeout must be between 1 and {} seconds",
+                policy.max_timeout.as_secs()
+            ));
+        }
+        let output = executor.execute(&AdmittedCommand {
+            command: command.to_owned(),
+            workspace_root: self.root.clone(),
+            read_only_paths: self
+                .read_only
+                .iter()
+                .map(|path| self.root.join(path))
+                .collect(),
+            timeout: requested,
+        })?;
+        let mut combined = output.stdout;
+        combined.push_str(&output.stderr);
+        let combined = self.cap(combined);
+        match output.exit_code {
+            Some(0) => Ok(combined),
+            Some(code) => Err(format!("command exited with status {code}\n{combined}")),
+            None => Err(format!("command terminated by signal\n{combined}")),
+        }
+    }
 }
 
 impl ResourceResolver for NativeWorkspaceResolver {
@@ -490,6 +617,15 @@ impl ResourceResolver for NativeWorkspaceResolver {
             "ls" => self.list(&call.arguments),
             "find" => self.find(&call.arguments),
             "grep" => self.grep(&call.arguments),
+            "bash" => {
+                if !admitted_resources
+                    .iter()
+                    .any(|resource| resource.kind == "command")
+                {
+                    return Err("turn has no admitted command capability".to_owned());
+                }
+                self.bash(&call.arguments)
+            }
             _ => Err("tool has no native workspace implementation".to_owned()),
         }
     }
@@ -499,6 +635,13 @@ impl ResourceResolver for NativeWorkspaceResolver {
 /// selects whether mutation is present; it cannot redefine their schemas or
 /// execution semantics.
 pub fn native_workspace_tool_specs(writable: bool) -> Vec<ToolSpec> {
+    native_workspace_tool_specs_with_command(writable, false)
+}
+
+pub fn native_workspace_tool_specs_with_command(
+    writable: bool,
+    command_execution: bool,
+) -> Vec<ToolSpec> {
     let mut tools = vec![
         tool_spec(
             "read",
@@ -562,6 +705,18 @@ pub fn native_workspace_tool_specs(writable: bool) -> Vec<ToolSpec> {
                 }),
             ),
         ]);
+    }
+    if command_execution {
+        tools.push(tool_spec(
+            "bash",
+            "Run one admitted simple command in the governed workspace.",
+            json!({
+                "type": "object", "properties": {
+                    "command": { "type": "string" },
+                    "timeout": { "type": "integer", "minimum": 1 }
+                }, "required": ["command"], "additionalProperties": false
+            }),
+        ));
     }
     tools
 }
@@ -687,6 +842,132 @@ fn wildcard_matches(pattern: &str, text: &str) -> bool {
         previous = current;
     }
     previous[text.len()]
+}
+
+fn validate_simple_command(command: &str, read_only: &[PathBuf]) -> Result<(), String> {
+    let words = simple_command_words(command)?;
+    let executable = words
+        .first()
+        .ok_or_else(|| "command must contain an executable".to_owned())?;
+    let executable_name = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(executable);
+    const SHELLS: &[&str] = &[
+        "sh",
+        "bash",
+        "dash",
+        "zsh",
+        "fish",
+        "cmd",
+        "cmd.exe",
+        "powershell",
+        "powershell.exe",
+        "pwsh",
+    ];
+    if words.iter().any(|word| SHELLS.contains(&word.as_str())) {
+        return Err("nested shell execution is not permitted".to_owned());
+    }
+    if matches!(
+        executable_name,
+        "python" | "python3" | "node" | "ruby" | "perl"
+    ) && words.iter().any(|word| word == "-c" || word == "-e")
+    {
+        return Err("inline interpreter programs are not permitted".to_owned());
+    }
+
+    for word in words.iter().skip(1) {
+        let candidate = word.split_once('=').map(|(_, value)| value).unwrap_or(word);
+        if candidate.is_empty() || candidate.starts_with('-') || !looks_path_shaped(candidate) {
+            continue;
+        }
+        let relative = normalize_relative(Path::new(candidate))?;
+        if read_only
+            .iter()
+            .any(|protected| relative.starts_with(protected))
+        {
+            return Err(format!(
+                "command path argument `{candidate}` enters a read-only workspace subtree"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn looks_path_shaped(word: &str) -> bool {
+    word == "."
+        || word == ".."
+        || word.starts_with("./")
+        || word.starts_with("../")
+        || word.starts_with('/')
+        || word.starts_with('~')
+        || word.contains('/')
+        || word.contains('\\')
+}
+
+fn simple_command_words(command: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            Some('"') => match ch {
+                '"' => quote = None,
+                '$' | '`' => {
+                    return Err("shell expansion is not permitted".to_owned());
+                }
+                '\\' => {
+                    let escaped = chars
+                        .next()
+                        .ok_or_else(|| "command has a trailing escape".to_owned())?;
+                    if !matches!(escaped, '"' | '\\') {
+                        return Err("only quote/backslash escapes are permitted".to_owned());
+                    }
+                    current.push(escaped);
+                }
+                '\n' | '\r' => return Err("command separators are not permitted".to_owned()),
+                _ => current.push(ch),
+            },
+            None => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '\\' => {
+                    let escaped = chars
+                        .next()
+                        .ok_or_else(|| "command has a trailing escape".to_owned())?;
+                    current.push(escaped);
+                }
+                '\n' | '\r' => return Err("command separators are not permitted".to_owned()),
+                ch if ch.is_whitespace() => {
+                    if !current.is_empty() {
+                        words.push(std::mem::take(&mut current));
+                    }
+                }
+                '$' | '`' | '*' | '?' | '[' | ']' | '{' | '}' | '~' | ';' | '|' | '&' | '('
+                | ')' | '<' | '>' => {
+                    return Err(format!(
+                        "shell operator or expansion `{ch}` is not permitted"
+                    ));
+                }
+                _ => current.push(ch),
+            },
+            Some(_) => unreachable!(),
+        }
+    }
+    if quote.is_some() {
+        return Err("command has an unterminated quote".to_owned());
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Ok(words)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2634,6 +2915,95 @@ workflow UnsafeHostChat {
         assert!(native_workspace_tool_specs(true)
             .iter()
             .any(|tool| tool.name == "write"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_command_tool_requires_governance_and_rejects_shell_bypasses() {
+        struct StubExecutor {
+            calls: std::sync::Mutex<Vec<AdmittedCommand>>,
+        }
+        impl CommandExecutor for StubExecutor {
+            fn execute(&self, command: &AdmittedCommand) -> Result<CommandExecutionOutput, String> {
+                self.calls.lock().expect("calls").push(command.clone());
+                Ok(CommandExecutionOutput {
+                    stdout: "clean\n".to_owned(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                })
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "whip-native-command-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join(".pi")).expect("dirs");
+        let executor = Arc::new(StubExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let resolver = NativeWorkspaceResolver::new(&root)
+            .expect("resolver")
+            .read_only([PathBuf::from(".pi")])
+            .expect("read-only")
+            .command_execution(
+                NativeCommandPolicy::allow_prefixes(["git".to_owned()], Duration::from_secs(60)),
+                executor.clone(),
+            );
+        let project_only = [ResourceRef {
+            handle: "project".to_owned(),
+            kind: "file_store".to_owned(),
+            selector: None,
+        }];
+        let admitted = [
+            project_only[0].clone(),
+            ResourceRef {
+                handle: "command".to_owned(),
+                kind: "command".to_owned(),
+                selector: None,
+            },
+        ];
+        let call = |command: &str| ToolCall {
+            id: "bash-1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: json!({ "command": command, "timeout": 30 }),
+        };
+
+        assert!(resolver
+            .execute_tool(&project_only, &call("git status"))
+            .is_err());
+        assert_eq!(
+            resolver
+                .execute_tool(&admitted, &call("git status"))
+                .expect("admitted command"),
+            "clean\n"
+        );
+        for refused in [
+            "cargo test",
+            "git status; rm -rf .",
+            "git status | cat",
+            "git status $(touch bad)",
+            "sh -c 'git status'",
+            "git status .pi/SYSTEM.md",
+            "git status ../outside",
+        ] {
+            assert!(
+                resolver.execute_tool(&admitted, &call(refused)).is_err(),
+                "refused {refused}"
+            );
+        }
+        let calls = executor.calls.lock().expect("calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].workspace_root, root.canonicalize().expect("root"));
+        assert_eq!(calls[0].timeout, Duration::from_secs(30));
+        assert!(native_workspace_tool_specs_with_command(true, true)
+            .iter()
+            .any(|tool| tool.name == "bash"));
+        drop(calls);
         let _ = fs::remove_dir_all(root);
     }
 
