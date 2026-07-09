@@ -49,8 +49,8 @@ use whipplescript_parser::{
 use whipplescript_store::{
     ArtifactRecord, ClaimableEffect, DerivedFact, DiagnosticRecord, EffectCancellation,
     EffectCompletion, EventView, EvidenceRecord, ExpiredLease, FactBatch, FactBatchOutcome,
-    InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent, NewFact, NewInboxItem,
-    NewInstance, NewInstanceAuthority, NewProgramVersion, NewWorkflowInvocation,
+    HumanAnswer, InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent, NewFact,
+    NewInboxItem, NewInstance, NewInstanceAuthority, NewProgramVersion, NewWorkflowInvocation,
     ProgramVersionRecord, RetryEffect, RevisionActivation, RuleCommit, RuleCommitRevisionGuard,
     RunStart, RuntimeStore, SkillEvidence, StoreError, StoreResult, StoredEvent,
     TerminalDiagnosticRecord, WorkflowInvocationView, WorkflowRevisionView,
@@ -206,7 +206,11 @@ fn brokered_observation_evidence(
             json!({
                 "call_id": call_id,
                 "tool": name,
-                "status": match status { ToolStatus::Ok => "ok", ToolStatus::Error => "error" },
+                "status": match status {
+                    ToolStatus::Ok => "ok",
+                    ToolStatus::Error => "error",
+                    ToolStatus::Suspended => "suspended",
+                },
             }),
         ),
         LoopObservation::Compacted {
@@ -221,6 +225,29 @@ fn brokered_observation_evidence(
                 "summary_bytes": summary_bytes,
             }),
         ),
+    }
+}
+
+fn merge_numeric_json(acc: Value, next: Value) -> Value {
+    match (acc, next) {
+        (Value::Null, next) => next,
+        (acc, Value::Null) => acc,
+        (Value::Object(mut acc), Value::Object(next)) => {
+            for (key, value) in next {
+                let merged = match (acc.get(&key), &value) {
+                    (Some(Value::Number(left)), Value::Number(right)) => {
+                        match (left.as_i64(), right.as_i64()) {
+                            (Some(left), Some(right)) => json!(left + right),
+                            _ => value.clone(),
+                        }
+                    }
+                    _ => value.clone(),
+                };
+                acc.insert(key, merged);
+            }
+            Value::Object(acc)
+        }
+        (_, next) => next,
     }
 }
 
@@ -281,16 +308,31 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
 
         let run_id = idempotency_key(&[ctx.instance_id, ctx.effect_id, "brokered-run"]);
         let lease_id = idempotency_key(&[ctx.instance_id, ctx.effect_id, "brokered-lease"]);
-        self.start_run(RunStart {
-            instance_id: ctx.instance_id,
-            effect_id: ctx.effect_id,
-            run_id: &run_id,
-            provider: "owned-harness",
-            worker_id: "whip-owned-harness",
-            lease_id: &lease_id,
-            lease_expires_at: "2030-01-01T00:00:00Z",
-            metadata_json: &json!({ "agent": ctx.agent }).to_string(),
-        })?;
+        let existing_run = self
+            .store
+            .list_runs(ctx.instance_id)?
+            .into_iter()
+            .find(|run| run.run_id == run_id);
+        match existing_run.as_ref().map(|run| run.status.as_str()) {
+            None => {
+                self.start_run(RunStart {
+                    instance_id: ctx.instance_id,
+                    effect_id: ctx.effect_id,
+                    run_id: &run_id,
+                    provider: "owned-harness",
+                    worker_id: "whip-owned-harness",
+                    lease_id: &lease_id,
+                    lease_expires_at: "2030-01-01T00:00:00Z",
+                    metadata_json: &json!({ "agent": ctx.agent }).to_string(),
+                })?;
+            }
+            Some("running") => {}
+            Some(status) => {
+                return Err(StoreError::Conflict(format!(
+                    "brokered run is already terminal ({status})"
+                )));
+            }
+        }
 
         // Resume-from-projection (slice 6): if a prior interrupted run left a
         // persisted transcript for this effect, continue from it; otherwise start
@@ -350,19 +392,53 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             }
         }
 
+        let (prior_steps, prior_usage) = self
+            .store
+            .list_evidence_for_subject("run", &run_id)?
+            .into_iter()
+            .filter(|evidence| evidence.kind == "human.ask")
+            .filter_map(|evidence| serde_json::from_str::<Value>(&evidence.metadata_json).ok())
+            .fold((0_usize, Value::Null), |(steps, usage), metadata| {
+                (
+                    steps + metadata.get("steps").and_then(Value::as_u64).unwrap_or(0) as usize,
+                    merge_numeric_json(
+                        usage,
+                        metadata.get("usage").cloned().unwrap_or(Value::Null),
+                    ),
+                )
+            });
         let resume_input;
-        let run_input: &crate::harness_loop::BrokeredTurnInput = if resume_from.is_empty() {
-            input
-        } else {
-            resume_input = crate::harness_loop::BrokeredTurnInput {
-                resume_from,
-                ..input.clone()
+        let run_input: &crate::harness_loop::BrokeredTurnInput =
+            if resume_from.is_empty() && prior_steps == 0 {
+                input
+            } else {
+                resume_input = crate::harness_loop::BrokeredTurnInput {
+                    resume_from,
+                    max_steps: input.max_steps.saturating_sub(prior_steps),
+                    ..input.clone()
+                };
+                &resume_input
             };
-            &resume_input
-        };
+        let checkpoint_step = self
+            .store
+            .list_events(ctx.instance_id)?
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "agent.turn.brokered.transcript"
+                    && serde_json::from_str::<Value>(&event.payload_json)
+                        .ok()
+                        .and_then(|payload| {
+                            payload
+                                .get("effect_id")
+                                .and_then(Value::as_str)
+                                .map(|effect_id| effect_id == ctx.effect_id)
+                        })
+                        .unwrap_or(false)
+            })
+            .count();
         let outcome = {
             let store = &self.store;
-            let mut step: usize = 0;
+            let mut step = checkpoint_step;
             let mut checkpoint = |messages: &[crate::harness_loop::ChatMessage]| {
                 let key = idempotency_key(&[
                     ctx.instance_id,
@@ -420,10 +496,81 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             })?;
         }
 
+        if outcome.status == TurnStatus::Suspended {
+            let ask = outcome.pending_human_ask.as_ref().ok_or_else(|| {
+                StoreError::Conflict("suspended brokered turn has no human ask".to_owned())
+            })?;
+            let inbox_item_id = idempotency_key(&[
+                ctx.instance_id,
+                ctx.effect_id,
+                &ask.call_id,
+                "brokered-human-ask",
+            ]);
+            let choices_json = serde_json::to_string(&ask.choices).map_err(StoreError::Json)?;
+            self.store.create_inbox_item(NewInboxItem {
+                inbox_item_id: &inbox_item_id,
+                instance_id: ctx.instance_id,
+                effect_id: Some(ctx.effect_id),
+                status: "pending",
+                prompt: &ask.question,
+                choices_json: &choices_json,
+                freeform_allowed: ask.freeform_allowed,
+                severity: "normal",
+                related_effects_json: &json!([ctx.effect_id]).to_string(),
+                related_artifacts_json: "[]",
+            })?;
+            self.store.record_evidence(EvidenceRecord {
+                instance_id: ctx.instance_id,
+                kind: "human.ask",
+                subject_type: "run",
+                subject_id: &run_id,
+                causation_id: Some(ctx.effect_id),
+                correlation_id: Some(&ask.call_id),
+                summary: Some("brokered turn awaiting human answer"),
+                metadata_json: &json!({
+                    "inbox_item_id": inbox_item_id,
+                    "call_id": ask.call_id,
+                    "question": ask.question,
+                    "choices": ask.choices,
+                    "freeform_allowed": ask.freeform_allowed,
+                    "steps": outcome.steps,
+                    "usage": outcome.usage,
+                })
+                .to_string(),
+            })?;
+            let payload = json!({
+                "effect_id": ctx.effect_id,
+                "run_id": run_id,
+                "inbox_item_id": inbox_item_id,
+                "call_id": ask.call_id,
+                "question": ask.question,
+                "choices": ask.choices,
+                "freeform_allowed": ask.freeform_allowed,
+                "status": "awaiting_human",
+            })
+            .to_string();
+            return self.store.append_event(NewEvent {
+                instance_id: ctx.instance_id,
+                event_type: "agent.turn.awaiting_human",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(&run_id),
+                correlation_id: Some(ctx.effect_id),
+                idempotency_key: Some(&idempotency_key(&[
+                    ctx.instance_id,
+                    ctx.effect_id,
+                    &ask.call_id,
+                    "awaiting-human",
+                ])),
+            });
+        }
+
         let terminal_key = idempotency_key(&[ctx.instance_id, ctx.effect_id, "terminal"]);
+        let total_steps = prior_steps + outcome.steps;
+        let total_usage = merge_numeric_json(prior_usage, outcome.usage.clone());
         let metadata_json = json!({
-            "steps": outcome.steps,
-            "usage": outcome.usage,
+            "steps": total_steps,
+            "usage": total_usage,
             "agent": ctx.agent,
         })
         .to_string();
@@ -433,6 +580,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             TurnStatus::Failed => ("failed", "agent.turn.failed"),
             TurnStatus::TimedOut => ("timed_out", "agent.turn.timed_out"),
             TurnStatus::Cancelled => ("cancelled", "agent.turn.cancelled"),
+            TurnStatus::Suspended => unreachable!("handled above"),
         };
 
         let completion = EffectCompletion {
@@ -456,6 +604,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             TurnStatus::Failed => self.fail_run(completion)?,
             TurnStatus::TimedOut => self.timeout_run(completion)?,
             TurnStatus::Cancelled => self.cancel_run(completion)?,
+            TurnStatus::Suspended => unreachable!("handled above"),
         };
 
         // The single terminal fact (layer 3) -- the only fact a brokered turn
@@ -506,6 +655,130 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         })?;
 
         Ok(terminal)
+    }
+
+    /// Admit an attributable answer to a brokered `ask_human` tool call and
+    /// append the correlated tool result to the durable transcript. The owning
+    /// host authenticates `answered_by`; the runtime validates the pending ask,
+    /// permitted answer shape, instance/effect/call correlation, and idempotency.
+    #[allow(clippy::too_many_arguments)]
+    pub fn answer_brokered_human_ask(
+        &mut self,
+        instance_id: &str,
+        effect_id: &str,
+        inbox_item_id: &str,
+        call_id: &str,
+        answer: &str,
+        answered_by: &str,
+        idempotency_key: &str,
+    ) -> StoreResult<StoredEvent> {
+        let item = self
+            .store
+            .get_inbox_item(inbox_item_id)?
+            .ok_or_else(|| StoreError::Conflict("human ask was not found".to_owned()))?;
+        if item.instance_id != instance_id || item.effect_id.as_deref() != Some(effect_id) {
+            return Err(StoreError::Conflict(
+                "human answer does not match the pending instance/effect".to_owned(),
+            ));
+        }
+        let answer = answer.trim();
+        if answer.is_empty() {
+            return Err(StoreError::Conflict(
+                "human answer must not be empty".to_owned(),
+            ));
+        }
+        let choices: Vec<String> = serde_json::from_str(&item.choices_json)?;
+        if !item.freeform_allowed && !choices.iter().any(|choice| choice == answer) {
+            return Err(StoreError::Conflict(
+                "human answer must select one of the admitted choices".to_owned(),
+            ));
+        }
+        let answer_json = json!({
+            "text": answer,
+            "respondent_ref": answered_by,
+        })
+        .to_string();
+        match item.status.as_str() {
+            "pending" => {
+                self.store.answer_inbox_item(HumanAnswer {
+                    inbox_item_id,
+                    answer_json: &answer_json,
+                    answered_by,
+                    idempotency_key: Some(idempotency_key),
+                })?;
+            }
+            "answered"
+                if item.answer_json.as_deref() == Some(answer_json.as_str())
+                    && item.answered_by.as_deref() == Some(answered_by) => {}
+            "answered" => {
+                return Err(StoreError::Conflict(
+                    "human ask was already answered differently".to_owned(),
+                ));
+            }
+            _ => {
+                return Err(StoreError::Conflict(
+                    "human ask is no longer answerable".to_owned(),
+                ));
+            }
+        }
+
+        let mut transcript = self.load_brokered_transcript(instance_id, effect_id);
+        let already_correlated = matches!(
+            transcript.last(),
+            Some(crate::harness_loop::ChatMessage::ToolResults(results))
+                if results.iter().any(|result| result.tool_call_id == call_id)
+        );
+        if !already_correlated {
+            let valid_call = matches!(
+                transcript.last(),
+                Some(crate::harness_loop::ChatMessage::Assistant { tool_calls, .. })
+                    if tool_calls.iter().any(|call| call.id == call_id && call.name == "ask_human")
+            );
+            if !valid_call {
+                return Err(StoreError::Conflict(
+                    "human answer does not match the suspended tool call".to_owned(),
+                ));
+            }
+            transcript.push(crate::harness_loop::ChatMessage::ToolResults(vec![
+                crate::harness_loop::ToolResultMsg {
+                    tool_call_id: call_id.to_owned(),
+                    tool_name: "ask_human".to_owned(),
+                    content: answer_json.clone(),
+                    is_error: false,
+                },
+            ]));
+            let checkpoint_payload = json!({
+                "effect_id": effect_id,
+                "messages": crate::harness_loop::chat_messages_to_json(&transcript),
+            })
+            .to_string();
+            self.store.append_event(NewEvent {
+                instance_id,
+                event_type: "agent.turn.brokered.transcript",
+                payload_json: &checkpoint_payload,
+                source: "kernel",
+                causation_id: Some(inbox_item_id),
+                correlation_id: Some(effect_id),
+                idempotency_key: Some(&format!("{idempotency_key}:transcript")),
+            })?;
+        }
+        let payload = json!({
+            "effect_id": effect_id,
+            "inbox_item_id": inbox_item_id,
+            "call_id": call_id,
+            "respondent_ref": answered_by,
+            "status": "answered",
+        })
+        .to_string();
+        self.store.append_event(NewEvent {
+            instance_id,
+            event_type: "agent.turn.human_answered",
+            payload_json: &payload,
+            source: "kernel",
+            causation_id: Some(inbox_item_id),
+            correlation_id: Some(effect_id),
+            idempotency_key: Some(&format!("{idempotency_key}:resumed")),
+        })
     }
 
     /// The agent's conversation thread: the final transcript of its latest

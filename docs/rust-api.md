@@ -14,9 +14,10 @@ IFC, or turn lifecycle semantics.
 
 `host_protocol` defines the placement-neutral `whipplescript.host.v1` wire
 types. `OpenInstanceCommand` opens one durable WhippleScript instance for a
-host chat. `StartTurnCommand`, `LabeledRuntimeEvent`, and `TurnReceipt` carry
-the same verified `PolicyEpochRef`; commands contain resource/provider refs,
-not resource bodies or credentials.
+host chat. `StartTurnCommand`, `LabeledRuntimeEvent`, terminal `TurnReceipt`,
+`LabeledHumanAsk`, `AnswerHumanAskCommand`, and `HumanAnswerReceipt` carry the
+same verified `PolicyEpochRef`; commands contain resource/provider refs, not
+resource bodies or credentials.
 
 `ResourceRef::handle` names the capability checked by governance/IFC;
 `ResourceRef::selector` optionally names one resolver-local object beneath that
@@ -30,15 +31,17 @@ principals and never contain the resource body.
 | `open(store_path, epoch, signed_envelope)` | Open/reopen SQLite and bind the runtime to the exact verified policy epoch. |
 | `open_with_verifier(store_path, epoch, signed_envelope, verifier)` | Open an embedded runtime under an externally signed envelope; requires the host's pinned `GovernanceAttestationVerifier` and never consults process-global admin state. |
 | `open_instance(command, packages)` | Resolve a pinned package and issue a durable WhippleScript instance ref; replaying the same request id reopens that exact instance. |
-| `run_turn(...)` | Run the owned brokered loop with the native HTTP driver, persistent transcript, evidence projection, and terminal receipt. |
+| `run_turn(...)` | Run the owned brokered loop with the native HTTP driver and persistent transcript. Returns either a terminal receipt or a labeled pending human ask, never both. |
 | `run_turn_with_driver(...)` | Drive the same sans-I/O machine with a host-supplied transport (tests and remote placements). |
+| `pending_human_turn(...)` | Recover the original admitted command and labeled question after a host restart without inspecting WhippleScript's runtime store. |
+| `answer_human_ask(...)` / `answer_human_ask_with_driver(...)` | Admit an authenticated respondent ref, append the correlated tool result, issue an attributable answer receipt, and resume the same suspended turn under its unchanged epoch. |
 | `cancellation_handle(instance, command)` | Mint an out-of-band `HostCancellationHandle`; its independent store connection records a durable cooperative-cancel request while the runtime thread is blocked. |
 | `TurnExecution::output` / `LabeledTurnOutput` | WhippleScript-folded assistant/tool projection carrying the turn's IFC join label; hosts never inspect the runtime store or recreate transcript folding. |
 | `PackageResolver` | Resolve immutable WhippleScript package bytes/IR and its package-declared tool schemas. |
 | `SecretResolver` | Resolve provider credentials ephemerally, after policy admission. |
 | `ResolvedProviderBinding::new_codex(...)` | Host-resolved short-lived Codex material; WhippleScript owns the Codex request/SSE wire but never credential acquisition, refresh, lookup, or persistence. |
-| `ResourceResolver` | Resolve image bytes and execute package-declared tools against only the resource refs admitted for the turn. |
-| `NativeWorkspaceResolver` / `native_workspace_tool_specs` | WhippleScript-owned native file capability: confined, symlink-refusing read/write/edit/grep/find/list operations with host-supplied read-only subtrees. |
+| `ResourceResolver` | Resolve image bytes, realize already-admitted tools, and project a package-declared human question against only the refs admitted for the turn. |
+| `NativeWorkspaceResolver` / `native_workspace_tool_specs_with_capabilities` | WhippleScript-owned native file/command/human surface: confined file operations, governed simple commands through a host executor, and labeled `ask_human` suspension. |
 
 The facade fails closed unless the signed envelope governs every resource,
 provider binding, and placement handle. `ResolvedPackage::compile` retains the
@@ -48,6 +51,13 @@ facade binds instances to a package fingerprint covering workflow source,
 selected root/agent, system prompt, exact tool schemas, and step limit plus the
 policy identity. It rejects cross-binding or changed-content reuse and persists
 only references/evidence—not resolved provider secrets.
+
+`ask_human` is an input door under the current epoch, not an authority-escalation
+shortcut. The runtime validates the governed `human` resource, question/choice
+shape, answer correlation, respondent attribution, and idempotency. A different
+policy epoch cannot answer or resume the suspended turn. If an operator ratifies
+new authority, the host must open/fork work under that new epoch and issue a
+fresh command; the old run is never widened in place.
 
 Embedding authorities create the exact bytes to sign with
 `gov::external_signing_bytes`, attach the result with

@@ -331,6 +331,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                         .get("usage")
                                         .cloned()
                                         .unwrap_or_else(|| serde_json::json!({})),
+                                    pending_human_ask: None,
                                 }
                             }
                             Ok(response) => BrokeredTurnOutcome {
@@ -347,6 +348,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                 steps: 0,
                                 observations: Vec::new(),
                                 usage: serde_json::json!({}),
+                                pending_human_ask: None,
                             },
                             Err(transport) => BrokeredTurnOutcome {
                                 status: TurnStatus::Failed,
@@ -354,6 +356,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                 steps: 0,
                                 observations: Vec::new(),
                                 usage: serde_json::json!({}),
+                                pending_human_ask: None,
                             },
                         };
                         let result = provider_result_from_brokered_turn(&outcome);

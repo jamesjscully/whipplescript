@@ -272,6 +272,92 @@ pub struct LabeledRuntimeEvent {
     pub payload_ref: Option<String>,
 }
 
+/// A question WhippleScript has admitted for the authenticated human surface.
+/// Unlike ordinary evidence references, the question and choices are projected
+/// intentionally because the respondent must see them. `label_ref` carries the
+/// IFC join governing that egress.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LabeledHumanAsk {
+    pub protocol: String,
+    pub ask_ref: String,
+    pub command_id: String,
+    pub instance_ref: String,
+    pub policy: PolicyEpochRef,
+    pub position: EventPosition,
+    pub label_ref: String,
+    pub evidence_ref: String,
+    pub question: String,
+    pub choices: Vec<String>,
+    pub freeform_allowed: bool,
+}
+
+/// GaugeDesk-authenticated answer to one pending human question. The answer is
+/// ordinary input under the ask's existing epoch; it cannot carry a replacement
+/// policy ref or widen the suspended turn.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AnswerHumanAskCommand {
+    pub protocol: String,
+    pub answer_id: String,
+    pub ask_ref: String,
+    pub instance_ref: String,
+    pub policy: PolicyEpochRef,
+    pub respondent_ref: String,
+    pub answer: String,
+}
+
+impl AnswerHumanAskCommand {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.protocol != HOST_PROTOCOL {
+            return Err(ProtocolError::WrongVersion(self.protocol.clone()));
+        }
+        nonempty("human answer id", &self.answer_id)?;
+        nonempty("human ask ref", &self.ask_ref)?;
+        nonempty("human answer instance ref", &self.instance_ref)?;
+        nonempty("human respondent ref", &self.respondent_ref)?;
+        nonempty("human answer", &self.answer)?;
+        self.policy.validate()
+    }
+}
+
+/// WhippleScript's attributable receipt for an admitted answer. `turn_command_id`
+/// names the same suspended turn that will resume; its policy is unchanged.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HumanAnswerReceipt {
+    pub protocol: String,
+    pub answer_id: String,
+    pub ask_ref: String,
+    pub turn_command_id: String,
+    pub instance_ref: String,
+    pub policy: PolicyEpochRef,
+    pub respondent_ref: String,
+    pub answered_at: EventPosition,
+}
+
+impl HumanAnswerReceipt {
+    pub fn validate_for(&self, command: &AnswerHumanAskCommand) -> Result<(), ProtocolError> {
+        command.validate()?;
+        if self.protocol != HOST_PROTOCOL {
+            return Err(ProtocolError::WrongVersion(self.protocol.clone()));
+        }
+        if self.answer_id != command.answer_id
+            || self.ask_ref != command.ask_ref
+            || self.instance_ref != command.instance_ref
+            || self.policy != command.policy
+            || self.respondent_ref != command.respondent_ref
+            || self.answered_at.instance_ref != command.instance_ref
+        {
+            return Err(ProtocolError::Mismatch("human answer receipt"));
+        }
+        nonempty("suspended turn command id", &self.turn_command_id)?;
+        if self.answered_at.sequence == 0 {
+            return Err(ProtocolError::Invalid(
+                "human answer event position must be nonzero",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
