@@ -71,6 +71,40 @@ pub struct StoredEvent {
     pub sequence: i64,
 }
 
+/// Restorable-context RC-3: a request to capture a consistent-cut checkpoint of
+/// an instance at a quiescent point. The three planes the cut binds are the
+/// agent transcript position (`transcript_ref`), the instance event-log
+/// sequence (captured as the checkpoint event's own sequence), and the
+/// file-store manifest hash (folded from `file.write.completed` facts at the
+/// cut). Models `checkpointReq(cutId)` in models/maude/restorable-context.maude.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointCapture<'a> {
+    pub instance_id: &'a str,
+    /// Caller-supplied stable identifier for this cut (surfaces to `whip
+    /// restore <cut_id>`).
+    pub cut_id: &'a str,
+    /// The transcript position at the cut — the owned-harness `checkpoint`
+    /// callback's step marker (Plane 1). `None` when the instance has no
+    /// brokered transcript yet.
+    pub transcript_ref: Option<&'a str>,
+    /// Idempotency key so a re-requested capture of the same cut is absorbed
+    /// rather than duplicated.
+    pub idempotency_key: Option<&'a str>,
+}
+
+/// Restorable-context RC-3: the recorded consistent cut. `sequence` is the
+/// checkpoint event's own event-log index — the single cut coordinate that
+/// `rebuild_projections_to` (Plane 2) and `load_brokered_transcript_at`
+/// (Plane 1) key off. Models `cut(cutId, tPos, seqN, mHash)`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedCheckpoint {
+    pub cut_id: String,
+    pub event_id: String,
+    pub sequence: i64,
+    pub manifest_hash: String,
+    pub file_count: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NewEvent<'a> {
     pub instance_id: &'a str,
@@ -5528,6 +5562,86 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Restorable-context RC-3: capture a consistent-cut checkpoint at a
+    /// quiescent point. In ONE `Immediate` transaction this (1) refuses unless
+    /// the instance is quiescent — no effect mid-run (INV-2 no-in-flight
+    /// straddle); (2) folds the file-store manifest from every
+    /// `file.write.completed` fact so far, latest-write-wins per path; (3)
+    /// stores that manifest content-addressed BEFORE the cut references its
+    /// hash, in the same transaction, so no committed cut names a manifest hash
+    /// absent from the blob store (INV-4 coherence); and (4) appends the
+    /// `context.checkpoint` event as the cut carrier. The event's own `sequence`
+    /// is the single cut coordinate that `rebuild_projections_to` (Plane 2) and
+    /// `load_brokered_transcript_at` (Plane 1) key off, binding all three planes
+    /// to one point. Models the `checkpoint` rule in
+    /// models/maude/restorable-context.maude.
+    pub fn capture_checkpoint(
+        &mut self,
+        capture: CheckpointCapture<'_>,
+    ) -> StoreResult<CapturedCheckpoint> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let running: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM effects WHERE instance_id = ?1 AND status = 'running'",
+            [capture.instance_id],
+            |row| row.get(0),
+        )?;
+        if running > 0 {
+            return Err(StoreError::Conflict(format!(
+                "checkpoint requires a quiescent instance; {running} effect(s) still running"
+            )));
+        }
+        let fact_payloads: Vec<String> = {
+            let mut statement = tx.prepare(
+                r#"
+                SELECT payload_json
+                FROM events
+                WHERE instance_id = ?1 AND event_type = 'fact.derived'
+                ORDER BY sequence
+                "#,
+            )?;
+            let rows = statement
+                .query_map([capture.instance_id], |row| row.get::<_, String>(0))?
+                .collect::<result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        let (manifest_json, manifest) = fold_file_manifest(&fact_payloads)?;
+        let manifest_hash = stable_hash_hex(&manifest_json);
+        tx.execute(
+            "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+            params![manifest_hash, manifest_json, manifest_json.len() as i64],
+        )?;
+        let payload = json!({
+            "cut_id": capture.cut_id,
+            "transcript_ref": capture.transcript_ref,
+            "manifest_hash": manifest_hash,
+            "manifest": manifest,
+            "file_count": manifest.len(),
+        })
+        .to_string();
+        let event = append_event_on(
+            &tx,
+            NewEvent {
+                instance_id: capture.instance_id,
+                event_type: "context.checkpoint",
+                payload_json: &payload,
+                source: "restorable-context",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: capture.idempotency_key,
+            },
+        )?;
+        tx.commit()?;
+        Ok(CapturedCheckpoint {
+            cut_id: capture.cut_id.to_owned(),
+            event_id: event.event_id,
+            sequence: event.sequence,
+            manifest_hash,
+            file_count: manifest.len(),
+        })
+    }
+
     pub fn table_exists(&self, table: &str) -> StoreResult<bool> {
         self.connection
             .query_row(
@@ -5671,6 +5785,15 @@ pub trait RuntimeStore {
     fn put_content(&self, body: &str) -> StoreResult<String>;
     /// Read a captured file body back by content id, or `None` if never held.
     fn get_content(&self, id: &str) -> StoreResult<Option<String>>;
+    /// Restorable-context RC-3: capture a consistent-cut checkpoint at a
+    /// quiescent point, binding the three planes to one cut coordinate (the
+    /// checkpoint event's sequence). Refuses if the instance is not quiescent
+    /// (INV-2) and stores the file manifest content-addressed before the cut
+    /// references it (INV-4). See the inherent method for the full contract.
+    fn capture_checkpoint(
+        &mut self,
+        capture: CheckpointCapture<'_>,
+    ) -> StoreResult<CapturedCheckpoint>;
     fn register_script_capability(
         &self,
         registration: ScriptCapabilityRegistration<'_>,
@@ -5969,6 +6092,13 @@ impl RuntimeStore for SqliteStore {
 
     fn get_content(&self, id: &str) -> StoreResult<Option<String>> {
         SqliteStore::get_content(self, id)
+    }
+
+    fn capture_checkpoint(
+        &mut self,
+        capture: CheckpointCapture<'_>,
+    ) -> StoreResult<CapturedCheckpoint> {
+        SqliteStore::capture_checkpoint(self, capture)
     }
 
     fn register_script_capability(
@@ -6280,6 +6410,39 @@ fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceView
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
     })
+}
+
+#[cfg(feature = "native")]
+/// Restorable-context RC-3: fold the file-store manifest at a cut from the
+/// sequence-ordered `fact.derived` event payloads of an instance. Only
+/// `file.write.completed` facts contribute; the RC-1 write value they carry
+/// lives at `payload.value.value` (the outer `value` is the fact body, the
+/// inner is the write descriptor `{store, path, ..., content_hash}`). Later
+/// writes to the same path supersede earlier ones (latest-wins), so the folded
+/// map is the file-plane state as of the cut. Returned as a `BTreeMap` (sorted
+/// by path) and its deterministic JSON serialization, so two cuts over the same
+/// file state hash identically. Backend-agnostic — native and DO both fold the
+/// same way after their own ordered SELECT.
+fn fold_file_manifest(fact_payloads: &[String]) -> StoreResult<(String, BTreeMap<String, String>)> {
+    let mut manifest: BTreeMap<String, String> = BTreeMap::new();
+    for payload_json in fact_payloads {
+        let payload: Value = serde_json::from_str(payload_json)?;
+        if payload.get("name").and_then(Value::as_str) != Some("file.write.completed") {
+            continue;
+        }
+        let descriptor = payload.get("value").and_then(|fact| fact.get("value"));
+        let path = descriptor
+            .and_then(|value| value.get("path"))
+            .and_then(Value::as_str);
+        let content_hash = descriptor
+            .and_then(|value| value.get("content_hash"))
+            .and_then(Value::as_str);
+        if let (Some(path), Some(content_hash)) = (path, content_hash) {
+            manifest.insert(path.to_owned(), content_hash.to_owned());
+        }
+    }
+    let manifest_json = serde_json::to_string(&manifest)?;
+    Ok((manifest_json, manifest))
 }
 
 #[cfg(feature = "native")]
@@ -13001,6 +13164,166 @@ mod tests {
         assert!(
             effect_exists(&store, "effect-b"),
             "effect B present in full"
+        );
+    }
+
+    #[test]
+    fn capture_checkpoint_folds_manifest_and_records_cut_at_quiescence() {
+        // RC-3: at a quiescent point, capture folds the file manifest from the
+        // file.write.completed facts (latest-write-wins per path), stores it
+        // content-addressed (INV-4: hash present), and records the
+        // context.checkpoint cut carrier whose sequence is the cut coordinate.
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Checkpoint", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        // Helper: derive a file.write.completed fact for `path` -> `content_hash`
+        // in the RC-1 payload shape (write descriptor nested at value.value).
+        let write_fact = |store: &mut SqliteStore, key: &str, path: &str, content_hash: &str| {
+            let value_json = json!({
+                "effect_id": key,
+                "run_id": format!("run-{key}"),
+                "status": "completed",
+                "value": { "store": "workspace", "path": path, "content_hash": content_hash },
+            })
+            .to_string();
+            store
+                .derive_fact(DerivedFact {
+                    instance_id: &instance.instance_id,
+                    fact: NewFact {
+                        fact_id: key,
+                        name: "file.write.completed",
+                        key,
+                        value_json: &value_json,
+                        schema_id: None,
+                        provenance_class: "derived",
+                        correlation_id: None,
+                        source_span_json: None,
+                    },
+                    source: "kernel",
+                    causation_id: None,
+                    idempotency_key: Some(key),
+                })
+                .expect("file.write.completed fact derives")
+        };
+
+        write_fact(&mut store, "w-a1", "a.txt", "hash-a1");
+        write_fact(&mut store, "w-b1", "b.txt", "hash-b1");
+        // Overwrite a.txt: the later write must supersede the earlier hash.
+        let last = write_fact(&mut store, "w-a2", "a.txt", "hash-a2");
+
+        let checkpoint = store
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: &instance.instance_id,
+                cut_id: "cut-1",
+                transcript_ref: Some("step-7"),
+                idempotency_key: Some("checkpoint-cut-1"),
+            })
+            .expect("checkpoint captures at quiescence");
+
+        assert_eq!(checkpoint.cut_id, "cut-1");
+        assert_eq!(
+            checkpoint.file_count, 2,
+            "two distinct paths in the manifest"
+        );
+        assert!(
+            checkpoint.sequence > last.sequence,
+            "checkpoint event is the latest sequence (the cut coordinate)"
+        );
+
+        // INV-4: the manifest hash the cut names is present in the blob store,
+        // and it is exactly the latest-wins path->hash map.
+        let manifest_body = store
+            .get_content(&checkpoint.manifest_hash)
+            .expect("manifest blob read")
+            .expect("manifest blob present");
+        let manifest: BTreeMap<String, String> =
+            serde_json::from_str(&manifest_body).expect("manifest parses");
+        assert_eq!(manifest.get("a.txt").map(String::as_str), Some("hash-a2"));
+        assert_eq!(manifest.get("b.txt").map(String::as_str), Some("hash-b1"));
+
+        // The cut carrier is a context.checkpoint event at the returned sequence.
+        let event_type: String = store
+            .connection
+            .query_row(
+                "SELECT event_type FROM events WHERE instance_id = ?1 AND sequence = ?2",
+                params![instance.instance_id, checkpoint.sequence],
+                |row| row.get(0),
+            )
+            .expect("checkpoint event row");
+        assert_eq!(event_type, "context.checkpoint");
+
+        // The cut carrier is NOT a state-changing event: replaying to its own
+        // sequence reproduces the same manifest fold (it is a no-op for the fold).
+        store
+            .rebuild_projections_to(&instance.instance_id, checkpoint.sequence)
+            .expect("bounded replay to the cut");
+        assert!(
+            store
+                .fact_exists(&instance.instance_id, "file.write.completed")
+                .expect("fact exists check"),
+            "file.write.completed facts survive replay to the cut"
+        );
+    }
+
+    #[test]
+    fn capture_checkpoint_refuses_when_an_effect_is_in_flight() {
+        // RC-3 INV-2 (no-in-flight straddle): a checkpoint is only a consistent
+        // cut at a quiescent point. With an effect mid-run, capture refuses.
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("CheckpointBusy", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("tell", "agent.tell", "checkpoint-busy-key")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-checkpoint-busy"),
+            })
+            .expect("effect commits");
+        store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                run_id: "run-busy",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-busy",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts (effect now running)");
+
+        let refused = store.capture_checkpoint(CheckpointCapture {
+            instance_id: &instance.instance_id,
+            cut_id: "cut-busy",
+            transcript_ref: None,
+            idempotency_key: None,
+        });
+        assert!(
+            matches!(refused, Err(StoreError::Conflict(_))),
+            "checkpoint refuses while an effect is running, got {refused:?}"
         );
     }
 

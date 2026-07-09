@@ -1119,6 +1119,36 @@ fn do_append_event<Sql: DoSql>(sql: &Sql, event: NewEvent<'_>) -> StoreResult<St
     })
 }
 
+/// Restorable-context RC-3: fold the file-store manifest at a cut from the
+/// sequence-ordered `fact.derived` event payloads. Mirrors the native
+/// `fold_file_manifest` verbatim (pure serde_json + `BTreeMap`): only
+/// `file.write.completed` facts contribute, the RC-1 write descriptor lives at
+/// `payload.value.value`, latest-write-wins per path, and the map serializes
+/// deterministically (sorted by path) so identical file states hash identically.
+fn do_fold_file_manifest(
+    fact_payloads: &[String],
+) -> StoreResult<(String, BTreeMap<String, String>)> {
+    let mut manifest: BTreeMap<String, String> = BTreeMap::new();
+    for payload_json in fact_payloads {
+        let payload: Value = serde_json::from_str(payload_json)?;
+        if payload.get("name").and_then(Value::as_str) != Some("file.write.completed") {
+            continue;
+        }
+        let descriptor = payload.get("value").and_then(|fact| fact.get("value"));
+        let path = descriptor
+            .and_then(|value| value.get("path"))
+            .and_then(Value::as_str);
+        let content_hash = descriptor
+            .and_then(|value| value.get("content_hash"))
+            .and_then(Value::as_str);
+        if let (Some(path), Some(content_hash)) = (path, content_hash) {
+            manifest.insert(path.to_owned(), content_hash.to_owned());
+        }
+    }
+    let manifest_json = serde_json::to_string(&manifest)?;
+    Ok((manifest_json, manifest))
+}
+
 /// The `effect.terminal` event payload, mirroring `effect_completion_payload`.
 fn effect_completion_payload(
     completion: &EffectCompletion<'_>,
@@ -4871,6 +4901,81 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .query("SELECT body FROM content_blobs WHERE id = ?1", &[text(id)])
             .map_err(sql_err)?;
         Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+
+    fn capture_checkpoint(
+        &mut self,
+        capture: CheckpointCapture<'_>,
+    ) -> StoreResult<CapturedCheckpoint> {
+        // INV-2 no-in-flight straddle: a checkpoint is a consistent cut only at
+        // a quiescent point; refuse if any effect is mid-run.
+        let running_rows = self
+            .sql
+            .query(
+                "SELECT COUNT(*) FROM effects WHERE instance_id = ?1 AND status = 'running'",
+                &[text(capture.instance_id)],
+            )
+            .map_err(sql_err)?;
+        let running = running_rows.first().map(|row| as_i64(&row[0])).unwrap_or(0);
+        if running > 0 {
+            return Err(StoreError::Conflict(format!(
+                "checkpoint requires a quiescent instance; {running} effect(s) still running"
+            )));
+        }
+        // Fold the manifest from all file.write.completed facts so far. The
+        // checkpoint event appended below is not a file write, so folding over
+        // the current max sequence equals folding <= the checkpoint's own.
+        let fact_rows = self
+            .sql
+            .query(
+                "SELECT payload_json FROM events \
+                 WHERE instance_id = ?1 AND event_type = 'fact.derived' ORDER BY sequence",
+                &[text(capture.instance_id)],
+            )
+            .map_err(sql_err)?;
+        let fact_payloads: Vec<String> = fact_rows.iter().map(|row| as_text(&row[0])).collect();
+        let (manifest_json, manifest) = do_fold_file_manifest(&fact_payloads)?;
+        // INV-4 coherence: store the manifest content-addressed BEFORE the cut
+        // references its hash (same DO SQLite), so no committed cut names a
+        // manifest hash absent from the blob store.
+        let manifest_hash = stable_hash_hex(&manifest_json);
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+                &[
+                    text(&manifest_hash),
+                    text(&manifest_json),
+                    int(manifest_json.len() as i64),
+                ],
+            )
+            .map_err(sql_err)?;
+        let payload = serde_json::json!({
+            "cut_id": capture.cut_id,
+            "transcript_ref": capture.transcript_ref,
+            "manifest_hash": manifest_hash,
+            "manifest": manifest,
+            "file_count": manifest.len(),
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: capture.instance_id,
+                event_type: "context.checkpoint",
+                payload_json: &payload,
+                source: "restorable-context",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: capture.idempotency_key,
+            },
+        )?;
+        Ok(CapturedCheckpoint {
+            cut_id: capture.cut_id.to_owned(),
+            event_id: event.event_id,
+            sequence: event.sequence,
+            manifest_hash,
+            file_count: manifest.len(),
+        })
     }
 
     fn register_script_capability(
@@ -10384,6 +10489,124 @@ mod tests {
         store.rebuild_projections("i1").expect("full rebuild");
         assert!(effect_exists(&store, "eff_a"), "effect A present in full");
         assert!(effect_exists(&store, "eff_b"), "effect B present in full");
+    }
+
+    /// RC-3 DO mirror: capture_checkpoint folds the file manifest from
+    /// file.write.completed facts (latest-write-wins), stores it
+    /// content-addressed (INV-4), records the context.checkpoint cut carrier,
+    /// and refuses while an effect is running (INV-2 no-in-flight straddle).
+    #[test]
+    fn do_store_capture_checkpoint_folds_manifest_and_guards_quiescence() {
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text("i1"),
+                    text("p"),
+                    text("ver_1"),
+                    int(0),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed instance");
+
+        // Insert file.write.completed fact.derived events in the RC-1 payload
+        // shape (write descriptor nested at value.value); a.txt is overwritten.
+        let write_event = |store: &DoSqliteStore<super::test_support::RusqliteDoSql>,
+                           seq: i64,
+                           key: &str,
+                           path: &str,
+                           content_hash: &str| {
+            let payload = serde_json::json!({
+                "name": "file.write.completed",
+                "key": key,
+                "value": {
+                    "effect_id": key,
+                    "value": { "store": "workspace", "path": path, "content_hash": content_hash },
+                },
+            })
+            .to_string();
+            store
+                .sql
+                .execute(
+                    "INSERT INTO events (event_id, instance_id, sequence, event_type, \
+                     payload_json, occurred_at, source) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    &[
+                        text(&format!("evt_{key}")),
+                        text("i1"),
+                        int(seq),
+                        text("fact.derived"),
+                        text(&payload),
+                        text("2030-01-01T00:00:00Z"),
+                        text("kernel"),
+                    ],
+                )
+                .expect("insert fact.derived event");
+        };
+        write_event(&store, 1, "w-a1", "a.txt", "hash-a1");
+        write_event(&store, 2, "w-b1", "b.txt", "hash-b1");
+        write_event(&store, 3, "w-a2", "a.txt", "hash-a2");
+
+        let checkpoint = store
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: "i1",
+                cut_id: "cut-1",
+                transcript_ref: Some("step-7"),
+                idempotency_key: Some("checkpoint-cut-1"),
+            })
+            .expect("checkpoint captures at quiescence");
+        assert_eq!(checkpoint.file_count, 2);
+        assert!(checkpoint.sequence > 3, "checkpoint is the latest sequence");
+
+        let manifest_body = store
+            .get_content(&checkpoint.manifest_hash)
+            .expect("manifest read")
+            .expect("manifest present");
+        let manifest: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&manifest_body).expect("manifest parses");
+        assert_eq!(manifest.get("a.txt").map(String::as_str), Some("hash-a2"));
+        assert_eq!(manifest.get("b.txt").map(String::as_str), Some("hash-b1"));
+
+        let carrier = store
+            .sql
+            .query(
+                "SELECT event_type FROM events WHERE instance_id = ?1 AND sequence = ?2",
+                &[text("i1"), int(checkpoint.sequence)],
+            )
+            .expect("carrier row");
+        assert_eq!(as_text(&carrier[0][0]), "context.checkpoint");
+
+        // INV-2: with an effect running, a further capture refuses.
+        store
+            .sql
+            .execute(
+                "INSERT INTO effects (effect_id, instance_id, kind, status) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    text("eff_run"),
+                    text("i1"),
+                    text("agent.tell"),
+                    text("running"),
+                ],
+            )
+            .expect("seed running effect");
+        let refused = store.capture_checkpoint(CheckpointCapture {
+            instance_id: "i1",
+            cut_id: "cut-busy",
+            transcript_ref: None,
+            idempotency_key: None,
+        });
+        assert!(
+            matches!(refused, Err(StoreError::Conflict(_))),
+            "checkpoint refuses while an effect runs, got {refused:?}"
+        );
     }
 
     /// answer_inbox_item answers a pending item (guarded), records the

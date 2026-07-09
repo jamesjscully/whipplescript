@@ -294,6 +294,13 @@ impl RuntimeStore for NativeStores {
         self.runtime.get_content(id)
     }
 
+    fn capture_checkpoint(
+        &mut self,
+        capture: CheckpointCapture<'_>,
+    ) -> StoreResult<CapturedCheckpoint> {
+        self.runtime.capture_checkpoint(capture)
+    }
+
     fn register_script_capability(
         &self,
         registration: ScriptCapabilityRegistration<'_>,
