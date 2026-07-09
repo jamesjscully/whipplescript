@@ -21,6 +21,7 @@ use whipplescript_kernel::sansio::{HostDriver, HttpResponse, IoRequest, IoResult
 use whipplescript_kernel::{
     idempotency_key, BrokeredTurnContext, ProgramVersionInput, RuntimeKernel,
 };
+use whipplescript_parser::IrProgram;
 use whipplescript_store::{
     EvidenceRecord, NewEffect, NewEvent, RuleCommit, SqliteStore, StoreError,
 };
@@ -39,13 +40,55 @@ use crate::ifc::VerifiedEnvelope;
 /// the package already declares.
 #[derive(Clone, Debug)]
 pub struct ResolvedPackage {
-    pub version_ref: String,
-    pub source_hash: String,
-    pub ir_hash: String,
-    pub agent: String,
-    pub system_prompt: String,
-    pub tools: Vec<ToolSpec>,
-    pub max_steps: usize,
+    version_ref: String,
+    source_hash: String,
+    ir_hash: String,
+    agent: String,
+    system_prompt: String,
+    tools: Vec<ToolSpec>,
+    max_steps: usize,
+    program: IrProgram,
+}
+
+impl ResolvedPackage {
+    /// Compile the exact pinned WhippleScript source the host resolved. Package
+    /// identity is derived from those bytes; the resulting IR is retained so
+    /// runtime admission can execute WhippleScript's IFC checker under the
+    /// verified governance envelope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile(
+        version_ref: impl Into<String>,
+        source: &str,
+        root: Option<&str>,
+        agent: impl Into<String>,
+        system_prompt: impl Into<String>,
+        tools: Vec<ToolSpec>,
+        max_steps: usize,
+    ) -> Result<Self, String> {
+        let compiled = whipplescript_parser::compile_program_with_root(source, root);
+        let program = compiled.ir.ok_or_else(|| {
+            compiled
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })?;
+        let source_hash = sha256_hex(source.as_bytes());
+        let ir_hash = sha256_hex(
+            format!("{}:{}:{}", source_hash, program.workflow, HOST_PROTOCOL).as_bytes(),
+        );
+        Ok(Self {
+            version_ref: version_ref.into(),
+            source_hash,
+            ir_hash,
+            agent: agent.into(),
+            system_prompt: system_prompt.into(),
+            tools,
+            max_steps,
+            program,
+        })
+    }
 }
 
 /// Resolve an immutable WhippleScript package version by opaque reference.
@@ -198,6 +241,7 @@ impl GovernedHostRuntime {
             .resolve_package(&command.package_version_ref)
             .map_err(HostRuntimeError::Resolver)?;
         validate_package(&package, &command.package_version_ref)?;
+        self.check_package_ifc(&package)?;
 
         let version = self
             .kernel
@@ -341,6 +385,7 @@ impl GovernedHostRuntime {
             .resolve_package(&command.package_version_ref)
             .map_err(HostRuntimeError::Resolver)?;
         validate_package(&package, &command.package_version_ref)?;
+        self.check_package_ifc(&package)?;
         let command_json = serde_json::to_string(command).map_err(HostRuntimeError::Json)?;
         let effects = self
             .kernel
@@ -487,6 +532,7 @@ impl GovernedHostRuntime {
             .resolve_package(&command.package_version_ref)
             .map_err(HostRuntimeError::Resolver)?;
         validate_package(&package, &command.package_version_ref)?;
+        self.check_package_ifc(&package)?;
         let version = self
             .kernel
             .store()
@@ -530,6 +576,7 @@ impl GovernedHostRuntime {
             "placement_ceiling_ref": command.placement_ceiling_ref,
             "guarantees": [
                 "signed_policy_identity_verified",
+                "package_ifc_checked_under_verified_envelope",
                 "instance_package_policy_binding_verified",
                 "resource_provider_placement_handles_governed",
                 "tool_surface_pinned_to_package",
@@ -772,6 +819,20 @@ impl GovernedHostRuntime {
         }
     }
 
+    fn check_package_ifc(&self, package: &ResolvedPackage) -> Result<(), HostRuntimeError> {
+        let diagnostics = crate::ifc::check_with_envelope(&package.program, &self.envelope);
+        if diagnostics.is_empty() {
+            Ok(())
+        } else {
+            Err(HostRuntimeError::Ifc(
+                diagnostics
+                    .into_iter()
+                    .map(|diagnostic| diagnostic.message)
+                    .collect(),
+            ))
+        }
+    }
+
     fn label_ref(&self) -> String {
         format!("whip:label:{}:turn-join", self.policy.envelope_hash)
     }
@@ -857,6 +918,7 @@ pub enum HostRuntimeError {
     Protocol(ProtocolError),
     PolicyRejected(String),
     UngovernedHandle(String),
+    Ifc(Vec<String>),
     UnknownInstance(String),
     Incomplete(String),
     Resolver(String),
@@ -872,6 +934,11 @@ impl fmt::Display for HostRuntimeError {
             Self::UngovernedHandle(handle) => {
                 write!(formatter, "host handle is not governed: {handle}")
             }
+            Self::Ifc(diagnostics) => write!(
+                formatter,
+                "package violates the admitted information-flow policy: {}",
+                diagnostics.join("; ")
+            ),
             Self::UnknownInstance(instance) => write!(formatter, "unknown instance: {instance}"),
             Self::Incomplete(command) => write!(formatter, "turn is not terminal: {command}"),
             Self::Resolver(message) => write!(formatter, "host resolver refused: {message}"),
@@ -899,12 +966,23 @@ fn validate_package(package: &ResolvedPackage, expected_ref: &str) -> Result<(),
         || package.ir_hash.trim().is_empty()
         || package.agent.trim().is_empty()
         || package.max_steps == 0
+        || !package
+            .program
+            .agents
+            .iter()
+            .any(|agent| agent.name == package.agent)
     {
         return Err(HostRuntimeError::Resolver(
             "resolved package is incomplete".to_owned(),
         ));
     }
     Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn positive_sequence(sequence: i64) -> Result<u64, HostRuntimeError> {
@@ -977,13 +1055,38 @@ mod tests {
 
     impl PackageResolver for Packages {
         fn resolve_package(&self, version_ref: &str) -> Result<ResolvedPackage, String> {
-            Ok(ResolvedPackage {
-                version_ref: version_ref.to_owned(),
-                source_hash: "source-v1".to_owned(),
-                ir_hash: "ir-v1".to_owned(),
-                agent: "assistant".to_owned(),
-                system_prompt: "Help through the governed resource tools.".to_owned(),
-                tools: vec![ToolSpec {
+            ResolvedPackage::compile(
+                version_ref,
+                r#"
+file store project {
+  root "."
+  allow read ["**"]
+  allow write ["**"]
+}
+
+workflow HostChat {
+  agent assistant {
+    provider owned
+    profile "repo-writer"
+    capacity 1
+  }
+
+  rule converse
+    when started
+  => {
+    tell assistant
+      with access to project {
+        read ["**"]
+        write ["**"]
+      }
+      "host turn"
+  }
+}
+"#,
+                Some("HostChat"),
+                "assistant",
+                "Help through the governed resource tools.",
+                vec![ToolSpec {
                     name: "read".to_owned(),
                     description: "Read an admitted resource.".to_owned(),
                     input_schema: json!({
@@ -993,8 +1096,47 @@ mod tests {
                         "additionalProperties": false
                     }),
                 }],
-                max_steps: 4,
-            })
+                4,
+            )
+        }
+    }
+
+    struct UnsafePackages;
+
+    impl PackageResolver for UnsafePackages {
+        fn resolve_package(&self, version_ref: &str) -> Result<ResolvedPackage, String> {
+            ResolvedPackage::compile(
+                version_ref,
+                r#"
+file store project {
+  root "."
+  allow read ["**"]
+}
+
+workflow UnsafeHostChat {
+  agent assistant {
+    provider fixture
+    profile "repo-reader"
+    capacity 1
+  }
+
+  rule leak
+    when started
+  => {
+    tell assistant
+      with access to project {
+        read ["**"]
+      }
+      "leak the project"
+  }
+}
+"#,
+                Some("UnsafeHostChat"),
+                "assistant",
+                "unsafe",
+                Vec::new(),
+                1,
+            )
         }
     }
 
@@ -1077,6 +1219,7 @@ mod tests {
         SignedEnvelope::sign_for_test(
             "grant file_store project -> file:/workspace readable by Operator\n\
              grant provider model -> provider:openai readable by Operator\n\
+             grant provider owned -> provider:owned readable by Operator\n\
              grant placement local -> placement:local readable by Operator\n",
             "gaugedesk-admin",
         )
@@ -1220,6 +1363,25 @@ mod tests {
             .expect_err("ungoverned resource");
         assert!(matches!(error, HostRuntimeError::UngovernedHandle(_)));
         assert_eq!(secrets.calls.get(), 0);
+        drop(runtime);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn package_ifc_violation_is_rejected_before_an_instance_opens() {
+        let path = temp_store();
+        let policy_text = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 4, &policy_text).expect("runtime");
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-unsafe-chat".to_owned(),
+            package_version_ref: "package:unsafe".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let error = runtime
+            .open_instance(&open, &UnsafePackages)
+            .expect_err("IFC violation");
+        assert!(matches!(error, HostRuntimeError::Ifc(_)));
         drop(runtime);
         let _ = fs::remove_file(&path);
     }

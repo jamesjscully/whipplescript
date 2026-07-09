@@ -31,9 +31,12 @@ not resource bodies or credentials.
 | `ResourceResolver` | Resolve image bytes and execute package-declared tools against only the resource refs admitted for the turn. |
 
 The facade fails closed unless the signed envelope governs every resource,
-provider binding, and placement handle. It binds instances to package content
-hashes and policy identity, rejects cross-binding reuse, and persists only
-references/evidence—not resolved provider secrets.
+provider binding, and placement handle. `ResolvedPackage::compile` retains the
+pinned program IR, and instance/turn admission runs WhippleScript's IFC checker
+over that IR under the verified envelope before any secret is resolved. The
+facade binds instances to package content hashes and policy identity, rejects
+cross-binding reuse, and persists only references/evidence—not resolved
+provider secrets.
 
 ## `whipplescript-core`
 
