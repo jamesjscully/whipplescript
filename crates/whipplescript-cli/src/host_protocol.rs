@@ -69,6 +69,62 @@ pub struct TurnInput {
     pub images: Vec<ResourceRef>,
 }
 
+/// Open a durable WhippleScript instance for one host-owned chat. WhippleScript
+/// issues the instance reference; the host persists that opaque reference with
+/// its chat record and presents it on later turn commands.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OpenInstanceCommand {
+    pub protocol: String,
+    pub request_id: String,
+    pub package_version_ref: String,
+    pub policy: PolicyEpochRef,
+}
+
+impl OpenInstanceCommand {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.protocol != HOST_PROTOCOL {
+            return Err(ProtocolError::WrongVersion(self.protocol.clone()));
+        }
+        nonempty("open-instance request id", &self.request_id)?;
+        nonempty("package version ref", &self.package_version_ref)?;
+        self.policy.validate()
+    }
+}
+
+/// WhippleScript's durable answer to [`OpenInstanceCommand`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OpenedInstance {
+    pub protocol: String,
+    pub request_id: String,
+    pub instance_ref: String,
+    pub package_version_ref: String,
+    pub policy: PolicyEpochRef,
+    pub opened_at: EventPosition,
+}
+
+impl OpenedInstance {
+    pub fn validate_for(&self, command: &OpenInstanceCommand) -> Result<(), ProtocolError> {
+        command.validate()?;
+        if self.protocol != HOST_PROTOCOL {
+            return Err(ProtocolError::WrongVersion(self.protocol.clone()));
+        }
+        if self.request_id != command.request_id
+            || self.package_version_ref != command.package_version_ref
+            || self.policy != command.policy
+            || self.opened_at.instance_ref != self.instance_ref
+        {
+            return Err(ProtocolError::Mismatch("opened instance"));
+        }
+        nonempty("instance ref", &self.instance_ref)?;
+        if self.opened_at.sequence == 0 {
+            return Err(ProtocolError::Invalid(
+                "instance-open event position must be nonzero",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The command GaugeDesk admits before WhippleScript begins a turn.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StartTurnCommand {
@@ -255,6 +311,32 @@ mod tests {
         assert!(!json.contains("resource body"));
         let decoded: StartTurnCommand = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn opened_instance_is_bound_to_package_and_policy() {
+        let command = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-chat-1".to_owned(),
+            package_version_ref: "whip:package-version:1".to_owned(),
+            policy: policy(),
+        };
+        let opened = OpenedInstance {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: command.request_id.clone(),
+            instance_ref: "whip:instance:1".to_owned(),
+            package_version_ref: command.package_version_ref.clone(),
+            policy: command.policy.clone(),
+            opened_at: EventPosition {
+                instance_ref: "whip:instance:1".to_owned(),
+                sequence: 1,
+            },
+        };
+        opened.validate_for(&command).expect("bound");
+
+        let mut mixed = opened;
+        mixed.policy.epoch += 1;
+        assert!(mixed.validate_for(&command).is_err());
     }
 
     #[test]

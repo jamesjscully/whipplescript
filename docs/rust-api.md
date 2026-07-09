@@ -5,6 +5,36 @@ for integration tests, local tooling, and contributors, but they are not a
 published semver contract. Users automating WhippleScript should prefer the CLI
 and the JSON contracts in [JSON reference](json-reference.md).
 
+One exception is the revision-pinned native host surface used by GaugeDesk and
+other embedding hosts. It is intentionally pre-1.0 and must be pinned to an
+exact commit, but its types are public so hosts do not reimplement governance,
+IFC, or turn lifecycle semantics.
+
+## `whipplescript` host library
+
+`host_protocol` defines the placement-neutral `whipplescript.host.v1` wire
+types. `OpenInstanceCommand` opens one durable WhippleScript instance for a
+host chat. `StartTurnCommand`, `LabeledRuntimeEvent`, and `TurnReceipt` carry
+the same verified `PolicyEpochRef`; commands contain resource/provider refs,
+not resource bodies or credentials.
+
+`host_runtime::GovernedHostRuntime` is the native persistent facade:
+
+| Item | Meaning |
+| --- | --- |
+| `open(store_path, epoch, signed_envelope)` | Open/reopen SQLite and bind the runtime to the exact verified policy epoch. |
+| `open_instance(command, packages)` | Resolve a pinned package and issue a durable WhippleScript instance ref. |
+| `run_turn(...)` | Run the owned brokered loop with the native HTTP driver, persistent transcript, evidence projection, and terminal receipt. |
+| `run_turn_with_driver(...)` | Drive the same sans-I/O machine with a host-supplied transport (tests and remote placements). |
+| `PackageResolver` | Resolve immutable WhippleScript package bytes/IR and its package-declared tool schemas. |
+| `SecretResolver` | Resolve provider credentials ephemerally, after policy admission. |
+| `ResourceResolver` | Resolve image bytes and execute package-declared tools against only the resource refs admitted for the turn. |
+
+The facade fails closed unless the signed envelope governs every resource,
+provider binding, and placement handle. It binds instances to package content
+hashes and policy identity, rejects cross-binding reuse, and persists only
+references/evidence—not resolved provider secrets.
+
 ## `whipplescript-core`
 
 | Item | Meaning |

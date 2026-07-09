@@ -6,5 +6,6 @@
 
 pub mod gov;
 pub mod host_protocol;
+pub mod host_runtime;
 pub mod ifc;
 pub mod principal;
