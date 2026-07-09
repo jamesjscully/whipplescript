@@ -16,6 +16,10 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
   and bind a policy epoch to the verified canonical hash and signer without
   reimplementing WhippleScript's policy parser or security algebra. A malformed
   configured envelope fails closed instead of becoming an ungoverned run.
+- The same library publishes `whipplescript.host.v1`: policy-bound turn commands,
+  labeled evidence references, stable event positions, and terminal receipts.
+  Receipt validation rejects command/run/instance/policy mixups, while resource
+  and provider inputs remain references rather than copied bodies or secrets.
 
 ## [0.2.0] — 2026-07-06
 
