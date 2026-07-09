@@ -5348,6 +5348,33 @@ impl SqliteStore {
     }
 
     pub fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {
+        self.rebuild_projections_impl(instance_id, None)
+    }
+
+    /// RC-2 Delta A: bounded projection replay. Reconstructs the instance's
+    /// projection tables AS OF event `up_to_sequence` — every persisted event
+    /// with `sequence <= up_to_sequence` is applied, none after. `N` is
+    /// INCLUSIVE (the event at the named sequence is itself replayed). Same
+    /// single `Immediate` transaction as the unbounded rebuild; the only
+    /// difference is the `WHERE sequence <= N` cut on the replayed event set.
+    ///
+    /// `up_to_sequence` is the single cut coordinate: the SAME per-instance
+    /// event sequence that `load_brokered_transcript_at` (Plane 1) and the file
+    /// manifest (`file.write.completed` facts ≤ N) key off, so one N names one
+    /// consistent point across all three planes.
+    pub fn rebuild_projections_to(
+        &mut self,
+        instance_id: &str,
+        up_to_sequence: i64,
+    ) -> StoreResult<()> {
+        self.rebuild_projections_impl(instance_id, Some(up_to_sequence))
+    }
+
+    fn rebuild_projections_impl(
+        &mut self,
+        instance_id: &str,
+        up_to_sequence: Option<i64>,
+    ) -> StoreResult<()> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -5393,7 +5420,15 @@ impl SqliteStore {
         tx.execute("DELETE FROM facts WHERE instance_id = ?1", [instance_id])?;
 
         let events = {
-            let mut statement = tx.prepare(
+            // RC-2 Delta A: when a bound is present, cut the replayed event set
+            // at `sequence <= N` (INCLUSIVE). `N` is an i64 so interpolation is
+            // injection-safe; when unbounded the clause is empty, leaving the
+            // full-replay query semantically identical to before.
+            let bound_clause = match up_to_sequence {
+                Some(n) => format!("  AND sequence <= {n}\n"),
+                None => String::new(),
+            };
+            let mut statement = tx.prepare(&format!(
                 r#"
                 SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source
                 FROM events
@@ -5411,9 +5446,9 @@ impl SqliteStore {
                       'effect.cancellation_requested',
                       'lease.expired'
                   )
-                ORDER BY sequence
-                "#,
-            )?;
+                {bound_clause}ORDER BY sequence
+                "#
+            ))?;
             let rows = statement
                 .query_map([instance_id], |row| {
                     Ok((
@@ -12884,6 +12919,89 @@ mod tests {
         assert_eq!(runs[0].status, "running");
         assert!(runs[0].cancel_requested);
         assert_eq!(lease_status(&store, "lease-replay-running"), "active");
+    }
+
+    #[test]
+    fn rebuild_projections_to_reconstructs_instance_state_as_of_sequence() {
+        // RC-2 Delta A: bounded replay reflects instance state AS OF event N —
+        // an effect committed AFTER N is absent; one at/before N is present.
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("BoundedReplay", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        let effect_exists = |store: &SqliteStore, effect_id: &str| -> bool {
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM effects WHERE effect_id = ?1",
+                    [effect_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("effect count")
+                > 0
+        };
+
+        // Commit effect A, then effect B at a strictly later event sequence.
+        let commit_a = store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "rule-a",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("effect-a", "agent.tell", "bounded-key-a")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-bounded-a"),
+            })
+            .expect("effect A commits");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "rule-b",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("effect-b", "agent.tell", "bounded-key-b")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-bounded-b"),
+            })
+            .expect("effect B commits");
+
+        // Cut AT effect A's commit sequence: A is in, B (later) is out.
+        store
+            .rebuild_projections_to(&instance.instance_id, commit_a.sequence)
+            .expect("bounded projections rebuild");
+        assert!(
+            effect_exists(&store, "effect-a"),
+            "effect A (<= N) present after bounded rebuild"
+        );
+        assert!(
+            !effect_exists(&store, "effect-b"),
+            "effect B (> N) absent after bounded rebuild"
+        );
+
+        // Unbounded rebuild restores the full current state (both effects).
+        store
+            .rebuild_projections(&instance.instance_id)
+            .expect("unbounded projections rebuild");
+        assert!(
+            effect_exists(&store, "effect-a"),
+            "effect A present in full"
+        );
+        assert!(
+            effect_exists(&store, "effect-b"),
+            "effect B present in full"
+        );
     }
 
     #[test]

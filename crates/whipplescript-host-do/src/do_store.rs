@@ -3453,6 +3453,165 @@ const WORKFLOW_INVOCATION_SELECT: &str = "SELECT invocation_id, parent_instance_
      ON parent_effect.instance_id = workflow_invocations.parent_instance_id \
      AND parent_effect.effect_id = workflow_invocations.parent_effect_id ";
 
+impl<Sql: DoSql> DoSqliteStore<Sql> {
+    /// RC-2 Delta A (DO mirror): bounded projection replay. Reconstructs the
+    /// instance's projection tables AS OF event `up_to_sequence` — every
+    /// persisted event with `sequence <= up_to_sequence` is applied, none
+    /// after. `N` is INCLUSIVE. When `up_to_sequence` is `None` this is the
+    /// unbounded full rebuild (the `RuntimeStore::rebuild_projections` default,
+    /// byte-identical to before). `up_to_sequence` is the single cut coordinate
+    /// shared with the transcript plane and the file manifest.
+    pub fn rebuild_projections_to(
+        &mut self,
+        instance_id: &str,
+        up_to_sequence: i64,
+    ) -> StoreResult<()> {
+        self.rebuild_projections_impl(instance_id, Some(up_to_sequence))
+    }
+
+    fn rebuild_projections_impl(
+        &mut self,
+        instance_id: &str,
+        up_to_sequence: Option<i64>,
+    ) -> StoreResult<()> {
+        // Detach artifacts from the runs we're about to delete, then re-link the
+        // surviving ones after replay.
+        let artifact_rows = self
+            .sql
+            .query(
+                "SELECT artifact_id, run_id FROM artifacts \
+                 WHERE run_id IN (SELECT run_id FROM runs WHERE instance_id = ?1) \
+                 ORDER BY artifact_id",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        let artifact_run_links: Vec<(String, String)> = artifact_rows
+            .iter()
+            .map(|r| (as_text(&r[0]), as_text(&r[1])))
+            .collect();
+        for (artifact_id, _) in &artifact_run_links {
+            self.sql
+                .execute(
+                    "UPDATE artifacts SET run_id = NULL WHERE artifact_id = ?1",
+                    &[text(artifact_id)],
+                )
+                .map_err(sql_err)?;
+        }
+        for table in [
+            "effect_cancellation_requests",
+            "leases",
+            "runs",
+            "instance_revisions",
+            "effect_dependencies",
+            "effects",
+            "facts",
+        ] {
+            self.sql
+                .execute(
+                    &format!("DELETE FROM {table} WHERE instance_id = ?1"),
+                    &[text(instance_id)],
+                )
+                .map_err(sql_err)?;
+        }
+
+        // RC-2 Delta A: when a bound is present, cut the replayed event set at
+        // `sequence <= N` (INCLUSIVE). `N` is an i64 so interpolation is
+        // injection-safe; when unbounded the clause is empty, leaving the
+        // full-replay query semantically identical to before.
+        let bound_clause = match up_to_sequence {
+            Some(n) => format!(" AND sequence <= {n}"),
+            None => String::new(),
+        };
+        let events = self
+            .sql
+            .query(
+                &format!(
+                    "SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source \
+                     FROM events WHERE instance_id = ?1 AND event_type IN ( \
+                     'rule.committed', 'fact.derived', 'workflow.completed', 'workflow.failed', \
+                     'instance.transitioned', 'workflow.revision_activated', 'effect.run_started', \
+                     'effect.terminal', 'effect.cancelled', 'effect.cancellation_requested', \
+                     'lease.expired'){bound_clause} ORDER BY sequence"
+                ),
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        for row in &events {
+            let event_id = as_text(&row[0]);
+            let event_type = as_text(&row[1]);
+            let payload_json = as_text(&row[2]);
+            let idempotency_key = as_opt_text(&row[3]);
+            let causation_id = as_opt_text(&row[4]);
+            let source = as_text(&row[5]);
+            match event_type.as_str() {
+                "rule.committed" => {
+                    do_replay_rule_commit(&self.sql, instance_id, &event_id, &payload_json)?
+                }
+                "fact.derived" => do_replay_fact_derived(
+                    &self.sql,
+                    instance_id,
+                    &event_id,
+                    &source,
+                    &payload_json,
+                )?,
+                "workflow.completed" | "workflow.failed" => do_replay_workflow_terminal(
+                    &self.sql,
+                    instance_id,
+                    &event_id,
+                    &event_type,
+                    &payload_json,
+                )?,
+                "instance.transitioned" => {
+                    do_replay_instance_transition(&self.sql, instance_id, &event_id, &payload_json)?
+                }
+                "workflow.revision_activated" => do_replay_revision_activation(
+                    &self.sql,
+                    instance_id,
+                    &event_id,
+                    &payload_json,
+                    idempotency_key.as_deref(),
+                )?,
+                "effect.run_started" => {
+                    do_replay_run_started(&self.sql, instance_id, &payload_json)?
+                }
+                "effect.terminal" => {
+                    do_replay_effect_terminal(&self.sql, instance_id, &event_id, &payload_json)?
+                }
+                "effect.cancelled" => {
+                    do_replay_effect_cancelled(&self.sql, instance_id, &event_id, &payload_json)?
+                }
+                "effect.cancellation_requested" => do_replay_cancellation_request(
+                    &self.sql,
+                    instance_id,
+                    &event_id,
+                    &payload_json,
+                    idempotency_key.as_deref(),
+                    causation_id.as_deref(),
+                )?,
+                "lease.expired" => do_replay_lease_expired(&self.sql, instance_id, &payload_json)?,
+                _ => {}
+            }
+        }
+
+        for (artifact_id, run_id) in artifact_run_links {
+            let run_exists = !self
+                .sql
+                .query("SELECT 1 FROM runs WHERE run_id = ?1", &[text(&run_id)])
+                .map_err(sql_err)?
+                .is_empty();
+            if run_exists {
+                self.sql
+                    .execute(
+                        "UPDATE artifacts SET run_id = ?1 WHERE artifact_id = ?2",
+                        &[text(&run_id), text(&artifact_id)],
+                    )
+                    .map_err(sql_err)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[allow(unused_variables, clippy::todo, clippy::too_many_arguments)]
 impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     fn schema_version(&self) -> StoreResult<i64> {
@@ -6352,131 +6511,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {
-        // Detach artifacts from the runs we're about to delete, then re-link the
-        // surviving ones after replay.
-        let artifact_rows = self
-            .sql
-            .query(
-                "SELECT artifact_id, run_id FROM artifacts \
-                 WHERE run_id IN (SELECT run_id FROM runs WHERE instance_id = ?1) \
-                 ORDER BY artifact_id",
-                &[text(instance_id)],
-            )
-            .map_err(sql_err)?;
-        let artifact_run_links: Vec<(String, String)> = artifact_rows
-            .iter()
-            .map(|r| (as_text(&r[0]), as_text(&r[1])))
-            .collect();
-        for (artifact_id, _) in &artifact_run_links {
-            self.sql
-                .execute(
-                    "UPDATE artifacts SET run_id = NULL WHERE artifact_id = ?1",
-                    &[text(artifact_id)],
-                )
-                .map_err(sql_err)?;
-        }
-        for table in [
-            "effect_cancellation_requests",
-            "leases",
-            "runs",
-            "instance_revisions",
-            "effect_dependencies",
-            "effects",
-            "facts",
-        ] {
-            self.sql
-                .execute(
-                    &format!("DELETE FROM {table} WHERE instance_id = ?1"),
-                    &[text(instance_id)],
-                )
-                .map_err(sql_err)?;
-        }
-
-        let events = self
-            .sql
-            .query(
-                "SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source \
-                 FROM events WHERE instance_id = ?1 AND event_type IN ( \
-                 'rule.committed', 'fact.derived', 'workflow.completed', 'workflow.failed', \
-                 'instance.transitioned', 'workflow.revision_activated', 'effect.run_started', \
-                 'effect.terminal', 'effect.cancelled', 'effect.cancellation_requested', \
-                 'lease.expired') ORDER BY sequence",
-                &[text(instance_id)],
-            )
-            .map_err(sql_err)?;
-        for row in &events {
-            let event_id = as_text(&row[0]);
-            let event_type = as_text(&row[1]);
-            let payload_json = as_text(&row[2]);
-            let idempotency_key = as_opt_text(&row[3]);
-            let causation_id = as_opt_text(&row[4]);
-            let source = as_text(&row[5]);
-            match event_type.as_str() {
-                "rule.committed" => {
-                    do_replay_rule_commit(&self.sql, instance_id, &event_id, &payload_json)?
-                }
-                "fact.derived" => do_replay_fact_derived(
-                    &self.sql,
-                    instance_id,
-                    &event_id,
-                    &source,
-                    &payload_json,
-                )?,
-                "workflow.completed" | "workflow.failed" => do_replay_workflow_terminal(
-                    &self.sql,
-                    instance_id,
-                    &event_id,
-                    &event_type,
-                    &payload_json,
-                )?,
-                "instance.transitioned" => {
-                    do_replay_instance_transition(&self.sql, instance_id, &event_id, &payload_json)?
-                }
-                "workflow.revision_activated" => do_replay_revision_activation(
-                    &self.sql,
-                    instance_id,
-                    &event_id,
-                    &payload_json,
-                    idempotency_key.as_deref(),
-                )?,
-                "effect.run_started" => {
-                    do_replay_run_started(&self.sql, instance_id, &payload_json)?
-                }
-                "effect.terminal" => {
-                    do_replay_effect_terminal(&self.sql, instance_id, &event_id, &payload_json)?
-                }
-                "effect.cancelled" => {
-                    do_replay_effect_cancelled(&self.sql, instance_id, &event_id, &payload_json)?
-                }
-                "effect.cancellation_requested" => do_replay_cancellation_request(
-                    &self.sql,
-                    instance_id,
-                    &event_id,
-                    &payload_json,
-                    idempotency_key.as_deref(),
-                    causation_id.as_deref(),
-                )?,
-                "lease.expired" => do_replay_lease_expired(&self.sql, instance_id, &payload_json)?,
-                _ => {}
-            }
-        }
-
-        for (artifact_id, run_id) in artifact_run_links {
-            let run_exists = !self
-                .sql
-                .query("SELECT 1 FROM runs WHERE run_id = ?1", &[text(&run_id)])
-                .map_err(sql_err)?
-                .is_empty();
-            if run_exists {
-                self.sql
-                    .execute(
-                        "UPDATE artifacts SET run_id = ?1 WHERE artifact_id = ?2",
-                        &[text(&run_id), text(&artifact_id)],
-                    )
-                    .map_err(sql_err)?;
-            }
-        }
-        Ok(())
+        self.rebuild_projections_impl(instance_id, None)
     }
 
     fn table_exists(&self, table: &str) -> StoreResult<bool> {
@@ -10231,6 +10266,124 @@ mod tests {
         let runs = store.list_runs("i1").expect("runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "completed");
+    }
+
+    /// RC-2 Delta A (DO mirror): rebuild_projections_to reflects instance state
+    /// AS OF event N — an effect committed after N is absent; one at/before N is
+    /// present. Unbounded rebuild restores the full current state.
+    #[test]
+    fn do_store_rebuild_projections_to_bounded_by_sequence() {
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text("i1"),
+                    text("p"),
+                    text("ver_1"),
+                    int(0),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed instance");
+
+        let effect_exists =
+            |store: &DoSqliteStore<super::test_support::RusqliteDoSql>, effect_id: &str| -> bool {
+                !store
+                    .sql
+                    .query(
+                        "SELECT 1 FROM effects WHERE effect_id = ?1",
+                        &[text(effect_id)],
+                    )
+                    .expect("effect count")
+                    .is_empty()
+            };
+        let max_sequence = |store: &DoSqliteStore<super::test_support::RusqliteDoSql>| -> i64 {
+            let rows = store
+                .sql
+                .query(
+                    "SELECT MAX(sequence) FROM events WHERE instance_id = ?1",
+                    &[text("i1")],
+                )
+                .expect("max sequence");
+            match &rows[0][0] {
+                SqlValue::Int(n) => *n,
+                other => panic!("expected integer sequence, got {other:?}"),
+            }
+        };
+
+        let effect_a = [NewEffect {
+            effect_id: "eff_a",
+            kind: "queue.push",
+            target: None,
+            input_json: "{}",
+            status: "queued",
+            idempotency_key: "e_a",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "i1",
+                rule: "r.a",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effect_a,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("c_a"),
+            })
+            .expect("commit A");
+        let cut = max_sequence(&store);
+
+        let effect_b = [NewEffect {
+            effect_id: "eff_b",
+            kind: "queue.push",
+            target: None,
+            input_json: "{}",
+            status: "queued",
+            idempotency_key: "e_b",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "i1",
+                rule: "r.b",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effect_b,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("c_b"),
+            })
+            .expect("commit B");
+
+        // Cut AT effect A's commit sequence: A is in, B (later) is out.
+        store
+            .rebuild_projections_to("i1", cut)
+            .expect("bounded rebuild");
+        assert!(effect_exists(&store, "eff_a"), "effect A (<= N) present");
+        assert!(!effect_exists(&store, "eff_b"), "effect B (> N) absent");
+
+        // Unbounded rebuild restores both.
+        store.rebuild_projections("i1").expect("full rebuild");
+        assert!(effect_exists(&store, "eff_a"), "effect A present in full");
+        assert!(effect_exists(&store, "eff_b"), "effect B present in full");
     }
 
     /// answer_inbox_item answers a pending item (guarded), records the

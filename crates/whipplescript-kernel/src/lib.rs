@@ -520,12 +520,53 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         instance_id: &str,
         effect_id: &str,
     ) -> Vec<crate::harness_loop::ChatMessage> {
+        self.load_brokered_transcript_bounded(instance_id, effect_id, None)
+    }
+
+    /// RC-2 Delta B: load the brokered-turn transcript for an effect as it was
+    /// AT a prior cut — the latest transcript checkpoint whose event-log
+    /// `sequence <= up_to_sequence` (INCLUSIVE), rather than the newest one.
+    ///
+    /// Keyed off the per-instance event-log `sequence` (NOT the per-effect
+    /// `step` index) deliberately: `sequence` is the single monotonic
+    /// per-instance coordinate that also cuts the instance projection plane
+    /// (`rebuild_projections_to`) and the file manifest. `step` only orders
+    /// transcripts within one effect and would not let a single cut coordinate
+    /// N address all three planes at once. Because each transcript checkpoint is
+    /// appended in step order and `sequence` is monotonic, "latest with
+    /// `sequence <= N`" is exactly the transcript position that was current at
+    /// the cut. Empty when no checkpoint exists at or before N.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn load_brokered_transcript_at(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+        up_to_sequence: i64,
+    ) -> Vec<crate::harness_loop::ChatMessage> {
+        self.load_brokered_transcript_bounded(instance_id, effect_id, Some(up_to_sequence))
+    }
+
+    fn load_brokered_transcript_bounded(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+        up_to_sequence: Option<i64>,
+    ) -> Vec<crate::harness_loop::ChatMessage> {
         let Ok(events) = self.store.list_events(instance_id) else {
             return Vec::new();
         };
         let latest = events.iter().rev().find(|event| {
             if event.event_type != "agent.turn.brokered.transcript" {
                 return false;
+            }
+            // RC-2 Delta B: honor the cut coordinate. `list_events` is ordered
+            // by ascending `sequence`, so `.rev().find` returns the newest
+            // matching checkpoint at or below the bound. `None` = unbounded
+            // (latest), the existing resume/crash-recovery behavior.
+            if let Some(n) = up_to_sequence {
+                if event.sequence > n {
+                    return false;
+                }
             }
             serde_json::from_str::<Value>(&event.payload_json)
                 .ok()
@@ -4104,6 +4145,106 @@ rule noop
             .count();
         assert_eq!(activation_records, 1);
         check_trace(kernel.trace()).expect("revision trace remains conformant");
+    }
+
+    #[test]
+    fn load_brokered_transcript_at_addresses_a_non_latest_checkpoint() {
+        // RC-2 Delta B: given a cut coordinate N (an event-log sequence), the
+        // transcript loads at the checkpoint that was CURRENT at N — the latest
+        // `agent.turn.brokered.transcript` with sequence <= N — not the newest.
+        // The unbounded latest-load is unchanged.
+        let compiled = compile_program(
+            r#"
+workflow TranscriptCut
+
+rule noop
+  when started
+=> {
+}
+"#,
+        );
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let program = compiled.ir.expect("program compiles");
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &program.workflow,
+                    source_hash: "source-1",
+                    ir_hash: "ir-1",
+                    compiler_version: "test",
+                },
+                &program,
+            )
+            .expect("version creates");
+        let instance_id = kernel.create_instance(&version, "{}").expect("instance");
+
+        let effect_id = "eff-transcript";
+        // Append three transcript checkpoints (steps 0..2) at increasing
+        // sequences, each carrying a distinct user message so the loaded
+        // checkpoint is identifiable.
+        let mut step_sequences = Vec::new();
+        for step in 0..3 {
+            let messages = vec![crate::harness_loop::ChatMessage::user_text(format!(
+                "step-{step}"
+            ))];
+            let payload = json!({
+                "effect_id": effect_id,
+                "messages": crate::harness_loop::chat_messages_to_json(&messages),
+            })
+            .to_string();
+            let key = idempotency_key(&[&instance_id, effect_id, "transcript", &step.to_string()]);
+            let stored = kernel
+                .store
+                .append_event(whipplescript_store::NewEvent {
+                    instance_id: &instance_id,
+                    event_type: "agent.turn.brokered.transcript",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: None,
+                    correlation_id: Some(effect_id),
+                    idempotency_key: Some(&key),
+                })
+                .expect("transcript event appends");
+            step_sequences.push(stored.sequence);
+        }
+
+        let text_of = |messages: &[crate::harness_loop::ChatMessage]| -> String {
+            match messages.first().expect("one message") {
+                crate::harness_loop::ChatMessage::User { text, .. } => text.clone(),
+                other => panic!("expected user message, got {other:?}"),
+            }
+        };
+
+        // Cut AT step 1's sequence: load the step-1 checkpoint, not step-2.
+        let at_mid = kernel.load_brokered_transcript_at(&instance_id, effect_id, step_sequences[1]);
+        assert_eq!(text_of(&at_mid), "step-1", "cut at N loads the step <= N");
+
+        // A cut BETWEEN step 1 and step 2 still resolves to step 1.
+        let between =
+            kernel.load_brokered_transcript_at(&instance_id, effect_id, step_sequences[2] - 1);
+        assert_eq!(
+            text_of(&between),
+            "step-1",
+            "cut below step-2 stays at step-1"
+        );
+
+        // The unbounded latest-load is unchanged — it returns the newest (step 2).
+        let latest = kernel.load_brokered_transcript(&instance_id, effect_id);
+        assert_eq!(
+            text_of(&latest),
+            "step-2",
+            "unbounded load returns the latest"
+        );
+
+        // A cut before any checkpoint yields an empty transcript.
+        let before =
+            kernel.load_brokered_transcript_at(&instance_id, effect_id, step_sequences[0] - 1);
+        assert!(
+            before.is_empty(),
+            "cut before the first checkpoint is empty"
+        );
     }
 
     #[test]
