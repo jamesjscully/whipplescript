@@ -13,9 +13,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use whipplescript_kernel::coerce_native::CoerceProvider;
+pub use whipplescript_kernel::harness_loop::ToolCall;
 use whipplescript_kernel::harness_loop::{
-    BrokeredTurnInput, ChatMessage, ImageBlock, NoopCompactor, ToolCall, ToolExecutor, ToolOutcome,
-    ToolSpec, ToolStatus,
+    BrokeredTurnInput, ChatMessage, ImageBlock, NoopCompactor, ToolExecutor, ToolOutcome, ToolSpec,
+    ToolStatus,
 };
 use whipplescript_kernel::harness_model::MessagesApiClient;
 use whipplescript_kernel::sansio::{HostDriver, HttpResponse, IoRequest, IoResult, TransportError};
