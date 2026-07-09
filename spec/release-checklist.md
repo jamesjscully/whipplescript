@@ -108,17 +108,18 @@ Web search/fetch tools and the deferred DO `[~]` residuals were moved to v0.4.
    release-infra files + the ~9 curated-tree files enumerated in the release-plan
    memory), or mirror CI/releases break.
 
-3. **Publish to crates.io in dependency order — 5 crates, first-time publishes**
-   (host-do is the DO host, not a CLI dep — skipped):
-   `cargo publish -p whipplescript-core`
-   `cargo publish -p whipplescript-parser`
-   `cargo publish -p whipplescript-store`
-   `cargo publish -p whipplescript-kernel`
-   `cargo publish -p whipplescript`
-   Prereqs (maintainer): verified crates.io email; an API token with the
-   `publish-new` scope (`cargo login`); the 5 crate names available/owned. Heads
-   up — crates.io throttles *new* crates (burst ~5, then ~1/10min); 5 = the burst,
-   so no stall is expected, but the last one may need a moment.
+3. **crates.io — DEFERRED to 0.3.1 (Jack, 2026-07-09).** `whipplescript-core
+   0.3.0` published successfully; the other four are blocked because the crates
+   are **not self-contained for a published tarball**: `whipplescript-parser`'s
+   `build.rs` reads `../../std/{manifests,grammars}/*.json`, and
+   `whipplescript`/`whipplescript-store` `include_str!("../../../std/manifests/…")`
+   — those workspace-root paths don't exist in a published crate, so the verify
+   build fails (and `--no-verify` would ship crates nobody can build). Fix
+   (0.3.1): vendor the shared std manifests + grammars into each crate that reads
+   them, with a gate check keeping the vendored copies in sync with the root SSOT,
+   then re-verify all five and publish `core→parser→store→kernel→whipplescript`
+   (host-do is the DO host, not a CLI dep — skipped). Prereqs (done):
+   verified crates.io email + a `publish-new`-scoped token (`cargo login`).
 
 4. **Post-publish smoke.**
    `cargo install --git https://github.com/jamesjscully/whipplescript --tag v0.3.0 --locked -p whipplescript`
