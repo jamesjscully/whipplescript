@@ -34,25 +34,29 @@ end-to-end through the real wasm boundary.
 
 **Thread B — agent-turn tool executor** (`NoToolExecutor` errors on any tool call;
 DO turns advertise `tools: Vec::new()`):
-- [ ] **P4 in-isolate DO tool executor.** Most tools resolve synchronously against
-      DO SQLite (`DoFileStore` + `ContentStore`) under the *current* synchronous
-      `ToolExecutor` trait — no reshape. A `DoToolExecutor` for the store-resolvable
-      tools (read/write/edit/recall; ls/find/grep semantics over the flat key-space
-      TBD), advertised on the DO turn. Depends on P1.
-- [ ] **P5 brokered-tool seam reshape (MODEL-FIRST).** `ToolExecutor::execute` is
-      synchronous and called inline mid-turn, so a tool needing a sidecar (bash)
-      cannot suspend on `fetch` — the "nested step machine" deferred at
-      `harness_loop.rs:485-487`. Reshape the seam into a nested
-      `ToolCallMachine: StepMachine<Output=ToolOutcome>` that yields
-      `NeedsIo(Http)` for brokered tools and settles immediately for in-isolate
-      ones (native parity for free); extend `BrokeredTurnSnapshot` for mid-tool
-      eviction. New per-tool `whip-tool/1` Maude lifecycle (the DR-0035
-      delegated-wire model is turn-scoped, wrong granularity). **Significant
-      shared-harness change — bring a design discussion before building.**
-- [ ] **P6 `bash` brokered over `whip-tool/1`.** Kernel-side `tool_http.rs`
-      (build/parse/settle) mirroring `exec_http.rs`; DO brokers `bash` to a sidecar
-      over the reshaped seam, reusing the `whip-executor/1` NeedsHttp suspend/resume
-      shape. `validate.cjs` tool-call case.
+- [ ] **P4 in-isolate DO tool executor.** All store-resolvable tools resolve
+      synchronously against DO SQLite (`DoFileStore` + `ContentStore` + work-item
+      store) under the *current* synchronous `ToolExecutor` trait — no reshape. A
+      separate `DoToolExecutor` (Jack 2026-07-09: separate impl over the DO seams,
+      not a shared refactor of the 5.3k-line fs-coupled native `FileToolExecutor`)
+      for read/write/edit/recall/todos/ls/find/grep (flat-key-space semantics for
+      ls/find/grep), advertised on the DO turn (fix `tools: Vec::new()` at
+      do_instance.rs). Depends on P1.
+
+**P5/P6 DROPPED (2026-07-09).** The old plan — reshape the tool seam into a
+nested `ToolCallMachine` yielding `NeedsIo(Http)` and broker `bash` to a
+`whip-tool/1` sidecar — was the WRONG model. `spec/in-isolate-bash-design-note.md`
+scopes the bash solution as an **in-isolate virtual interpreter** (bashkit):
+bash builtins run in-process over a store-backed VFS, settling synchronously like
+every other tool — no fetch-suspend, no sidecar, no seam reshape. Only *real*
+exec (cargo/builds) escalates to the existing Class-A `whip-executor/1` sidecar.
+The synchronous `ToolExecutor` trait stays.
+
+**bash-via-bashkit = a SEPARATE initiative, not this sweep** (Jack 2026-07-09):
+it is pre-ADR (the note's §9 requirements pass is unrun) and spans native too (it
+un-cripples the crippled v0 native `bash`, giving native + DO the same bash
+semantics). Picked up after its requirements pass; tracked by
+`spec/in-isolate-bash-design-note.md`, not here.
 
 Out of scope (intentional asymmetries): `exec.command` is native-only by design
 (DR-0033 Decision 7, re-expressed as the Class-A executor HTTP effect); the
