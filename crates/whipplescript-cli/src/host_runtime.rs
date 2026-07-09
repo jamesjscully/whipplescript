@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_loop::{
-    BrokeredTurnInput, ImageBlock, NoopCompactor, ToolCall, ToolExecutor, ToolOutcome, ToolSpec,
-    ToolStatus,
+    BrokeredTurnInput, ChatMessage, ImageBlock, NoopCompactor, ToolCall, ToolExecutor, ToolOutcome,
+    ToolSpec, ToolStatus,
 };
 use whipplescript_kernel::harness_model::MessagesApiClient;
 use whipplescript_kernel::sansio::{HostDriver, HttpResponse, IoRequest, IoResult, TransportError};
@@ -627,9 +627,33 @@ fn wildcard_matches(pattern: &str, text: &str) -> bool {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectedToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: Value,
+    pub result: Option<String>,
+    pub ok: Option<bool>,
+}
+
+/// The content projection WhippleScript has admitted for its embedding host.
+///
+/// The projection is derived from WhippleScript's durable transcript, carries
+/// the same IFC join label as the evidence stream, and is the only supported
+/// way for a product shell to obtain assistant/tool content. Embedding hosts do
+/// not inspect the runtime store or recreate transcript-folding semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LabeledTurnOutput {
+    pub output_handle: Option<String>,
+    pub label_ref: String,
+    pub assistant_text: String,
+    pub tool_calls: Vec<ProjectedToolCall>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TurnExecution {
     pub events: Vec<LabeledRuntimeEvent>,
     pub receipt: TurnReceipt,
+    pub output: Option<LabeledTurnOutput>,
 }
 
 /// A persistent, policy-bound native WhippleScript runtime.
@@ -1088,7 +1112,12 @@ impl GovernedHostRuntime {
             workspace_cut_ref: None,
         };
         receipt.validate_for(command)?;
-        Ok(TurnExecution { events, receipt })
+        let output = self.project_turn_output(command, receipt.output_handle.clone())?;
+        Ok(TurnExecution {
+            events,
+            receipt,
+            output,
+        })
     }
 
     fn ensure_evidence(
@@ -1251,9 +1280,88 @@ impl GovernedHostRuntime {
                 payload_ref: None,
             });
         }
+        let output = self.project_turn_output(command, receipt.output_handle.clone())?;
         Ok(Some(TurnExecution {
             events: projected,
             receipt,
+            output,
+        }))
+    }
+
+    fn project_turn_output(
+        &self,
+        command: &StartTurnCommand,
+        output_handle: Option<String>,
+    ) -> Result<Option<LabeledTurnOutput>, HostRuntimeError> {
+        let events = self
+            .kernel
+            .store()
+            .list_events(&command.instance_ref)
+            .map_err(HostRuntimeError::Store)?;
+        let Some(checkpoint) = events.iter().rev().find(|event| {
+            event.event_type == "agent.turn.brokered.transcript"
+                && serde_json::from_str::<Value>(&event.payload_json)
+                    .ok()
+                    .and_then(|payload| {
+                        payload
+                            .get("effect_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some(&command.command_id)
+        }) else {
+            return Ok(None);
+        };
+        let value: Value =
+            serde_json::from_str(&checkpoint.payload_json).map_err(HostRuntimeError::Json)?;
+        let messages = whipplescript_kernel::harness_loop::chat_messages_from_json(
+            value.get("messages").unwrap_or(&Value::Null),
+        );
+        let turn_start = messages
+            .iter()
+            .rposition(|message| matches!(message, ChatMessage::User { .. }))
+            .map_or(0, |index| index + 1);
+        let mut assistant_text = String::new();
+        let mut tool_calls: Vec<ProjectedToolCall> = Vec::new();
+        for message in &messages[turn_start..] {
+            match message {
+                ChatMessage::Assistant {
+                    text,
+                    tool_calls: calls,
+                } => {
+                    if calls.is_empty() {
+                        assistant_text.clone_from(text);
+                    } else {
+                        tool_calls.extend(calls.iter().map(|call| ProjectedToolCall {
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                            result: None,
+                            ok: None,
+                        }));
+                    }
+                }
+                ChatMessage::ToolResults(results) => {
+                    for result in results {
+                        if let Some(projected) = tool_calls
+                            .iter_mut()
+                            .rev()
+                            .find(|call| call.call_id == result.tool_call_id)
+                        {
+                            projected.result = Some(result.content.clone());
+                            projected.ok = Some(!result.is_error);
+                        }
+                    }
+                }
+                ChatMessage::System(_) | ChatMessage::User { .. } => {}
+            }
+        }
+        Ok(Some(LabeledTurnOutput {
+            output_handle,
+            label_ref: self.label_ref(),
+            assistant_text,
+            tool_calls,
         }))
     }
 
@@ -1762,6 +1870,20 @@ workflow UnsafeHostChat {
             .expect("first turn");
         assert_eq!(first.receipt.status, TurnStatus::Completed);
         assert!(!first.events.is_empty());
+        let first_output = first.output.expect("labeled output projection");
+        assert_eq!(first_output.output_handle, first.receipt.output_handle);
+        assert_eq!(first_output.assistant_text, "first answer");
+        assert_eq!(first_output.tool_calls.len(), 1);
+        assert_eq!(first_output.tool_calls[0].name, "read");
+        assert_eq!(
+            first_output.tool_calls[0].arguments,
+            json!({ "path": "README.md" })
+        );
+        assert_eq!(
+            first_output.tool_calls[0].result.as_deref(),
+            Some("governed file body")
+        );
+        assert_eq!(first_output.tool_calls[0].ok, Some(true));
         assert_eq!(resources.calls.get(), 1);
         drop(runtime);
 
@@ -1780,6 +1902,13 @@ workflow UnsafeHostChat {
             )
             .expect("second turn");
         assert_eq!(second.receipt.status, TurnStatus::Completed);
+        assert_eq!(
+            second
+                .output
+                .as_ref()
+                .map(|output| output.assistant_text.as_str()),
+            Some("second answer")
+        );
         let request = second_driver.requests.borrow();
         let serialized = request.first().expect("request").to_string();
         assert!(serialized.contains("first answer"));

@@ -27,6 +27,7 @@ not resource bodies or credentials.
 | `open_instance(command, packages)` | Resolve a pinned package and issue a durable WhippleScript instance ref. |
 | `run_turn(...)` | Run the owned brokered loop with the native HTTP driver, persistent transcript, evidence projection, and terminal receipt. |
 | `run_turn_with_driver(...)` | Drive the same sans-I/O machine with a host-supplied transport (tests and remote placements). |
+| `TurnExecution::output` / `LabeledTurnOutput` | WhippleScript-folded assistant/tool projection carrying the turn's IFC join label; hosts never inspect the runtime store or recreate transcript folding. |
 | `PackageResolver` | Resolve immutable WhippleScript package bytes/IR and its package-declared tool schemas. |
 | `SecretResolver` | Resolve provider credentials ephemerally, after policy admission. |
 | `ResourceResolver` | Resolve image bytes and execute package-declared tools against only the resource refs admitted for the turn. |
