@@ -718,6 +718,9 @@ impl GovernedHostRuntime {
     ) -> Result<OpenedInstance, HostRuntimeError> {
         command.validate()?;
         self.require_policy(&command.policy)?;
+        if let Some(opened) = self.replayed_open_instance(command)? {
+            return Ok(opened);
+        }
         let package = packages
             .resolve_package(&command.package_version_ref)
             .map_err(HostRuntimeError::Resolver)?;
@@ -779,6 +782,51 @@ impl GovernedHostRuntime {
         };
         result.validate_for(command)?;
         Ok(result)
+    }
+
+    fn replayed_open_instance(
+        &self,
+        command: &OpenInstanceCommand,
+    ) -> Result<Option<OpenedInstance>, HostRuntimeError> {
+        for instance in self
+            .kernel
+            .store()
+            .list_instances()
+            .map_err(HostRuntimeError::Store)?
+        {
+            let events = self
+                .kernel
+                .store()
+                .list_events(&instance.instance_id)
+                .map_err(HostRuntimeError::Store)?;
+            for event in events {
+                if event.event_type != "host.instance.opened" {
+                    continue;
+                }
+                let payload: Value =
+                    serde_json::from_str(&event.payload_json).map_err(HostRuntimeError::Json)?;
+                if payload.get("request_id").and_then(Value::as_str)
+                    != Some(command.request_id.as_str())
+                {
+                    continue;
+                }
+                let opened = OpenedInstance {
+                    protocol: HOST_PROTOCOL.to_owned(),
+                    request_id: command.request_id.clone(),
+                    instance_ref: instance.instance_id.clone(),
+                    package_version_ref: required_string(&payload, "package_version_ref")?,
+                    policy: serde_json::from_value(payload["policy"].clone())
+                        .map_err(HostRuntimeError::Json)?,
+                    opened_at: EventPosition {
+                        instance_ref: instance.instance_id.clone(),
+                        sequence: positive_sequence(event.sequence)?,
+                    },
+                };
+                opened.validate_for(command)?;
+                return Ok(Some(opened));
+            }
+        }
+        Ok(None)
     }
 
     /// Run a turn through WhippleScript's owned brokered loop using the native
@@ -1890,6 +1938,11 @@ workflow UnsafeHostChat {
         drop(runtime);
 
         let mut reopened = GovernedHostRuntime::open(&path, 7, &policy_text).expect("reopen");
+        let replayed = reopened
+            .open_instance(&open, &Packages)
+            .expect("open command replays");
+        assert_eq!(replayed.instance_ref, instance.instance_ref);
+        assert_eq!(replayed.opened_at, instance.opened_at);
         let second_driver = ScriptedDriver::new(vec![json!({
             "output_text": "second answer",
             "usage": { "input_tokens": 20, "output_tokens": 3 }
