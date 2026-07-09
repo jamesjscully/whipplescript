@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use whipplescript_kernel::coerce_native::CoerceProvider;
 pub use whipplescript_kernel::harness_loop::ToolCall;
 use whipplescript_kernel::harness_loop::{
-    BrokeredTurnInput, ChatMessage, ImageBlock, NoopCompactor, ToolExecutor, ToolOutcome, ToolSpec,
-    ToolStatus,
+    BrokeredTurnInput, ChatMessage, HumanAskRequest, ImageBlock, NoopCompactor, ToolExecutor,
+    ToolOutcome, ToolSpec, ToolStatus,
 };
 use whipplescript_kernel::harness_model::MessagesApiClient;
 use whipplescript_kernel::sansio::{HostDriver, HttpResponse, IoRequest, IoResult, TransportError};
@@ -31,9 +31,10 @@ use whipplescript_store::{
 };
 
 use crate::host_protocol::{
-    EventPosition, ForkInstanceCommand, ForkedInstance, LabeledRuntimeEvent, OpenInstanceCommand,
-    OpenedInstance, PolicyEpochRef, ProtocolError, ProviderBindingRef, ResourceRef,
-    StartTurnCommand, TurnReceipt, TurnStatus, HOST_PROTOCOL,
+    AnswerHumanAskCommand, EventPosition, ForkInstanceCommand, ForkedInstance, HumanAnswerReceipt,
+    LabeledHumanAsk, LabeledRuntimeEvent, OpenInstanceCommand, OpenedInstance, PolicyEpochRef,
+    ProtocolError, ProviderBindingRef, ResourceRef, StartTurnCommand, TurnReceipt, TurnStatus,
+    HOST_PROTOCOL,
 };
 use crate::ifc::VerifiedEnvelope;
 
@@ -254,6 +255,17 @@ pub trait ResourceResolver {
         admitted_resources: &[ResourceRef],
         call: &ToolCall,
     ) -> Result<String, String>;
+
+    /// Resolve a package-declared human question after WhippleScript has
+    /// admitted the turn's `human` resource. Implementations may further refuse
+    /// the crossing but cannot manufacture authority or answer it themselves.
+    fn request_human(
+        &self,
+        _admitted_resources: &[ResourceRef],
+        _call: &ToolCall,
+    ) -> Result<HumanAskRequest, String> {
+        Err("human interaction is not configured for this host".to_owned())
+    }
 }
 
 /// Host realization request for a command that WhippleScript has already
@@ -629,6 +641,70 @@ impl ResourceResolver for NativeWorkspaceResolver {
             _ => Err("tool has no native workspace implementation".to_owned()),
         }
     }
+
+    fn request_human(
+        &self,
+        admitted_resources: &[ResourceRef],
+        call: &ToolCall,
+    ) -> Result<HumanAskRequest, String> {
+        if call.name != "ask_human" {
+            return Err("tool is not the governed human interface".to_owned());
+        }
+        if !admitted_resources
+            .iter()
+            .any(|resource| resource.kind == "human")
+        {
+            return Err("turn has no admitted human capability".to_owned());
+        }
+        let question = string_argument(&call.arguments, "question")?.trim();
+        if question.is_empty() || question.len() > 10_000 {
+            return Err("human question must contain 1 to 10000 bytes".to_owned());
+        }
+        let choices = call
+            .arguments
+            .get("choices")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|choice| !choice.is_empty() && choice.len() <= 256)
+                            .map(str::to_owned)
+                            .ok_or_else(|| {
+                                "human choices must be nonempty strings up to 256 bytes".to_owned()
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        if choices.len() > 20 {
+            return Err("human question may offer at most 20 choices".to_owned());
+        }
+        let mut unique = choices.clone();
+        unique.sort();
+        unique.dedup();
+        if unique.len() != choices.len() {
+            return Err("human question choices must be unique".to_owned());
+        }
+        let freeform_allowed = call
+            .arguments
+            .get("freeform_allowed")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if choices.is_empty() && !freeform_allowed {
+            return Err("human question must allow freeform or offer a choice".to_owned());
+        }
+        Ok(HumanAskRequest {
+            call_id: call.id.clone(),
+            question: question.to_owned(),
+            choices,
+            freeform_allowed,
+        })
+    }
 }
 
 /// The model-facing workspace tools owned by WhippleScript. An embedding host
@@ -641,6 +717,14 @@ pub fn native_workspace_tool_specs(writable: bool) -> Vec<ToolSpec> {
 pub fn native_workspace_tool_specs_with_command(
     writable: bool,
     command_execution: bool,
+) -> Vec<ToolSpec> {
+    native_workspace_tool_specs_with_capabilities(writable, command_execution, false)
+}
+
+pub fn native_workspace_tool_specs_with_capabilities(
+    writable: bool,
+    command_execution: bool,
+    human_interaction: bool,
 ) -> Vec<ToolSpec> {
     let mut tools = vec![
         tool_spec(
@@ -715,6 +799,21 @@ pub fn native_workspace_tool_specs_with_command(
                     "command": { "type": "string" },
                     "timeout": { "type": "integer", "minimum": 1 }
                 }, "required": ["command"], "additionalProperties": false
+            }),
+        ));
+    }
+    if human_interaction {
+        tools.push(tool_spec(
+            "ask_human",
+            "Pause this turn for one attributable human answer under the current policy epoch.",
+            json!({
+                "type": "object", "properties": {
+                    "question": { "type": "string", "minLength": 1, "maxLength": 10000 },
+                    "choices": { "type": "array", "maxItems": 20, "items": {
+                        "type": "string", "minLength": 1, "maxLength": 256
+                    }},
+                    "freeform_allowed": { "type": "boolean" }
+                }, "required": ["question"], "additionalProperties": false
             }),
         ));
     }
@@ -996,8 +1095,26 @@ pub struct LabeledTurnOutput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TurnExecution {
     pub events: Vec<LabeledRuntimeEvent>,
-    pub receipt: TurnReceipt,
+    /// Present only after the turn reaches a runtime terminal. A suspended turn
+    /// has no terminal receipt by construction.
+    pub receipt: Option<TurnReceipt>,
     pub output: Option<LabeledTurnOutput>,
+    pub pending_human_ask: Option<LabeledHumanAsk>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HumanAnswerExecution {
+    pub answer_receipt: HumanAnswerReceipt,
+    pub turn: TurnExecution,
+}
+
+/// One durable human suspension recovered from WhippleScript's owned store.
+/// The original command is returned so an embedding host can resume the exact
+/// admitted turn after a process restart without inspecting runtime internals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingHumanTurn {
+    pub command: StartTurnCommand,
+    pub ask: LabeledHumanAsk,
 }
 
 /// Out-of-band cooperative cancellation capability for one admitted host
@@ -1429,7 +1546,11 @@ impl GovernedHostRuntime {
         S: SecretResolver + ?Sized,
         R: ResourceResolver + ?Sized,
     {
-        let binding = self.admit_and_resolve(command, packages, secrets)?;
+        self.admit_command(command, packages)?;
+        if let Some(suspended) = self.pending_execution(command)? {
+            return Ok(suspended);
+        }
+        let binding = self.resolve_provider(command, secrets)?;
         let driver = NativeHttpDriver::new(binding.timeout);
         self.run_admitted_turn(command, packages, resources, binding, &driver)
     }
@@ -1451,19 +1572,219 @@ impl GovernedHostRuntime {
         R: ResourceResolver + ?Sized,
         H: HostDriver,
     {
-        let binding = self.admit_and_resolve(command, packages, secrets)?;
+        self.admit_command(command, packages)?;
+        if let Some(suspended) = self.pending_execution(command)? {
+            return Ok(suspended);
+        }
+        let binding = self.resolve_provider(command, secrets)?;
         self.run_admitted_turn(command, packages, resources, binding, driver)
     }
 
-    fn admit_and_resolve<P, S>(
+    /// Recover the pending human suspension, if any, for an instance. This is
+    /// the restart-safe discovery surface for embedding hosts: WhippleScript
+    /// reconstructs and re-admits the original command, then projects only the
+    /// labeled question intended for the authenticated human surface.
+    pub fn pending_human_turn<P>(
         &self,
-        command: &StartTurnCommand,
+        instance_ref: &str,
+        packages: &P,
+    ) -> Result<Option<PendingHumanTurn>, HostRuntimeError>
+    where
+        P: PackageResolver + ?Sized,
+    {
+        let mut pending = self
+            .kernel
+            .store()
+            .list_inbox_items(Some("pending"))
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .filter(|item| item.instance_id == instance_ref);
+        let Some(item) = pending.next() else {
+            return Ok(None);
+        };
+        if pending.next().is_some() {
+            return Err(HostRuntimeError::Incomplete(
+                "instance has more than one pending human ask".to_owned(),
+            ));
+        }
+        let effect_id = item.effect_id.as_deref().ok_or_else(|| {
+            HostRuntimeError::Incomplete("human ask has no suspended turn".to_owned())
+        })?;
+        let effect = self
+            .kernel
+            .store()
+            .list_effects(instance_ref)
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .find(|effect| effect.effect_id == effect_id)
+            .ok_or_else(|| HostRuntimeError::Incomplete(effect_id.to_owned()))?;
+        let command: StartTurnCommand =
+            serde_json::from_str(&effect.input_json).map_err(HostRuntimeError::Json)?;
+        if command.instance_ref != instance_ref || command.command_id != effect_id {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "pending human turn",
+            )));
+        }
+        self.admit_command(&command, packages)?;
+        let execution = self.pending_execution(&command)?.ok_or_else(|| {
+            HostRuntimeError::Incomplete("pending human ask cannot be projected".to_owned())
+        })?;
+        let ask = execution.pending_human_ask.ok_or_else(|| {
+            HostRuntimeError::Incomplete("pending human ask projection is empty".to_owned())
+        })?;
+        Ok(Some(PendingHumanTurn { command, ask }))
+    }
+
+    /// Admit an attributable human answer and resume the exact suspended turn
+    /// under its unchanged policy epoch using the native HTTP transport.
+    pub fn answer_human_ask<P, S, R>(
+        &mut self,
+        answer: &AnswerHumanAskCommand,
         packages: &P,
         secrets: &S,
-    ) -> Result<ResolvedProviderBinding, HostRuntimeError>
+        resources: &R,
+    ) -> Result<HumanAnswerExecution, HostRuntimeError>
     where
         P: PackageResolver + ?Sized,
         S: SecretResolver + ?Sized,
+        R: ResourceResolver + ?Sized,
+    {
+        let (turn_command, answer_receipt) = self.admit_human_answer(answer, packages)?;
+        let binding = self.resolve_provider(&turn_command, secrets)?;
+        let driver = NativeHttpDriver::new(binding.timeout);
+        let turn = self.run_admitted_turn(&turn_command, packages, resources, binding, &driver)?;
+        Ok(HumanAnswerExecution {
+            answer_receipt,
+            turn,
+        })
+    }
+
+    /// Sans-I/O-driver form of [`Self::answer_human_ask`].
+    pub fn answer_human_ask_with_driver<P, S, R, H>(
+        &mut self,
+        answer: &AnswerHumanAskCommand,
+        packages: &P,
+        secrets: &S,
+        resources: &R,
+        driver: &H,
+    ) -> Result<HumanAnswerExecution, HostRuntimeError>
+    where
+        P: PackageResolver + ?Sized,
+        S: SecretResolver + ?Sized,
+        R: ResourceResolver + ?Sized,
+        H: HostDriver,
+    {
+        let (turn_command, answer_receipt) = self.admit_human_answer(answer, packages)?;
+        let binding = self.resolve_provider(&turn_command, secrets)?;
+        let turn = self.run_admitted_turn(&turn_command, packages, resources, binding, driver)?;
+        Ok(HumanAnswerExecution {
+            answer_receipt,
+            turn,
+        })
+    }
+
+    fn admit_human_answer<P>(
+        &mut self,
+        answer: &AnswerHumanAskCommand,
+        packages: &P,
+    ) -> Result<(StartTurnCommand, HumanAnswerReceipt), HostRuntimeError>
+    where
+        P: PackageResolver + ?Sized,
+    {
+        answer.validate()?;
+        self.require_policy(&answer.policy)?;
+        let item = self
+            .kernel
+            .store()
+            .get_inbox_item(&answer.ask_ref)
+            .map_err(HostRuntimeError::Store)?
+            .ok_or_else(|| HostRuntimeError::Incomplete(answer.ask_ref.clone()))?;
+        if item.instance_id != answer.instance_ref {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "human ask instance",
+            )));
+        }
+        let effect_id = item.effect_id.as_deref().ok_or_else(|| {
+            HostRuntimeError::Incomplete("human ask has no suspended turn".to_owned())
+        })?;
+        let effect = self
+            .kernel
+            .store()
+            .list_effects(&answer.instance_ref)
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .find(|effect| effect.effect_id == effect_id)
+            .ok_or_else(|| HostRuntimeError::Incomplete(effect_id.to_owned()))?;
+        let turn_command: StartTurnCommand =
+            serde_json::from_str(&effect.input_json).map_err(HostRuntimeError::Json)?;
+        if turn_command.instance_ref != answer.instance_ref || turn_command.policy != answer.policy
+        {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "human answer turn/policy",
+            )));
+        }
+        self.admit_command(&turn_command, packages)?;
+        let waiting_event = self
+            .kernel
+            .store()
+            .list_events(&answer.instance_ref)
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.event_type == "agent.turn.awaiting_human"
+                    && serde_json::from_str::<Value>(&event.payload_json)
+                        .ok()
+                        .and_then(|payload| {
+                            payload
+                                .get("inbox_item_id")
+                                .and_then(Value::as_str)
+                                .map(|id| id == answer.ask_ref)
+                        })
+                        .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                HostRuntimeError::Incomplete("human ask has no suspension event".to_owned())
+            })?;
+        let waiting_payload: Value =
+            serde_json::from_str(&waiting_event.payload_json).map_err(HostRuntimeError::Json)?;
+        let call_id = required_string(&waiting_payload, "call_id")?;
+        let answered = self
+            .kernel
+            .answer_brokered_human_ask(
+                &answer.instance_ref,
+                &turn_command.command_id,
+                &answer.ask_ref,
+                &call_id,
+                &answer.answer,
+                &answer.respondent_ref,
+                &answer.answer_id,
+            )
+            .map_err(HostRuntimeError::Store)?;
+        let receipt = HumanAnswerReceipt {
+            protocol: HOST_PROTOCOL.to_owned(),
+            answer_id: answer.answer_id.clone(),
+            ask_ref: answer.ask_ref.clone(),
+            turn_command_id: turn_command.command_id.clone(),
+            instance_ref: answer.instance_ref.clone(),
+            policy: answer.policy.clone(),
+            respondent_ref: answer.respondent_ref.clone(),
+            answered_at: EventPosition {
+                instance_ref: answer.instance_ref.clone(),
+                sequence: positive_sequence(answered.sequence)?,
+            },
+        };
+        receipt.validate_for(answer)?;
+        Ok((turn_command, receipt))
+    }
+
+    fn admit_command<P>(
+        &self,
+        command: &StartTurnCommand,
+        packages: &P,
+    ) -> Result<(), HostRuntimeError>
+    where
+        P: PackageResolver + ?Sized,
     {
         command.validate()?;
         self.require_policy(&command.policy)?;
@@ -1473,6 +1794,17 @@ impl GovernedHostRuntime {
             self.require_governed(&resource.handle)?;
         }
         self.validate_instance(command, packages)?;
+        Ok(())
+    }
+
+    fn resolve_provider<S>(
+        &self,
+        command: &StartTurnCommand,
+        secrets: &S,
+    ) -> Result<ResolvedProviderBinding, HostRuntimeError>
+    where
+        S: SecretResolver + ?Sized,
+    {
         let binding = secrets
             .resolve_provider(&command.provider_binding, &command.placement_ceiling_ref)
             .map_err(HostRuntimeError::Resolver)?;
@@ -1634,6 +1966,9 @@ impl GovernedHostRuntime {
                 &input,
             )
             .map_err(HostRuntimeError::Store)?;
+        if let Some(suspended) = self.pending_execution(command)? {
+            return Ok(suspended);
+        }
         self.finish_execution(command)
     }
 
@@ -1780,8 +2115,9 @@ impl GovernedHostRuntime {
         let output = self.project_turn_output(command, receipt.output_handle.clone())?;
         Ok(TurnExecution {
             events,
-            receipt,
+            receipt: Some(receipt),
             output,
+            pending_human_ask: None,
         })
     }
 
@@ -1827,9 +2163,40 @@ impl GovernedHostRuntime {
             .store()
             .list_evidence_for_subject("run", run_id)
             .map_err(HostRuntimeError::Store)?;
+        let existing_events = self
+            .kernel
+            .store()
+            .list_events(&command.instance_ref)
+            .map_err(HostRuntimeError::Store)?;
         let mut projected = Vec::with_capacity(evidence.len());
         for item in evidence {
             let evidence_ref = format!("whip:evidence:{}", item.evidence_id);
+            if let Some(existing) = existing_events.iter().find(|event| {
+                event.event_type == "host.turn.evidence"
+                    && serde_json::from_str::<Value>(&event.payload_json)
+                        .ok()
+                        .is_some_and(|payload| {
+                            payload.get("command_id").and_then(Value::as_str)
+                                == Some(command.command_id.as_str())
+                                && payload.get("evidence_ref").and_then(Value::as_str)
+                                    == Some(evidence_ref.as_str())
+                        })
+            }) {
+                projected.push(LabeledRuntimeEvent {
+                    protocol: HOST_PROTOCOL.to_owned(),
+                    command_id: command.command_id.clone(),
+                    position: EventPosition {
+                        instance_ref: command.instance_ref.clone(),
+                        sequence: positive_sequence(existing.sequence)?,
+                    },
+                    policy: command.policy.clone(),
+                    kind: item.kind,
+                    label_ref: self.label_ref(),
+                    evidence_ref,
+                    payload_ref: None,
+                });
+                continue;
+            }
             let payload = json!({
                 "command_id": command.command_id,
                 "kind": item.kind,
@@ -1870,6 +2237,87 @@ impl GovernedHostRuntime {
             });
         }
         Ok(projected)
+    }
+
+    fn pending_execution(
+        &self,
+        command: &StartTurnCommand,
+    ) -> Result<Option<TurnExecution>, HostRuntimeError> {
+        let pending = self
+            .kernel
+            .store()
+            .list_inbox_items(Some("pending"))
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .find(|item| {
+                item.instance_id == command.instance_ref
+                    && item.effect_id.as_deref() == Some(command.command_id.as_str())
+            });
+        let Some(item) = pending else {
+            return Ok(None);
+        };
+        let events = self
+            .kernel
+            .store()
+            .list_events(&command.instance_ref)
+            .map_err(HostRuntimeError::Store)?;
+        let event = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.event_type == "agent.turn.awaiting_human"
+                    && serde_json::from_str::<Value>(&event.payload_json)
+                        .ok()
+                        .and_then(|payload| {
+                            payload
+                                .get("inbox_item_id")
+                                .and_then(Value::as_str)
+                                .map(|id| id == item.inbox_item_id)
+                        })
+                        .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                HostRuntimeError::Incomplete("pending human ask has no runtime event".to_owned())
+            })?;
+        let payload: Value =
+            serde_json::from_str(&event.payload_json).map_err(HostRuntimeError::Json)?;
+        let run_id = idempotency_key(&[&command.instance_ref, &command.command_id, "brokered-run"]);
+        let evidence = self
+            .kernel
+            .store()
+            .list_evidence_for_subject("run", &run_id)
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .find(|evidence| {
+                evidence.kind == "human.ask"
+                    && evidence.correlation_id.as_deref()
+                        == payload.get("call_id").and_then(Value::as_str)
+            })
+            .ok_or_else(|| {
+                HostRuntimeError::Incomplete("pending human ask has no evidence".to_owned())
+            })?;
+        let ask = LabeledHumanAsk {
+            protocol: HOST_PROTOCOL.to_owned(),
+            ask_ref: item.inbox_item_id,
+            command_id: command.command_id.clone(),
+            instance_ref: command.instance_ref.clone(),
+            policy: command.policy.clone(),
+            position: EventPosition {
+                instance_ref: command.instance_ref.clone(),
+                sequence: positive_sequence(event.sequence)?,
+            },
+            label_ref: self.label_ref(),
+            evidence_ref: format!("whip:evidence:{}", evidence.evidence_id),
+            question: item.prompt,
+            choices: serde_json::from_str(&item.choices_json).map_err(HostRuntimeError::Json)?,
+            freeform_allowed: item.freeform_allowed,
+        };
+        Ok(Some(TurnExecution {
+            events: self.project_events(command, &run_id)?,
+            receipt: None,
+            output: self.project_turn_output(command, None)?,
+            pending_human_ask: Some(ask),
+        }))
     }
 
     fn stored_execution(
@@ -1948,8 +2396,9 @@ impl GovernedHostRuntime {
         let output = self.project_turn_output(command, receipt.output_handle.clone())?;
         Ok(Some(TurnExecution {
             events: projected,
-            receipt,
+            receipt: Some(receipt),
             output,
+            pending_human_ask: None,
         }))
     }
 
@@ -2086,6 +2535,19 @@ impl<R: ResourceResolver + ?Sized> ToolExecutor for ResolverToolExecutor<'_, R> 
             return ToolOutcome {
                 status: ToolStatus::Error,
                 content: "tool is not declared by the pinned package".to_owned(),
+            };
+        }
+        if call.name == "ask_human" {
+            return match self.resolver.request_human(self.admitted_resources, call) {
+                Ok(request) => ToolOutcome {
+                    status: ToolStatus::Suspended,
+                    content: serde_json::to_string(&request)
+                        .unwrap_or_else(|_| "invalid human ask".to_owned()),
+                },
+                Err(message) => ToolOutcome {
+                    status: ToolStatus::Error,
+                    content: message,
+                },
             };
         }
         match self.resolver.execute_tool(self.admitted_resources, call) {
@@ -2411,6 +2873,40 @@ workflow UnsafeHostChat {
         }
     }
 
+    struct HumanPackages;
+
+    impl PackageResolver for HumanPackages {
+        fn resolve_package(&self, version_ref: &str) -> Result<ResolvedPackage, String> {
+            ResolvedPackage::compile(
+                version_ref,
+                r#"
+workflow HumanHostChat {
+  agent assistant {
+    provider owned
+    profile "human-review"
+    capacity 1
+  }
+
+  rule converse
+    when started
+  => {
+    tell assistant
+      with access to human {
+        ask
+      }
+      "host turn"
+  }
+}
+"#,
+                Some("HumanHostChat"),
+                "assistant",
+                "Ask only when an attributable human answer is required.",
+                native_workspace_tool_specs_with_capabilities(false, false, true),
+                4,
+            )
+        }
+    }
+
     struct Secrets {
         calls: Cell<usize>,
     }
@@ -2518,6 +3014,7 @@ workflow UnsafeHostChat {
             "grant file_store project -> file:/workspace readable by Operator\n\
              grant provider model -> provider:openai readable by Operator\n\
              grant provider owned -> provider:owned readable by Operator\n\
+             grant human human -> human:operator readable by Operator from Operator\n\
              grant placement local -> placement:local readable by Operator\n",
             "gaugedesk-admin",
         )
@@ -2550,6 +3047,30 @@ workflow UnsafeHostChat {
             resources: vec![ResourceRef {
                 handle: "project".to_owned(),
                 kind: "file_store".to_owned(),
+                selector: None,
+            }],
+            provider_binding: ProviderBindingRef {
+                binding_id: "model".to_owned(),
+            },
+            placement_ceiling_ref: "local".to_owned(),
+        }
+    }
+
+    fn human_turn(instance_ref: &str, policy: &PolicyEpochRef) -> StartTurnCommand {
+        StartTurnCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            command_id: "command-human".to_owned(),
+            run_ref: "gaugedesk:run:human".to_owned(),
+            instance_ref: instance_ref.to_owned(),
+            package_version_ref: "package:human".to_owned(),
+            policy: policy.clone(),
+            input: TurnInput {
+                text: "Ask me for the missing color.".to_owned(),
+                images: Vec::new(),
+            },
+            resources: vec![ResourceRef {
+                handle: "human".to_owned(),
+                kind: "human".to_owned(),
                 selector: None,
             }],
             provider_binding: ProviderBindingRef {
@@ -2603,10 +3124,11 @@ workflow UnsafeHostChat {
                 &first_driver,
             )
             .expect("first turn");
-        assert_eq!(first.receipt.status, TurnStatus::Completed);
+        let first_receipt = first.receipt.as_ref().expect("terminal receipt");
+        assert_eq!(first_receipt.status, TurnStatus::Completed);
         assert!(!first.events.is_empty());
         let first_output = first.output.expect("labeled output projection");
-        assert_eq!(first_output.output_handle, first.receipt.output_handle);
+        assert_eq!(first_output.output_handle, first_receipt.output_handle);
         assert_eq!(first_output.assistant_text, "first answer");
         assert_eq!(first_output.tool_calls.len(), 1);
         assert_eq!(first_output.tool_calls[0].name, "read");
@@ -2641,7 +3163,10 @@ workflow UnsafeHostChat {
                 &second_driver,
             )
             .expect("second turn");
-        assert_eq!(second.receipt.status, TurnStatus::Completed);
+        assert_eq!(
+            second.receipt.as_ref().expect("terminal receipt").status,
+            TurnStatus::Completed
+        );
         assert_eq!(
             second
                 .output
@@ -2657,6 +3182,174 @@ workflow UnsafeHostChat {
 
         let bytes = fs::read(&path).expect("store bytes");
         assert!(!String::from_utf8_lossy(&bytes).contains("secret-that-must-not-be-persisted"));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[test]
+    fn governed_human_ask_suspends_without_a_terminal_and_resumes_same_epoch() {
+        let path = temp_store();
+        let workspace = std::env::temp_dir().join(format!(
+            "whip-host-human-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let policy_text = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 12, &policy_text).expect("runtime");
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-human-chat".to_owned(),
+            package_version_ref: "package:human".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime
+            .open_instance(&open, &HumanPackages)
+            .expect("human instance");
+        let command = human_turn(&instance.instance_ref, &open.policy);
+        let secrets = Secrets {
+            calls: Cell::new(0),
+        };
+        let resources = NativeWorkspaceResolver::new(&workspace).expect("resources");
+        let ask_driver = ScriptedDriver::new(vec![json!({
+            "output": [{
+                "type": "function_call",
+                "call_id": "ask-color",
+                "name": "ask_human",
+                "arguments": "{\"question\":\"Which color?\",\"choices\":[\"blue\",\"green\"],\"freeform_allowed\":false}"
+            }],
+            "usage": { "input_tokens": 10, "output_tokens": 4 }
+        })]);
+        let suspended = runtime
+            .run_turn_with_driver(&command, &HumanPackages, &secrets, &resources, &ask_driver)
+            .expect("turn suspends");
+        assert!(suspended.receipt.is_none(), "suspension is not terminal");
+        let ask = suspended.pending_human_ask.expect("labeled human ask");
+        assert_eq!(ask.question, "Which color?");
+        assert_eq!(ask.choices, vec!["blue", "green"]);
+        assert!(!ask.freeform_allowed);
+        assert_eq!(ask.policy, command.policy);
+
+        let secret_calls = secrets.calls.get();
+        let replay = runtime
+            .run_turn_with_driver(
+                &command,
+                &HumanPackages,
+                &secrets,
+                &resources,
+                &ScriptedDriver::new(Vec::new()),
+            )
+            .expect("pending replay");
+        assert_eq!(
+            replay.pending_human_ask.as_ref().map(|ask| &ask.ask_ref),
+            Some(&ask.ask_ref)
+        );
+        assert_eq!(
+            secrets.calls.get(),
+            secret_calls,
+            "reading a pending ask must not resolve provider secrets"
+        );
+
+        drop(runtime);
+        let mut runtime = GovernedHostRuntime::open(&path, 12, &policy_text)
+            .expect("reopen runtime after suspension");
+        let recovered = runtime
+            .pending_human_turn(&instance.instance_ref, &HumanPackages)
+            .expect("discover pending ask after restart")
+            .expect("pending human turn");
+        assert_eq!(recovered.command, command);
+        assert_eq!(recovered.ask, ask);
+        assert_eq!(
+            secrets.calls.get(),
+            secret_calls,
+            "pending discovery must not resolve provider secrets"
+        );
+
+        let mut wrong_epoch = command.policy.clone();
+        wrong_epoch.epoch += 1;
+        let mismatch = AnswerHumanAskCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            answer_id: "answer-wrong-epoch".to_owned(),
+            ask_ref: ask.ask_ref.clone(),
+            instance_ref: instance.instance_ref.clone(),
+            policy: wrong_epoch,
+            respondent_ref: "authority:alice".to_owned(),
+            answer: "blue".to_owned(),
+        };
+        assert!(runtime
+            .answer_human_ask_with_driver(
+                &mismatch,
+                &HumanPackages,
+                &secrets,
+                &resources,
+                &ScriptedDriver::new(Vec::new()),
+            )
+            .is_err());
+
+        let answer = AnswerHumanAskCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            answer_id: "answer-color".to_owned(),
+            ask_ref: ask.ask_ref,
+            instance_ref: instance.instance_ref.clone(),
+            policy: command.policy.clone(),
+            respondent_ref: "authority:alice".to_owned(),
+            answer: "blue".to_owned(),
+        };
+        let resumed_driver = ScriptedDriver::new(vec![json!({
+            "output_text": "Blue it is.",
+            "usage": { "input_tokens": 16, "output_tokens": 4 }
+        })]);
+        let resumed = runtime
+            .answer_human_ask_with_driver(
+                &answer,
+                &HumanPackages,
+                &secrets,
+                &resources,
+                &resumed_driver,
+            )
+            .expect("answer resumes turn");
+        resumed
+            .answer_receipt
+            .validate_for(&answer)
+            .expect("attributable answer receipt");
+        assert_eq!(
+            resumed.turn.receipt.as_ref().expect("terminal").status,
+            TurnStatus::Completed
+        );
+        assert_eq!(
+            resumed
+                .turn
+                .output
+                .as_ref()
+                .map(|output| output.assistant_text.as_str()),
+            Some("Blue it is.")
+        );
+        let request = resumed_driver.requests.borrow();
+        let body = request.first().expect("resumed model request").to_string();
+        assert!(body.contains("authority:alice"));
+        assert!(body.contains("blue"));
+        let run = runtime
+            .kernel
+            .store()
+            .list_runs(&instance.instance_ref)
+            .expect("runs")
+            .into_iter()
+            .find(|run| run.effect_id == command.command_id)
+            .expect("brokered run");
+        let metadata: Value = serde_json::from_str(&run.metadata_json).expect("run metadata");
+        assert_eq!(metadata.get("steps").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            metadata
+                .pointer("/usage/input_tokens")
+                .and_then(Value::as_u64),
+            Some(26)
+        );
+
+        let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("sqlite-wal"));
         let _ = fs::remove_file(path.with_extension("sqlite-shm"));
@@ -2813,8 +3506,9 @@ workflow UnsafeHostChat {
                 &driver,
             )
             .expect("cancelled execution settles");
-        assert_eq!(execution.receipt.status, TurnStatus::Cancelled);
-        assert!(execution.receipt.output_handle.is_none());
+        let receipt = execution.receipt.as_ref().expect("terminal receipt");
+        assert_eq!(receipt.status, TurnStatus::Cancelled);
+        assert!(receipt.output_handle.is_none());
         assert!(driver.fired.get());
         drop(runtime);
         let _ = fs::remove_file(&path);

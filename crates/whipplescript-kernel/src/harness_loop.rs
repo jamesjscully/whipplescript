@@ -50,6 +50,20 @@ pub struct ToolCall {
 pub enum ToolStatus {
     Ok,
     Error,
+    /// The tool intentionally paused the brokered turn for an attributable
+    /// human answer. No tool result is fed to the model until that answer is
+    /// admitted and correlated to the call.
+    Suspended,
+}
+
+/// A runtime-owned request to cross the labeled human interface. This is a
+/// question under the current authority epoch, never an authority grant.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HumanAskRequest {
+    pub call_id: String,
+    pub question: String,
+    pub choices: Vec<String>,
+    pub freeform_allowed: bool,
 }
 
 /// The result of executing one tool, fed back to the model.
@@ -249,6 +263,9 @@ pub enum TurnStatus {
     /// A durable cancellation request was observed between model rounds
     /// (pi-conformance §3: cooperative abort; the partial transcript persists).
     Cancelled,
+    /// The foreground turn remains live but cannot make another model call
+    /// until its pending human tool call receives an answer.
+    Suspended,
 }
 
 /// The outcome of a brokered turn: exactly one terminal, plus the in-turn stream
@@ -262,6 +279,7 @@ pub struct BrokeredTurnOutcome {
     pub steps: usize,
     pub observations: Vec<LoopObservation>,
     pub usage: Value,
+    pub pending_human_ask: Option<HumanAskRequest>,
 }
 
 /// Project a finished [`BrokeredTurnOutcome`] onto the [`ProviderRunResult`] the
@@ -271,9 +289,14 @@ pub struct BrokeredTurnOutcome {
 pub fn provider_result_from_brokered_turn(outcome: &BrokeredTurnOutcome) -> ProviderRunResult {
     let (status, failure) = match outcome.status {
         TurnStatus::Completed => (ProviderRunStatus::Completed, None),
-        TurnStatus::Failed | TurnStatus::TimedOut | TurnStatus::Cancelled => {
+        TurnStatus::Failed
+        | TurnStatus::TimedOut
+        | TurnStatus::Cancelled
+        | TurnStatus::Suspended => {
             let error_kind = if matches!(outcome.status, TurnStatus::Cancelled) {
                 "cancelled"
+            } else if matches!(outcome.status, TurnStatus::Suspended) {
+                "awaiting_human"
             } else if matches!(outcome.status, TurnStatus::TimedOut) {
                 "timeout"
             } else {
@@ -415,6 +438,7 @@ where
                     steps: step + 1,
                     observations,
                     usage,
+                    pending_human_ask: None,
                 };
             }
         };
@@ -434,6 +458,7 @@ where
                 steps: step + 1,
                 observations,
                 usage,
+                pending_human_ask: None,
             };
         }
 
@@ -455,6 +480,23 @@ where
                 name: call.name.clone(),
                 status: outcome.status,
             });
+            if outcome.status == ToolStatus::Suspended {
+                let request = serde_json::from_str::<HumanAskRequest>(&outcome.content).ok();
+                checkpoint(&messages);
+                return BrokeredTurnOutcome {
+                    status: request
+                        .as_ref()
+                        .map_or(TurnStatus::Failed, |_| TurnStatus::Suspended),
+                    summary: request.as_ref().map_or_else(
+                        || "human ask tool returned an invalid suspension".to_owned(),
+                        |ask| ask.question.clone(),
+                    ),
+                    steps: step + 1,
+                    observations,
+                    usage,
+                    pending_human_ask: request,
+                };
+            }
             results.push(ToolResultMsg {
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
@@ -475,6 +517,7 @@ where
         steps: input.max_steps,
         observations,
         usage,
+        pending_human_ask: None,
     }
 }
 
@@ -704,6 +747,7 @@ where
                 steps: self.step,
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
+                pending_human_ask: None,
             });
         }
         self.awaiting = Awaiting::Main;
@@ -725,6 +769,7 @@ where
             steps: self.input.max_steps,
             observations: std::mem::take(&mut self.observations),
             usage: std::mem::take(&mut self.usage),
+            pending_human_ask: None,
         }
     }
 }
@@ -836,6 +881,7 @@ where
                     steps: self.step + 1,
                     observations: std::mem::take(&mut self.observations),
                     usage: std::mem::take(&mut self.usage),
+                    pending_human_ask: None,
                 });
             }
         };
@@ -859,6 +905,7 @@ where
                 steps: self.step + 1,
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
+                pending_human_ask: None,
             });
         }
 
@@ -881,6 +928,23 @@ where
                 name: call.name.clone(),
                 status: outcome.status,
             });
+            if outcome.status == ToolStatus::Suspended {
+                let request = serde_json::from_str::<HumanAskRequest>(&outcome.content).ok();
+                (self.checkpoint)(&self.messages);
+                return Outcome::Settle(BrokeredTurnOutcome {
+                    status: request
+                        .as_ref()
+                        .map_or(TurnStatus::Failed, |_| TurnStatus::Suspended),
+                    summary: request.as_ref().map_or_else(
+                        || "human ask tool returned an invalid suspension".to_owned(),
+                        |ask| ask.question.clone(),
+                    ),
+                    steps: self.step + 1,
+                    observations: std::mem::take(&mut self.observations),
+                    usage: std::mem::take(&mut self.usage),
+                    pending_human_ask: request,
+                });
+            }
             results.push(ToolResultMsg {
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
