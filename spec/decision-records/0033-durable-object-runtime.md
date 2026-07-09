@@ -75,11 +75,11 @@ An effect may be evicted mid-`fetch`; on resume we retry. Delivery is therefore
 **at-least-once**, and the duplicate is bounded by a **per-round idempotency key
 derived only from durable identity** — `idempotency_key([instance, version, epoch,
 rule, node_id, identity])` — so a retry carries the *same* key and the provider
-dedupes it. Where a provider exposes an idempotency header (Anthropic; OpenAI is
-uneven) the duplicate is absorbed provider-side; where it does not, the residual
-duplicate-on-eviction risk is stated in the guarantee report (see the tracker's
-open-questions matrix). Content-addressed writes (Decision 4) are idempotent by
-construction and need no key.
+dedupes it. Where a provider honors an `Idempotency-Key` request header (OpenAI +
+codex; see the wired coverage note below) the duplicate is absorbed provider-side;
+where it does not (Anthropic ignores the header), the residual duplicate-on-eviction
+risk is stated in the guarantee report (see the tracker's open-questions matrix).
+Content-addressed writes (Decision 4) are idempotent by construction and need no key.
 
 **This decision is the one carrying formal risk, so it is the core of the Phase-0
 model** (`ResumableEffectLifecycle.tla`, Apalache, coverage + bite). The model
@@ -100,23 +100,28 @@ sharpest is `ProviderExecBoundedByRounds`: make the key attempt-dependent and th
 provider double-executes a round — that is exactly the bug the durable identity
 key exists to prevent.
 
-**Recorded residual — provider idempotency-key coverage (verified 2026-07-09).**
-The wording above ("Where a provider exposes an idempotency header (Anthropic;
-OpenAI is uneven) the duplicate is absorbed provider-side") describes the intended
-posture, not the wired state. A code audit of every provider HTTP builder
-(`coerce_native::build_{anthropic,openai,codex}_request`,
-`harness_model::build_{anthropic,openai}_request`) found that **no provider path
-currently sends a provider-level idempotency key** — the sync Messages
-(`/v1/messages`) and Responses (`/v1/responses`) APIs do not expose a request-level
-idempotency header, and `cache_control` / `prompt_cache_key` are prompt-caching
-(cost) controls, not request dedup. The residual is therefore the honest
-at-least-once external delivery this decision already states: on eviction after a
-`fetch` reaches the provider but before the response is recorded, the resume may
-cause a **duplicate provider execution**. The store-side effect idempotency key
-bounds this to **exactly-once settle** (one terminal in the ledger), not
-exactly-once provider execution. The full per-endpoint matrix is recorded in the
-tracker's open-questions list (`spec/durable-object-runtime-tracker.md`), which is
-the home this decision points to.
+**Provider idempotency-key coverage — wired 2026-07-09.** Every provider HTTP
+builder now emits a stable per-effect `Idempotency-Key` request header
+(`coerce_native::build_{anthropic,openai,codex}_request` via the shared
+`with_idempotency_key`; `harness_model::build_{anthropic,openai}_request` from the
+Decision-7 `cache_key`). The key is the effect's durable identity —
+`idempotency_key([instance, effect, "coerce"])` for coerce, the run/effect id
+(`cache_key`) for the agent turn — so a resume carries the *same* key and is
+resume-stable by construction. **OpenAI/codex** (`POST /v1/responses`,
+`POST /backend-api/codex/responses`) honor `Idempotency-Key`: the resumed duplicate
+after an eviction is absorbed provider-side, giving exactly-once provider execution
+within the provider's idempotency window (~24h). This closes the double-billing
+residual on those paths. **Anthropic** (`POST /v1/messages`) does not document an
+idempotency header; it ignores the unknown request header (harmless — no rejection,
+no dedup), so the honest at-least-once external delivery this decision states still
+holds for Anthropic: on eviction after a `fetch` reaches the provider but before the
+response is recorded, the resume may cause a **duplicate provider execution** until
+(or unless) Anthropic supports idempotency. On every path the store-side effect
+idempotency key still bounds the outcome to **exactly-once settle** (one terminal in
+the ledger). `cache_control` / `prompt_cache_key` remain prompt-caching (cost)
+controls, sent alongside — separate from request dedup. The full per-endpoint matrix
+is recorded in the tracker's open-questions list
+(`spec/durable-object-runtime-tracker.md`).
 
 ## Decision 4 — One file construct; the runtime owns storage tiering
 

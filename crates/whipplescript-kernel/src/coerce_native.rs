@@ -282,6 +282,14 @@ pub struct CoerceCall<'a> {
     pub max_tokens: u32,
     /// When set (OpenAI + a ChatGPT-plan OAuth token), use the codex backend.
     pub codex: Option<CodexAuth<'a>>,
+    /// Stable per-effect `Idempotency-Key` (DR-0033): the same value across a
+    /// resume/retry of the same coerce effect, unique per distinct effect —
+    /// derived from `(instance_id, effect_id)`. Sent as an `Idempotency-Key`
+    /// request header so OpenAI/codex dedupe a duplicate call after a worker
+    /// eviction (the fetch reached the provider but the response never recorded).
+    /// Empty on the fixture/no-key path — then no header is emitted and the
+    /// request stays byte-identical to before.
+    pub idempotency_key: &'a str,
 }
 
 /// Build the HTTP request for a coerce call. Auth headers are included so the
@@ -327,23 +335,43 @@ fn build_codex_request(call: &CoerceCall<'_>, codex: CodexAuth<'_>) -> HttpReque
             "{}/backend-api/codex/responses",
             call.base_url.trim_end_matches('/')
         ),
-        headers: vec![
-            (
-                "authorization".to_owned(),
-                format!("Bearer {}", call.api_key),
-            ),
-            ("chatgpt-account-id".to_owned(), codex.account_id.to_owned()),
-            ("content-type".to_owned(), "application/json".to_owned()),
-            ("accept".to_owned(), "text/event-stream".to_owned()),
-            (
-                "openai-beta".to_owned(),
-                "responses=experimental".to_owned(),
-            ),
-            ("originator".to_owned(), "codex_cli_rs".to_owned()),
-            ("session_id".to_owned(), codex.session_id.to_owned()),
-        ],
+        headers: with_idempotency_key(
+            call,
+            vec![
+                (
+                    "authorization".to_owned(),
+                    format!("Bearer {}", call.api_key),
+                ),
+                ("chatgpt-account-id".to_owned(), codex.account_id.to_owned()),
+                ("content-type".to_owned(), "application/json".to_owned()),
+                ("accept".to_owned(), "text/event-stream".to_owned()),
+                (
+                    "openai-beta".to_owned(),
+                    "responses=experimental".to_owned(),
+                ),
+                ("originator".to_owned(), "codex_cli_rs".to_owned()),
+                ("session_id".to_owned(), codex.session_id.to_owned()),
+            ],
+        ),
         body,
     }
+}
+
+/// Append the `Idempotency-Key` header when the call carries a non-empty key,
+/// otherwise leave the header list untouched (the fixture/no-key path must stay
+/// byte-identical). OpenAI/codex dedupe a resumed duplicate against this key;
+/// providers that don't support it ignore the unknown request header.
+fn with_idempotency_key(
+    call: &CoerceCall<'_>,
+    mut headers: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    if !call.idempotency_key.is_empty() {
+        headers.push((
+            "Idempotency-Key".to_owned(),
+            call.idempotency_key.to_owned(),
+        ));
+    }
+    headers
 }
 
 fn build_openai_request(call: &CoerceCall<'_>) -> HttpRequest {
@@ -365,13 +393,16 @@ fn build_openai_request(call: &CoerceCall<'_>) -> HttpRequest {
     });
     HttpRequest {
         url: format!("{}/v1/responses", call.base_url.trim_end_matches('/')),
-        headers: vec![
-            (
-                "authorization".to_owned(),
-                format!("Bearer {}", call.api_key),
-            ),
-            ("content-type".to_owned(), "application/json".to_owned()),
-        ],
+        headers: with_idempotency_key(
+            call,
+            vec![
+                (
+                    "authorization".to_owned(),
+                    format!("Bearer {}", call.api_key),
+                ),
+                ("content-type".to_owned(), "application/json".to_owned()),
+            ],
+        ),
         body,
     }
 }
@@ -395,11 +426,14 @@ fn build_anthropic_request(call: &CoerceCall<'_>) -> HttpRequest {
     // we get here — this path always carries a real key.
     HttpRequest {
         url: format!("{}/v1/messages", call.base_url.trim_end_matches('/')),
-        headers: vec![
-            ("x-api-key".to_owned(), call.api_key.to_owned()),
-            ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
-            ("content-type".to_owned(), "application/json".to_owned()),
-        ],
+        headers: with_idempotency_key(
+            call,
+            vec![
+                ("x-api-key".to_owned(), call.api_key.to_owned()),
+                ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
+                ("content-type".to_owned(), "application/json".to_owned()),
+            ],
+        ),
         body,
     }
 }
@@ -622,6 +656,9 @@ pub struct NativeCoerceClient<'a, T: CoerceTransport> {
     pub max_tokens: u32,
     /// `(account_id, session_id)` when using the codex backend (OpenAI only).
     pub codex: Option<(String, String)>,
+    /// Stable per-effect `Idempotency-Key` (see [`CoerceCall::idempotency_key`]);
+    /// empty for the fixture/no-key path.
+    pub idempotency_key: String,
     pub transport: &'a T,
 }
 
@@ -643,6 +680,7 @@ impl<T: CoerceTransport> CoerceClient for NativeCoerceClient<'_, T> {
                     account_id,
                     session_id,
                 }),
+            idempotency_key: &self.idempotency_key,
         };
         // Coerce is a one-round step machine (prepare → HTTP → finish). The
         // native host drives it to completion synchronously via its transport;
@@ -988,6 +1026,7 @@ mod tests {
             schema_name: "WorkReview",
             max_tokens: 1024,
             codex: None,
+            idempotency_key: "key_openai_effect",
         };
         let request = build_request(&call);
         assert_eq!(request.url, "https://api.openai.com/v1/responses");
@@ -997,6 +1036,66 @@ mod tests {
             .headers
             .iter()
             .any(|(k, v)| k == "authorization" && v == "Bearer sk-test"));
+        // A non-empty per-effect key rides as an `Idempotency-Key` header.
+        assert!(request
+            .headers
+            .iter()
+            .any(|(k, v)| k == "Idempotency-Key" && v == "key_openai_effect"));
+    }
+
+    #[test]
+    fn empty_idempotency_key_emits_no_header_on_every_builder() {
+        // The fixture/no-key path must stay byte-identical to before: an empty
+        // key produces no `Idempotency-Key` header on any of the three builders.
+        let schema = json!({ "type": "object" });
+        let has_key =
+            |request: &HttpRequest| request.headers.iter().any(|(k, _)| k == "Idempotency-Key");
+        let openai = CoerceCall {
+            provider: CoerceProvider::OpenAi,
+            base_url: "https://api.openai.com",
+            api_key: "sk-test",
+            model: "gpt-4o",
+            prompt: "p",
+            output_schema: &schema,
+            schema_name: "WorkReview",
+            max_tokens: 1024,
+            codex: None,
+            idempotency_key: "",
+        };
+        assert!(!has_key(&build_request(&openai)));
+
+        let codex = CoerceCall {
+            codex: Some(CodexAuth {
+                account_id: "acct-1",
+                session_id: "sess-1",
+            }),
+            ..openai.clone()
+        };
+        assert!(!has_key(&build_request(&codex)));
+
+        let anthropic = CoerceCall {
+            provider: CoerceProvider::Anthropic,
+            base_url: "https://api.anthropic.com",
+            api_key: "key",
+            codex: None,
+            ..openai
+        };
+        assert!(!has_key(&build_request(&anthropic)));
+    }
+
+    #[test]
+    fn idempotency_key_is_resume_stable_per_effect() {
+        // The whole correctness argument: the key must be identical across a
+        // resume of the SAME effect (so the provider returns its cached response)
+        // and differ for a distinct effect. The helper is a pure hash of
+        // `(instance_id, effect_id, tag)`, so equal inputs → equal key.
+        let same_1 = crate::idempotency_key(&["inst-A", "eff-1", "coerce"]);
+        let same_2 = crate::idempotency_key(&["inst-A", "eff-1", "coerce"]);
+        assert_eq!(same_1, same_2, "same effect must map to the same key");
+        let other_effect = crate::idempotency_key(&["inst-A", "eff-2", "coerce"]);
+        assert_ne!(same_1, other_effect, "a distinct effect must differ");
+        let other_instance = crate::idempotency_key(&["inst-B", "eff-1", "coerce"]);
+        assert_ne!(same_1, other_instance, "a distinct instance must differ");
     }
 
     #[test]
@@ -1015,6 +1114,7 @@ mod tests {
                 account_id: "acct-1",
                 session_id: "sess-1",
             }),
+            idempotency_key: "key_codex_effect",
         };
         let request = build_request(&call);
         assert_eq!(
@@ -1041,6 +1141,11 @@ mod tests {
             header("openai-beta").as_deref(),
             Some("responses=experimental")
         );
+        // Codex honors `Idempotency-Key` — the resume-stable per-effect key.
+        assert_eq!(
+            header("Idempotency-Key").as_deref(),
+            Some("key_codex_effect")
+        );
     }
 
     #[test]
@@ -1056,6 +1161,7 @@ mod tests {
             schema_name: "WorkReview",
             max_tokens: 1024,
             codex: None,
+            idempotency_key: "key_anthropic_effect",
         };
         let request = build_request(&call);
         assert_eq!(request.url, "https://api.anthropic.com/v1/messages");
@@ -1068,6 +1174,12 @@ mod tests {
             .any(|(k, v)| k == "x-api-key" && v == "key"));
         // Anthropic coerce uses x-api-key only — never the OAuth bearer header.
         assert!(!request.headers.iter().any(|(k, _)| k == "authorization"));
+        // The header is still sent to Anthropic (harmless — an unknown request
+        // header is ignored); Anthropic simply does not dedupe on it.
+        assert!(request
+            .headers
+            .iter()
+            .any(|(k, v)| k == "Idempotency-Key" && v == "key_anthropic_effect"));
     }
 
     #[test]
@@ -1095,6 +1207,7 @@ mod tests {
             schema_name: "Bag",
             max_tokens: 256,
             codex: None,
+            idempotency_key: "",
         };
         let request = build_request(&call);
         assert_eq!(
@@ -1190,6 +1303,7 @@ mod tests {
             schema_name: "WorkReview".to_owned(),
             max_tokens: 1024,
             codex: None,
+            idempotency_key: String::new(),
             transport: &transport,
         };
         let request = CoerceRequest {
@@ -1222,6 +1336,7 @@ mod tests {
             schema_name: "X".to_owned(),
             max_tokens: 256,
             codex: None,
+            idempotency_key: String::new(),
             transport: &transport,
         };
         let request = CoerceRequest {
@@ -1256,6 +1371,7 @@ mod tests {
                 schema_name: "WorkReview",
                 max_tokens: 1024,
                 codex: None,
+                idempotency_key: "",
             },
             provider,
             wrapped: false,

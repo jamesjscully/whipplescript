@@ -21711,6 +21711,9 @@ fn run_native_coerce_effect(
         schema_name,
         max_tokens: config.max_tokens,
         codex,
+        // Stable per-effect `Idempotency-Key` (DR-0033): resume-stable so
+        // OpenAI/codex dedupe a duplicate provider call after a worker eviction.
+        idempotency_key: idempotency_key(&[instance_id, &effect.effect_id, "coerce"]),
         transport: &transport,
     };
     let store = SqliteStore::open(store_path)?;

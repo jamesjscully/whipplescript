@@ -550,6 +550,11 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "coerce-run"]);
                 let lease_id =
                     idempotency_key(&[self.instance_id, &effect.effect_id, "coerce-lease"]);
+                // Stable per-effect `Idempotency-Key` (DR-0033): identical across a
+                // resume of this coerce effect so OpenAI/codex dedupe the resumed
+                // provider call after a worker eviction. Derived here where the
+                // effect identity (instance_id + effect_id) is in scope.
+                let idem_key = idempotency_key(&[self.instance_id, &effect.effect_id, "coerce"]);
                 let request = CoerceRequest {
                     function_name,
                     arguments_json: arguments.to_string(),
@@ -581,6 +586,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             schema_name: &schema_name,
                             max_tokens: cfg.max_tokens,
                             codex: None,
+                            idempotency_key: &idem_key,
                         };
                         return Ok(EffectStep::NeedsHttp(build_request(&call)));
                     }

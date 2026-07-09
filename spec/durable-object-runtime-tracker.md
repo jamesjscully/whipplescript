@@ -856,36 +856,38 @@ fixed-size `getRandom` pools). Open build work:
       set, so it is **deferred-with-cause to production load** — no in-repo
       code decision remains.
 - [x] Provider idempotency-key coverage matrix (Anthropic vs OpenAI endpoints).
-      **Investigated 2026-07-09; matrix recorded here — the tracker open-questions
+      **Investigated 2026-07-09; header WIRED 2026-07-09 — the tracker open-questions
       list is the home DR-0033 Decision 3 points to** ("stated in the guarantee
-      report (see the tracker's open-questions matrix)"). Finding: **no provider
-      HTTP path currently sends a provider-level idempotency key.** Per endpoint:
+      report (see the tracker's open-questions matrix)"). Every provider HTTP path
+      now sends a stable per-effect **`Idempotency-Key` request header** derived from
+      the effect's durable identity (resume-stable by construction). Per endpoint:
 
-      | Effect | Provider endpoint | Builder | Provider idempotency key? | Residual on eviction+resume |
+      | Effect | Provider endpoint | Builder | `Idempotency-Key` header | Residual on eviction+resume |
       |---|---|---|---|---|
-      | coerce Anthropic | `POST {base}/v1/messages` | `coerce_native::build_anthropic_request` | **No** (`x-api-key`, `anthropic-version`, `content-type` only) | duplicate provider call possible |
-      | coerce OpenAI | `POST {base}/v1/responses` | `coerce_native::build_openai_request` | **No** (`authorization`, `content-type`) | duplicate provider call possible |
-      | coerce OpenAI/codex | `POST {base}/backend-api/codex/responses` | `coerce_native::build_codex_request` | **No** (codex/session headers, no idempotency) | duplicate provider call possible |
-      | agent Anthropic | `POST {base}/v1/messages` | `harness_model::build_anthropic_request` | **No**; a `cache_control` breakpoint rides the system block, but that is *prompt caching* (cost), not request dedup | duplicate provider call possible |
-      | agent OpenAI | `POST {base}/v1/responses` | `harness_model::build_openai_request` | **No**; `prompt_cache_key` in the body is *prompt caching* (cost), not request dedup | duplicate provider call possible |
+      | coerce Anthropic | `POST {base}/v1/messages` | `coerce_native::build_anthropic_request` | **Sent** (via `with_idempotency_key`) | Anthropic ignores it — duplicate provider call still possible |
+      | coerce OpenAI | `POST {base}/v1/responses` | `coerce_native::build_openai_request` | **Sent + honored** | deduped provider-side (~24h window) |
+      | coerce OpenAI/codex | `POST {base}/backend-api/codex/responses` | `coerce_native::build_codex_request` | **Sent + honored** | deduped provider-side (~24h window) |
+      | agent Anthropic | `POST {base}/v1/messages` | `harness_model::build_anthropic_request` | **Sent** (from Decision-7 `cache_key`); `cache_control` breakpoint is separate *prompt caching* | Anthropic ignores it — duplicate provider call still possible |
+      | agent OpenAI | `POST {base}/v1/responses` | `harness_model::build_openai_request` | **Sent + honored** (from `cache_key`); `prompt_cache_key` in the body is separate *prompt caching* | deduped provider-side (~24h window) |
 
-      The sync Messages / Responses APIs do not expose a request-level
-      idempotency-key header (idempotency keys are not part of `POST /v1/messages`;
-      `cache_control` / `prompt_cache_key` are cost optimizations, not dedup), so
-      the DR's aspirational "Anthropic header" is **not** wired. The residual is
-      therefore the honest **at-least-once external delivery** stated in DR-0033
-      Decision 3 and proven in `ResumableEffectLifecycle.tla`
-      (`AtLeastOnceLowerBounds`): if an isolate is evicted after `fetch` reaches
-      the provider but before the response is durably recorded, the resume
-      re-dispatches and the provider may execute the round a **second time**
-      (double billing / double side effect). The store-side effect idempotency key
-      (`idempotency_key([instance, effect, ...])`, e.g. `do_store.rs`) bounds this
-      only to **exactly-once settle** — the ledger records one terminal regardless
-      of duplicate dispatches — it does *not* dedup the provider call itself.
-      Closing the residual requires a provider that accepts an idempotency header
-      (none of the above do today); content-addressed writes (Decision 4) are the
-      only class idempotent by construction. **No mitigation is silently missing —
-      the residual is named, bounded (settle is exactly-once), and modeled.**
+      The key = `idempotency_key([instance, effect, "coerce"])` for coerce and the
+      run/effect id (`cache_key`) for the agent turn — a pure function of durable
+      identity, unchanged across suspend/resume/re-dispatch (this is exactly the
+      `IdemKeyStable` property in `ResumableEffectLifecycle.tla`). The header is
+      skipped when the key is empty (fixture / no-key path), so canned-response tests
+      stay byte-identical. **OpenAI + codex honor `Idempotency-Key`** — the resumed
+      duplicate after an eviction is absorbed provider-side, closing the
+      double-billing residual on those paths (exactly-once provider execution within
+      the provider's idempotency window). **Anthropic** does not document an
+      idempotency header for `POST /v1/messages`; standard HTTP APIs ignore unknown
+      request headers, so sending it is harmless (no rejection, no dedup) — the honest
+      **at-least-once external delivery** stated in DR-0033 Decision 3 and proven in
+      `AtLeastOnceLowerBounds` still holds for Anthropic until (or unless) it supports
+      idempotency. On every path the store-side effect idempotency key
+      (`idempotency_key([instance, effect, ...])`, e.g. `do_store.rs`) still bounds the
+      outcome to **exactly-once settle** — one terminal in the ledger regardless of
+      duplicate dispatches. **Residual is now scoped to Anthropic only; OpenAI/codex
+      closed.**
 - [x] Threshold + spill policy for file tiering (Decision 4). **Decided +
       wired 2026-07-09.** `TieredFileStore` previously took a caller-supplied
       `threshold_bytes` with no default (only the 8-byte test value ever set it).
