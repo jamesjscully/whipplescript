@@ -79,21 +79,6 @@ pub fn unix_ms_to_iso8601(unix_ms: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-/// A tool executor that errors on any request (turns declaring no tools never hit
-/// it). A live worker passes one that brokers tools to an HTTP sidecar.
-struct NoToolExecutor;
-impl ToolExecutor for NoToolExecutor {
-    fn execute(
-        &self,
-        call: &whipplescript_kernel::harness_loop::ToolCall,
-    ) -> whipplescript_kernel::harness_loop::ToolOutcome {
-        whipplescript_kernel::harness_loop::ToolOutcome {
-            status: whipplescript_kernel::harness_loop::ToolStatus::Error,
-            content: format!("no tool executor configured: {}", call.name),
-        }
-    }
-}
-
 /// The effect seams a live worker injects from its bindings/secrets. All optional
 /// so an instance running only store-only + effect-free workflows needs none.
 #[derive(Default)]
@@ -294,9 +279,14 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                 .unwrap_or_else(|| Box::new(DoFileStore::new(DoSqlStorage::new(Rc::clone(&sql))))),
             coerce: ports.coerce,
             agent_model: ports.agent_model,
+            // P4: the DO agent turn gets a real in-isolate tool executor over
+            // the shared DO SQLite by default (the file plane IS the sandbox),
+            // so agent turns can read/write/edit/search files and drive the
+            // tracker with no extra deploy config. An explicit port override
+            // (e.g. an HTTP sidecar broker) still wins.
             agent_tools: ports
                 .agent_tools
-                .unwrap_or_else(|| Box::new(NoToolExecutor)),
+                .unwrap_or_else(|| Box::new(crate::do_tools::DoToolExecutor::new(Rc::clone(&sql)))),
             exec: ports.exec,
             turn: ports.turn,
         })

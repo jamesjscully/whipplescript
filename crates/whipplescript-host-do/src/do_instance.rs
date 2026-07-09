@@ -419,7 +419,10 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 let turn_input = BrokeredTurnInput {
                     system,
                     user: prompt,
-                    tools: Vec::new(),
+                    // P4: the DO agent turn advertises the in-isolate tool set
+                    // (read/write/edit/ls/find/grep/recall + the tracker todos),
+                    // brokered by the `DoToolExecutor` over the DO file plane.
+                    tools: crate::do_tools::do_tool_specs(),
                     max_steps: 8,
                     resume_from: Vec::new(),
                     user_images: Vec::new(),
@@ -465,9 +468,9 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     }
                 }
                 let mut discard = |_: &[ChatMessage]| {};
-                // The DO agent turn is still a no-tools stub; conversation compaction
-                // (context-assembly Phase 4 Layer B) lands with the DO agent-tool
-                // executor, so drive the machine with the no-op compactor for now.
+                // The DO agent turn now brokers a real in-isolate tool set (P4);
+                // conversation compaction (context-assembly Phase 4 Layer B) is a
+                // separate lift, so drive the machine with the no-op compactor for now.
                 let compactor = NoopCompactor;
                 let mut machine = match loaded {
                     None => BrokeredTurnMachine::new(

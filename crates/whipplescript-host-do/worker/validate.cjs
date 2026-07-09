@@ -138,6 +138,78 @@ function testAgentSuspendResume() {
 }
 
 
+// 3b) An AGENT workflow that CALLS A TOOL (DO parity P4): the turn's first model
+//     call suspends on fetch; a canned Anthropic `tool_use` reply drives the
+//     in-isolate `write` tool (against the DO `files` table over the shared DoSql);
+//     the turn then issues the NEXT model call, and a canned final text reply
+//     settles it to a terminal. The written bytes land in the `files` table -- the
+//     tool executed through the REAL wasm boundary, no fetch for the tool itself.
+function testAgentToolCall() {
+  const source = [
+    "workflow AgentTool", "", "output result Done", "",
+    "class Done {", "  ok int", "}", "",
+    "agent helper {", "  provider owned", '  profile "repo-writer"', "  capacity 1", "}", "",
+    "rule go", "  when started", "=> {", '  tell helper as reply """', "  Write the greeting.", '  """', "",
+    "  after reply succeeds {", "    complete result { ok 1 }", "  }", "",
+    "  after reply fails {", "    complete result { ok 0 }", "  }", "}",
+  ].join("\n");
+  const seed = [
+    "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('agent.tell', 'Run an agent turn.', '{}')",
+    "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+    "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+    "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) VALUES ('profile_repo_writer', 'repo-writer', 'writes', 'enforce', '[\"agent.tell\"]', '{}')",
+  ];
+  const { bridge, db } = freshInstanceEnv(seed);
+  const agentConfig = JSON.stringify({
+    provider: "anthropic", base_url: "https://api.anthropic.com",
+    api_key: "test-key", model: "claude-test", max_tokens: 4096,
+  });
+  const inst = WasmDurableInstance.create(bridge, source, "{}", "local/AgentTool", undefined, agentConfig, undefined);
+
+  // First step: the agent turn's first model call suspends on `fetch`, and it
+  // advertises the DO tool set (P4) built into the messages request.
+  const first = JSON.parse(inst.step(undefined, Date.now()));
+  assert.strictEqual(first.kind, "needs_http", `agent-tool step1: ${JSON.stringify(first)}`);
+  assert.ok(first.request.url.endsWith("/v1/messages"), "request targets the messages endpoint");
+  const toolNames = (first.request.body.tools || []).map((t) => t.name);
+  assert.ok(toolNames.includes("write"), `write tool is advertised: ${JSON.stringify(toolNames)}`);
+
+  // The shell performs the fetch; feed a canned Anthropic reply that CALLS `write`.
+  const toolUse = JSON.stringify({
+    status: 200,
+    body: {
+      content: [{
+        type: "tool_use", id: "tc1", name: "write",
+        input: { path: "greeting.md", content: "hello from the model" },
+      }],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+  });
+  // The turn runs `write` in-isolate against DO SQLite, then issues the next call.
+  const second = JSON.parse(inst.step(toolUse, Date.now()));
+  assert.strictEqual(second.kind, "needs_http", `agent-tool step2: ${JSON.stringify(second)}`);
+
+  // The tool's effect already landed in the `files` table -- keyed flat by path.
+  const row = db.prepare("SELECT content FROM files WHERE key = ?").get("greeting.md");
+  assert.strictEqual(row && row.content, "hello from the model", "write tool bytes landed in DO SQLite");
+  // RC-1 history: the body is captured content-addressed like the file.write effect.
+  const blobs = db.prepare("SELECT COUNT(*) AS n FROM content_blobs").get();
+  assert.ok(Number(blobs.n) >= 1, "write tool captured an RC-1 history blob");
+
+  // Feed the canned FINAL reply (no tool calls) -> terminal.
+  const finalReply = JSON.stringify({
+    status: 200,
+    body: {
+      content: [{ type: "text", text: "wrote the greeting" }],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+  });
+  const third = JSON.parse(inst.step(finalReply, Date.now()));
+  assert.strictEqual(third.kind, "terminal", `agent-tool step3: ${JSON.stringify(third)}`);
+  assert.strictEqual(inst.status(), "completed");
+  console.log("PASS  agent workflow -> tool_use (write in-isolate) -> terminal (three steps)");
+}
+
 // 4) A Class-A EXEC workflow (compute plane P8): the exec.command effect builds a
 //    whip-executor/1 request and SUSPENDS on fetch; the sidecar's canned response
 //    RESUMES it to a terminal -- and the delta-kernel cache entry is recorded.
@@ -313,6 +385,7 @@ function testCheckpointRestore() {
 testEffectFree();
 testCoerceSuspendResume();
 testAgentSuspendResume();
+testAgentToolCall();
 testExecSuspendResume();
 testTurnContainerAgent();
 testFileWrite();

@@ -34,6 +34,8 @@ use whipplescript_store::files::FileStore;
 pub mod do_instance;
 /// `RuntimeStore` over the DO's synchronous SQLite (`DoSql`).
 pub mod do_store;
+/// The in-isolate agent-turn tool executor over the DO file plane (P4).
+pub mod do_tools;
 #[cfg(target_arch = "wasm32")]
 pub mod do_wasm;
 pub mod do_worker;
