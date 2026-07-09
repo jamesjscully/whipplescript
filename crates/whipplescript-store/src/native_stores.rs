@@ -686,6 +686,15 @@ impl WorkItems for NativeStores {
         self.items.claim_item(item_id, claimed_by)
     }
 
+    fn renew_claim(
+        &mut self,
+        item_id: &str,
+        actor: &str,
+        expires: Option<&str>,
+    ) -> StoreResult<RenewOutcome> {
+        self.items.renew_claim(item_id, actor, expires)
+    }
+
     fn release_item(&mut self, item_id: &str) -> StoreResult<bool> {
         self.items.release_item(item_id)
     }

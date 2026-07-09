@@ -31,7 +31,7 @@ use serde_json::Value;
 use whipplescript_store::coordination::{
     AcquireOutcome, ConsumeOutcome, Coordination, CounterRow, LeaseRow, LedgerEntry,
 };
-use whipplescript_store::items::{ClaimOutcome, WorkItem, WorkItems};
+use whipplescript_store::items::{apply_overlay, ClaimOutcome, RenewOutcome, WorkItem, WorkItems};
 use whipplescript_store::{NewEvent, RuntimeStore, StoreError, StoreResult, StoredEvent};
 // The remaining ported methods reference the full set of store data types.
 #[allow(unused_imports)]
@@ -6468,23 +6468,33 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 }
 
-// -- WorkItems over DoSql (DR-0033 chunk 5a) --------------------------------
+// -- WorkItems over DoSql (event-sourced; ADR-0002 v1) ----------------------
 //
-// The builtin work-item tracker (`spec/work-queues.md`) ported to the DO's one
-// SQLite, so the DO backs the `WorkItems` surface the rule pass reaches
-// (`project_tracker_issues` / holder-release) the same way it backs `RuntimeStore`.
-// Natively this is a separate `.whipplescript/items.sqlite`; on the DO it is the
-// `items` + `item_counter` tables in the single durable store. The native SQL used
-// a rusqlite transaction for the file/claim atomic pairs; the DO's single-writer
-// per-invocation model supplies that atomicity (these methods never yield
-// mid-sequence), so no explicit transaction is needed — the same argument as the
+// The builtin work-item tracker (`spec/work-queues.md`) rebuilt as an
+// event-sourced provider on the DO's one SQLite, so the DO backs the
+// `WorkItems` surface the rule pass reaches (`project_tracker_issues` /
+// holder-release) the same way it backs `RuntimeStore`. This is the exact same
+// event/projection/lease model as the native `WorkItemStore` (append-only
+// `tracker_events` = source of truth; `tracker_issues` / `tracker_relations` /
+// `tracker_leases` = disposable projections; claims are runtime leases split
+// from durable status). The native SQL used a rusqlite `Immediate` transaction
+// for the claim CAS; the DO's single-writer per-invocation model supplies that
+// atomicity (these methods never yield mid-sequence), so the check-then-insert
+// claim is exclusive without an explicit transaction — the same argument as the
 // RuntimeStore port.
 
-const DO_ITEM_COLS: &str = "item_id, queue, title, body, status, labels_json, \
-     metadata_json, claimed_by, filed_by, created_at, updated_at";
+const DO_ISSUE_COLS: &str = "issue_id, queue, title, body, status, labels_json, \
+     metadata_json, filed_by, created_at, updated_at";
 
-/// Map a positional `items` row to a `WorkItem` (column order = `DO_ITEM_COLS`).
-fn do_work_item_row(row: &[SqlValue]) -> WorkItem {
+/// The active-lease predicate over `tracker_leases`, with the clock inlined as
+/// `datetime('now')`. A NULL `expires_at` models a lease with no TTL.
+const DO_ACTIVE_LEASE: &str =
+    "released_at IS NULL AND (expires_at IS NULL OR expires_at > datetime('now'))";
+
+/// Map a positional `tracker_issues` row to a `WorkItem` (column order =
+/// `DO_ISSUE_COLS`). `claimed_by` is supplied by the lease overlay, not the
+/// durable projection.
+fn do_issue_row(row: &[SqlValue]) -> WorkItem {
     WorkItem {
         id: as_text(&row[0]),
         queue: as_text(&row[1]),
@@ -6493,11 +6503,131 @@ fn do_work_item_row(row: &[SqlValue]) -> WorkItem {
         status: as_text(&row[4]),
         labels: serde_json::from_str(&as_text(&row[5])).unwrap_or_default(),
         metadata: serde_json::from_str(&as_text(&row[6])).unwrap_or_else(|_| serde_json::json!({})),
-        claimed_by: as_opt_text(&row[7]),
-        filed_by: as_opt_text(&row[8]),
-        created_at: as_text(&row[9]),
-        updated_at: as_text(&row[10]),
+        claimed_by: None,
+        filed_by: as_opt_text(&row[7]),
+        created_at: as_text(&row[8]),
+        updated_at: as_text(&row[9]),
     }
+}
+
+/// Capture a single now-timestamp for one op; every event + projection field it
+/// derives uses this, so a rebuild reproduces the same values.
+fn do_now(sql: &impl DoSql) -> StoreResult<String> {
+    let rows = sql.query("SELECT datetime('now')", &[]).map_err(sql_err)?;
+    Ok(rows
+        .first()
+        .map_or_else(String::new, |row| as_text(&row[0])))
+}
+
+/// Append one immutable tracker event (INSERT only — never updated or deleted).
+fn do_tracker_append(
+    sql: &impl DoSql,
+    issue_id: Option<&str>,
+    kind: &str,
+    payload: &serde_json::Value,
+    actor: Option<&str>,
+    now: &str,
+) -> StoreResult<()> {
+    sql.execute(
+        "INSERT INTO tracker_events (issue_id, kind, payload_json, actor, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        &[
+            opt_text(issue_id),
+            text(kind),
+            text(&payload.to_string()),
+            opt_text(actor),
+            text(now),
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+/// The holder of the active lease on an issue, if any.
+fn do_active_holder(sql: &impl DoSql, item_id: &str) -> StoreResult<Option<String>> {
+    let rows = sql
+        .query(
+            &format!(
+                "SELECT actor FROM tracker_leases WHERE issue_id = ?1 AND {DO_ACTIVE_LEASE} \
+                 ORDER BY acquired_at DESC LIMIT 1"
+            ),
+            &[text(item_id)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows.first().map(|row| as_text(&row[0])))
+}
+
+/// All active leases as an `issue_id -> holder` map (for the list overlay).
+fn do_active_holders(sql: &impl DoSql) -> StoreResult<std::collections::HashMap<String, String>> {
+    let rows = sql
+        .query(
+            &format!("SELECT issue_id, actor FROM tracker_leases WHERE {DO_ACTIVE_LEASE}"),
+            &[],
+        )
+        .map_err(sql_err)?;
+    Ok(rows
+        .iter()
+        .map(|row| (as_text(&row[0]), as_text(&row[1])))
+        .collect())
+}
+
+/// Lazily expire past-due, still-held leases on an issue, so an expired lease
+/// frees the issue for a fresh claim.
+fn do_expire_stale_leases(sql: &impl DoSql, item_id: &str, now: &str) -> StoreResult<()> {
+    let stale = sql
+        .query(
+            "SELECT lease_id FROM tracker_leases \
+             WHERE issue_id = ?1 AND released_at IS NULL AND expires_at IS NOT NULL \
+               AND expires_at <= ?2",
+            &[text(item_id), text(now)],
+        )
+        .map_err(sql_err)?;
+    for row in &stale {
+        let lease_id = as_text(&row[0]);
+        do_mark_lease_released(sql, &lease_id, item_id, "claim.expired", "system", now)?;
+    }
+    Ok(())
+}
+
+/// Release the (single) active lease on an issue, if present.
+fn do_release_active_lease(sql: &impl DoSql, item_id: &str, now: &str) -> StoreResult<bool> {
+    let rows = sql
+        .query(
+            &format!(
+                "SELECT lease_id, actor FROM tracker_leases WHERE issue_id = ?1 AND {DO_ACTIVE_LEASE} \
+                 ORDER BY acquired_at DESC LIMIT 1"
+            ),
+            &[text(item_id)],
+        )
+        .map_err(sql_err)?;
+    match rows.first() {
+        None => Ok(false),
+        Some(row) => {
+            let lease_id = as_text(&row[0]);
+            let actor = as_text(&row[1]);
+            do_mark_lease_released(sql, &lease_id, item_id, "claim.released", &actor, now)?;
+            Ok(true)
+        }
+    }
+}
+
+/// Append a lease-terminal event and fold it into the lease projection.
+fn do_mark_lease_released(
+    sql: &impl DoSql,
+    lease_id: &str,
+    item_id: &str,
+    kind: &str,
+    actor: &str,
+    now: &str,
+) -> StoreResult<()> {
+    let payload = serde_json::json!({"lease_id": lease_id, "actor": actor, "released_at": now});
+    do_tracker_append(sql, Some(item_id), kind, &payload, Some(actor), now)?;
+    sql.execute(
+        "UPDATE tracker_leases SET released_at = ?2 WHERE lease_id = ?1",
+        &[text(lease_id), text(now)],
+    )
+    .map_err(sql_err)?;
+    Ok(())
 }
 
 impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
@@ -6510,12 +6640,13 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         metadata: &serde_json::Value,
         filed_by: Option<&str>,
     ) -> StoreResult<WorkItem> {
+        let now = do_now(&self.sql)?;
         // Mint the next sequential id (`WS-1`, `WS-2`, …); single-writer per
-        // invocation makes the counter bump + insert atomic without a txn.
+        // invocation makes the counter bump + append + project atomic.
         let bumped = self
             .sql
             .query(
-                "UPDATE item_counter SET next_id = next_id + 1 WHERE singleton = 1 \
+                "UPDATE tracker_counter SET next_id = next_id + 1 WHERE singleton = 1 \
                  RETURNING next_id - 1",
                 &[],
             )
@@ -6523,14 +6654,31 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         let next = bumped
             .first()
             .map(|row| as_i64(&row[0]))
-            .ok_or_else(|| StoreError::Conflict("item_counter row missing".to_owned()))?;
+            .ok_or_else(|| StoreError::Conflict("tracker_counter row missing".to_owned()))?;
         let item_id = format!("WS-{next}");
         let labels_json =
             serde_json::to_string(labels).map_err(|error| sql_err(error.to_string()))?;
+        let payload = serde_json::json!({
+            "queue": queue,
+            "title": title,
+            "body": body,
+            "labels": labels,
+            "metadata": metadata,
+            "filed_by": filed_by,
+        });
+        do_tracker_append(
+            &self.sql,
+            Some(&item_id),
+            "issue.created",
+            &payload,
+            filed_by,
+            &now,
+        )?;
         self.sql
             .execute(
-                "INSERT INTO items (item_id, queue, title, body, labels_json, metadata_json, \
-                 filed_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO tracker_issues \
+                 (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?8)",
                 &[
                     text(&item_id),
                     text(queue),
@@ -6539,6 +6687,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
                     text(&labels_json),
                     text(&metadata.to_string()),
                     opt_text(filed_by),
+                    text(&now),
                 ],
             )
             .map_err(sql_err)?;
@@ -6550,11 +6699,17 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                &format!("SELECT {DO_ITEM_COLS} FROM items WHERE item_id = ?1"),
+                &format!("SELECT {DO_ISSUE_COLS} FROM tracker_issues WHERE issue_id = ?1"),
                 &[text(item_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.first().map(|row| do_work_item_row(row)))
+        match rows.first() {
+            None => Ok(None),
+            Some(row) => {
+                let holder = do_active_holder(&self.sql, item_id)?;
+                Ok(Some(apply_overlay(do_issue_row(row), holder)))
+            }
+        }
     }
 
     fn list_items(&self, queue: Option<&str>, status: Option<&str>) -> StoreResult<Vec<WorkItem>> {
@@ -6562,96 +6717,224 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
             .sql
             .query(
                 &format!(
-                    "SELECT {DO_ITEM_COLS} FROM items \
-                     WHERE (?1 IS NULL OR queue = ?1) AND (?2 IS NULL OR status = ?2) \
-                     ORDER BY created_at, item_id"
+                    "SELECT {DO_ISSUE_COLS} FROM tracker_issues \
+                     WHERE (?1 IS NULL OR queue = ?1) ORDER BY created_at, issue_id"
                 ),
-                &[opt_text(queue), opt_text(status)],
+                &[opt_text(queue)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|row| do_work_item_row(row)).collect())
+        let holders = do_active_holders(&self.sql)?;
+        // The overlay can turn a durable-`open` issue into effective
+        // `in_progress`, so the status filter runs over the OVERLAID status.
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let base = do_issue_row(row);
+                let holder = holders.get(&base.id).cloned();
+                apply_overlay(base, holder)
+            })
+            .filter(|item| status.is_none_or(|want| item.status == want))
+            .collect())
     }
 
     fn ready_items(&self, queue: &str) -> StoreResult<Vec<WorkItem>> {
+        // Ready iff durable `open`, no active lease, no active blocker (a
+        // `blocks(B, id)` with B still open). Expired/released leases and
+        // closed/canceled blockers do not gate.
         let rows = self
             .sql
             .query(
                 &format!(
-                    "SELECT {DO_ITEM_COLS} FROM items \
-                     WHERE queue = ?1 AND status = 'open' AND claimed_by IS NULL \
-                     ORDER BY created_at, item_id"
+                    "SELECT {DO_ISSUE_COLS} FROM tracker_issues i \
+                     WHERE i.queue = ?1 AND i.status = 'open' \
+                     AND NOT EXISTS ( \
+                       SELECT 1 FROM tracker_leases l \
+                       WHERE l.issue_id = i.issue_id \
+                         AND l.released_at IS NULL \
+                         AND (l.expires_at IS NULL OR l.expires_at > datetime('now'))) \
+                     AND NOT EXISTS ( \
+                       SELECT 1 FROM tracker_relations r JOIN tracker_issues b ON b.issue_id = r.from_issue \
+                       WHERE r.to_issue = i.issue_id AND r.kind = 'blocks' AND b.status = 'open') \
+                     ORDER BY i.created_at, i.issue_id"
                 ),
                 &[text(queue)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|row| do_work_item_row(row)).collect())
+        // Ready rows have no active lease by construction; the overlay is a no-op.
+        Ok(rows.iter().map(|row| do_issue_row(row)).collect())
     }
 
     fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome> {
-        let changed = self
-            .sql
-            .execute(
-                "UPDATE items SET status = 'in_progress', claimed_by = ?2, \
-                 updated_at = CURRENT_TIMESTAMP \
-                 WHERE item_id = ?1 AND status = 'open' AND claimed_by IS NULL",
-                &[text(item_id), text(claimed_by)],
-            )
-            .map_err(sql_err)?;
-        if changed == 1 {
-            return Ok(ClaimOutcome::Claimed);
-        }
-        let holder = self
+        let now = do_now(&self.sql)?;
+        let exists = !self
             .sql
             .query(
-                "SELECT claimed_by FROM items WHERE item_id = ?1",
+                "SELECT 1 FROM tracker_issues WHERE issue_id = ?1",
                 &[text(item_id)],
             )
-            .map_err(sql_err)?;
-        match holder.first() {
-            None => Ok(ClaimOutcome::NotFound),
-            Some(row) => Ok(ClaimOutcome::AlreadyClaimed {
-                holder: as_opt_text(&row[0]).unwrap_or_default(),
-            }),
+            .map_err(sql_err)?
+            .is_empty();
+        if !exists {
+            return Ok(ClaimOutcome::NotFound);
         }
+        do_expire_stale_leases(&self.sql, item_id, &now)?;
+        // Exclusivity (tracker-lease I1): grant only when no active lease. The
+        // single-writer invocation serializes this check-then-insert.
+        if let Some(holder) = do_active_holder(&self.sql, item_id)? {
+            return Ok(ClaimOutcome::AlreadyClaimed { holder });
+        }
+        let n = self
+            .sql
+            .query(
+                "SELECT COUNT(*) FROM tracker_events WHERE issue_id = ?1 AND kind = 'claim.acquired'",
+                &[text(item_id)],
+            )
+            .map_err(sql_err)?
+            .first()
+            .map_or(0, |row| as_i64(&row[0]));
+        let lease_id = format!("L-{item_id}-{n}");
+        let payload = serde_json::json!({
+            "lease_id": lease_id, "actor": claimed_by, "expires_at": serde_json::Value::Null
+        });
+        do_tracker_append(
+            &self.sql,
+            Some(item_id),
+            "claim.acquired",
+            &payload,
+            Some(claimed_by),
+            &now,
+        )?;
+        self.sql
+            .execute(
+                "INSERT INTO tracker_leases (lease_id, issue_id, actor, acquired_at, expires_at, released_at) \
+                 VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
+                &[text(&lease_id), text(item_id), text(claimed_by), text(&now)],
+            )
+            .map_err(sql_err)?;
+        Ok(ClaimOutcome::Claimed)
+    }
+
+    fn renew_claim(
+        &mut self,
+        item_id: &str,
+        actor: &str,
+        expires: Option<&str>,
+    ) -> StoreResult<RenewOutcome> {
+        let now = do_now(&self.sql)?;
+        let rows = self
+            .sql
+            .query(
+                "SELECT lease_id, expires_at FROM tracker_leases \
+                 WHERE issue_id = ?1 AND actor = ?2 AND released_at IS NULL \
+                   AND (expires_at IS NULL OR expires_at > ?3)",
+                &[text(item_id), text(actor), text(&now)],
+            )
+            .map_err(sql_err)?;
+        let Some(row) = rows.first() else {
+            return Ok(RenewOutcome::NotHeld);
+        };
+        let lease_id = as_text(&row[0]);
+        let current_expires = as_opt_text(&row[1]);
+        // Monotonicity (tracker-lease I2): a finite deadline may not move back.
+        if let (Some(want), Some(current)) = (expires, current_expires.as_deref()) {
+            if want <= current {
+                return Ok(RenewOutcome::NotMonotonic);
+            }
+        }
+        let new_expires: Option<String> = match expires {
+            Some(want) => Some(want.to_owned()),
+            None => current_expires,
+        };
+        let payload =
+            serde_json::json!({"lease_id": lease_id, "actor": actor, "expires_at": new_expires});
+        do_tracker_append(
+            &self.sql,
+            Some(item_id),
+            "claim.renewed",
+            &payload,
+            Some(actor),
+            &now,
+        )?;
+        if expires.is_some() {
+            self.sql
+                .execute(
+                    "UPDATE tracker_leases SET expires_at = ?2 WHERE lease_id = ?1",
+                    &[text(&lease_id), opt_text(new_expires.as_deref())],
+                )
+                .map_err(sql_err)?;
+        }
+        Ok(RenewOutcome::Renewed {
+            expires_at: new_expires,
+        })
     }
 
     fn release_item(&mut self, item_id: &str) -> StoreResult<bool> {
-        let changed = self
-            .sql
-            .execute(
-                "UPDATE items SET status = 'open', claimed_by = NULL, \
-                 updated_at = CURRENT_TIMESTAMP \
-                 WHERE item_id = ?1 AND status = 'in_progress'",
-                &[text(item_id)],
-            )
-            .map_err(sql_err)?;
-        Ok(changed == 1)
+        let now = do_now(&self.sql)?;
+        do_release_active_lease(&self.sql, item_id, &now)
     }
 
     fn release_claims_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
-        let changed = self
+        // Terminal-releases-all (tracker-lease I3): every active lease the actor
+        // holds across ALL issues is released in one invocation.
+        let now = do_now(&self.sql)?;
+        let rows = self
             .sql
-            .execute(
-                "UPDATE items SET status = 'open', claimed_by = NULL, \
-                 updated_at = CURRENT_TIMESTAMP \
-                 WHERE claimed_by = ?1 AND status = 'in_progress'",
+            .query(
+                &format!(
+                    "SELECT lease_id, issue_id FROM tracker_leases WHERE actor = ?1 AND {DO_ACTIVE_LEASE}"
+                ),
                 &[text(holder)],
             )
             .map_err(sql_err)?;
-        Ok(changed as usize)
+        let leases: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| (as_text(&row[0]), as_text(&row[1])))
+            .collect();
+        for (lease_id, issue_id) in &leases {
+            do_mark_lease_released(
+                &self.sql,
+                lease_id,
+                issue_id,
+                "claim.released",
+                holder,
+                &now,
+            )?;
+        }
+        Ok(leases.len())
     }
 
     fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> StoreResult<bool> {
-        let changed = self
+        let now = do_now(&self.sql)?;
+        let status = self
             .sql
+            .query(
+                "SELECT status FROM tracker_issues WHERE issue_id = ?1",
+                &[text(item_id)],
+            )
+            .map_err(sql_err)?
+            .first()
+            .map(|row| as_text(&row[0]));
+        if status.as_deref() != Some("open") {
+            return Ok(false);
+        }
+        let payload = serde_json::json!({"status": "closed", "summary": summary});
+        do_tracker_append(
+            &self.sql,
+            Some(item_id),
+            "issue.closed",
+            &payload,
+            None,
+            &now,
+        )?;
+        self.sql
             .execute(
-                "UPDATE items SET status = 'closed', claim_summary = ?2, \
-                 updated_at = CURRENT_TIMESTAMP \
-                 WHERE item_id = ?1 AND status IN ('open', 'in_progress')",
-                &[text(item_id), opt_text(summary)],
+                "UPDATE tracker_issues SET status = 'closed', claim_summary = ?2, updated_at = ?3 \
+                 WHERE issue_id = ?1",
+                &[text(item_id), opt_text(summary), text(&now)],
             )
             .map_err(sql_err)?;
-        Ok(changed == 1)
+        do_release_active_lease(&self.sql, item_id, &now)?;
+        Ok(true)
     }
 }
 
@@ -7224,18 +7507,35 @@ pub(crate) mod test_support {
             CREATE TABLE agent_turn_snapshots (
                 effect_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL
             );
-            CREATE TABLE items (
-                item_id TEXT PRIMARY KEY, queue TEXT NOT NULL, title TEXT NOT NULL,
+            CREATE TABLE tracker_events (
+                event_seq INTEGER PRIMARY KEY AUTOINCREMENT, issue_id TEXT, kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}', actor TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE tracker_issues (
+                issue_id TEXT PRIMARY KEY, queue TEXT NOT NULL, title TEXT NOT NULL,
                 body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'open',
                 labels_json TEXT NOT NULL DEFAULT '[]', metadata_json TEXT NOT NULL DEFAULT '{}',
-                claimed_by TEXT, claim_summary TEXT, filed_by TEXT,
+                claim_summary TEXT, filed_by TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
-            CREATE TABLE item_counter (
+            CREATE TABLE tracker_relations (
+                from_issue TEXT NOT NULL, to_issue TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'blocks', dep_kind TEXT,
+                PRIMARY KEY (from_issue, to_issue, kind)
+            );
+            CREATE TABLE tracker_leases (
+                lease_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, actor TEXT NOT NULL,
+                acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, expires_at TEXT, released_at TEXT
+            );
+            CREATE TABLE tracker_counter (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1), next_id INTEGER NOT NULL
             );
-            INSERT INTO item_counter (singleton, next_id) VALUES (1, 1);
+            INSERT INTO tracker_counter (singleton, next_id) VALUES (1, 1);
+            CREATE INDEX idx_tracker_issues_queue ON tracker_issues(queue, status);
+            CREATE INDEX idx_tracker_leases_issue ON tracker_leases(issue_id, released_at);
+            CREATE INDEX idx_tracker_events_issue ON tracker_events(issue_id, kind);
             CREATE TABLE coord_leases (
                 owner TEXT NOT NULL, resource TEXT NOT NULL, key TEXT NOT NULL, holder TEXT NOT NULL,
                 acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, expires_at TEXT NOT NULL,
