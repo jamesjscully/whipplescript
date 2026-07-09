@@ -1,0 +1,286 @@
+//! Placement-neutral host protocol for governed agent turns.
+//!
+//! GaugeDesk and other hosts send commands containing references and a verified
+//! policy identity; WhippleScript returns labeled evidence references and a
+//! terminal receipt. Payload, secret, transcript, and tool-effect bodies remain
+//! in their owning stores (GaugeWright ADR 0012; WhippleScript DR-0027/0028).
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::ifc::VerifiedEnvelope;
+
+pub const HOST_PROTOCOL: &str = "whipplescript.host.v1";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PolicyEpochRef {
+    pub epoch: u64,
+    pub envelope_hash: String,
+    pub signer: String,
+}
+
+impl PolicyEpochRef {
+    /// Bind a nonzero host epoch to the exact attestation WhippleScript verified.
+    pub fn from_verified(epoch: u64, envelope: &VerifiedEnvelope) -> Result<Self, ProtocolError> {
+        if epoch == 0 {
+            return Err(ProtocolError::Invalid("policy epoch must be nonzero"));
+        }
+        let Some(attestation) = envelope.attestation() else {
+            return Err(ProtocolError::Invalid(
+                "a host policy epoch requires a signed governance envelope",
+            ));
+        };
+        Ok(Self {
+            epoch,
+            envelope_hash: attestation.envelope_hash.clone(),
+            signer: attestation.signer.clone(),
+        })
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.epoch == 0 {
+            return Err(ProtocolError::Invalid("policy epoch must be nonzero"));
+        }
+        nonempty("policy envelope hash", &self.envelope_hash)?;
+        nonempty("policy signer", &self.signer)
+    }
+}
+
+/// An opaque durable resource name. Content crosses only through the resolver
+/// associated with this handle; it is never copied into the command.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResourceRef {
+    pub handle: String,
+    pub kind: String,
+}
+
+/// A credential-free provider binding. Secret material is resolved ephemerally
+/// by reference after policy admission.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderBindingRef {
+    pub binding_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TurnInput {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ResourceRef>,
+}
+
+/// The command GaugeDesk admits before WhippleScript begins a turn.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StartTurnCommand {
+    pub protocol: String,
+    pub command_id: String,
+    pub run_ref: String,
+    pub instance_ref: String,
+    pub package_version_ref: String,
+    pub policy: PolicyEpochRef,
+    pub input: TurnInput,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ResourceRef>,
+    pub provider_binding: ProviderBindingRef,
+    pub placement_ceiling_ref: String,
+}
+
+impl StartTurnCommand {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.protocol != HOST_PROTOCOL {
+            return Err(ProtocolError::WrongVersion(self.protocol.clone()));
+        }
+        nonempty("command id", &self.command_id)?;
+        nonempty("run ref", &self.run_ref)?;
+        nonempty("instance ref", &self.instance_ref)?;
+        nonempty("package version ref", &self.package_version_ref)?;
+        nonempty("provider binding ref", &self.provider_binding.binding_id)?;
+        nonempty("placement ceiling ref", &self.placement_ceiling_ref)?;
+        self.policy.validate()?;
+        for resource in self.resources.iter().chain(self.input.images.iter()) {
+            nonempty("resource handle", &resource.handle)?;
+            nonempty("resource kind", &resource.kind)?;
+        }
+        Ok(())
+    }
+}
+
+/// A stable WhippleScript event-log coordinate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EventPosition {
+    pub instance_ref: String,
+    pub sequence: u64,
+}
+
+/// One ordered runtime happening. Label and payload bodies remain
+/// WhippleScript-owned and are named by stable evidence references.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LabeledRuntimeEvent {
+    pub protocol: String,
+    pub command_id: String,
+    pub position: EventPosition,
+    pub policy: PolicyEpochRef,
+    pub kind: String,
+    pub label_ref: String,
+    pub evidence_ref: String,
+    pub payload_ref: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStatus {
+    Completed,
+    Failed,
+    TimedOut,
+    Cancelled,
+}
+
+/// The terminal proof returned for a command. Bodies are referenced, never
+/// duplicated into GaugeDesk's decision log.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TurnReceipt {
+    pub protocol: String,
+    pub command_id: String,
+    pub run_ref: String,
+    pub instance_ref: String,
+    pub policy: PolicyEpochRef,
+    pub terminal_position: EventPosition,
+    pub status: TurnStatus,
+    pub output_handle: Option<String>,
+    pub usage_ref: String,
+    pub guarantee_report_ref: String,
+    pub workspace_cut_ref: Option<String>,
+}
+
+impl TurnReceipt {
+    /// Validate the receipt against the command it claims to settle. This is the
+    /// host-side anti-mixup check; it does not reinterpret runtime evidence.
+    pub fn validate_for(&self, command: &StartTurnCommand) -> Result<(), ProtocolError> {
+        command.validate()?;
+        if self.protocol != HOST_PROTOCOL {
+            return Err(ProtocolError::WrongVersion(self.protocol.clone()));
+        }
+        if self.command_id != command.command_id
+            || self.run_ref != command.run_ref
+            || self.instance_ref != command.instance_ref
+            || self.terminal_position.instance_ref != command.instance_ref
+        {
+            return Err(ProtocolError::Mismatch("receipt command/run/instance"));
+        }
+        if self.policy != command.policy {
+            return Err(ProtocolError::Mismatch("receipt policy epoch"));
+        }
+        if self.terminal_position.sequence == 0 {
+            return Err(ProtocolError::Invalid(
+                "terminal event position must be nonzero",
+            ));
+        }
+        nonempty("usage ref", &self.usage_ref)?;
+        nonempty("guarantee report ref", &self.guarantee_report_ref)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProtocolError {
+    Invalid(&'static str),
+    WrongVersion(String),
+    Mismatch(&'static str),
+}
+
+impl fmt::Display for ProtocolError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(message) => write!(formatter, "invalid host protocol: {message}"),
+            Self::WrongVersion(version) => {
+                write!(formatter, "unsupported host protocol version `{version}`")
+            }
+            Self::Mismatch(field) => write!(formatter, "host protocol mismatch: {field}"),
+        }
+    }
+}
+
+impl std::error::Error for ProtocolError {}
+
+fn nonempty(field: &'static str, value: &str) -> Result<(), ProtocolError> {
+    if value.trim().is_empty() {
+        Err(ProtocolError::Invalid(field))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gov::SignedEnvelope;
+
+    fn policy() -> PolicyEpochRef {
+        let signed = SignedEnvelope::sign_for_test(
+            "grant file_store project -> file:/workspace readable by Operator\n",
+            "gaugedesk-admin",
+        );
+        let verified = VerifiedEnvelope::verify_signed_text(&signed.to_json()).expect("verified");
+        PolicyEpochRef::from_verified(7, &verified).expect("epoch")
+    }
+
+    fn command() -> StartTurnCommand {
+        StartTurnCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            command_id: "turn-command-1".to_owned(),
+            run_ref: "gaugedesk:run:1".to_owned(),
+            instance_ref: "whip:instance:1".to_owned(),
+            package_version_ref: "whip:package-version:1".to_owned(),
+            policy: policy(),
+            input: TurnInput {
+                text: "inspect the project".to_owned(),
+                images: Vec::new(),
+            },
+            resources: vec![ResourceRef {
+                handle: "gaugedesk:resource:project".to_owned(),
+                kind: "file_store".to_owned(),
+            }],
+            provider_binding: ProviderBindingRef {
+                binding_id: "gaugedesk:provider:primary".to_owned(),
+            },
+            placement_ceiling_ref: "gaugedesk:placement:local".to_owned(),
+        }
+    }
+
+    #[test]
+    fn command_round_trips_without_resource_or_secret_bodies() {
+        let command = command();
+        command.validate().expect("valid");
+        let json = serde_json::to_string(&command).expect("serialize");
+        assert!(!json.contains("api_key"));
+        assert!(!json.contains("resource body"));
+        let decoded: StartTurnCommand = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn receipt_must_echo_the_exact_command_instance_and_policy() {
+        let command = command();
+        let mut receipt = TurnReceipt {
+            protocol: HOST_PROTOCOL.to_owned(),
+            command_id: command.command_id.clone(),
+            run_ref: command.run_ref.clone(),
+            instance_ref: command.instance_ref.clone(),
+            policy: command.policy.clone(),
+            terminal_position: EventPosition {
+                instance_ref: command.instance_ref.clone(),
+                sequence: 42,
+            },
+            status: TurnStatus::Completed,
+            output_handle: Some("whip:output:1".to_owned()),
+            usage_ref: "whip:evidence:usage:1".to_owned(),
+            guarantee_report_ref: "whip:evidence:guarantee:1".to_owned(),
+            workspace_cut_ref: None,
+        };
+        receipt.validate_for(&command).expect("matching receipt");
+        receipt.policy.epoch += 1;
+        assert_eq!(
+            receipt.validate_for(&command),
+            Err(ProtocolError::Mismatch("receipt policy epoch"))
+        );
+    }
+}

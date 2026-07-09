@@ -229,10 +229,14 @@ replace git for working branches + workstreams.)*
       `VerifiedEnvelope::verify_signed_text`, which requires and verifies the
       attestation and retains its canonical envelope hash + signer for epoch
       binding; malformed configured envelopes now reject instead of silently
-      degrading to ungoverned mode. Remaining: carry the versioned epoch on the
-      runtime command, enforce the complete capability/provider/egress/clearance
-      envelope during the owned turn, and cite it in the terminal guarantee
-      receipt.
+      degrading to ungoverned mode. The published `whipplescript.host.v1`
+      protocol now carries that identity on `StartTurnCommand`, every
+      `LabeledRuntimeEvent`, and `TurnReceipt`; receipt validation rejects
+      command/run/instance/policy mixups, and commands contain resource/provider
+      refs rather than bodies or secrets. Remaining: drive the owned turn through
+      this protocol, enforce the complete capability/provider/egress/clearance
+      envelope, and mint the referenced evidence/guarantee artifacts from real
+      log positions.
 - [ ] Auth simplification: provider profiles carry host-resolved
       credentials; whip's own auth shrinks to the thin standalone resolver
       (current env/keychain design becomes the fallback path).
