@@ -393,9 +393,10 @@ impl NativeWorkspaceResolver {
 
 impl ResourceResolver for NativeWorkspaceResolver {
     fn resolve_image(&self, image: &ResourceRef) -> Result<ResolvedImage, String> {
-        let path = self.resolve(&image.handle, false)?;
-        let bytes = fs::read(&path)
-            .map_err(|error| format!("cannot read image `{}`: {error}", image.handle))?;
+        let locator = image.selector.as_deref().unwrap_or(&image.handle);
+        let path = self.resolve(locator, false)?;
+        let bytes =
+            fs::read(&path).map_err(|error| format!("cannot read image `{locator}`: {error}"))?;
         let media_type = match path.extension().and_then(|extension| extension.to_str()) {
             Some("png") => "image/png",
             Some("jpg" | "jpeg") => "image/jpeg",
@@ -1816,6 +1817,7 @@ workflow UnsafeHostChat {
             resources: vec![ResourceRef {
                 handle: "project".to_owned(),
                 kind: "file_store".to_owned(),
+                selector: None,
             }],
             provider_binding: ProviderBindingRef {
                 binding_id: "model".to_owned(),
@@ -1991,6 +1993,7 @@ workflow UnsafeHostChat {
         let resources = [ResourceRef {
             handle: "project".to_owned(),
             kind: "file_store".to_owned(),
+            selector: None,
         }];
 
         let read = resolver
