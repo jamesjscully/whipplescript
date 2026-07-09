@@ -33,6 +33,16 @@ gains its context layer and a restore-to-a-prior-point capability.
 - A Class-A compute plane for real toolchains (`whip executor` sidecar over a
   `whip-executor/1` wire) and a Class-B per-turn container path are built and
   live-proven; enabling them in production is a follow-on configuration step.
+  In-cluster sidecar calls authenticate with a constant-time-compared `Bearer`
+  token (`WHIP_EXECUTOR_TOKEN`), and the sidecars refuse non-loopback calls that
+  lack it — the production hardening the compute plane needed.
+
+### Network access
+- `http source` fetches an external URL, GET-only, behind an SSRF/egress policy:
+  http(s) schemes only, private/loopback IP addresses blocked, and a host
+  allowlist (`WHIPPLESCRIPT_HTTP_SOURCE_ALLOW`, with
+  `WHIPPLESCRIPT_HTTP_SOURCE_ALLOW_PRIVATE=1` to permit private hosts for local
+  development). Web *search* is designed but deferred to a later release.
 
 ### Owned agent harness — the context layer
 - The owned harness gains a pi-mirrored context layer: a system-prompt assembler,
