@@ -464,7 +464,9 @@ pub fn run_file_effect_generic<S: RuntimeStore>(
     // The `file store` root + `allow read` policy is the scope boundary
     // (spec/std-library/files.md), checked before any disk access.
     let allow = effect_allow_globs(&input);
-    let read_outcome = match file_path_policy_error(path, store_name, &allow, "read") {
+    let read_outcome = match file_path_policy_error(path, store_name, &allow, "read")
+        .or_else(|| files.path_policy_error(Path::new(root), Path::new(path), store_name, "read"))
+    {
         Some(reason) => Err(reason),
         None => files
             .read_to_string(&full)
@@ -599,36 +601,38 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
     let terminal_key = idempotency_key(&[instance_id, &effect.effect_id, "terminal"]);
     let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
     let allow = effect_allow_globs(&input);
-    let write_outcome: Result<(), String> =
-        if let Some(reason) = file_path_policy_error(path, store_name, &allow, "write") {
-            Err(reason)
-        } else {
-            let exists = files.exists(&full);
-            // Mode policy (spec/std-library/files.md): no silent overwrite.
-            let mode_ok = match mode.as_str() {
-                "create" if exists => Err(format!(
-                    "write mode `create` requires `{path}` to not already exist"
-                )),
-                "replace" if !exists => Err(format!(
-                    "write mode `replace` requires `{path}` to already exist"
-                )),
-                "create" | "replace" | "upsert" | "append" => Ok(()),
-                other => Err(format!("unknown write mode `{other}`")),
-            };
-            mode_ok.and_then(|()| {
-                if let Some(parent) = full.parent() {
-                    files
-                        .create_dir_all(parent)
-                        .map_err(|error| format!("create parent of `{path}`: {error}"))?;
-                }
-                let result = if mode == "append" {
-                    files.append(&full, body.as_bytes())
-                } else {
-                    files.write(&full, body.as_bytes())
-                };
-                result.map_err(|error| format!("write of `{}` failed: {error}", full.display()))
-            })
+    let write_outcome: Result<(), String> = if let Some(reason) =
+        file_path_policy_error(path, store_name, &allow, "write").or_else(|| {
+            files.path_policy_error(Path::new(root), Path::new(path), store_name, "write")
+        }) {
+        Err(reason)
+    } else {
+        let exists = files.exists(&full);
+        // Mode policy (spec/std-library/files.md): no silent overwrite.
+        let mode_ok = match mode.as_str() {
+            "create" if exists => Err(format!(
+                "write mode `create` requires `{path}` to not already exist"
+            )),
+            "replace" if !exists => Err(format!(
+                "write mode `replace` requires `{path}` to already exist"
+            )),
+            "create" | "replace" | "upsert" | "append" => Ok(()),
+            other => Err(format!("unknown write mode `{other}`")),
         };
+        mode_ok.and_then(|()| {
+            if let Some(parent) = full.parent() {
+                files
+                    .create_dir_all(parent)
+                    .map_err(|error| format!("create parent of `{path}`: {error}"))?;
+            }
+            let result = if mode == "append" {
+                files.append(&full, body.as_bytes())
+            } else {
+                files.write(&full, body.as_bytes())
+            };
+            result.map_err(|error| format!("write of `{}` failed: {error}", full.display()))
+        })
+    };
     match write_outcome {
         Ok(()) => {
             // Restorable-context RC-1: capture the written body content-addressed
@@ -862,7 +866,11 @@ pub fn run_file_import_effect_generic<S: RuntimeStore>(
 
     // Decode + validate every row before admitting any (all-or-nothing).
     let decoded: Result<Vec<Value>, String> = (|| {
-        if let Some(reason) = file_path_policy_error(path, store_name, &allow, "read") {
+        if let Some(reason) =
+            file_path_policy_error(path, store_name, &allow, "read").or_else(|| {
+                files.path_policy_error(Path::new(root), Path::new(path), store_name, "read")
+            })
+        {
             return Err(reason);
         }
         let content = files

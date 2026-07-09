@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
     io::{self, Write},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     time::Duration,
@@ -19719,6 +19720,100 @@ fn resolve_due_file_sources(
 /// assumes an APPEND-ONLY feed (the cursor is keyed by cumulative array index, so
 /// an element inserted at the head or a shrinking feed would desync the cursor).
 /// A recurrence-gated cadence and content-keyed dedup are follow-ons.
+fn http_source_url_policy_error(url: &str) -> Option<String> {
+    if env::var("WHIPPLESCRIPT_HTTP_SOURCE_ALLOW_PRIVATE")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return Some("source URL must include an http(s) scheme".to_owned());
+    };
+    if scheme != "http" && scheme != "https" {
+        return Some("only http(s) source URLs are supported".to_owned());
+    }
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    }
+    .trim()
+    .trim_end_matches('.')
+    .to_ascii_lowercase();
+    if host.is_empty() {
+        return Some("source URL has no host".to_owned());
+    }
+    if !http_source_host_is_allowlisted(&host) {
+        return Some(format!(
+            "host `{host}` is not in WHIPPLESCRIPT_HTTP_SOURCE_ALLOW"
+        ));
+    }
+    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
+        return Some(format!("host `{host}` resolves to a local namespace"));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if private_or_local_ip(ip) {
+            return Some(format!("host `{host}` is not a public routable address"));
+        }
+    }
+    None
+}
+
+fn http_source_host_is_allowlisted(host: &str) -> bool {
+    let Ok(allow) = env::var("WHIPPLESCRIPT_HTTP_SOURCE_ALLOW") else {
+        return true;
+    };
+    allow
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            let entry = entry.trim_end_matches('.').to_ascii_lowercase();
+            if let Some(suffix) = entry.strip_prefix("*.") {
+                host == suffix || host.ends_with(&format!(".{suffix}"))
+            } else {
+                host == entry
+            }
+        })
+}
+
+fn private_or_local_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => private_or_local_ipv4(ip),
+        IpAddr::V6(ip) => private_or_local_ipv6(ip),
+    }
+}
+
+fn private_or_local_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || a >= 224
+}
+
+fn private_or_local_ipv6(ip: Ipv6Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || (octets[0] & 0xfe) == 0xfc
+        || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+        || octets[0] == 0xff
+}
+
 fn resolve_due_http_sources(
     store_path: &Path,
     instance_id: &str,
@@ -19732,6 +19827,10 @@ fn resolve_due_http_sources(
         let Some(url) = source.url.as_ref() else {
             continue;
         };
+        if let Some(reason) = http_source_url_policy_error(url) {
+            eprintln!("http source `{}`: refused {url}: {reason}", source.name);
+            continue;
+        }
         let already_admitted = {
             let store = SqliteStore::open(store_path)?;
             if store.get_instance(instance_id)?.is_none() {
@@ -22565,7 +22664,11 @@ fn run_file_export_effect_generic<S: RuntimeStore>(
     let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
 
     let outcome: Result<(usize, String), String> = (|| {
-        if let Some(reason) = file_path_policy_error(path, store_name, &allow, "write") {
+        if let Some(reason) =
+            file_path_policy_error(path, store_name, &allow, "write").or_else(|| {
+                files.path_policy_error(Path::new(root), Path::new(path), store_name, "write")
+            })
+        {
             return Err(reason);
         }
         // Resolve the collection: facts of <schema> [where predicate], ordered by
@@ -22810,6 +22913,10 @@ fn run_script_capability_exec(
     argv[script_index] = verified_path.display().to_string();
     let mut command = Command::new(&argv[0]);
     command.args(&argv[1..]);
+    command.env_clear();
+    if let Some(path) = env::var_os("PATH") {
+        command.env("PATH", path);
+    }
     let resolved_env = match resolve_script_capability_env(script) {
         Ok(resolved_env) => resolved_env,
         Err(reason) => return Err((None, reason)),

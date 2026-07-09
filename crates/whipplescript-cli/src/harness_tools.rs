@@ -30,6 +30,7 @@ use whipplescript_kernel::{BrokeredTurnContext, RuntimeKernel};
 use whipplescript_parser::IrWorkflowContractKind;
 use whipplescript_store::content::ContentStore;
 use whipplescript_store::coordination::{AcquireOutcome, CoordinationStore};
+use whipplescript_store::files::{FileStore, NativeFileStore};
 use whipplescript_store::items::WorkItemStore;
 use whipplescript_store::{
     RegisteredProfilePolicy, SqliteStore, StoreError, StoreResult, StoredEvent,
@@ -832,7 +833,8 @@ impl FileToolExecutor {
             ));
         }
         let Some(scopes) = &self.file_policy else {
-            return crate::file_path_policy_error(path, "workspace", &[], op);
+            return crate::file_path_policy_error(path, "workspace", &[], op)
+                .or_else(|| self.native_path_policy_error(path, "workspace", op));
         };
         if scopes.is_empty() {
             return Some(format!("file {op} is not granted for this turn"));
@@ -890,6 +892,12 @@ impl FileToolExecutor {
             &scope.store_read
         };
         crate::file_path_policy_error(&relative, &scope.store_name, store_globs, op)
+            .or_else(|| self.native_path_policy_error(path, &scope.store_name, op))
+    }
+
+    fn native_path_policy_error(&self, path: &str, store_name: &str, op: &str) -> Option<String> {
+        let files = NativeFileStore;
+        files.path_policy_error(&self.root, Path::new(path), store_name, op)
     }
 
     /// Override the bash allow-list (test/programmatic use).
@@ -2180,6 +2188,16 @@ fn middle_truncate(text: &str, max_bytes: usize) -> String {
 /// Recursively walk `dir` (under `root`), invoking `visit` with each file's
 /// root-relative slash path. Bounded by [`MAX_FILES_WALKED`].
 fn walk(root: &Path, dir: &Path, walked: &mut usize, visit: &mut dyn FnMut(&str)) {
+    let canonical_root = match root.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    let Ok(canonical_dir) = dir.canonicalize() else {
+        return;
+    };
+    if !canonical_dir.starts_with(&canonical_root) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -2188,6 +2206,12 @@ fn walk(root: &Path, dir: &Path, walked: &mut usize, visit: &mut dyn FnMut(&str)
     for path in children {
         if *walked >= MAX_FILES_WALKED {
             return;
+        }
+        let Ok(canonical_path) = path.canonicalize() else {
+            continue;
+        };
+        if !canonical_path.starts_with(&canonical_root) {
+            continue;
         }
         if path.is_dir() {
             walk(root, &path, walked, visit);

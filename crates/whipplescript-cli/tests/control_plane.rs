@@ -760,7 +760,7 @@ rule record_item
 
     let store = store_path.to_str().expect("utf-8 store path");
     let program = source_path.to_str().expect("utf-8 source path");
-    let dev = run_json(
+    let dev = run_json_with_env(
         bin,
         &[
             "--store",
@@ -773,6 +773,7 @@ rule record_item
             "--until",
             "idle",
         ],
+        &[("WHIPPLESCRIPT_HTTP_SOURCE_ALLOW_PRIVATE", "1")],
     );
     let instance_id = dev
         .get("instance_id")
@@ -18887,6 +18888,22 @@ assert missing.value
 fn run_json(bin: &str, args: &[&str]) -> Value {
     let text = run_text(bin, args);
     serde_json::from_str(&text).expect("valid JSON output")
+}
+
+fn run_json_with_env(bin: &str, args: &[&str], envs: &[(&str, &str)]) -> Value {
+    let mut command = Command::new(bin);
+    command.args(args);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    let output = command.output().expect("command runs");
+    assert!(
+        output.status.success(),
+        "command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("valid JSON output")
 }
 
 fn run_text(bin: &str, args: &[&str]) -> String {

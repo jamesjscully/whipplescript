@@ -359,7 +359,8 @@ report schema — no premature shared framework.
   broker/tenant requirement.
 - **Web search tool.** Not this package's item — canonical home is
   [`owned-harness-tool-surface.md`](owned-harness-tool-surface.md) "Open
-  items"; gated on the network-tool policy discussion (Jack).
+  items"; the network-tool gate closed 2026-07-07 (designs accepted:
+  web-search + web-fetch design notes); remaining work is build.
 
 ## Open naming-boundary questions
 

@@ -18,7 +18,7 @@
 //! `TcpListener`, thread per connection, threads not async.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -31,6 +31,7 @@ use whipplescript_kernel::exec_http::{base64_decode, sha256_hex};
 /// Per-stream response cap. Bounded so a runaway script cannot balloon the
 /// response; the flag tells the caller truncation happened.
 const STREAM_CAP_BYTES: usize = 512 * 1024;
+const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Default and ceiling for the per-exec timeout.
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -141,6 +142,7 @@ pub fn serve_on(listener: TcpListener) -> std::io::Result<()> {
 }
 
 fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
+    let local_addr = stream.local_addr().ok();
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
@@ -151,6 +153,8 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
     let mut content_length = 0usize;
     let mut websocket_key = None;
     let mut wants_upgrade = false;
+    let mut authorization = None;
+    let mut executor_token_header = None;
     loop {
         let mut line = String::new();
         reader.read_line(&mut line)?;
@@ -167,8 +171,16 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
                 && value.trim().eq_ignore_ascii_case("websocket")
             {
                 wants_upgrade = true;
+            } else if name.eq_ignore_ascii_case("authorization") {
+                authorization = Some(value.trim().to_owned());
+            } else if name.eq_ignore_ascii_case("x-whip-executor-token") {
+                executor_token_header = Some(value.trim().to_owned());
             }
         }
+    }
+
+    if content_length > MAX_REQUEST_BODY_BYTES {
+        return write_json_response(stream, 413, json!({"error": "request body too large"}));
     }
 
     // Class-B turn channel (whip-turn/1): hand the raw socket to the
@@ -176,6 +188,13 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
     // client sends no frames until it sees the 101 — the buffered reader has
     // consumed exactly through the header terminator.
     if method == "GET" && path == "/turn" && wants_upgrade {
+        if let Err((status, message)) = check_executor_auth(
+            local_addr.map(|addr| addr.ip()),
+            &authorization,
+            &executor_token_header,
+        ) {
+            return write_json_response(stream, status, json!({"error": message}));
+        }
         if let Some(key) = websocket_key {
             drop(reader);
             return crate::turn_server::handle_turn_websocket(stream, &key);
@@ -189,30 +208,55 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
 
     let (status, response_body) = match (method.as_str(), path.as_str()) {
         ("GET", "/healthz") => (200, json!({"protocol": EXECUTOR_PROTOCOL, "ok": true})),
-        ("POST", "/exec") => match serde_json::from_slice::<Value>(&body) {
-            Ok(request) => match handle_exec_request(&request) {
-                Ok(response) => (200, response),
+        ("POST", "/exec") => {
+            match check_executor_auth(
+                local_addr.map(|addr| addr.ip()),
+                &authorization,
+                &executor_token_header,
+            ) {
+                Ok(()) => match serde_json::from_slice::<Value>(&body) {
+                    Ok(request) => match handle_exec_request(&request) {
+                        Ok(response) => (200, response),
+                        Err((status, message)) => (status, json!({"error": message})),
+                    },
+                    Err(error) => (400, json!({"error": format!("invalid JSON body: {error}")})),
+                },
                 Err((status, message)) => (status, json!({"error": message})),
-            },
-            Err(error) => (400, json!({"error": format!("invalid JSON body: {error}")})),
-        },
+            }
+        }
         // Class-B blocking form: run (or re-attach to) a whole agent turn and
         // answer with its final outcome. The WS form on GET /turn streams.
-        ("POST", "/turn") => match serde_json::from_slice::<Value>(&body) {
-            Ok(request) => match crate::turn_server::handle_turn_http(&request) {
-                Ok(response) => (200, response),
+        ("POST", "/turn") => {
+            match check_executor_auth(
+                local_addr.map(|addr| addr.ip()),
+                &authorization,
+                &executor_token_header,
+            ) {
+                Ok(()) => match serde_json::from_slice::<Value>(&body) {
+                    Ok(request) => match crate::turn_server::handle_turn_http(&request) {
+                        Ok(response) => (200, response),
+                        Err((status, message)) => (status, json!({"error": message})),
+                    },
+                    Err(error) => (400, json!({"error": format!("invalid JSON body: {error}")})),
+                },
                 Err((status, message)) => (status, json!({"error": message})),
-            },
-            Err(error) => (400, json!({"error": format!("invalid JSON body: {error}")})),
-        },
+            }
+        }
         _ => (
             404,
             json!({"error": "unknown route; POST /exec or GET /healthz"}),
         ),
     };
 
+    write_json_response(stream, status, response_body)
+}
+
+fn write_json_response(
+    mut stream: TcpStream,
+    status: u16,
+    response_body: Value,
+) -> std::io::Result<()> {
     let payload = response_body.to_string();
-    let mut stream = stream;
     write!(
         stream,
         "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
@@ -225,6 +269,55 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
         payload.len(),
     )?;
     stream.flush()
+}
+
+fn check_executor_auth(
+    local_ip: Option<IpAddr>,
+    authorization: &Option<String>,
+    token_header: &Option<String>,
+) -> Result<(), (u16, String)> {
+    let configured = std::env::var("WHIP_EXECUTOR_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty());
+    let requires_auth =
+        configured.is_some() || !local_ip.map(|ip| ip.is_loopback()).unwrap_or(false);
+    let Some(expected) = configured else {
+        return if requires_auth {
+            Err((
+                503,
+                "WHIP_EXECUTOR_TOKEN is required for non-loopback executor binds".to_owned(),
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    let actual = authorization
+        .as_deref()
+        .and_then(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .or(token_header.as_deref())
+        .unwrap_or_default();
+    if constant_time_equal(actual, &expected) {
+        Ok(())
+    } else {
+        Err((401, "unauthorized".to_owned()))
+    }
+}
+
+fn constant_time_equal(left: &str, right: &str) -> bool {
+    let mut diff = left.len() ^ right.len();
+    let max = left.len().max(right.len());
+    let left_bytes = left.as_bytes();
+    let right_bytes = right.as_bytes();
+    for i in 0..max {
+        diff |= usize::from(*left_bytes.get(i).unwrap_or(&0) ^ *right_bytes.get(i).unwrap_or(&0));
+    }
+    diff == 0
 }
 
 /// Validate + run one exec request. Pure with respect to the transport, so

@@ -206,8 +206,9 @@ tracker/workflow-tool suites),
 
 - [~] Re-homed to `owned-harness-tool-surface.md` § Open items (its canonical
   home): shape settled (owned-harness ToolSpec, egress-checked query,
-  low-integrity ingress result, `with access to`-grantable), **gated on the
-  broader network-tool policy discussion** (open, per Jack).
+  low-integrity ingress result, `with access to`-grantable). The
+  network-tool policy gate closed 2026-07-07 (designs accepted:
+  web-search + web-fetch design notes).
 
 ## Phase 5 — Docs, examples, gate — SHIPPED 2026-07-02
 

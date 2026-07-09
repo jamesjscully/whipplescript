@@ -41,6 +41,14 @@ export interface Env {
   // Dev/test override for the provider endpoint (e.g. a local mock in
   // `wrangler dev`); production omits it and uses the real Anthropic API.
   WHIP_PROVIDER_BASE_URL?: string;
+  // Required shared secret for the public Worker control plane. Requests must
+  // carry `Authorization: Bearer <token>` (or `x-whip-control-token` for local
+  // clients that cannot set auth headers).
+  WHIP_CONTROL_TOKEN?: string;
+  // Secret shared with the executor/turn container sidecar. The DO sends it as
+  // a bearer token on in-cluster calls; the sidecar rejects non-loopback calls
+  // without it.
+  WHIP_EXECUTOR_TOKEN?: string;
   // Class-A executor sidecar (compute plane P8): where exec.command effects
   // go as whip-executor/1 HTTP rounds. Unset = exec effects error. URLs on
   // this host are routed to the EXECUTOR container pool, not the network.
@@ -56,6 +64,10 @@ export interface Env {
   // a per-turn container instance (idFromName over the turn id) — the 1:1
   // container-per-turn pattern. Unset = agent turns use the in-DO machine.
   WHIP_TURN_URL?: string;
+  // Deploy-shipped AGENTS.md/CLAUDE.md and script capabilities. These are
+  // operator configuration, not public runtime input.
+  WHIP_PROJECT_CONTEXT_JSON?: string;
+  WHIP_SCRIPT_CAPABILITIES_JSON?: string;
   EXECUTOR: DurableObjectNamespace<ExecutorContainer>;
 }
 
@@ -72,6 +84,7 @@ export class ExecutorContainer extends Container {
 // Fixed pool size until platform autoscaling ships (manual knob, working
 // zero-config default). `getRandom` is location-blind today — accepted.
 const EXECUTOR_POOL_SIZE = 4;
+const MAX_BOOTSTRAP_BYTES = 1024 * 1024;
 
 // The DO schema (33 tables) as a bundled text module (wrangler.toml `rules`).
 import DO_SCHEMA from "../do_schema.sql";
@@ -139,6 +152,80 @@ type StepOutcome =
   | { kind: "parked"; next_due_unix_ms: number | null }
   | { kind: "failed"; message: string };
 
+function constantTimeEqual(left: string, right: string): boolean {
+  let diff = left.length ^ right.length;
+  const max = Math.max(left.length, right.length);
+  for (let i = 0; i < max; i += 1) {
+    diff |= (left.charCodeAt(i) || 0) ^ (right.charCodeAt(i) || 0);
+  }
+  return diff === 0;
+}
+
+function requestBearerToken(request: Request): string | undefined {
+  const authorization = request.headers.get("authorization") ?? "";
+  if (authorization.toLowerCase().startsWith("bearer ")) {
+    return authorization.slice("bearer ".length).trim();
+  }
+  return request.headers.get("x-whip-control-token") ?? undefined;
+}
+
+function controlAuthError(request: Request, env: Env): Response | undefined {
+  const expected = env.WHIP_CONTROL_TOKEN?.trim();
+  if (!expected) {
+    return Response.json({ error: "WHIP_CONTROL_TOKEN is required" }, { status: 503 });
+  }
+  const actual = requestBearerToken(request) ?? "";
+  if (!constantTimeEqual(actual, expected)) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  return undefined;
+}
+
+function requestBodyTooLarge(request: Request): Response | undefined {
+  const declared = request.headers.get("content-length");
+  if (declared && Number(declared) > MAX_BOOTSTRAP_BYTES) {
+    return Response.json({ error: "request body too large" }, { status: 413 });
+  }
+  return undefined;
+}
+
+async function readJsonBody(request: Request): Promise<Record<string, unknown> | Response> {
+  const early = requestBodyTooLarge(request);
+  if (early) {
+    return early;
+  }
+  const text = await request.text();
+  if (new TextEncoder().encode(text).length > MAX_BOOTSTRAP_BYTES) {
+    return Response.json({ error: "request body too large" }, { status: 413 });
+  }
+  try {
+    const parsed = JSON.parse(text || "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    return Response.json({ error: "JSON body must be an object" }, { status: 400 });
+  } catch (error) {
+    return Response.json({ error: `invalid JSON body: ${error instanceof Error ? error.message : String(error)}` }, { status: 400 });
+  }
+}
+
+function isSentinelRoute(requestUrl: string, sentinelBase: string, suffix: "/exec" | "/turn"): boolean {
+  const request = new URL(requestUrl);
+  const sentinel = new URL(sentinelBase);
+  const basePath = sentinel.pathname.replace(/\/$/, "");
+  const expectedPath = `${basePath}${suffix}`;
+  return request.origin === sentinel.origin && request.pathname === expectedPath;
+}
+
+function redactedUrlForLog(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return "<invalid-url>";
+  }
+}
+
 // Perform one suspended HTTP round and marshal the result back for `step`.
 // Requests targeting the executor sentinel host are routed to a
 // getRandom-picked container in the EXECUTOR pool instead of the network.
@@ -159,14 +246,14 @@ async function performFetch(
     const executorHost = env?.WHIP_EXECUTOR_URL;
     const turnHost = env?.WHIP_TURN_URL;
     let resp: Response;
-    if (turnHost && req.url.startsWith(turnHost)) {
+    if (turnHost && isSentinelRoute(req.url, turnHost, "/turn")) {
       // Class-B: a per-turn container (1:1), addressed by the turn id in the
       // whip-turn/1 request body. The blocking POST /turn answers with the
       // final outcome; a re-sent start re-attaches idempotently.
       const turnId = String((req.body as { turn_id?: string })?.turn_id ?? "turn");
       const container = env.EXECUTOR.get(env.EXECUTOR.idFromName(`turn-${turnId}`));
       resp = await container.fetch(req.url, init);
-    } else if (executorHost && req.url.startsWith(executorHost)) {
+    } else if (executorHost && isSentinelRoute(req.url, executorHost, "/exec")) {
       resp = await (await getRandom(env.EXECUTOR, EXECUTOR_POOL_SIZE)).fetch(req.url, init);
     } else {
       resp = await fetch(req.url, init);
@@ -174,7 +261,7 @@ async function performFetch(
     return JSON.stringify({ status: resp.status, body: await resp.json() });
   } catch (error) {
     // The core maps `{"error": ...}` to a TransportError terminal.
-    console.log(`performFetch failed for ${req.url}: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+    console.log(`performFetch failed for ${redactedUrlForLog(req.url)}: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
     return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
   }
 }
@@ -183,21 +270,6 @@ interface Bootstrap {
   program: string;
   input: string;
   principal: string;
-  // Deploy-shipped AGENTS.md/CLAUDE.md content (context-assembly Phase 3):
-  // [{ path, content }] in injection order; resolved from the DO store by the
-  // agent turn (the DO has no filesystem).
-  project_context?: { path: string; content: string }[];
-  // Deploy-shipped script capabilities (compute plane P8): the DO-store
-  // mirror of the native script manifest. Each body is verified against its
-  // sha256 pin at registration; argv carries the "{script}" placeholder.
-  scripts?: {
-    name: string;
-    argv: string[];
-    sha256: string;
-    env?: Record<string, string>;
-    hermetic?: boolean;
-    body: string;
-  }[];
 }
 
 export class WorkflowInstance implements DurableObject {
@@ -210,10 +282,18 @@ export class WorkflowInstance implements DurableObject {
   // suspension or terminal. Subsequent external events / alarms re-enter and drive
   // further; the durable state is entirely in DO SQLite.
   async fetch(request: Request): Promise<Response> {
-    const body = (await request.json()) as Partial<Bootstrap> & {
-      command?: string;
-      cut_id?: string;
-    };
+    if (request.method !== "POST") {
+      return Response.json({ error: "method not allowed" }, { status: 405 });
+    }
+    const authError = controlAuthError(request, this.env);
+    if (authError) {
+      return authError;
+    }
+    const parsed = await readJsonBody(request);
+    if (parsed instanceof Response) {
+      return parsed;
+    }
+    const body = parsed as Partial<Bootstrap> & { command?: string; cut_id?: string };
     // Operator commands (P3): checkpoint / restore an existing instance. The
     // worker's only verb dispatch — everything else is the start/poke bootstrap.
     if (body.command === "checkpoint" || body.command === "restore") {
@@ -237,15 +317,19 @@ export class WorkflowInstance implements DurableObject {
         return Response.json({ error: String(error) }, { status: 400 });
       }
     }
-    const { program, input, principal, project_context, scripts } = body;
+    const program = typeof body.program === "string" ? body.program : undefined;
+    const input = typeof body.input === "string" ? body.input : undefined;
+    const principal = typeof body.principal === "string" ? body.principal : undefined;
     let bootstrap: Bootstrap | undefined;
     if (program) {
+      const existing = await this.ctx.storage.get<Bootstrap>("bootstrap");
+      if (existing) {
+        return Response.json({ error: "instance already bootstrapped; use a new id" }, { status: 409 });
+      }
       bootstrap = {
         program,
         input: input ?? "{}",
         principal: principal ?? "local/Workflow",
-        project_context,
-        scripts,
       };
       // Persisted so an alarm (or a body-less poke) can rehydrate the wasm
       // instance without the caller resupplying the program.
@@ -302,6 +386,7 @@ export class WorkflowInstance implements DurableObject {
             ...(this.env.ANTHROPIC_API_KEY ? { ANTHROPIC_API_KEY: this.env.ANTHROPIC_API_KEY } : {}),
             ...(this.env.OPENAI_API_KEY ? { OPENAI_API_KEY: this.env.OPENAI_API_KEY } : {}),
           },
+          auth_token: this.env.WHIP_EXECUTOR_TOKEN,
         })
       : undefined;
     // Class-B turn containers: forward the provider config into the container
@@ -318,6 +403,7 @@ export class WorkflowInstance implements DurableObject {
                 max_tokens: 4096,
               }
             : { provider: "fixture" },
+          auth_token: this.env.WHIP_EXECUTOR_TOKEN,
         })
       : undefined;
     return WasmDurableInstance.create(
@@ -327,9 +413,9 @@ export class WorkflowInstance implements DurableObject {
       bootstrap.principal,
       coerceConfig,
       agentConfig,
-      bootstrap.project_context ? JSON.stringify(bootstrap.project_context) : undefined,
+      this.env.WHIP_PROJECT_CONTEXT_JSON,
       execConfig,
-      bootstrap.scripts ? JSON.stringify(bootstrap.scripts) : undefined,
+      this.env.WHIP_SCRIPT_CAPABILITIES_JSON,
       turnConfig,
     );
   }
@@ -363,6 +449,19 @@ export class WorkflowInstance implements DurableObject {
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/healthz") {
+      return Response.json({ ok: true });
+    }
+    if (url.pathname !== "/start") {
+      return Response.json({ error: "not found" }, { status: 404 });
+    }
+    if (request.method !== "POST") {
+      return Response.json({ error: "method not allowed" }, { status: 405 });
+    }
+    const authError = controlAuthError(request, env) ?? requestBodyTooLarge(request);
+    if (authError) {
+      return authError;
+    }
     const id = url.searchParams.get("id") ?? "default";
     const stub = env.WORKFLOW_INSTANCE.get(env.WORKFLOW_INSTANCE.idFromName(id));
     return stub.fetch(request);

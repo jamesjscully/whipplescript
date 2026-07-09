@@ -240,6 +240,10 @@ fn parse_exec_config(json: &str) -> Result<ExecutorSidecarConfig, String> {
             .unwrap_or("do-v0")
             .to_owned(),
         timeout_ms: value.get("timeout_ms").and_then(serde_json::Value::as_u64),
+        auth_token: value
+            .get("auth_token")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
     })
 }
 
@@ -301,6 +305,10 @@ fn parse_turn_config(json: &str) -> Result<TurnContainerConfig, String> {
             .get("max_steps")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(30),
+        auth_token: value
+            .get("auth_token")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
     })
 }
 

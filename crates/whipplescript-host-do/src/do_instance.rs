@@ -80,6 +80,7 @@ pub struct ExecutorSidecarConfig {
     pub env_values: std::collections::BTreeMap<String, String>,
     pub environment_epoch: String,
     pub timeout_ms: Option<u64>,
+    pub auth_token: Option<String>,
 }
 
 /// Projected Class-B turn-container wiring (compute plane P8): when present,
@@ -92,6 +93,7 @@ pub struct TurnContainerConfig {
     pub base_url: String,
     pub provider: serde_json::Value,
     pub max_steps: u64,
+    pub auth_token: Option<String>,
 }
 
 /// Drives a workflow instance's rule pass + effect discovery on the durable object.
@@ -275,12 +277,14 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             lease_expires_at: "2030-01-01T00:00:00Z",
                             metadata_json: r#"{"class":"B"}"#,
                         })?;
+                        let mut headers =
+                            vec![("content-type".to_owned(), "application/json".to_owned())];
+                        if let Some(token) = &cfg.auth_token {
+                            headers.push(("authorization".to_owned(), format!("Bearer {token}")));
+                        }
                         let request = whipplescript_kernel::sansio::HttpRequest {
                             url: format!("{}/turn", cfg.base_url.trim_end_matches('/')),
-                            headers: vec![(
-                                "content-type".to_owned(),
-                                "application/json".to_owned(),
-                            )],
+                            headers,
                             body: serde_json::json!({
                                 "protocol": "whip-turn/1",
                                 "turn_id": effect.effect_id,
@@ -754,7 +758,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                 return Ok(EffectStep::Done(event));
                             }
                         }
-                        let request = build_executor_exec_request(
+                        let mut request = build_executor_exec_request(
                             &cfg.base_url,
                             &effect.effect_id,
                             &script.sha256,
@@ -765,6 +769,11 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             cfg.timeout_ms,
                         )
                         .map_err(StoreError::Conflict)?;
+                        if let Some(token) = &cfg.auth_token {
+                            request
+                                .headers
+                                .push(("authorization".to_owned(), format!("Bearer {token}")));
+                        }
                         return Ok(EffectStep::NeedsHttp(request));
                     }
                     resumed => {
@@ -1112,6 +1121,7 @@ mod tests {
             env_values: std::collections::BTreeMap::new(),
             environment_epoch: "test-epoch".to_owned(),
             timeout_ms: Some(10_000),
+            auth_token: None,
         };
         let mut driver = DoInstanceDriver {
             kernel,
@@ -1665,6 +1675,7 @@ mod tests {
             base_url: "http://turn".to_owned(),
             provider: serde_json::json!({"provider": "fixture"}),
             max_steps: 8,
+            auth_token: None,
         };
         let driver = DoInstanceDriver {
             kernel,
