@@ -645,6 +645,10 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
             let value = json!({
                 "store": store_name,
                 "path": path,
+                // RC-5: the full resolved path (root-joined) so restore is
+                // self-contained and writes the body back to the exact location.
+                // `path` stays the workflow-visible relative path.
+                "full_path": full.display().to_string(),
                 "format": format,
                 "mode": mode,
                 "bytes": body.len(),

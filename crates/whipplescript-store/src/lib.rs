@@ -6637,8 +6637,11 @@ fn fold_file_manifest(fact_payloads: &[String]) -> StoreResult<(String, BTreeMap
             continue;
         }
         let descriptor = payload.get("value").and_then(|fact| fact.get("value"));
+        // Prefer the full resolved path (RC-5) so restore is self-contained and
+        // writes back to the exact location; fall back to the relative `path`
+        // for facts recorded before RC-5 (and synthetic test facts).
         let path = descriptor
-            .and_then(|value| value.get("path"))
+            .and_then(|value| value.get("full_path").or_else(|| value.get("path")))
             .and_then(Value::as_str);
         let content_hash = descriptor
             .and_then(|value| value.get("content_hash"))
@@ -6651,10 +6654,6 @@ fn fold_file_manifest(fact_payloads: &[String]) -> StoreResult<(String, BTreeMap
     Ok((manifest_json, manifest))
 }
 
-/// Restorable-context RC-4b: the target sequence a `context.restored` marker
-/// rewinds the replay to (`restored_to_sequence`). `None` for a malformed
-/// marker, in which case the fold applies no rewind (retains all live events)
-/// rather than corrupting the projection.
 /// Restorable-context RC-4c: the LIVE `fact.derived` payloads for an instance,
 /// with the restore-marker fold already applied (RC-4b) so abandoned-branch
 /// facts are excluded. Used to fold the file manifest at a cut (`capture_checkpoint`)
@@ -6718,6 +6717,10 @@ type ReplayRow = (
     i64,
 );
 
+/// Restorable-context RC-4b: the target sequence a `context.restored` marker
+/// rewinds the replay to (`restored_to_sequence`). `None` for a malformed
+/// marker, in which case the fold applies no rewind (retains all live events)
+/// rather than corrupting the projection.
 #[cfg(feature = "native")]
 fn restore_marker_target(payload_json: &str) -> Option<i64> {
     serde_json::from_str::<Value>(payload_json)

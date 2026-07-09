@@ -77,14 +77,15 @@ use whipplescript_parser::{
     QueryKind, RuleStatus, RunKind, SourceSpan, StubPayload, TestClause, TestField, UnaryOp,
 };
 use whipplescript_store::{
-    ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, ClaimableEffect,
-    ComputeResultRegistration, DerivedFact, DiagnosticRecord, DiagnosticView, EffectCancellation,
-    EffectCompletion, EffectView, EventView, EvidenceLink, EvidenceLinkView, EvidenceRecord,
-    EvidenceView, FactView, HumanAnswer, InboxItemView, InstanceView, NewEvent, NewFact,
-    NewInboxItem, NewInstanceAuthority, NewWorkflowInvocation, ProviderValidationEvidence,
-    RetryEffect, RevisionActivation, RevisionCancellationImpact, RevisionCandidate,
-    RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RunStart, RunView, RuntimeStore,
-    SqliteStore, StatusView, StoreError, WorkflowInvocationView, WorkflowRevisionView,
+    ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, CheckpointCapture,
+    ClaimableEffect, ComputeResultRegistration, DerivedFact, DiagnosticRecord, DiagnosticView,
+    EffectCancellation, EffectCompletion, EffectView, EventView, EvidenceLink, EvidenceLinkView,
+    EvidenceRecord, EvidenceView, FactView, HumanAnswer, InboxItemView, InstanceView, NewEvent,
+    NewFact, NewInboxItem, NewInstanceAuthority, NewWorkflowInvocation, ProviderValidationEvidence,
+    RestoreDecision, RetryEffect, RevisionActivation, RevisionCancellationImpact,
+    RevisionCandidate, RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RunStart,
+    RunView, RuntimeStore, SqliteStore, StatusView, StoreError, WorkflowInvocationView,
+    WorkflowRevisionView,
 };
 // File-effect byte I/O routes through the FileStore seam (DR-0033 Phase 4); the
 // native backing is `std::fs`.
@@ -213,6 +214,8 @@ fn main() -> ExitCode {
         Some("pause") => pause(&options),
         Some("resume") => resume(&options),
         Some("cancel") => cancel(&options),
+        Some("checkpoint") => checkpoint(&options),
+        Some("restore") => restore(&options),
         Some("retry") => retry(&options),
         Some("recover") => recover(&options),
         Some("auth") => auth_command(&options),
@@ -613,7 +616,7 @@ fn print_usage() {
     println!(
         "          artifacts, inbox, signal, issue, leases, ledger, counters, evidence, diagnostics, trace"
     );
-    println!("          otel-export, pause, resume, cancel, retry, recover, doctor, deploy");
+    println!("          otel-export, pause, resume, cancel, checkpoint, restore, retry, recover, doctor, deploy");
     println!("run `whip <command> --help` or `whip help <command>` for command usage");
 }
 
@@ -654,6 +657,8 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "pause" => "usage: whip pause <instance>",
         "resume" => "usage: whip resume <instance>",
         "cancel" => "usage: whip cancel <instance>",
+        "checkpoint" => "usage: whip [--json] checkpoint <instance> [--cut-id <id>]",
+        "restore" => "usage: whip [--json] restore <instance> <cut-id>",
         "retry" => "usage: whip retry <instance> <effect>",
         "recover" => "usage: whip recover <instance>",
         "doctor" => "usage: whip doctor [--providers] [--provider-config <path>] [--record-provider-evidence <instance>]",
@@ -30898,6 +30903,175 @@ fn cancel(options: &CliOptions) -> ExitCode {
                 .inspect(|_| release_holder_resources_native(instance_id))
         },
     )
+}
+
+/// `whip checkpoint <instance> [--cut-id <id>]` — capture a restorable
+/// consistent-cut checkpoint (RC-5). Binds the transcript, instance event-log,
+/// and file-manifest planes at one quiescent point; refuses if an effect is
+/// mid-run. `--cut-id` names the cut for a later `whip restore`; a timestamped
+/// id is generated when omitted.
+fn checkpoint(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip checkpoint <instance> [--cut-id <id>]";
+    let mut instance_id: Option<&str> = None;
+    let mut cut_id: Option<String> = None;
+    let mut iter = options.args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--cut-id" => {
+                let Some(id) = iter.next() else {
+                    eprintln!("expected an id after `--cut-id`");
+                    return ExitCode::from(2);
+                };
+                cut_id = Some(id.clone());
+            }
+            other if instance_id.is_none() => instance_id = Some(other),
+            other => {
+                eprintln!("unexpected argument `{other}`");
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(instance_id) = instance_id else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let cut_id = cut_id.unwrap_or_else(generated_cut_id);
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let mut kernel = RuntimeKernel::new(store);
+    let key = idempotency_key(&[instance_id, &cut_id, "checkpoint"]);
+    match kernel.store_mut().capture_checkpoint(CheckpointCapture {
+        instance_id,
+        cut_id: &cut_id,
+        transcript_ref: None,
+        idempotency_key: Some(&key),
+    }) {
+        Ok(checkpoint) if options.json => emit_json(json!({
+            "instance_id": instance_id,
+            "cut_id": checkpoint.cut_id,
+            "sequence": checkpoint.sequence,
+            "manifest_hash": checkpoint.manifest_hash,
+            "file_count": checkpoint.file_count,
+        })),
+        Ok(checkpoint) => {
+            println!(
+                "checkpoint `{}` captured at event #{} ({} file(s))",
+                checkpoint.cut_id, checkpoint.sequence, checkpoint.file_count
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => report_store_error("failed to capture checkpoint", error),
+    }
+}
+
+/// `whip restore <instance> <cut-id>` — restore the three planes to a prior
+/// checkpoint (RC-5). Coherence-checks the cut up front (refuse-or-complete),
+/// auto-checkpoints the current head so the restore is itself undoable, applies
+/// the full file reconcile (write manifest paths to cut content, remove
+/// post-cut mediated files) through the native file store, then commits the
+/// `context.restored` marker so the instance and transcript planes fold to the
+/// cut.
+fn restore(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip restore <instance> <cut-id>";
+    if options.args.len() != 2 {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    }
+    let instance_id = options.args[0].as_str();
+    let cut_id = options.args[1].as_str();
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let mut kernel = RuntimeKernel::new(store);
+
+    // 1) Plan: the whole coherence check up front. A refusal mutates nothing.
+    let plan = match kernel.store().plan_restore(instance_id, cut_id) {
+        Ok(RestoreDecision::Ready(plan)) => plan,
+        Ok(RestoreDecision::Refused { reason }) => {
+            eprintln!("restore refused: {reason}");
+            return ExitCode::FAILURE;
+        }
+        Err(error) => return report_store_error("failed to plan restore", error),
+    };
+
+    // 2) Auto-checkpoint the current head so this restore is itself undoable.
+    let auto_cut_id = format!("auto-before-{cut_id}");
+    let auto_key = idempotency_key(&[instance_id, &auto_cut_id, "checkpoint"]);
+    if let Err(error) = kernel.store_mut().capture_checkpoint(CheckpointCapture {
+        instance_id,
+        cut_id: &auto_cut_id,
+        transcript_ref: None,
+        idempotency_key: Some(&auto_key),
+    }) {
+        return report_store_error("failed to auto-checkpoint before restore", error);
+    }
+
+    // 3) Apply the file reconcile through the native file store. Every content
+    //    hash was verified present in step 1, so writes cannot fail for missing
+    //    bytes.
+    let files = NativeFileStore;
+    for (path, body) in &plan.writes {
+        let target = Path::new(path);
+        if let Some(parent) = target.parent() {
+            if let Err(error) = files.create_dir_all(parent) {
+                eprintln!("restore: create parent of `{path}`: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+        if let Err(error) = files.write(target, body.as_bytes()) {
+            eprintln!("restore: write `{path}`: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    for path in &plan.removes {
+        if let Err(error) = files.remove(Path::new(path)) {
+            eprintln!("restore: remove `{path}`: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // 4) Commit: the marker + marker-aware rebuild fold the instance and
+    //    transcript planes to the cut.
+    let commit_key = idempotency_key(&[instance_id, cut_id, "restore"]);
+    match kernel.store_mut().commit_restore(
+        instance_id,
+        plan.restored_to_sequence,
+        cut_id,
+        Some(&commit_key),
+    ) {
+        Ok(marker) if options.json => emit_json(json!({
+            "instance_id": instance_id,
+            "cut_id": cut_id,
+            "restored_to_sequence": plan.restored_to_sequence,
+            "marker_sequence": marker.sequence,
+            "files_written": plan.writes.len(),
+            "files_removed": plan.removes.len(),
+            "auto_checkpoint": auto_cut_id,
+        })),
+        Ok(marker) => {
+            println!(
+                "restored `{instance_id}` to cut `{cut_id}` (event #{}); {} written, {} removed; undo with `whip restore {instance_id} {auto_cut_id}`",
+                marker.sequence,
+                plan.writes.len(),
+                plan.removes.len(),
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => report_store_error("failed to commit restore", error),
+    }
+}
+
+/// A timestamped default cut id for `whip checkpoint` when `--cut-id` is omitted.
+fn generated_cut_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    format!("cut-{nanos}")
 }
 
 fn transition_instance(

@@ -1135,8 +1135,9 @@ fn do_fold_file_manifest(
             continue;
         }
         let descriptor = payload.get("value").and_then(|fact| fact.get("value"));
+        // Prefer the full resolved path (RC-5); fall back to relative `path`.
         let path = descriptor
-            .and_then(|value| value.get("path"))
+            .and_then(|value| value.get("full_path").or_else(|| value.get("path")))
             .and_then(Value::as_str);
         let content_hash = descriptor
             .and_then(|value| value.get("content_hash"))

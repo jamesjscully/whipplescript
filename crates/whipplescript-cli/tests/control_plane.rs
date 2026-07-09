@@ -1241,6 +1241,135 @@ rule pick
     let _ = fs::remove_dir_all(root);
 }
 
+/// RC-5: `whip checkpoint` then `whip restore` round-trips the file plane. A
+/// workflow writes a file; a checkpoint captures the cut; the file is then
+/// tampered on disk; `restore` reverts it to the checkpoint content and reports
+/// the auto-checkpoint that makes the restore itself undoable.
+#[test]
+fn checkpoint_then_restore_reverts_the_file_plane() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let root = unique_temp_dir("restore-root");
+    let note = root.join("note.md");
+
+    // 1) A workflow writes note.md = "V1".
+    let src = temp_workflow_path("restore-write");
+    fs::write(
+        &src,
+        format!(
+            r#"
+workflow RestoreWrite
+
+output result Result
+
+class Result {{
+  status string
+}}
+
+file store out_files {{
+  root "{}"
+}}
+
+rule pick
+  when started
+=> {{
+  write text to out_files at "note.md" {{
+    body "V1"
+    mode create
+  }} as written
+  after written succeeds as result {{
+    complete result {{
+      status "wrote"
+    }}
+  }}
+}}
+"#,
+            root.display()
+        ),
+    )
+    .expect("write source");
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            src.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+    assert_eq!(fs::read_to_string(&note).ok(), Some("V1".to_owned()));
+
+    // 2) Checkpoint the cut.
+    let checkpoint = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "checkpoint",
+            &instance_id,
+            "--cut-id",
+            "cut-1",
+        ],
+    );
+    assert_eq!(
+        checkpoint.get("cut_id").and_then(Value::as_str),
+        Some("cut-1")
+    );
+    assert_eq!(
+        checkpoint.get("file_count").and_then(Value::as_i64),
+        Some(1),
+        "the cut manifest holds note.md: {checkpoint}"
+    );
+
+    // 3) Tamper the file on disk (drift away from the cut).
+    fs::write(&note, "TAMPERED").expect("tamper note");
+    assert_eq!(fs::read_to_string(&note).ok(), Some("TAMPERED".to_owned()));
+
+    // 4) Restore to the cut: note.md reverts to V1.
+    let restored = run_json(
+        bin,
+        &["--store", store, "--json", "restore", &instance_id, "cut-1"],
+    );
+    assert_eq!(
+        restored.get("files_written").and_then(Value::as_i64),
+        Some(1),
+        "restore wrote note.md back: {restored}"
+    );
+    assert_eq!(
+        restored.get("auto_checkpoint").and_then(Value::as_str),
+        Some("auto-before-cut-1"),
+        "restore auto-checkpoints the pre-restore head for undo: {restored}"
+    );
+    assert_eq!(
+        fs::read_to_string(&note).ok(),
+        Some("V1".to_owned()),
+        "the file plane reverted to the checkpoint content"
+    );
+
+    // 5) Restoring an unknown cut refuses (non-zero, no mutation).
+    let refused = Command::new(bin)
+        .args(["--store", store, "restore", &instance_id, "no-such-cut"])
+        .output()
+        .expect("restore runs");
+    assert!(!refused.status.success(), "unknown cut refuses");
+
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_dir_all(root);
+}
+
 /// A `file store`'s `allow read [...]` policy narrows which paths a `read` may
 /// touch (beyond root containment): a path matching a glob reads, a path inside
 /// the root but outside the policy fails. An empty policy means any path in the
