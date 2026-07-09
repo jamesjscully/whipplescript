@@ -1,6 +1,16 @@
 # Restorable Context (checkpointing) — decision record
 
-**Status: PROPOSED (decided in principle 2026-07-01, Jack).** Not built.
+**Status: BUILT (accepted 2026-07-01, built 2026-07-09 on v0.3).** All three
+planes rewind as one consistent, coherence-checked cut. Shipped as seven slices
+(RC-1 content-addressed file history → RC-2 bounded reconstruct-to-N → RC-3
+checkpoint event + manifest → RC-4a restore-marker replay model → RC-4b
+marker-aware rebuild fold → RC-4c plan/commit restore + marker-aware transcript
+& manifest reads → RC-5 `whip checkpoint` / `whip restore` surface). Models:
+models/maude/restorable-context.maude (the consistent-cut theorem) +
+models/maude/restore-replay.maude (append-only-log branch exclusion). Jack chose
+the full-reconcile + auto-checkpoint restore package (the restore is itself
+undoable). Native + durable-object store mirrors; restore file I/O is native-only
+for now (the DO storage backends have no delete primitive yet).
 
 ## Problem
 
