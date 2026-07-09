@@ -17688,7 +17688,17 @@ fn load_package_manifest(path: &Path) -> Result<PackageManifest, String> {
             path.display()
         )
     })?;
-    package_manifest_from_json(path, manifest_json)
+    // Parse + structurally validate (pure, wasm-kernel-hostable), then run the
+    // filesystem-coupled DR-0025 `@tool` attestation as a separate pass. This is
+    // the single load-from-disk chokepoint every real caller funnels through
+    // (`load_package_manifests` for `whip package check`/`lock`, `read_package_set`
+    // for `whip package sync`, and `load_package_lock_file` for lock load / `whip
+    // run` bootstrap), so attestation still runs at every site it did before the
+    // split. The embedded std manifests parse via `package_manifest_from_json`
+    // directly and correctly skip attestation (they declare no `@tool`s).
+    let mut manifest = package_manifest_from_json(path, manifest_json)?;
+    attest_manifest_workflow_tools(&mut manifest)?;
+    Ok(manifest)
 }
 
 fn package_manifest_from_json(
@@ -17740,7 +17750,7 @@ fn package_manifest_from_json_with_embedded(
         &registry,
         privileged,
     )?;
-    let workflow_tools = package_manifest_workflow_tools(path, &value)?;
+    let workflow_tools = package_manifest_workflow_tool_decls(path, &value)?;
 
     Ok(PackageManifest {
         path: path.to_path_buf(),
@@ -17754,13 +17764,18 @@ fn package_manifest_from_json_with_embedded(
     })
 }
 
-/// Parse, validate, and derive the attestation for a package's exported `@tool`
-/// workflows (DR-0025). Each entry names a workflow and a source path relative to
-/// the manifest; the source is compiled (with `root = name`) and convergence-
-/// checked here, so a non-`@tool`/non-convergent export fails manifest loading on
-/// both the producer and the consumer. The input/output contracts are derived
-/// into JSON schemas — the cross-package tool contract a consumer checks against.
-fn package_manifest_workflow_tools(
+/// Parse the DECLARATIONS of a package's exported `@tool` workflows (DR-0025):
+/// each entry's name and resolved source path, with structural validation (array
+/// shape, required `name`/`source` fields, no duplicate names). This is pure — it
+/// reads no source files — so it stays inside the wasm-kernel-hostable parse.
+///
+/// The source COMPILATION + attestation (`@tool` tag, convergence, workflow-name
+/// match, derived input/output schemas) is a SEPARATE cli-only pass,
+/// `attest_manifest_workflow_tools`, run right after parse at every load site (see
+/// `load_package_manifest`), because it reads tool sources from disk and cannot
+/// enter the kernel. Splitting it out is what makes the parse+validate core
+/// filesystem-free.
+fn package_manifest_workflow_tool_decls(
     path: &Path,
     value: &Value,
 ) -> Result<Vec<PackageWorkflowTool>, String> {
@@ -17786,6 +17801,37 @@ fn package_manifest_workflow_tools(
             ));
         }
         let source = manifest_dir.join(&source_rel);
+        // The input/output tool schemas are derived by the attestation pass, which
+        // compiles the source; the declaration carries only name + resolved path.
+        tools.push(PackageWorkflowTool {
+            name,
+            source,
+            input_schema: String::new(),
+            output_schema: String::new(),
+        });
+    }
+    Ok(tools)
+}
+
+/// Attest a package's exported `@tool` workflows (DR-0025) by compiling their
+/// declared sources, filling the derived input/output tool schemas back onto the
+/// already-parsed declarations. Each source is compiled (with `root = name`) and
+/// convergence-checked, so a non-`@tool`/non-convergent export fails manifest
+/// loading on both the producer (`whip package`) and the consumer (`use`) side.
+/// The input/output contracts are derived into JSON schemas — the cross-package
+/// tool contract a consumer checks against.
+///
+/// This is the filesystem-coupled half of manifest loading, split out of parse so
+/// the parse+validate core stays wasm-kernel-hostable. It runs as a separate pass
+/// right after `package_manifest_from_json` at every load site that loads a
+/// manifest from disk (`load_package_manifest`); manifests parsed without a
+/// backing source tree (e.g. the embedded std manifests, which declare no
+/// cross-package `@tool`s) simply skip it.
+fn attest_manifest_workflow_tools(manifest: &mut PackageManifest) -> Result<(), String> {
+    let path = manifest.path.clone();
+    for tool in &mut manifest.workflow_tools {
+        let name = tool.name.clone();
+        let source = tool.source.clone();
         let (_, ir) =
             compile_source_path_for_validation(source.to_str().unwrap_or_default(), Some(&name))
                 .map_err(|error| {
@@ -17828,14 +17874,10 @@ fn package_manifest_workflow_tools(
                 whipplescript_kernel::coerce_native::json_schema_for_type(&contract.ty, &ir.schemas)
             })
             .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": false }));
-        tools.push(PackageWorkflowTool {
-            name,
-            source,
-            input_schema: input_schema.to_string(),
-            output_schema: output_schema.to_string(),
-        });
+        tool.input_schema = input_schema.to_string();
+        tool.output_schema = output_schema.to_string();
     }
-    Ok(tools)
+    Ok(())
 }
 
 /// `privileged` marks the platform's own embedded std copy (byte-identity with
