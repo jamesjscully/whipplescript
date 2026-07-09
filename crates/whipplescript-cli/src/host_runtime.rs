@@ -6,7 +6,8 @@
 //! resolved after admission and never enter the host command or receipt.
 
 use std::fmt;
-use std::path::Path;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -190,6 +191,439 @@ pub trait ResourceResolver {
         admitted_resources: &[ResourceRef],
         call: &ToolCall,
     ) -> Result<String, String>;
+}
+
+/// WhippleScript-owned native implementation of the workspace capability used
+/// by embedding desktop hosts. GaugeDesk supplies only the root and any
+/// read-only subtrees; WhippleScript parses tool arguments, confines paths,
+/// rejects symlink traversal, and performs the operation.
+pub struct NativeWorkspaceResolver {
+    root: PathBuf,
+    read_only: Vec<PathBuf>,
+    max_output_bytes: usize,
+}
+
+impl NativeWorkspaceResolver {
+    pub fn new(root: impl AsRef<Path>) -> Result<Self, String> {
+        let root = root
+            .as_ref()
+            .canonicalize()
+            .map_err(|error| format!("cannot open workspace capability: {error}"))?;
+        if !root.is_dir() {
+            return Err("workspace capability root is not a directory".to_owned());
+        }
+        Ok(Self {
+            root,
+            read_only: Vec::new(),
+            max_output_bytes: 50_000,
+        })
+    }
+
+    pub fn read_only(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Result<Self, String> {
+        self.read_only = paths
+            .into_iter()
+            .map(|path| normalize_relative(&path))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self)
+    }
+
+    fn resolve(&self, path: &str, write: bool) -> Result<PathBuf, String> {
+        let relative = normalize_relative(Path::new(path))?;
+        if write
+            && self
+                .read_only
+                .iter()
+                .any(|protected| relative.starts_with(protected))
+        {
+            return Err(format!("workspace path `{path}` is read-only"));
+        }
+        let mut resolved = self.root.clone();
+        for component in relative.components() {
+            let Component::Normal(segment) = component else {
+                return Err(format!("workspace path `{path}` escapes its capability"));
+            };
+            resolved.push(segment);
+            if let Ok(metadata) = fs::symlink_metadata(&resolved) {
+                if metadata.file_type().is_symlink() {
+                    return Err(format!("workspace path `{path}` traverses a symlink"));
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
+    fn cap(&self, text: String) -> String {
+        if text.len() <= self.max_output_bytes {
+            return text;
+        }
+        let mut boundary = self.max_output_bytes;
+        while !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        format!(
+            "{}\n… output truncated by WhippleScript …",
+            &text[..boundary]
+        )
+    }
+
+    fn read(&self, arguments: &Value) -> Result<String, String> {
+        let path = string_argument(arguments, "path")?;
+        let resolved = self.resolve(path, false)?;
+        let text = fs::read_to_string(&resolved)
+            .map_err(|error| format!("cannot read workspace path `{path}`: {error}"))?;
+        let offset = arguments
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(1) as usize;
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(2_000) as usize;
+        let lines = text
+            .lines()
+            .skip(offset - 1)
+            .take(limit)
+            .enumerate()
+            .map(|(index, line)| format!("{}: {line}", offset + index))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(self.cap(lines))
+    }
+
+    fn write(&self, arguments: &Value) -> Result<String, String> {
+        let path = string_argument(arguments, "path")?;
+        let content = string_argument(arguments, "content")?;
+        let resolved = self.resolve(path, true)?;
+        if let Some(parent) = resolved.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create parent for `{path}`: {error}"))?;
+            reject_symlinks_between(&self.root, parent, path)?;
+        }
+        fs::write(&resolved, content)
+            .map_err(|error| format!("cannot write workspace path `{path}`: {error}"))?;
+        Ok(format!("wrote {} bytes to {path}", content.len()))
+    }
+
+    fn edit(&self, arguments: &Value) -> Result<String, String> {
+        let path = string_argument(arguments, "path")?;
+        let resolved = self.resolve(path, true)?;
+        let mut text = fs::read_to_string(&resolved)
+            .map_err(|error| format!("cannot edit workspace path `{path}`: {error}"))?;
+        let edits = arguments
+            .get("edits")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "`edits` must be an array".to_owned())?;
+        for edit in edits {
+            let old = string_argument(edit, "oldText")?;
+            let new = string_argument(edit, "newText")?;
+            if old.is_empty() {
+                return Err("edit oldText must not be empty".to_owned());
+            }
+            if text.matches(old).count() != 1 {
+                return Err("edit oldText must match exactly once".to_owned());
+            }
+            text = text.replacen(old, new, 1);
+        }
+        fs::write(&resolved, text)
+            .map_err(|error| format!("cannot edit workspace path `{path}`: {error}"))?;
+        Ok(format!("applied {} edit(s) to {path}", edits.len()))
+    }
+
+    fn list(&self, arguments: &Value) -> Result<String, String> {
+        let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+        let resolved = self.resolve(path, false)?;
+        let mut names = fs::read_dir(&resolved)
+            .map_err(|error| format!("cannot list workspace path `{path}`: {error}"))?
+            .filter_map(Result::ok)
+            .map(|entry| {
+                let mut name = entry.file_name().to_string_lossy().into_owned();
+                if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                    name.push('/');
+                }
+                name
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        Ok(self.cap(names.join("\n")))
+    }
+
+    fn find(&self, arguments: &Value) -> Result<String, String> {
+        let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+        let pattern = string_argument(arguments, "pattern")?;
+        let resolved = self.resolve(path, false)?;
+        let mut matches = Vec::new();
+        walk_workspace(&self.root, &resolved, &mut |relative, _| {
+            if wildcard_matches(pattern, relative) {
+                matches.push(relative.to_owned());
+            }
+            matches.len() < 5_000
+        })?;
+        matches.sort();
+        Ok(self.cap(matches.join("\n")))
+    }
+
+    fn grep(&self, arguments: &Value) -> Result<String, String> {
+        let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+        let pattern = string_argument(arguments, "pattern")?;
+        let matcher = regex::Regex::new(pattern).ok();
+        let resolved = self.resolve(path, false)?;
+        let mut matches = Vec::new();
+        walk_workspace(&self.root, &resolved, &mut |relative, absolute| {
+            let Ok(text) = fs::read_to_string(absolute) else {
+                return true;
+            };
+            for (line, content) in text.lines().enumerate() {
+                let hit = matcher
+                    .as_ref()
+                    .map(|regex| regex.is_match(content))
+                    .unwrap_or_else(|| content.contains(pattern));
+                if hit {
+                    matches.push(format!("{relative}:{}:{content}", line + 1));
+                    if matches.len() >= 5_000 {
+                        return false;
+                    }
+                }
+            }
+            true
+        })?;
+        Ok(self.cap(matches.join("\n")))
+    }
+}
+
+impl ResourceResolver for NativeWorkspaceResolver {
+    fn resolve_image(&self, image: &ResourceRef) -> Result<ResolvedImage, String> {
+        let path = self.resolve(&image.handle, false)?;
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("cannot read image `{}`: {error}", image.handle))?;
+        let media_type = match path.extension().and_then(|extension| extension.to_str()) {
+            Some("png") => "image/png",
+            Some("jpg" | "jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            _ => return Err("unsupported image media type".to_owned()),
+        };
+        Ok(ResolvedImage {
+            media_type: media_type.to_owned(),
+            bytes,
+        })
+    }
+
+    fn execute_tool(
+        &self,
+        admitted_resources: &[ResourceRef],
+        call: &ToolCall,
+    ) -> Result<String, String> {
+        if !admitted_resources
+            .iter()
+            .any(|resource| resource.kind == "file_store")
+        {
+            return Err("turn has no admitted file-store capability".to_owned());
+        }
+        match call.name.as_str() {
+            "read" => self.read(&call.arguments),
+            "write" => self.write(&call.arguments),
+            "edit" => self.edit(&call.arguments),
+            "ls" => self.list(&call.arguments),
+            "find" => self.find(&call.arguments),
+            "grep" => self.grep(&call.arguments),
+            _ => Err("tool has no native workspace implementation".to_owned()),
+        }
+    }
+}
+
+/// The model-facing workspace tools owned by WhippleScript. An embedding host
+/// selects whether mutation is present; it cannot redefine their schemas or
+/// execution semantics.
+pub fn native_workspace_tool_specs(writable: bool) -> Vec<ToolSpec> {
+    let mut tools = vec![
+        tool_spec(
+            "read",
+            "Read a workspace text file.",
+            json!({
+                "type": "object", "properties": {
+                    "path": { "type": "string" }, "offset": { "type": "integer" },
+                    "limit": { "type": "integer" }
+                }, "required": ["path"], "additionalProperties": false
+            }),
+        ),
+        tool_spec(
+            "grep",
+            "Search text in workspace files.",
+            json!({
+                "type": "object", "properties": {
+                    "pattern": { "type": "string" }, "path": { "type": "string" }
+                }, "required": ["pattern"], "additionalProperties": false
+            }),
+        ),
+        tool_spec(
+            "find",
+            "Find workspace paths by wildcard pattern.",
+            json!({
+                "type": "object", "properties": {
+                    "pattern": { "type": "string" }, "path": { "type": "string" }
+                }, "required": ["pattern"], "additionalProperties": false
+            }),
+        ),
+        tool_spec(
+            "ls",
+            "List a workspace directory.",
+            json!({
+                "type": "object", "properties": { "path": { "type": "string" } },
+                "additionalProperties": false
+            }),
+        ),
+    ];
+    if writable {
+        tools.extend([
+            tool_spec(
+                "write",
+                "Create or replace a workspace text file.",
+                json!({
+                    "type": "object", "properties": {
+                        "path": { "type": "string" }, "content": { "type": "string" }
+                    }, "required": ["path", "content"], "additionalProperties": false
+                }),
+            ),
+            tool_spec(
+                "edit",
+                "Apply exact, unique string replacements.",
+                json!({
+                    "type": "object", "properties": {
+                        "path": { "type": "string" }, "edits": { "type": "array", "items": {
+                            "type": "object", "properties": {
+                                "oldText": { "type": "string" }, "newText": { "type": "string" }
+                            }, "required": ["oldText", "newText"], "additionalProperties": false
+                        }}
+                    }, "required": ["path", "edits"], "additionalProperties": false
+                }),
+            ),
+        ]);
+    }
+    tools
+}
+
+fn tool_spec(name: &str, description: &str, input_schema: Value) -> ToolSpec {
+    ToolSpec {
+        name: name.to_owned(),
+        description: description.to_owned(),
+        input_schema,
+    }
+}
+
+fn string_argument<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
+    arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing required string argument `{name}`"))
+}
+
+fn normalize_relative(path: &Path) -> Result<PathBuf, String> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "workspace path `{}` escapes its capability",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn reject_symlinks_between(root: &Path, target: &Path, display: &str) -> Result<(), String> {
+    let relative = target
+        .strip_prefix(root)
+        .map_err(|_| format!("workspace path `{display}` escapes its capability"))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        if fs::symlink_metadata(&current)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(format!("workspace path `{display}` traverses a symlink"));
+        }
+    }
+    Ok(())
+}
+
+fn walk_workspace(
+    root: &Path,
+    start: &Path,
+    visit: &mut dyn FnMut(&str, &Path) -> bool,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(start)
+        .map_err(|error| format!("cannot inspect workspace path: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("workspace traversal reached a symlink".to_owned());
+    }
+    if metadata.is_file() {
+        let relative = start
+            .strip_prefix(root)
+            .map_err(|_| "workspace traversal escaped its capability".to_owned())?
+            .to_string_lossy();
+        let _ = visit(&relative, start);
+        return Ok(());
+    }
+    let mut pending = vec![start.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let mut entries = fs::read_dir(&directory)
+            .map_err(|error| format!("cannot walk workspace: {error}"))?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|error| format!("cannot inspect workspace entry: {error}"))?;
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| "workspace traversal escaped its capability".to_owned())?
+                .to_string_lossy();
+            if !visit(&relative, &path) {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn wildcard_matches(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let text = text.as_bytes();
+    let mut previous = vec![false; text.len() + 1];
+    previous[0] = true;
+    for &token in pattern {
+        let mut current = vec![false; text.len() + 1];
+        if token == b'*' {
+            current[0] = previous[0];
+        }
+        for index in 1..=text.len() {
+            current[index] = match token {
+                b'*' => previous[index] || current[index - 1],
+                b'?' => previous[index - 1],
+                byte => previous[index - 1] && byte == text[index - 1],
+            };
+        }
+        previous = current;
+    }
+    previous[text.len()]
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1406,5 +1840,81 @@ workflow UnsafeHostChat {
         assert!(matches!(error, HostRuntimeError::Ifc(_)));
         drop(runtime);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn native_workspace_tools_are_confined_and_honor_read_only_subtrees() {
+        let root = std::env::temp_dir().join(format!(
+            "whip-native-workspace-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join(".pi")).expect("dirs");
+        fs::write(root.join("note.txt"), "alpha\nbeta\n").expect("note");
+        fs::write(root.join(".pi/SYSTEM.md"), "protected").expect("method");
+        let resolver = NativeWorkspaceResolver::new(&root)
+            .expect("resolver")
+            .read_only([PathBuf::from(".pi")])
+            .expect("read-only path");
+        let resources = [ResourceRef {
+            handle: "project".to_owned(),
+            kind: "file_store".to_owned(),
+        }];
+
+        let read = resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "read-1".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: json!({ "path": "note.txt" }),
+                },
+            )
+            .expect("read");
+        assert!(read.contains("1: alpha"));
+        resolver
+            .execute_tool(
+                &resources,
+                &ToolCall {
+                    id: "edit-1".to_owned(),
+                    name: "edit".to_owned(),
+                    arguments: json!({
+                        "path": "note.txt",
+                        "edits": [{ "oldText": "beta", "newText": "gamma" }]
+                    }),
+                },
+            )
+            .expect("edit");
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("edited note"),
+            "alpha\ngamma\n"
+        );
+
+        for path in ["../outside", ".pi/SYSTEM.md"] {
+            assert!(resolver
+                .execute_tool(
+                    &resources,
+                    &ToolCall {
+                        id: "write-denied".to_owned(),
+                        name: "write".to_owned(),
+                        arguments: json!({ "path": path, "content": "tampered" }),
+                    },
+                )
+                .is_err());
+        }
+        assert_eq!(
+            fs::read_to_string(root.join(".pi/SYSTEM.md")).expect("protected method"),
+            "protected"
+        );
+        assert!(native_workspace_tool_specs(false)
+            .iter()
+            .all(|tool| tool.name != "write" && tool.name != "edit"));
+        assert!(native_workspace_tool_specs(true)
+            .iter()
+            .any(|tool| tool.name == "write"));
+        let _ = fs::remove_dir_all(root);
     }
 }
