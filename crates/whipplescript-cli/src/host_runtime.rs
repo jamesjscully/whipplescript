@@ -21,7 +21,7 @@ use whipplescript_kernel::harness_loop::{
 use whipplescript_kernel::harness_model::MessagesApiClient;
 use whipplescript_kernel::sansio::{HostDriver, HttpResponse, IoRequest, IoResult, TransportError};
 use whipplescript_kernel::{
-    idempotency_key, BrokeredTurnContext, ProgramVersionInput, RuntimeKernel,
+    idempotency_key, AgentThreadSeed, BrokeredTurnContext, ProgramVersionInput, RuntimeKernel,
 };
 use whipplescript_parser::IrProgram;
 use whipplescript_store::{
@@ -30,9 +30,9 @@ use whipplescript_store::{
 };
 
 use crate::host_protocol::{
-    EventPosition, LabeledRuntimeEvent, OpenInstanceCommand, OpenedInstance, PolicyEpochRef,
-    ProtocolError, ProviderBindingRef, ResourceRef, StartTurnCommand, TurnReceipt, TurnStatus,
-    HOST_PROTOCOL,
+    EventPosition, ForkInstanceCommand, ForkedInstance, LabeledRuntimeEvent, OpenInstanceCommand,
+    OpenedInstance, PolicyEpochRef, ProtocolError, ProviderBindingRef, ResourceRef,
+    StartTurnCommand, TurnReceipt, TurnStatus, HOST_PROTOCOL,
 };
 use crate::ifc::VerifiedEnvelope;
 
@@ -808,6 +808,23 @@ impl GovernedHostRuntime {
         &self.policy
     }
 
+    /// The latest durable coordinate for an instance. Hosts use this to bind a
+    /// fork to one explicit source point rather than an implicit moving head.
+    pub fn current_position(&self, instance_ref: &str) -> Result<EventPosition, HostRuntimeError> {
+        let events = self
+            .kernel
+            .store()
+            .list_events(instance_ref)
+            .map_err(HostRuntimeError::Store)?;
+        let latest = events
+            .last()
+            .ok_or_else(|| HostRuntimeError::UnknownInstance(instance_ref.to_owned()))?;
+        Ok(EventPosition {
+            instance_ref: instance_ref.to_owned(),
+            sequence: positive_sequence(latest.sequence)?,
+        })
+    }
+
     /// Mint the out-of-band cancel capability for a command before driving it.
     /// The handle contains no provider secret or resource body.
     pub fn cancellation_handle(
@@ -895,6 +912,168 @@ impl GovernedHostRuntime {
         };
         result.validate_for(command)?;
         Ok(result)
+    }
+
+    /// Fork the source runtime's live agent thread into a distinct target
+    /// instance. The source coordinate, package, and policy are all validated;
+    /// the target records an idempotent seed event rather than copying a store
+    /// file or pretending to have executed the source effects.
+    pub fn fork_instance_from<P: PackageResolver + ?Sized>(
+        &mut self,
+        source_runtime: &GovernedHostRuntime,
+        command: &ForkInstanceCommand,
+        packages: &P,
+    ) -> Result<ForkedInstance, HostRuntimeError> {
+        command.validate()?;
+        self.require_policy(&command.policy)?;
+        source_runtime.require_policy(&command.policy)?;
+
+        let package = packages
+            .resolve_package(&command.package_version_ref)
+            .map_err(HostRuntimeError::Resolver)?;
+        validate_package(&package, &command.package_version_ref)?;
+        self.check_package_ifc(&package)?;
+        source_runtime.check_package_ifc(&package)?;
+        source_runtime.validate_instance_binding(
+            &command.source.instance_ref,
+            &command.package_version_ref,
+            &command.policy,
+            packages,
+        )?;
+
+        let current = source_runtime.current_position(&command.source.instance_ref)?;
+        if command.source.sequence > current.sequence {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "fork source position",
+            )));
+        }
+        let running = source_runtime
+            .kernel
+            .store()
+            .list_effects(&command.source.instance_ref)
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .any(|effect| effect.status == "running");
+        if running {
+            return Err(HostRuntimeError::Incomplete(format!(
+                "source instance {} is not quiescent",
+                command.source.instance_ref
+            )));
+        }
+
+        let target_command = command.target_open_command();
+        let target = self.open_instance(&target_command, packages)?;
+        if let Some(replayed) = self.replayed_fork_instance(command, &target)? {
+            return Ok(replayed);
+        }
+        if target.instance_ref == command.source.instance_ref {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "fork target identity",
+            )));
+        }
+
+        let messages = source_runtime
+            .kernel
+            .snapshot_agent_thread(
+                &command.source.instance_ref,
+                &package.agent,
+                Some(command.source.sequence as i64),
+            )
+            .map_err(HostRuntimeError::Store)?;
+        self.kernel
+            .seed_agent_thread(AgentThreadSeed {
+                instance_id: &target.instance_ref,
+                agent: &package.agent,
+                messages: &messages,
+                source_instance_id: &command.source.instance_ref,
+                source_sequence: command.source.sequence as i64,
+                idempotency_key: &idempotency_key(&[
+                    &target.instance_ref,
+                    &command.request_id,
+                    "host-instance-thread-seed",
+                ]),
+            })
+            .map_err(HostRuntimeError::Store)?;
+        let payload = json!({
+            "request_id": command.request_id,
+            "source": command.source,
+            "target_request_id": command.target_request_id,
+            "package_version_ref": command.package_version_ref,
+            "policy": command.policy,
+        })
+        .to_string();
+        let event = self
+            .kernel
+            .store()
+            .append_event(NewEvent {
+                instance_id: &target.instance_ref,
+                event_type: "host.instance.forked",
+                payload_json: &payload,
+                source: "host-runtime",
+                causation_id: None,
+                correlation_id: Some(&command.request_id),
+                idempotency_key: Some(&idempotency_key(&[
+                    &target.instance_ref,
+                    &command.request_id,
+                    "host-instance-forked",
+                ])),
+            })
+            .map_err(HostRuntimeError::Store)?;
+        let target_instance_ref = target.instance_ref.clone();
+        let result = ForkedInstance {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: command.request_id.clone(),
+            source: command.source.clone(),
+            target,
+            forked_at: EventPosition {
+                instance_ref: target_instance_ref,
+                sequence: positive_sequence(event.sequence)?,
+            },
+        };
+        result.validate_for(command)?;
+        Ok(result)
+    }
+
+    fn replayed_fork_instance(
+        &self,
+        command: &ForkInstanceCommand,
+        target: &OpenedInstance,
+    ) -> Result<Option<ForkedInstance>, HostRuntimeError> {
+        let events = self
+            .kernel
+            .store()
+            .list_events(&target.instance_ref)
+            .map_err(HostRuntimeError::Store)?;
+        let Some(event) = events.iter().find(|event| {
+            event.event_type == "host.instance.forked"
+                && serde_json::from_str::<Value>(&event.payload_json)
+                    .ok()
+                    .and_then(|payload| {
+                        payload
+                            .get("request_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some(command.request_id.as_str())
+        }) else {
+            return Ok(None);
+        };
+        let payload: Value =
+            serde_json::from_str(&event.payload_json).map_err(HostRuntimeError::Json)?;
+        let result = ForkedInstance {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: required_string(&payload, "request_id")?,
+            source: serde_json::from_value(payload["source"].clone())
+                .map_err(HostRuntimeError::Json)?,
+            target: target.clone(),
+            forked_at: EventPosition {
+                instance_ref: target.instance_ref.clone(),
+                sequence: positive_sequence(event.sequence)?,
+            },
+        };
+        result.validate_for(command)?;
+        Ok(Some(result))
     }
 
     fn replayed_open_instance(
@@ -1182,33 +1361,48 @@ impl GovernedHostRuntime {
         command: &StartTurnCommand,
         packages: &P,
     ) -> Result<(), HostRuntimeError> {
+        self.validate_instance_binding(
+            &command.instance_ref,
+            &command.package_version_ref,
+            &command.policy,
+            packages,
+        )
+    }
+
+    fn validate_instance_binding<P: PackageResolver + ?Sized>(
+        &self,
+        instance_ref: &str,
+        package_version_ref: &str,
+        policy: &PolicyEpochRef,
+        packages: &P,
+    ) -> Result<(), HostRuntimeError> {
         let instance = self
             .kernel
             .store()
-            .get_instance(&command.instance_ref)
+            .get_instance(instance_ref)
             .map_err(HostRuntimeError::Store)?
-            .ok_or_else(|| HostRuntimeError::UnknownInstance(command.instance_ref.clone()))?;
+            .ok_or_else(|| HostRuntimeError::UnknownInstance(instance_ref.to_owned()))?;
         let metadata: InstanceMetadata =
             serde_json::from_str(&instance.input_json).map_err(HostRuntimeError::Json)?;
         if metadata.protocol != HOST_PROTOCOL
-            || metadata.package_version_ref != command.package_version_ref
-            || metadata.policy != command.policy
+            || metadata.package_version_ref != package_version_ref
+            || metadata.policy != *policy
         {
             return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
                 "instance package/policy binding",
             )));
         }
         let package = packages
-            .resolve_package(&command.package_version_ref)
+            .resolve_package(package_version_ref)
             .map_err(HostRuntimeError::Resolver)?;
-        validate_package(&package, &command.package_version_ref)?;
+        validate_package(&package, package_version_ref)?;
         self.check_package_ifc(&package)?;
         let version = self
             .kernel
             .store()
             .get_program_version(&instance.version_id)
             .map_err(HostRuntimeError::Store)?
-            .ok_or_else(|| HostRuntimeError::UnknownInstance(command.instance_ref.clone()))?;
+            .ok_or_else(|| HostRuntimeError::UnknownInstance(instance_ref.to_owned()))?;
         if version.source_hash != package.source_hash || version.ir_hash != package.ir_hash {
             return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
                 "resolved package content",
@@ -2185,6 +2379,97 @@ workflow UnsafeHostChat {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("sqlite-wal"));
         let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[test]
+    fn governed_instance_fork_seeds_a_distinct_continuing_thread() {
+        let source_path = temp_store();
+        let target_path = temp_store();
+        let policy_text = signed_policy();
+        let mut source =
+            GovernedHostRuntime::open(&source_path, 9, &policy_text).expect("source runtime");
+        let source_open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-source-chat".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: source.policy_ref().clone(),
+        };
+        let source_instance = source
+            .open_instance(&source_open, &Packages)
+            .expect("source instance");
+        source
+            .run_turn_with_driver(
+                &turn(&source_instance.instance_ref, &source_open.policy, 1),
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &Resources {
+                    calls: Cell::new(0),
+                },
+                &ScriptedDriver::new(vec![json!({
+                    "output_text": "source answer",
+                    "usage": { "input_tokens": 10, "output_tokens": 3 }
+                })]),
+            )
+            .expect("source turn");
+        let source_position = source
+            .current_position(&source_instance.instance_ref)
+            .expect("source position");
+
+        let mut target =
+            GovernedHostRuntime::open(&target_path, 9, &policy_text).expect("target runtime");
+        let fork = ForkInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "fork-source-into-target".to_owned(),
+            source: source_position,
+            target_request_id: "open-target-chat".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: target.policy_ref().clone(),
+        };
+        let forked = target
+            .fork_instance_from(&source, &fork, &Packages)
+            .expect("fork succeeds");
+        forked.validate_for(&fork).expect("fork binding");
+        assert_ne!(forked.target.instance_ref, source_instance.instance_ref);
+        let replayed = target
+            .fork_instance_from(&source, &fork, &Packages)
+            .expect("fork replays");
+        assert_eq!(replayed, forked);
+
+        let driver = ScriptedDriver::new(vec![json!({
+            "output_text": "target answer",
+            "usage": { "input_tokens": 20, "output_tokens": 3 }
+        })]);
+        target
+            .run_turn_with_driver(
+                &turn(&forked.target.instance_ref, &fork.policy, 2),
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &Resources {
+                    calls: Cell::new(0),
+                },
+                &driver,
+            )
+            .expect("target turn");
+        let serialized = driver
+            .requests
+            .borrow()
+            .first()
+            .expect("target request")
+            .to_string();
+        assert!(serialized.contains("source answer"));
+        assert!(serialized.contains("turn 2"));
+
+        drop(target);
+        drop(source);
+        for path in [&source_path, &target_path] {
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+            let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+        }
     }
 
     #[test]

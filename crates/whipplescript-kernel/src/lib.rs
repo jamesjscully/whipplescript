@@ -47,7 +47,7 @@ use whipplescript_parser::{
 };
 use whipplescript_store::{
     ArtifactRecord, ClaimableEffect, DerivedFact, DiagnosticRecord, EffectCancellation,
-    EffectCompletion, EvidenceRecord, ExpiredLease, FactBatch, FactBatchOutcome,
+    EffectCompletion, EventView, EvidenceRecord, ExpiredLease, FactBatch, FactBatchOutcome,
     InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent, NewFact, NewInboxItem,
     NewInstance, NewInstanceAuthority, NewProgramVersion, NewWorkflowInvocation,
     ProgramVersionRecord, RetryEffect, RevisionActivation, RuleCommit, RuleCommitRevisionGuard,
@@ -167,6 +167,13 @@ pub fn idempotency_key(parts: &[&str]) -> String {
     format!("key_{:016x}", stable_hash(&input))
 }
 
+fn restore_marker_target_of(payload_json: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(payload_json)
+        .ok()?
+        .get("restored_to_sequence")
+        .and_then(Value::as_i64)
+}
+
 /// Identifies the effect a brokered turn settles. The owned harness runner uses
 /// it to open the run, attribute evidence, and key the terminal fact.
 pub struct BrokeredTurnContext<'a> {
@@ -178,6 +185,19 @@ pub struct BrokeredTurnContext<'a> {
     /// agent's latest completed-turn transcript in this instance, appending the
     /// new user message — the chat-shaped continuation. `false` = fresh turn.
     pub thread_continue: bool,
+}
+
+/// A host-governed seed for a newly forked agent thread. The seed is runtime
+/// state, not a user message or a completed effect: it preserves the source
+/// conversation while giving the target instance its own identity and future
+/// event history.
+pub struct AgentThreadSeed<'a> {
+    pub instance_id: &'a str,
+    pub agent: &'a str,
+    pub messages: &'a [crate::harness_loop::ChatMessage],
+    pub source_instance_id: &'a str,
+    pub source_sequence: i64,
+    pub idempotency_key: &'a str,
 }
 
 /// Evidence kind + shape-only metadata for one in-turn observation. Per DR-0024
@@ -505,23 +525,96 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         instance_id: &str,
         agent: &str,
     ) -> Vec<crate::harness_loop::ChatMessage> {
-        let Ok(events) = self.store.list_events(instance_id) else {
-            return Vec::new();
-        };
-        let latest_completed_effect = events.iter().rev().find_map(|event| {
-            if event.event_type != "agent.turn.completed" {
-                return None;
+        self.snapshot_agent_thread(instance_id, agent, None)
+            .unwrap_or_default()
+    }
+
+    /// Return the live conversation thread for `agent`, optionally bounded at
+    /// one event-log coordinate. Restore markers are folded before selecting
+    /// the latest completed turn or imported fork seed, so abandoned history
+    /// never leaks into a fork or subsequent turn.
+    pub fn snapshot_agent_thread(
+        &self,
+        instance_id: &str,
+        agent: &str,
+        up_to_sequence: Option<i64>,
+    ) -> StoreResult<Vec<crate::harness_loop::ChatMessage>> {
+        let events = self.store.list_events(instance_id)?;
+        let mut live: Vec<&EventView> = Vec::new();
+        for event in &events {
+            if up_to_sequence.is_some_and(|sequence| event.sequence > sequence) {
+                break;
             }
-            let payload = serde_json::from_str::<Value>(&event.payload_json).ok()?;
-            if payload.get("agent").and_then(Value::as_str) != Some(agent) {
-                return None;
+            if event.event_type == "context.restored" {
+                if let Some(target) = restore_marker_target_of(&event.payload_json) {
+                    live.retain(|folded| folded.sequence <= target);
+                }
+            } else {
+                live.push(event);
             }
-            Some(payload.get("effect_id")?.as_str()?.to_owned())
-        });
-        match latest_completed_effect {
-            Some(effect_id) => self.load_brokered_transcript(instance_id, &effect_id),
-            None => Vec::new(),
         }
+
+        for event in live.iter().rev() {
+            let payload = match serde_json::from_str::<Value>(&event.payload_json) {
+                Ok(payload) => payload,
+                Err(_) => continue,
+            };
+            if payload.get("agent").and_then(Value::as_str) != Some(agent) {
+                continue;
+            }
+            if event.event_type == "agent.thread.seeded" {
+                return Ok(crate::harness_loop::chat_messages_from_json(
+                    payload.get("messages").unwrap_or(&Value::Null),
+                ));
+            }
+            if event.event_type != "agent.turn.completed" {
+                continue;
+            }
+            let Some(effect_id) = payload.get("effect_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let transcript = live.iter().rev().find(|candidate| {
+                candidate.event_type == "agent.turn.brokered.transcript"
+                    && serde_json::from_str::<Value>(&candidate.payload_json)
+                        .ok()
+                        .and_then(|checkpoint| {
+                            checkpoint
+                                .get("effect_id")
+                                .and_then(Value::as_str)
+                                .map(|candidate_id| candidate_id == effect_id)
+                        })
+                        .unwrap_or(false)
+            });
+            if let Some(transcript) = transcript {
+                let checkpoint: Value = serde_json::from_str(&transcript.payload_json)?;
+                return Ok(crate::harness_loop::chat_messages_from_json(
+                    checkpoint.get("messages").unwrap_or(&Value::Null),
+                ));
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Seed a newly opened instance with an exported thread snapshot. The
+    /// event is idempotent and records the exact source coordinate; later
+    /// continuation treats it as the target's initial live thread without
+    /// pretending that the target executed the source effects.
+    pub fn seed_agent_thread(&mut self, seed: AgentThreadSeed<'_>) -> StoreResult<StoredEvent> {
+        self.store.append_event(NewEvent {
+            instance_id: seed.instance_id,
+            event_type: "agent.thread.seeded",
+            payload_json: &json!({
+                "agent": seed.agent,
+                "messages": crate::harness_loop::chat_messages_to_json(seed.messages),
+                "source_instance_id": seed.source_instance_id,
+                "source_sequence": seed.source_sequence,
+            })
+            .to_string(),
+            source: "kernel",
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: Some(seed.idempotency_key),
+        })
     }
 
     /// Load the latest persisted brokered-turn transcript for an effect, for
