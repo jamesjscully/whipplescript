@@ -5453,18 +5453,22 @@ impl SqliteStore {
         tx.execute("DELETE FROM effects WHERE instance_id = ?1", [instance_id])?;
         tx.execute("DELETE FROM facts WHERE instance_id = ?1", [instance_id])?;
 
-        let events = {
+        let fetched = {
             // RC-2 Delta A: when a bound is present, cut the replayed event set
             // at `sequence <= N` (INCLUSIVE). `N` is an i64 so interpolation is
             // injection-safe; when unbounded the clause is empty, leaving the
             // full-replay query semantically identical to before.
+            //
+            // RC-4b: `context.restored` markers are fetched alongside the state
+            // events (and `sequence` is selected) so the fold below can honor
+            // them. A marker is not itself replayed; it rewinds the live set.
             let bound_clause = match up_to_sequence {
                 Some(n) => format!("  AND sequence <= {n}\n"),
                 None => String::new(),
             };
             let mut statement = tx.prepare(&format!(
                 r#"
-                SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source
+                SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source, sequence
                 FROM events
                 WHERE instance_id = ?1
                   AND event_type IN (
@@ -5478,7 +5482,8 @@ impl SqliteStore {
                       'effect.terminal',
                       'effect.cancelled',
                       'effect.cancellation_requested',
-                      'lease.expired'
+                      'lease.expired',
+                      'context.restored'
                   )
                 {bound_clause}ORDER BY sequence
                 "#
@@ -5492,13 +5497,43 @@ impl SqliteStore {
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
                     ))
                 })?
                 .collect::<result::Result<Vec<_>, _>>()?;
             rows
         };
 
-        for (event_id, event_type, payload_json, idempotency_key, causation_id, source) in events {
+        // RC-4b: the restore-marker replay fold (models/maude/restore-replay.maude).
+        // Walk the log ascending; a `context.restored` marker rewinds the live
+        // set to its target sequence, dropping every event that a later restore
+        // orphaned so an abandoned branch is never re-applied. With no markers
+        // present, `events` is exactly the ordered state-event set as before, so
+        // the rebuild is byte-identical for instances that were never restored.
+        let events = {
+            let mut live: Vec<ReplayRow> = Vec::new();
+            for entry in fetched {
+                if entry.1 == "context.restored" {
+                    if let Some(target) = restore_marker_target(&entry.2) {
+                        live.retain(|folded| folded.6 <= target);
+                    }
+                } else {
+                    live.push(entry);
+                }
+            }
+            live
+        };
+
+        for (
+            event_id,
+            event_type,
+            payload_json,
+            idempotency_key,
+            causation_id,
+            source,
+            _sequence,
+        ) in events
+        {
             match event_type.as_str() {
                 "rule.committed" => replay_rule_commit(&tx, instance_id, &event_id, &payload_json)?,
                 "fact.derived" => {
@@ -6443,6 +6478,32 @@ fn fold_file_manifest(fact_payloads: &[String]) -> StoreResult<(String, BTreeMap
     }
     let manifest_json = serde_json::to_string(&manifest)?;
     Ok((manifest_json, manifest))
+}
+
+/// Restorable-context RC-4b: the target sequence a `context.restored` marker
+/// rewinds the replay to (`restored_to_sequence`). `None` for a malformed
+/// marker, in which case the fold applies no rewind (retains all live events)
+/// rather than corrupting the projection.
+/// A fetched replayable event row for the restore-marker fold (RC-4b):
+/// (event_id, event_type, payload_json, idempotency_key, causation_id, source,
+/// sequence).
+#[cfg(feature = "native")]
+type ReplayRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    i64,
+);
+
+#[cfg(feature = "native")]
+fn restore_marker_target(payload_json: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(payload_json)
+        .ok()?
+        .get("restored_to_sequence")
+        .and_then(Value::as_i64)
 }
 
 #[cfg(feature = "native")]
@@ -13164,6 +13225,111 @@ mod tests {
         assert!(
             effect_exists(&store, "effect-b"),
             "effect B present in full"
+        );
+    }
+
+    #[test]
+    fn rebuild_projections_honors_restore_marker_excluding_the_abandoned_branch() {
+        // RC-4b: an unbounded rebuild folds `context.restored` markers — an
+        // effect committed AFTER the cut but BEFORE the marker is abandoned and
+        // never re-applied, while post-restore work survives. This is the
+        // append-only-log coherence the model proves
+        // (models/maude/restore-replay.maude).
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("RestoreFold", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        let effect_exists = |store: &SqliteStore, effect_id: &str| -> bool {
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM effects WHERE effect_id = ?1",
+                    [effect_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("effect count")
+                > 0
+        };
+
+        // Effect A at the cut, then effect B (the branch to abandon).
+        let commit_a = store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "rule-a",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("effect-a", "agent.tell", "restore-key-a")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-restore-a"),
+            })
+            .expect("effect A commits");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "rule-b",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("effect-b", "agent.tell", "restore-key-b")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-restore-b"),
+            })
+            .expect("effect B commits");
+
+        // A restore marker rewinding to A's sequence: B (later) is abandoned.
+        let marker_payload = json!({ "restored_to_sequence": commit_a.sequence }).to_string();
+        store
+            .append_event(NewEvent {
+                instance_id: &instance.instance_id,
+                event_type: "context.restored",
+                payload_json: &marker_payload,
+                source: "restorable-context",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some("restore-marker-1"),
+            })
+            .expect("restore marker appends");
+
+        // Post-restore work: effect C, committed after the marker, stays live.
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "rule-c",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("effect-c", "agent.tell", "restore-key-c")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-restore-c"),
+            })
+            .expect("effect C commits");
+
+        store
+            .rebuild_projections(&instance.instance_id)
+            .expect("marker-aware rebuild");
+        assert!(
+            effect_exists(&store, "effect-a"),
+            "effect A (<= cut) survives the restore"
+        );
+        assert!(
+            !effect_exists(&store, "effect-b"),
+            "effect B (abandoned branch) is excluded by the marker"
+        );
+        assert!(
+            effect_exists(&store, "effect-c"),
+            "effect C (post-restore work) stays live"
         );
     }
 

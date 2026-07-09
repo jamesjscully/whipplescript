@@ -1149,6 +1149,16 @@ fn do_fold_file_manifest(
     Ok((manifest_json, manifest))
 }
 
+/// RC-4b: the target sequence a `context.restored` marker rewinds replay to.
+/// Mirrors the native `restore_marker_target`: `None` for a malformed marker so
+/// the fold applies no rewind rather than corrupting the projection.
+fn do_restore_marker_target(payload_json: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(payload_json)
+        .ok()?
+        .get("restored_to_sequence")
+        .and_then(Value::as_i64)
+}
+
 /// The `effect.terminal` event payload, mirroring `effect_completion_payload`.
 fn effect_completion_payload(
     completion: &EffectCompletion<'_>,
@@ -3552,21 +3562,40 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             Some(n) => format!(" AND sequence <= {n}"),
             None => String::new(),
         };
+        // RC-4b: fetch `context.restored` markers alongside state events (and
+        // select `sequence`) so the restore-marker replay fold below can honor
+        // them (models/maude/restore-replay.maude).
         let events = self
             .sql
             .query(
                 &format!(
-                    "SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source \
+                    "SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source, sequence \
                      FROM events WHERE instance_id = ?1 AND event_type IN ( \
                      'rule.committed', 'fact.derived', 'workflow.completed', 'workflow.failed', \
                      'instance.transitioned', 'workflow.revision_activated', 'effect.run_started', \
                      'effect.terminal', 'effect.cancelled', 'effect.cancellation_requested', \
-                     'lease.expired'){bound_clause} ORDER BY sequence"
+                     'lease.expired', 'context.restored'){bound_clause} ORDER BY sequence"
                 ),
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
-        for row in &events {
+        // RC-4b restore-marker fold: walk ascending; a `context.restored` marker
+        // rewinds the live set to its target sequence, dropping every event a
+        // later restore orphaned. With no markers present, `live` is exactly the
+        // ordered state-event set, so the rebuild is byte-identical for instances
+        // that were never restored.
+        let mut live: Vec<usize> = Vec::new();
+        for (idx, row) in events.iter().enumerate() {
+            if as_text(&row[1]) == "context.restored" {
+                if let Some(target) = do_restore_marker_target(&as_text(&row[2])) {
+                    live.retain(|&i| as_i64(&events[i][6]) <= target);
+                }
+            } else {
+                live.push(idx);
+            }
+        }
+        for &idx in &live {
+            let row = &events[idx];
             let event_id = as_text(&row[0]);
             let event_type = as_text(&row[1]);
             let payload_json = as_text(&row[2]);
@@ -10606,6 +10635,116 @@ mod tests {
         assert!(
             matches!(refused, Err(StoreError::Conflict(_))),
             "checkpoint refuses while an effect runs, got {refused:?}"
+        );
+    }
+
+    /// RC-4b DO mirror: an unbounded rebuild folds `context.restored` markers —
+    /// an effect committed after the cut but before the marker is abandoned;
+    /// post-restore work survives (models/maude/restore-replay.maude).
+    #[test]
+    fn do_store_rebuild_projections_honors_restore_marker() {
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text("i1"),
+                    text("p"),
+                    text("ver_1"),
+                    int(0),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed instance");
+
+        let effect_exists =
+            |store: &DoSqliteStore<super::test_support::RusqliteDoSql>, effect_id: &str| -> bool {
+                !store
+                    .sql
+                    .query(
+                        "SELECT 1 FROM effects WHERE effect_id = ?1",
+                        &[text(effect_id)],
+                    )
+                    .expect("effect count")
+                    .is_empty()
+            };
+        let max_sequence = |store: &DoSqliteStore<super::test_support::RusqliteDoSql>| -> i64 {
+            match &store
+                .sql
+                .query(
+                    "SELECT MAX(sequence) FROM events WHERE instance_id = ?1",
+                    &[text("i1")],
+                )
+                .expect("max sequence")[0][0]
+            {
+                SqlValue::Int(n) => *n,
+                other => panic!("expected integer sequence, got {other:?}"),
+            }
+        };
+        let commit = |store: &mut DoSqliteStore<super::test_support::RusqliteDoSql>,
+                      rule: &str,
+                      effect_id: &str,
+                      key: &str| {
+            let effects = [NewEffect {
+                effect_id,
+                kind: "queue.push",
+                target: None,
+                input_json: "{}",
+                status: "queued",
+                idempotency_key: key,
+                required_capabilities_json: "[]",
+                profile: None,
+                correlation_id: None,
+                source_span_json: None,
+                timeout_seconds: None,
+            }];
+            store
+                .commit_rule(RuleCommit {
+                    instance_id: "i1",
+                    rule,
+                    trigger_event_id: None,
+                    facts: &[],
+                    consumed_fact_ids: &[],
+                    effects: &effects,
+                    dependencies: &[],
+                    terminal: None,
+                    idempotency_key: Some(key),
+                })
+                .expect("commit");
+        };
+
+        commit(&mut store, "r.a", "eff_a", "c_a");
+        let cut = max_sequence(&store);
+        commit(&mut store, "r.b", "eff_b", "c_b");
+
+        let marker_payload = serde_json::json!({ "restored_to_sequence": cut }).to_string();
+        store
+            .append_event(NewEvent {
+                instance_id: "i1",
+                event_type: "context.restored",
+                payload_json: &marker_payload,
+                source: "restorable-context",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some("restore-marker-1"),
+            })
+            .expect("marker appends");
+        commit(&mut store, "r.c", "eff_c", "c_c");
+
+        store
+            .rebuild_projections("i1")
+            .expect("marker-aware rebuild");
+        assert!(effect_exists(&store, "eff_a"), "A survives the restore");
+        assert!(!effect_exists(&store, "eff_b"), "B abandoned by the marker");
+        assert!(
+            effect_exists(&store, "eff_c"),
+            "C (post-restore) stays live"
         );
     }
 
