@@ -151,6 +151,12 @@ pub struct MessagesApiClient {
     /// `cache_control` breakpoint still applies. Wiring the per-turn key through
     /// the DO agent path is a later-phase follow-up.
     cache_key: Option<String>,
+    codex: Option<CodexBackend>,
+}
+
+struct CodexBackend {
+    account_id: String,
+    session_id: String,
 }
 
 impl MessagesApiClient {
@@ -169,12 +175,51 @@ impl MessagesApiClient {
             base_url: base_url.into(),
             max_tokens,
             cache_key,
+            codex: None,
+        }
+    }
+
+    /// ChatGPT-plan Codex backend. Credential acquisition, refresh, and storage
+    /// remain host-owned; this client owns only the provider wire contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_codex(
+        access_token: impl Into<String>,
+        account_id: impl Into<String>,
+        session_id: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        max_tokens: u64,
+        cache_key: Option<String>,
+    ) -> Self {
+        Self {
+            provider: CoerceProvider::OpenAi,
+            api_key: access_token.into(),
+            model: model.into(),
+            base_url: base_url.into(),
+            max_tokens,
+            cache_key,
+            codex: Some(CodexBackend {
+                account_id: account_id.into(),
+                session_id: session_id.into(),
+            }),
         }
     }
 }
 
 impl HttpModelClient for MessagesApiClient {
     fn build_request(&self, messages: &[ChatMessage], tools: &[ToolSpec]) -> HttpRequest {
+        if let Some(codex) = &self.codex {
+            return build_codex_request(
+                &self.base_url,
+                &self.api_key,
+                &self.model,
+                self.cache_key.as_deref(),
+                &codex.account_id,
+                &codex.session_id,
+                messages,
+                tools,
+            );
+        }
         build_request(
             self.provider,
             &self.base_url,
@@ -197,6 +242,39 @@ impl HttpModelClient for MessagesApiClient {
     fn context_window(&self) -> u64 {
         model_context_window(self.provider, &self.model)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_codex_request(
+    base_url: &str,
+    access_token: &str,
+    model: &str,
+    cache_key: Option<&str>,
+    account_id: &str,
+    session_id: &str,
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+) -> HttpRequest {
+    let mut request =
+        build_openai_request(base_url, access_token, model, cache_key, messages, tools);
+    request.url = format!(
+        "{}/backend-api/codex/responses",
+        base_url.trim_end_matches('/')
+    );
+    request.body["stream"] = json!(true);
+    request.body["store"] = json!(false);
+    request.body["parallel_tool_calls"] = json!(false);
+    request.headers.extend([
+        ("chatgpt-account-id".to_owned(), account_id.to_owned()),
+        ("accept".to_owned(), "text/event-stream".to_owned()),
+        (
+            "openai-beta".to_owned(),
+            "responses=experimental".to_owned(),
+        ),
+        ("originator".to_owned(), "gaugedesk".to_owned()),
+        ("session_id".to_owned(), session_id.to_owned()),
+    ]);
+    request
 }
 
 /// Map a transport outcome to a model reply: parse a delivered response, or lift a
@@ -970,5 +1048,37 @@ mod tests {
         let reply = client.next(&convo(), &tool_specs()).expect("reply");
         assert_eq!(reply.text, "done");
         assert!(reply.is_final());
+    }
+
+    #[test]
+    fn codex_client_uses_host_material_only_for_the_codex_wire() {
+        let client = MessagesApiClient::new_codex(
+            "oauth-access",
+            "account-1",
+            "session-1",
+            "gpt-5.5",
+            "https://chatgpt.com",
+            8_192,
+            Some("command-1".to_owned()),
+        );
+        let request = client.build_request(&convo(), &tool_specs());
+        assert_eq!(
+            request.url,
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(request.body["stream"], true);
+        assert_eq!(request.body["store"], false);
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "chatgpt-account-id" && value == "account-1"));
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "session_id" && value == "session-1"));
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "accept" && value == "text/event-stream"));
     }
 }
