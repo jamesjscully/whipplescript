@@ -223,10 +223,16 @@ replace git for working branches + workstreams.)*
 
 ## Phase 4 — policy plane + auth · **v0.4**
 
-- [ ] Policy-epoch consumption: a versioned policy snapshot as ambient
-      config (capability grants, provider allowlists, egress policy, label
-      clearances); the guarantee report cites the enforced epoch; an epoch
-      bump is identity-visible like a provider-profile bump.
+- [~] Policy-epoch consumption: **host trust boundary published 2026-07-09.**
+      The `whipplescript` package now has a library target exposing the exact
+      governance/IFC implementation used by the CLI. Embedding hosts call
+      `VerifiedEnvelope::verify_signed_text`, which requires and verifies the
+      attestation and retains its canonical envelope hash + signer for epoch
+      binding; malformed configured envelopes now reject instead of silently
+      degrading to ungoverned mode. Remaining: carry the versioned epoch on the
+      runtime command, enforce the complete capability/provider/egress/clearance
+      envelope during the owned turn, and cite it in the terminal guarantee
+      receipt.
 - [ ] Auth simplification: provider profiles carry host-resolved
       credentials; whip's own auth shrinks to the thin standalone resolver
       (current env/keychain design becomes the fallback path).

@@ -68,6 +68,13 @@ gains its context layer and a restore-to-a-prior-point capability.
   (resume-stable, not fingerprint-derived), so an at-least-once retry after an
   eviction mid-request is de-duplicated by providers that honor it.
 
+### Embedding and governance
+- The `whipplescript` package now publishes its governance and IFC trust boundary
+  as a Rust library. Hosts can require a signed envelope, verify its attestation,
+  and bind a policy epoch to the verified canonical hash and signer without
+  reimplementing WhippleScript's policy parser or security algebra. A malformed
+  configured envelope fails closed instead of becoming an ungoverned run.
+
 ## [0.2.0] — 2026-07-06
 
 WhippleScript is a small scripting language for AI to orchestrate AI: a durable,
