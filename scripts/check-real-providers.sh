@@ -2,8 +2,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=scripts/loft-fixtures-lib.sh
-source "$ROOT/scripts/loft-fixtures-lib.sh"
 
 PREFLIGHT_REPORT="${WHIPPLESCRIPT_REAL_PROVIDER_PREFLIGHT_REPORT:-$ROOT/target/real-provider-preflight.jsonl}"
 mkdir -p "$(dirname "$PREFLIGHT_REPORT")"
@@ -50,7 +48,7 @@ NATIVE_SURFACE="${WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_SURFACE:-0}"
 if [[ "$STRICT_NATIVE" == "1" ]]; then
   SELECTED_PROVIDERS="${WHIPPLESCRIPT_REAL_PROVIDERS:-codex,claude,pi}"
 else
-  SELECTED_PROVIDERS="${WHIPPLESCRIPT_REAL_PROVIDERS:-loft,coerce}"
+  SELECTED_PROVIDERS="${WHIPPLESCRIPT_REAL_PROVIDERS:-coerce}"
 fi
 CURRENT_PROVIDER="all"
 
@@ -78,8 +76,8 @@ validate_selected_providers() {
   IFS=',' read -ra providers <<<"$SELECTED_PROVIDERS"
   for provider in "${providers[@]}"; do
     case "$provider" in
-      loft | coerce | codex)
-        if [[ "$STRICT_NATIVE" == "1" && ( "$provider" == "loft" || "$provider" == "coerce" ) ]]; then
+      coerce | codex)
+        if [[ "$STRICT_NATIVE" == "1" && "$provider" == "coerce" ]]; then
           record_preflight "$provider" native.strict.failed provider fail "command-wrapper provider is not accepted in native strict mode"
           echo "native strict mode requires Codex, Claude, and Pi native providers; $provider is command-wrapper coverage" >&2
           selected_any=1
@@ -105,7 +103,7 @@ validate_selected_providers() {
 
   if [[ "$selected_any" -ne 1 ]]; then
     record_preflight all adapter.resolve.failed provider fail "no supported real providers selected"
-    echo "WHIPPLESCRIPT_REAL_PROVIDERS must include loft, coerce, codex, claude, pi, or a comma-separated subset" >&2
+    echo "WHIPPLESCRIPT_REAL_PROVIDERS must include coerce, codex, claude, pi, or a comma-separated subset" >&2
     missing=1
   fi
   if [[ "$STRICT_NATIVE" == "1" ]]; then
@@ -290,24 +288,6 @@ check_coerce_endpoint() {
   fi
 }
 
-check_loft_fixture_repo() {
-  local repo="${WHIPPLESCRIPT_LOFT_REPO:-$ROOT/vendor/loft}"
-  if [[ ! -d "$repo/.git" ]]; then
-    record_preflight loft workspace.prepare.failed repo fail "Loft fixture repo not present"
-    echo "Loft fixture repo not present at $repo"
-    echo "Set WHIPPLESCRIPT_LOFT_REPO or add the Loft repo as vendor/loft when fixtures are tracked."
-    missing=1
-    return
-  fi
-
-  if ! "$ROOT/scripts/check-loft-source-repo.sh" "$repo" "Loft fixture repo"; then
-    record_preflight loft workspace.prepare.failed repo fail "Loft fixture repo preflight failed"
-    missing=1
-  else
-    record_preflight loft workspace.prepare.ok repo pass "Loft fixture repo preflight passed"
-  fi
-}
-
 echo "Selected real providers: $SELECTED_PROVIDERS"
 echo "Native strict mode: $STRICT_NATIVE"
 validate_selected_providers
@@ -327,17 +307,6 @@ if [[ "${WHIPPLESCRIPT_REAL_PROVIDER_FIXTURE_GATE_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
-if [[ "$STRICT_NATIVE" != "1" ]] && provider_enabled loft; then
-  CURRENT_PROVIDER="loft"
-  require_command "${WHIPPLESCRIPT_LOFT_CLI:-loft}" || true
-  require_env WHIPPLESCRIPT_LOFT_TEST_ISSUE || true
-  if [[ "${WHIPPLESCRIPT_LOFT_SKIP_REPO_PREFLIGHT:-}" == "1" ]]; then
-    record_preflight loft workspace.prepare.skip repo skip "WHIPPLESCRIPT_LOFT_SKIP_REPO_PREFLIGHT=1"
-    echo "Skipping Loft fixture repo preflight because WHIPPLESCRIPT_LOFT_SKIP_REPO_PREFLIGHT=1"
-  else
-    check_loft_fixture_repo
-  fi
-fi
 
 if [[ "$STRICT_NATIVE" != "1" ]] && provider_enabled coerce; then
   CURRENT_PROVIDER="coerce"
@@ -429,11 +398,6 @@ cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript -- check \
   "$ROOT/examples/queue-worker-with-review.whip" \
   "$ROOT/examples/coerce-branch.whip"
 
-if provider_enabled loft; then
-  cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript-kernel \
-    real_loft_show_smoke -- --nocapture
-fi
-
 if provider_enabled coerce; then
   cargo test --quiet --manifest-path "$ROOT/Cargo.toml" -p whipplescript-kernel \
     real_coerce_endpoint_smoke -- --nocapture
@@ -471,4 +435,4 @@ if provider_enabled pi; then
 fi
 
 echo "Real-provider readiness checks passed."
-echo "Provider-destructive flows remain manual until isolated Loft/coerce fixtures are approved."
+echo "Provider-destructive flows remain manual until isolated coerce fixtures are approved."

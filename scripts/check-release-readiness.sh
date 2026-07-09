@@ -68,12 +68,6 @@ run_check required "report schemas" "cd '$ROOT' && scripts/check-report-schemas.
 run_check required "artifact admission differential" "cd '$ROOT' && scripts/check-artifact-admission-differential.sh"
 run_check required "format check" "cd '$ROOT' && cargo fmt --all -- --check"
 run_check required "diff whitespace check" "cd '$ROOT' && git diff --check"
-run_check required "Loft compatibility fixtures" "cd '$ROOT' && scripts/check-loft-fixtures.sh"
-run_check required "Loft source patch export" \
-  "cd '$ROOT' && tmp=\$(mktemp -d) && patch=\$(mktemp) && rm -f \"\$patch\" && git -C \"\$tmp\" init -q && mkdir -p \"\$tmp/spec\" && printf '# Loft v0.1 Specification\n' >\"\$tmp/spec/loft-v0.1.md\" && scripts/export-loft-source-patch.sh \"\$tmp\" \"\$patch\" && grep -q 'fixtures/whipplescript/v0.1/manifest.json' \"\$patch\"; status=\$?; rm -rf \"\$tmp\" \"\$patch\"; exit \$status"
-run_check required "Loft source repo preflight" \
-  "cd '$ROOT' && tmp=\$(mktemp -d) && git -C \"\$tmp\" init -q && mkdir -p \"\$tmp/spec\" && printf '# Loft v0.1 Specification\n' >\"\$tmp/spec/loft-v0.1.md\" && scripts/stage-loft-fixtures.sh \"\$tmp\" >/dev/null && git -C \"\$tmp\" add spec/loft-v0.1.md fixtures/whipplescript/v0.1 && git -C \"\$tmp\" -c user.name=WhippleScript -c user.email=whipplescript@example.invalid commit -q -m 'Add Loft spec fixtures' && scripts/check-loft-source-repo.sh \"\$tmp\"; status=\$?; rm -rf \"\$tmp\"; exit \$status"
-run_check required "Loft handoff report" "cd '$ROOT' && scripts/loft-handoff-report.sh"
 run_check required "real-provider smoke report" "cd '$ROOT' && scripts/check-real-providers-report.sh"
 run_check required "real-provider report redaction" "cd '$ROOT' && scripts/check-real-provider-report-redaction.sh"
 run_check required "real-provider destructive fixture gate" "cd '$ROOT' && scripts/check-real-provider-destructive-gate.sh"
@@ -101,9 +95,6 @@ if [[ "$FULL" == "1" ]]; then
   run_check required "e2e suite" "cd '$ROOT' && scripts/check-e2e.sh"
 fi
 
-# The strict Loft submodule checks were retired with the dead vendor/loft
-# submodule (ced3ae3, 2026-07-06); Loft compatibility stays covered by the
-# required `Loft compatibility fixtures` check over the vendored copies.
 run_check external "native provider surface probe" \
   "cd '$ROOT' && scripts/check-native-provider-surfaces.sh"
 run_check external "Codex app-server schema pin" \

@@ -35,7 +35,7 @@ strict_native="${WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_STRICT:-0}"
 if [[ "$strict_native" == "1" ]]; then
   selected_providers="${WHIPPLESCRIPT_REAL_PROVIDERS:-codex,claude,pi}"
 else
-  selected_providers="${WHIPPLESCRIPT_REAL_PROVIDERS:-loft,coerce}"
+  selected_providers="${WHIPPLESCRIPT_REAL_PROVIDERS:-coerce}"
 fi
 
 set +e
@@ -63,10 +63,6 @@ const envNames = [
   "WHIPPLESCRIPT_REAL_PROVIDER_DESTRUCTIVE_TESTS",
   "WHIPPLESCRIPT_REAL_PROVIDER_DISPOSABLE_TARGET",
   "WHIPPLESCRIPT_REAL_PROVIDER_DISPOSABLE_ACK",
-  "WHIPPLESCRIPT_LOFT_TEST_ISSUE",
-  "WHIPPLESCRIPT_LOFT_DESTRUCTIVE_TESTS",
-  "WHIPPLESCRIPT_LOFT_DISPOSABLE_TARGET",
-  "WHIPPLESCRIPT_LOFT_DISPOSABLE_ACK",
   "WHIPPLESCRIPT_COERCE_TEST_ENDPOINT",
   "WHIPPLESCRIPT_COERCE_TEST_FUNCTION",
   "WHIPPLESCRIPT_COERCE_TEST_ARGUMENTS_JSON",
@@ -203,13 +199,6 @@ NODE
   echo "- Destructive provider tests: $(env_state WHIPPLESCRIPT_REAL_PROVIDER_DESTRUCTIVE_TESTS)"
   echo "- Disposable target marker: $(env_state WHIPPLESCRIPT_REAL_PROVIDER_DISPOSABLE_TARGET)"
   echo "- Disposable target acknowledgement: $(env_state WHIPPLESCRIPT_REAL_PROVIDER_DISPOSABLE_ACK)"
-  echo "- Loft test issue: $(env_state WHIPPLESCRIPT_LOFT_TEST_ISSUE)"
-  echo "- Loft destructive tests: $(env_state WHIPPLESCRIPT_LOFT_DESTRUCTIVE_TESTS)"
-  echo "- Loft disposable target: $(env_state WHIPPLESCRIPT_LOFT_DISPOSABLE_TARGET)"
-  echo "- Loft disposable acknowledgement: $(env_state WHIPPLESCRIPT_LOFT_DISPOSABLE_ACK)"
-  echo "- Loft CLI override: $(env_state WHIPPLESCRIPT_LOFT_CLI)"
-  echo "- Loft repo override: $(env_state WHIPPLESCRIPT_LOFT_REPO)"
-  echo "- Loft repo preflight skip: $(env_state WHIPPLESCRIPT_LOFT_SKIP_REPO_PREFLIGHT)"
   echo "- coerce endpoint: $(env_state WHIPPLESCRIPT_COERCE_TEST_ENDPOINT)"
   echo "- coerce destructive tests: $(env_state WHIPPLESCRIPT_COERCE_DESTRUCTIVE_TESTS)"
   echo "- coerce disposable target: $(env_state WHIPPLESCRIPT_COERCE_DISPOSABLE_TARGET)"
