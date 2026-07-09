@@ -12,13 +12,18 @@ Registered in `spec/TRACKERS.md` (status: active).
 
 ---
 
-## DO feature-parity sweep (open intent, 2026-07-09)
+## DO feature-parity sweep — COMPLETE 2026-07-09
 
 Jack directed: bring the DO backend to full feature parity with native, **including
-the agent-turn tool executor**. The store primitives are already at parity
-(`capture_checkpoint`/`plan_restore`/`commit_restore` on both `SqliteStore` and
-`DoSqliteStore`); the gaps are the file plane, restore surface, and tools. Two
-threads:
+the agent-turn tool executor**. DONE except bash (a separate initiative — see
+P5/P6 note). The DO now runs `file.*` effects, exposes `checkpoint`/`restore`
+operator commands, and runs a real in-isolate agent tool set — all proven
+end-to-end through the real wasm boundary (validate.cjs 8 cases). Remaining DO
+asymmetries are intentional (below): `exec.command` (native-only by design, →
+Class-A executor HTTP effect on the DO), bash (bashkit initiative), and the
+coordination-state checkpoint snapshot (deferred on both hosts).
+
+Two threads (both done):
 
 **Thread A — file plane + restore** — DONE 2026-07-09 (P1 3d523ad, P2 31f895b,
 P3 e7af877). The DO now runs `file.*` effects over a real `files` table
@@ -32,16 +37,14 @@ end-to-end through the real wasm boundary.
 - [x] **P3 DO checkpoint/restore entry point** (wasm methods + `index.ts` command
       route; the worker's first verb dispatch).
 
-**Thread B — agent-turn tool executor** (`NoToolExecutor` errors on any tool call;
-DO turns advertise `tools: Vec::new()`):
-- [ ] **P4 in-isolate DO tool executor.** All store-resolvable tools resolve
-      synchronously against DO SQLite (`DoFileStore` + `ContentStore` + work-item
-      store) under the *current* synchronous `ToolExecutor` trait — no reshape. A
-      separate `DoToolExecutor` (Jack 2026-07-09: separate impl over the DO seams,
-      not a shared refactor of the 5.3k-line fs-coupled native `FileToolExecutor`)
-      for read/write/edit/recall/todos/ls/find/grep (flat-key-space semantics for
-      ls/find/grep), advertised on the DO turn (fix `tools: Vec::new()` at
-      do_instance.rs). Depends on P1.
+**Thread B — agent-turn tool executor** — DONE 2026-07-09 (P4 b6b2fcd). The DO
+turn now advertises a real in-isolate tool set instead of `tools: Vec::new()`.
+- [x] **P4 in-isolate DO tool executor.** `DoToolExecutor` over the shared
+      `Rc<DoSql>` for read/write/edit/ls/find/grep/recall + list/add/update_todo,
+      all synchronous SQLite rounds against the flat `files` table / `content_blobs`
+      / work-item store; schemas mirror native; wired as the default `agent_tools`.
+      validate.cjs case: an agent turn calls `write` in-isolate through real wasm.
+      bash excluded (bashkit initiative).
 
 **P5/P6 DROPPED (2026-07-09).** The old plan — reshape the tool seam into a
 nested `ToolCallMachine` yielding `NeedsIo(Http)` and broker `bash` to a
