@@ -20,26 +20,17 @@ the agent-turn tool executor**. The store primitives are already at parity
 `DoSqliteStore`); the gaps are the file plane, restore surface, and tools. Two
 threads:
 
-**Thread A — file plane + restore** (restore is downstream of the file plane):
-- [ ] **P1 DO file plane wired end-to-end.** No production `DoStorage` exists (only
-      test `MemStorage`), and `create` never passes a `files` port, so every
-      instance falls back to `NoFileStore` and `file.*` effects error on the
-      deployed DO. Add a `files` table (both schema homes), an `Rc<DoSql>` sharing
-      seam (test `RusqliteDoSql` is not `Clone`, so share the handle, not clone the
-      connection), a production `DoSqlStorage: DoStorage` over that table, construct
-      `DoFileStore`, and pass it through the `files` port in `create` + `index.ts`.
-      `validate.cjs` file-effect case.
-- [ ] **P2 delete on the `FileStore` seam.** Promote the native-inherent
-      `NativeFileStore::remove` to a `FileStore::delete` trait method across every
-      impl (`NativeFileStore`, `DoFileStore`, `TieredFileStore` — both tiers,
-      `NoFileStore`), plus `DoStorage::delete_file` (`MemStorage` + `DoSqlStorage`).
-      CLI restore calls the trait method.
-- [ ] **P3 DO restore entry point.** The DO worker has no operator-command surface
-      (only step/alarm). Add `restore(cut_id)` on `WasmDurableInstance`/
-      `DurableInstance` + a command route in the TS worker, running plan → apply
-      writes/deletes through the wired `FileStore` → `commit_restore` (mirrors the
-      CLI `restore` orchestration incl. auto-checkpoint). `validate.cjs` restore
-      case.
+**Thread A — file plane + restore** — DONE 2026-07-09 (P1 3d523ad, P2 31f895b,
+P3 e7af877). The DO now runs `file.*` effects over a real `files` table
+(`DoSqlStorage` shared via `Rc<DoSql>`), has `FileStore::remove` on the seam, and
+exposes `checkpoint`/`restore` operator commands (wasm + an `index.ts` verb
+route). validate.cjs cases 6-7 prove file-write + checkpoint→tamper→restore
+end-to-end through the real wasm boundary.
+- [x] **P1 DO file plane wired end-to-end.**
+- [x] **P2 delete on the `FileStore` seam** (promoted to a trait method +
+      `DoStorage::delete_file`).
+- [x] **P3 DO checkpoint/restore entry point** (wasm methods + `index.ts` command
+      route; the worker's first verb dispatch).
 
 **Thread B — agent-turn tool executor** (`NoToolExecutor` errors on any tool call;
 DO turns advertise `tools: Vec::new()`):
