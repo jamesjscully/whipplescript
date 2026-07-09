@@ -1149,6 +1149,41 @@ fn do_fold_file_manifest(
     Ok((manifest_json, manifest))
 }
 
+/// RC-4c: the LIVE `fact.derived` payloads for an instance with the
+/// restore-marker fold applied (RC-4b), mirroring native `live_fact_payloads_on`.
+/// `up_to_sequence` bounds the read INCLUSIVE; `None` reads to the head.
+fn do_live_fact_payloads<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    up_to_sequence: Option<i64>,
+) -> StoreResult<Vec<String>> {
+    let bound_clause = match up_to_sequence {
+        Some(n) => format!(" AND sequence <= {n}"),
+        None => String::new(),
+    };
+    let rows = sql
+        .query(
+            &format!(
+                "SELECT event_type, payload_json, sequence FROM events \
+                 WHERE instance_id = ?1 AND event_type IN ('fact.derived', 'context.restored'){bound_clause} \
+                 ORDER BY sequence"
+            ),
+            &[text(instance_id)],
+        )
+        .map_err(sql_err)?;
+    let mut live: Vec<(String, i64)> = Vec::new();
+    for row in &rows {
+        if as_text(&row[0]) == "context.restored" {
+            if let Some(target) = do_restore_marker_target(&as_text(&row[1])) {
+                live.retain(|(_, seq)| *seq <= target);
+            }
+        } else {
+            live.push((as_text(&row[1]), as_i64(&row[2])));
+        }
+    }
+    Ok(live.into_iter().map(|(payload, _)| payload).collect())
+}
+
 /// RC-4b: the target sequence a `context.restored` marker rewinds replay to.
 /// Mirrors the native `restore_marker_target`: `None` for a malformed marker so
 /// the fold applies no rewind rather than corrupting the projection.
@@ -4951,18 +4986,12 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 "checkpoint requires a quiescent instance; {running} effect(s) still running"
             )));
         }
-        // Fold the manifest from all file.write.completed facts so far. The
+        // RC-4c: fold the manifest from the LIVE fact.derived payloads (the
+        // restore-marker fold applied), so a checkpoint after a restore reflects
+        // the reconciled file plane, never an abandoned-branch write. The
         // checkpoint event appended below is not a file write, so folding over
-        // the current max sequence equals folding <= the checkpoint's own.
-        let fact_rows = self
-            .sql
-            .query(
-                "SELECT payload_json FROM events \
-                 WHERE instance_id = ?1 AND event_type = 'fact.derived' ORDER BY sequence",
-                &[text(capture.instance_id)],
-            )
-            .map_err(sql_err)?;
-        let fact_payloads: Vec<String> = fact_rows.iter().map(|row| as_text(&row[0])).collect();
+        // the current head equals folding <= the checkpoint's own sequence.
+        let fact_payloads = do_live_fact_payloads(&self.sql, capture.instance_id, None)?;
         let (manifest_json, manifest) = do_fold_file_manifest(&fact_payloads)?;
         // INV-4 coherence: store the manifest content-addressed BEFORE the cut
         // references its hash (same DO SQLite), so no committed cut names a
@@ -5005,6 +5034,103 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             manifest_hash,
             file_count: manifest.len(),
         })
+    }
+
+    fn plan_restore(&self, instance_id: &str, cut_id: &str) -> StoreResult<RestoreDecision> {
+        // Resolve the checkpoint by cut id (latest first).
+        let checkpoint_rows = self
+            .sql
+            .query(
+                "SELECT payload_json, sequence FROM events \
+                 WHERE instance_id = ?1 AND event_type = 'context.checkpoint' ORDER BY sequence DESC",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        let resolved = checkpoint_rows.iter().find_map(|row| {
+            let payload_json = as_text(&row[0]);
+            let payload: Value = serde_json::from_str(&payload_json).ok()?;
+            (payload.get("cut_id").and_then(Value::as_str) == Some(cut_id))
+                .then(|| (payload, as_i64(&row[1])))
+        });
+        let Some((payload, restored_to_sequence)) = resolved else {
+            return Ok(RestoreDecision::Refused {
+                reason: format!("no checkpoint with cut id `{cut_id}`"),
+            });
+        };
+        let manifest_hash = payload
+            .get("manifest_hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let transcript_ref = payload
+            .get("transcript_ref")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let Some(manifest_body) = self.get_content(&manifest_hash)? else {
+            return Ok(RestoreDecision::Refused {
+                reason: format!("manifest blob `{manifest_hash}` missing for cut `{cut_id}`"),
+            });
+        };
+        let cut_manifest: BTreeMap<String, String> = serde_json::from_str(&manifest_body)?;
+        // INV-4 coherence: every referenced content hash present, up front.
+        let mut writes: BTreeMap<String, String> = BTreeMap::new();
+        for (path, content_hash) in &cut_manifest {
+            match self.get_content(content_hash)? {
+                Some(body) => {
+                    writes.insert(path.clone(), body);
+                }
+                None => {
+                    return Ok(RestoreDecision::Refused {
+                        reason: format!(
+                            "content `{content_hash}` for `{path}` missing (dangling manifest)"
+                        ),
+                    });
+                }
+            }
+        }
+        // Full reconcile: mediated paths live now but absent from the cut.
+        let current_payloads = do_live_fact_payloads(&self.sql, instance_id, None)?;
+        let (_, current_manifest) = do_fold_file_manifest(&current_payloads)?;
+        let removes: Vec<String> = current_manifest
+            .keys()
+            .filter(|path| !cut_manifest.contains_key(*path))
+            .cloned()
+            .collect();
+        Ok(RestoreDecision::Ready(RestorePlan {
+            cut_id: cut_id.to_owned(),
+            restored_to_sequence,
+            transcript_ref,
+            writes,
+            removes,
+        }))
+    }
+
+    fn commit_restore(
+        &mut self,
+        instance_id: &str,
+        restored_to_sequence: i64,
+        cut_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        let payload = serde_json::json!({
+            "cut_id": cut_id,
+            "restored_to_sequence": restored_to_sequence,
+        })
+        .to_string();
+        let marker = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id,
+                event_type: "context.restored",
+                payload_json: &payload,
+                source: "restorable-context",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key,
+            },
+        )?;
+        self.rebuild_projections(instance_id)?;
+        Ok(marker)
     }
 
     fn register_script_capability(
@@ -10635,6 +10761,109 @@ mod tests {
         assert!(
             matches!(refused, Err(StoreError::Conflict(_))),
             "checkpoint refuses while an effect runs, got {refused:?}"
+        );
+    }
+
+    /// RC-4c DO mirror: plan_restore returns the full reconcile (writes + removes)
+    /// and commit_restore's marker rewinds the file plane so a later checkpoint
+    /// hashes to the cut; refuses on unknown cut / dangling manifest.
+    #[test]
+    fn do_store_plan_restore_reconciles_and_commit_restore_rewinds() {
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text("i1"),
+                    text("p"),
+                    text("ver_1"),
+                    int(0),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed instance");
+
+        // Record a mediated file write: capture the blob content-addressed and
+        // append the matching file.write.completed fact.derived event.
+        fn record_file_write(
+            store: &mut DoSqliteStore<super::test_support::RusqliteDoSql>,
+            key: &str,
+            path: &str,
+            body: &str,
+        ) {
+            let content_hash = store.put_content(body).expect("blob captures");
+            let payload = serde_json::json!({
+                "name": "file.write.completed",
+                "key": key,
+                "value": {
+                    "effect_id": key,
+                    "value": { "store": "workspace", "path": path, "content_hash": content_hash },
+                },
+            })
+            .to_string();
+            store
+                .append_event(NewEvent {
+                    instance_id: "i1",
+                    event_type: "fact.derived",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: None,
+                    correlation_id: None,
+                    idempotency_key: Some(key),
+                })
+                .expect("fact.derived appends");
+        }
+
+        record_file_write(&mut store, "w-a1", "a.txt", "A1");
+        record_file_write(&mut store, "w-b1", "b.txt", "B1");
+        let cut = store
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: "i1",
+                cut_id: "cut-1",
+                transcript_ref: Some("step-3"),
+                idempotency_key: Some("checkpoint-cut-1"),
+            })
+            .expect("checkpoint captures");
+        record_file_write(&mut store, "w-a2", "a.txt", "A2");
+        record_file_write(&mut store, "w-c1", "c.txt", "C1");
+
+        let plan = match store.plan_restore("i1", "cut-1").expect("plan resolves") {
+            RestoreDecision::Ready(plan) => plan,
+            RestoreDecision::Refused { reason } => panic!("unexpected refusal: {reason}"),
+        };
+        assert_eq!(plan.restored_to_sequence, cut.sequence);
+        assert_eq!(plan.writes.get("a.txt").map(String::as_str), Some("A1"));
+        assert_eq!(plan.writes.get("b.txt").map(String::as_str), Some("B1"));
+        assert_eq!(plan.removes, vec!["c.txt".to_owned()]);
+
+        store
+            .commit_restore("i1", plan.restored_to_sequence, "cut-1", Some("restore-1"))
+            .expect("restore commits");
+        let after = store
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: "i1",
+                cut_id: "cut-after",
+                transcript_ref: None,
+                idempotency_key: Some("checkpoint-after"),
+            })
+            .expect("post-restore checkpoint");
+        assert_eq!(
+            after.manifest_hash, cut.manifest_hash,
+            "the file plane rewound to the cut"
+        );
+
+        assert!(
+            matches!(
+                store.plan_restore("i1", "nope").expect("plan resolves"),
+                RestoreDecision::Refused { .. }
+            ),
+            "unknown cut refuses"
         );
     }
 

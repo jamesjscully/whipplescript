@@ -301,6 +301,21 @@ impl RuntimeStore for NativeStores {
         self.runtime.capture_checkpoint(capture)
     }
 
+    fn plan_restore(&self, instance_id: &str, cut_id: &str) -> StoreResult<RestoreDecision> {
+        self.runtime.plan_restore(instance_id, cut_id)
+    }
+
+    fn commit_restore(
+        &mut self,
+        instance_id: &str,
+        restored_to_sequence: i64,
+        cut_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime
+            .commit_restore(instance_id, restored_to_sequence, cut_id, idempotency_key)
+    }
+
     fn register_script_capability(
         &self,
         registration: ScriptCapabilityRegistration<'_>,

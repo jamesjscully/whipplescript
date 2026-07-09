@@ -48,7 +48,7 @@ use whipplescript_parser::{
 };
 use whipplescript_store::{
     ArtifactRecord, ClaimableEffect, DerivedFact, DiagnosticRecord, EffectCancellation,
-    EffectCompletion, EvidenceRecord, ExpiredLease, FactBatch, FactBatchOutcome,
+    EffectCompletion, EventView, EvidenceRecord, ExpiredLease, FactBatch, FactBatchOutcome,
     InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent, NewFact, NewInboxItem,
     NewInstance, NewInstanceAuthority, NewProgramVersion, NewWorkflowInvocation,
     ProgramVersionRecord, RetryEffect, RevisionActivation, RuleCommit, RuleCommitRevisionGuard,
@@ -209,6 +209,17 @@ fn brokered_observation_evidence(
             }),
         ),
     }
+}
+
+/// Restorable-context RC-4c: the target sequence a `context.restored` marker
+/// rewinds to (`restored_to_sequence`), for the marker-aware transcript fold.
+/// Mirrors the store-side `restore_marker_target`; `None` for a malformed marker
+/// so the fold applies no rewind rather than dropping live transcripts.
+fn restore_marker_target_of(payload_json: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(payload_json)
+        .ok()?
+        .get("restored_to_sequence")
+        .and_then(Value::as_i64)
 }
 
 impl<S: RuntimeStore> RuntimeKernel<S> {
@@ -555,19 +566,35 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         let Ok(events) = self.store.list_events(instance_id) else {
             return Vec::new();
         };
-        let latest = events.iter().rev().find(|event| {
-            if event.event_type != "agent.turn.brokered.transcript" {
-                return false;
-            }
-            // RC-2 Delta B: honor the cut coordinate. `list_events` is ordered
-            // by ascending `sequence`, so `.rev().find` returns the newest
-            // matching checkpoint at or below the bound. `None` = unbounded
-            // (latest), the existing resume/crash-recovery behavior.
+        // RC-4c: the transcript plane rewinds with the other two. Walk the log
+        // ascending (`list_events` is ordered by `sequence`), folding
+        // `context.restored` markers (models/maude/restore-replay.maude): a
+        // marker drops every transcript checkpoint it orphaned, so after a
+        // restore the newest LIVE transcript is the one that was current at the
+        // cut, not an abandoned-branch turn. With no markers the live list is
+        // every transcript in order, so latest/bounded reads are unchanged.
+        //
+        // RC-2 Delta B: `up_to_sequence` bounds the fold INCLUSIVE; because the
+        // list is ascending we can stop at the first event past the bound.
+        // `None` = unbounded (latest), the resume/crash-recovery behavior.
+        let mut live: Vec<&EventView> = Vec::new();
+        for event in &events {
             if let Some(n) = up_to_sequence {
                 if event.sequence > n {
-                    return false;
+                    break;
                 }
             }
+            match event.event_type.as_str() {
+                "context.restored" => {
+                    if let Some(target) = restore_marker_target_of(&event.payload_json) {
+                        live.retain(|folded| folded.sequence <= target);
+                    }
+                }
+                "agent.turn.brokered.transcript" => live.push(event),
+                _ => {}
+            }
+        }
+        let latest = live.iter().rev().find(|event| {
             serde_json::from_str::<Value>(&event.payload_json)
                 .ok()
                 .and_then(|payload| {
@@ -4244,6 +4271,108 @@ rule noop
         assert!(
             before.is_empty(),
             "cut before the first checkpoint is empty"
+        );
+    }
+
+    #[test]
+    fn load_brokered_transcript_rewinds_past_a_restore_marker() {
+        // RC-4c: the transcript plane rewinds with the other planes. After a
+        // `context.restored` marker to step-1's sequence, the unbounded latest
+        // load returns step-1 (step-2 is abandoned), and a post-restore
+        // checkpoint (step-3) becomes the new latest.
+        let compiled = compile_program(
+            r#"
+workflow TranscriptRestore
+
+rule noop
+  when started
+=> {
+}
+"#,
+        );
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let program = compiled.ir.expect("program compiles");
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &program.workflow,
+                    source_hash: "source-1",
+                    ir_hash: "ir-1",
+                    compiler_version: "test",
+                },
+                &program,
+            )
+            .expect("version creates");
+        let instance_id = kernel.create_instance(&version, "{}").expect("instance");
+        let effect_id = "eff-transcript";
+
+        let append_transcript = |kernel: &mut RuntimeKernel<SqliteStore>, step: i64| -> i64 {
+            let messages = vec![crate::harness_loop::ChatMessage::user_text(format!(
+                "step-{step}"
+            ))];
+            let payload = json!({
+                "effect_id": effect_id,
+                "messages": crate::harness_loop::chat_messages_to_json(&messages),
+            })
+            .to_string();
+            let key = idempotency_key(&[&instance_id, effect_id, "transcript", &step.to_string()]);
+            kernel
+                .store
+                .append_event(whipplescript_store::NewEvent {
+                    instance_id: &instance_id,
+                    event_type: "agent.turn.brokered.transcript",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: None,
+                    correlation_id: Some(effect_id),
+                    idempotency_key: Some(&key),
+                })
+                .expect("transcript appends")
+                .sequence
+        };
+        let text_of = |messages: &[crate::harness_loop::ChatMessage]| -> String {
+            match messages.first().expect("one message") {
+                crate::harness_loop::ChatMessage::User { text, .. } => text.clone(),
+                other => panic!("expected user message, got {other:?}"),
+            }
+        };
+
+        let step0 = append_transcript(&mut kernel, 0);
+        append_transcript(&mut kernel, 1);
+        // Before any restore, the latest is step-1.
+        assert_eq!(
+            text_of(&kernel.load_brokered_transcript(&instance_id, effect_id)),
+            "step-1"
+        );
+
+        // Restore to step-0's sequence: step-1 is abandoned.
+        let marker_payload = json!({ "restored_to_sequence": step0 }).to_string();
+        kernel
+            .store
+            .append_event(whipplescript_store::NewEvent {
+                instance_id: &instance_id,
+                event_type: "context.restored",
+                payload_json: &marker_payload,
+                source: "restorable-context",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some("restore-marker-1"),
+            })
+            .expect("marker appends");
+        assert_eq!(
+            text_of(&kernel.load_brokered_transcript(&instance_id, effect_id)),
+            "step-0",
+            "the latest live transcript rewinds past the abandoned step-1"
+        );
+
+        // Post-restore work (step-3) is live and becomes the new latest.
+        append_transcript(&mut kernel, 3);
+        assert_eq!(
+            text_of(&kernel.load_brokered_transcript(&instance_id, effect_id)),
+            "step-3",
+            "post-restore transcript is live"
         );
     }
 

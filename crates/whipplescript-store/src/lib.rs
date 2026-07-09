@@ -105,6 +105,34 @@ pub struct CapturedCheckpoint {
     pub file_count: usize,
 }
 
+/// Restorable-context RC-4c: the outcome of PLANNING a restore. `plan_restore`
+/// is read-only and performs the whole coherence check up front (models the
+/// `restore-apply` vs `restore-refuse` split in
+/// models/maude/restorable-context.maude): either every referenced content hash
+/// is present and a `Ready` plan is returned, or a required hash is missing /
+/// the cut is unknown and the restore is `Refused` with no mutation. The caller
+/// applies the file ops through the file store, then calls `commit_restore`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RestoreDecision {
+    Ready(RestorePlan),
+    Refused { reason: String },
+}
+
+/// The file + coordinate plan for a coherent restore. `writes` and `removes`
+/// are the FULL reconcile of the mediated file plane to the cut manifest:
+/// every manifest path is rewritten to its cut content, and every mediated path
+/// present now but absent from the cut is removed. `restored_to_sequence` is the
+/// cut coordinate the `context.restored` marker will carry (RC-4b), rewinding
+/// the instance and transcript planes to the same point.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestorePlan {
+    pub cut_id: String,
+    pub restored_to_sequence: i64,
+    pub transcript_ref: Option<String>,
+    pub writes: std::collections::BTreeMap<String, String>,
+    pub removes: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NewEvent<'a> {
     pub instance_id: &'a str,
@@ -5627,20 +5655,10 @@ impl SqliteStore {
                 "checkpoint requires a quiescent instance; {running} effect(s) still running"
             )));
         }
-        let fact_payloads: Vec<String> = {
-            let mut statement = tx.prepare(
-                r#"
-                SELECT payload_json
-                FROM events
-                WHERE instance_id = ?1 AND event_type = 'fact.derived'
-                ORDER BY sequence
-                "#,
-            )?;
-            let rows = statement
-                .query_map([capture.instance_id], |row| row.get::<_, String>(0))?
-                .collect::<result::Result<Vec<_>, _>>()?;
-            rows
-        };
+        // RC-4c: fold the manifest from the LIVE fact.derived payloads (the
+        // restore-marker fold applied), so a checkpoint taken after a restore
+        // reflects the reconciled file plane, never an abandoned-branch write.
+        let fact_payloads = live_fact_payloads_on(&tx, capture.instance_id, None)?;
         let (manifest_json, manifest) = fold_file_manifest(&fact_payloads)?;
         let manifest_hash = stable_hash_hex(&manifest_json);
         tx.execute(
@@ -5675,6 +5693,126 @@ impl SqliteStore {
             manifest_hash,
             file_count: manifest.len(),
         })
+    }
+
+    /// Restorable-context RC-4c: PLAN a restore to the cut `cut_id` (read-only).
+    /// Resolves the checkpoint by cut id, reads its manifest, and performs the
+    /// whole coherence check up front (model `restore-apply` vs `restore-refuse`):
+    /// an unknown cut, a missing manifest blob, or ANY dangling content hash
+    /// yields `Refused` with no mutation. Otherwise returns a `Ready` plan whose
+    /// `writes` restore every manifest path to its cut content and whose
+    /// `removes` are the mediated paths present now but absent from the cut (the
+    /// full reconcile to the model's "file plane = exactly the manifest"). The
+    /// caller applies the file ops through the file store, then `commit_restore`.
+    /// Both the current file plane and the cut manifest are folded marker-aware
+    /// (RC-4c), so a prior restore's abandoned writes never enter the diff.
+    pub fn plan_restore(&self, instance_id: &str, cut_id: &str) -> StoreResult<RestoreDecision> {
+        let checkpoint = {
+            let mut statement = self.connection.prepare(
+                r#"
+                SELECT payload_json, sequence
+                FROM events
+                WHERE instance_id = ?1 AND event_type = 'context.checkpoint'
+                ORDER BY sequence DESC
+                "#,
+            )?;
+            let rows: Vec<(String, i64)> = statement
+                .query_map([instance_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<result::Result<Vec<_>, _>>()?;
+            rows.into_iter().find_map(|(payload_json, sequence)| {
+                let payload: Value = serde_json::from_str(&payload_json).ok()?;
+                (payload.get("cut_id").and_then(Value::as_str) == Some(cut_id))
+                    .then_some((payload, sequence))
+            })
+        };
+        let Some((payload, restored_to_sequence)) = checkpoint else {
+            return Ok(RestoreDecision::Refused {
+                reason: format!("no checkpoint with cut id `{cut_id}`"),
+            });
+        };
+        let manifest_hash = payload
+            .get("manifest_hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let transcript_ref = payload
+            .get("transcript_ref")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let Some(manifest_body) = self.get_content(&manifest_hash)? else {
+            return Ok(RestoreDecision::Refused {
+                reason: format!("manifest blob `{manifest_hash}` missing for cut `{cut_id}`"),
+            });
+        };
+        let cut_manifest: BTreeMap<String, String> = serde_json::from_str(&manifest_body)?;
+        // INV-4 coherence: every referenced content hash must be present, up
+        // front, before any mutation. A single dangling hash refuses the whole
+        // restore.
+        let mut writes: BTreeMap<String, String> = BTreeMap::new();
+        for (path, content_hash) in &cut_manifest {
+            match self.get_content(content_hash)? {
+                Some(body) => {
+                    writes.insert(path.clone(), body);
+                }
+                None => {
+                    return Ok(RestoreDecision::Refused {
+                        reason: format!(
+                            "content `{content_hash}` for `{path}` missing (dangling manifest)"
+                        ),
+                    });
+                }
+            }
+        }
+        // Full reconcile: mediated paths live now but absent from the cut are
+        // removed so the file plane equals exactly the cut manifest.
+        let current_payloads = live_fact_payloads_on(&self.connection, instance_id, None)?;
+        let (_, current_manifest) = fold_file_manifest(&current_payloads)?;
+        let removes: Vec<String> = current_manifest
+            .keys()
+            .filter(|path| !cut_manifest.contains_key(*path))
+            .cloned()
+            .collect();
+        Ok(RestoreDecision::Ready(RestorePlan {
+            cut_id: cut_id.to_owned(),
+            restored_to_sequence,
+            transcript_ref,
+            writes,
+            removes,
+        }))
+    }
+
+    /// Restorable-context RC-4c: COMMIT a restore. Appends the `context.restored`
+    /// marker carrying the cut coordinate, then rebuilds projections (marker-aware,
+    /// RC-4b) so the instance plane lands exactly at the cut and every later read
+    /// (rebuild, transcript, manifest) folds past the abandoned branch. Call
+    /// AFTER the caller has applied the plan's file ops and auto-checkpointed the
+    /// pre-restore head (so the restore is itself undoable). The marker is
+    /// appended before the rebuild so the unbounded rebuild folds it immediately.
+    pub fn commit_restore(
+        &mut self,
+        instance_id: &str,
+        restored_to_sequence: i64,
+        cut_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        let payload = json!({
+            "cut_id": cut_id,
+            "restored_to_sequence": restored_to_sequence,
+        })
+        .to_string();
+        let marker = self.append_event(NewEvent {
+            instance_id,
+            event_type: "context.restored",
+            payload_json: &payload,
+            source: "restorable-context",
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key,
+        })?;
+        self.rebuild_projections(instance_id)?;
+        Ok(marker)
     }
 
     pub fn table_exists(&self, table: &str) -> StoreResult<bool> {
@@ -5829,6 +5967,19 @@ pub trait RuntimeStore {
         &mut self,
         capture: CheckpointCapture<'_>,
     ) -> StoreResult<CapturedCheckpoint>;
+    /// Restorable-context RC-4c: plan a restore to `cut_id` (read-only, coherence
+    /// check up front; `Refused` on unknown cut / dangling manifest). See the
+    /// inherent method for the full contract.
+    fn plan_restore(&self, instance_id: &str, cut_id: &str) -> StoreResult<RestoreDecision>;
+    /// Restorable-context RC-4c: commit a restore — append the `context.restored`
+    /// marker and rebuild marker-aware so the instance plane lands at the cut.
+    fn commit_restore(
+        &mut self,
+        instance_id: &str,
+        restored_to_sequence: i64,
+        cut_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent>;
     fn register_script_capability(
         &self,
         registration: ScriptCapabilityRegistration<'_>,
@@ -6134,6 +6285,26 @@ impl RuntimeStore for SqliteStore {
         capture: CheckpointCapture<'_>,
     ) -> StoreResult<CapturedCheckpoint> {
         SqliteStore::capture_checkpoint(self, capture)
+    }
+
+    fn plan_restore(&self, instance_id: &str, cut_id: &str) -> StoreResult<RestoreDecision> {
+        SqliteStore::plan_restore(self, instance_id, cut_id)
+    }
+
+    fn commit_restore(
+        &mut self,
+        instance_id: &str,
+        restored_to_sequence: i64,
+        cut_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        SqliteStore::commit_restore(
+            self,
+            instance_id,
+            restored_to_sequence,
+            cut_id,
+            idempotency_key,
+        )
     }
 
     fn register_script_capability(
@@ -6484,6 +6655,55 @@ fn fold_file_manifest(fact_payloads: &[String]) -> StoreResult<(String, BTreeMap
 /// rewinds the replay to (`restored_to_sequence`). `None` for a malformed
 /// marker, in which case the fold applies no rewind (retains all live events)
 /// rather than corrupting the projection.
+/// Restorable-context RC-4c: the LIVE `fact.derived` payloads for an instance,
+/// with the restore-marker fold already applied (RC-4b) so abandoned-branch
+/// facts are excluded. Used to fold the file manifest at a cut (`capture_checkpoint`)
+/// and the current file plane (`plan_restore`) so both see the same
+/// marker-aware file state. `up_to_sequence` bounds the read (INCLUSIVE) for a
+/// point-in-time fold; `None` reads to the current head.
+#[cfg(feature = "native")]
+fn live_fact_payloads_on(
+    connection: &Connection,
+    instance_id: &str,
+    up_to_sequence: Option<i64>,
+) -> StoreResult<Vec<String>> {
+    let bound_clause = match up_to_sequence {
+        Some(n) => format!("  AND sequence <= {n}\n"),
+        None => String::new(),
+    };
+    let mut statement = connection.prepare(&format!(
+        r#"
+        SELECT event_type, payload_json, sequence
+        FROM events
+        WHERE instance_id = ?1 AND event_type IN ('fact.derived', 'context.restored')
+        {bound_clause}ORDER BY sequence
+        "#
+    ))?;
+    let rows: Vec<(String, String, i64)> = {
+        let mapped = statement
+            .query_map([instance_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<result::Result<Vec<_>, _>>()?;
+        mapped
+    };
+    let mut live: Vec<(String, i64)> = Vec::new();
+    for (event_type, payload_json, sequence) in rows {
+        if event_type == "context.restored" {
+            if let Some(target) = restore_marker_target(&payload_json) {
+                live.retain(|(_, seq)| *seq <= target);
+            }
+        } else {
+            live.push((payload_json, sequence));
+        }
+    }
+    Ok(live.into_iter().map(|(payload, _)| payload).collect())
+}
+
 /// A fetched replayable event row for the restore-marker fold (RC-4b):
 /// (event_id, event_type, payload_json, idempotency_key, causation_id, source,
 /// sequence).
@@ -13490,6 +13710,164 @@ mod tests {
         assert!(
             matches!(refused, Err(StoreError::Conflict(_))),
             "checkpoint refuses while an effect is running, got {refused:?}"
+        );
+    }
+
+    // RC-4c helper: record a mediated file write — put the body content-addressed
+    // (so `plan_restore` can read it back) and derive the matching
+    // file.write.completed fact with `content_hash = stable_hash_hex(body)`.
+    #[cfg(test)]
+    fn record_file_write(
+        store: &mut SqliteStore,
+        instance_id: &str,
+        key: &str,
+        path: &str,
+        body: &str,
+    ) {
+        let content_hash = store.put_content(body).expect("blob captures");
+        let value_json = json!({
+            "effect_id": key,
+            "run_id": format!("run-{key}"),
+            "status": "completed",
+            "value": { "store": "workspace", "path": path, "content_hash": content_hash },
+        })
+        .to_string();
+        store
+            .derive_fact(DerivedFact {
+                instance_id,
+                fact: NewFact {
+                    fact_id: key,
+                    name: "file.write.completed",
+                    key,
+                    value_json: &value_json,
+                    schema_id: None,
+                    provenance_class: "derived",
+                    correlation_id: None,
+                    source_span_json: None,
+                },
+                source: "kernel",
+                causation_id: None,
+                idempotency_key: Some(key),
+            })
+            .expect("file.write.completed fact derives");
+    }
+
+    #[test]
+    fn plan_restore_reconciles_files_and_commit_restore_rewinds_the_planes() {
+        // RC-4c: plan_restore returns the full reconcile (write manifest paths
+        // to cut content, remove post-cut mediated files) and commit_restore's
+        // marker rewinds the file plane so a later checkpoint hashes to the cut.
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("RestorePlan", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let id = &instance.instance_id;
+
+        // File plane at the cut: a.txt=A1, b.txt=B1.
+        record_file_write(&mut store, id, "w-a1", "a.txt", "A1");
+        record_file_write(&mut store, id, "w-b1", "b.txt", "B1");
+        let cut = store
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: id,
+                cut_id: "cut-1",
+                transcript_ref: Some("step-3"),
+                idempotency_key: Some("checkpoint-cut-1"),
+            })
+            .expect("checkpoint captures");
+
+        // Post-cut work: overwrite a.txt, create c.txt.
+        record_file_write(&mut store, id, "w-a2", "a.txt", "A2");
+        record_file_write(&mut store, id, "w-c1", "c.txt", "C1");
+
+        let plan = match store.plan_restore(id, "cut-1").expect("plan resolves") {
+            RestoreDecision::Ready(plan) => plan,
+            RestoreDecision::Refused { reason } => panic!("unexpected refusal: {reason}"),
+        };
+        assert_eq!(plan.restored_to_sequence, cut.sequence);
+        assert_eq!(plan.transcript_ref.as_deref(), Some("step-3"));
+        // writes restore every manifest path to its CUT content (a.txt back to A1).
+        assert_eq!(plan.writes.get("a.txt").map(String::as_str), Some("A1"));
+        assert_eq!(plan.writes.get("b.txt").map(String::as_str), Some("B1"));
+        assert_eq!(plan.writes.len(), 2);
+        // removes = mediated paths present now but absent from the cut (c.txt).
+        assert_eq!(plan.removes, vec!["c.txt".to_owned()]);
+
+        // Commit the restore: the marker rewinds the file plane so a fresh
+        // checkpoint of the (marker-folded) manifest hashes to the cut manifest.
+        store
+            .commit_restore(id, plan.restored_to_sequence, "cut-1", Some("restore-1"))
+            .expect("restore commits");
+        let after = store
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: id,
+                cut_id: "cut-after",
+                transcript_ref: None,
+                idempotency_key: Some("checkpoint-after"),
+            })
+            .expect("post-restore checkpoint");
+        assert_eq!(
+            after.manifest_hash, cut.manifest_hash,
+            "the file plane rewound to the cut (a.txt=A2 and c.txt abandoned)"
+        );
+        assert_eq!(after.file_count, 2);
+    }
+
+    #[test]
+    fn plan_restore_refuses_unknown_cut_and_dangling_manifest() {
+        // RC-4c INV-4: an unknown cut or a missing referenced blob refuses the
+        // whole restore, with no mutation.
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("RestoreRefuse", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let id = &instance.instance_id;
+
+        assert!(
+            matches!(
+                store.plan_restore(id, "nope").expect("plan resolves"),
+                RestoreDecision::Refused { .. }
+            ),
+            "unknown cut refuses"
+        );
+
+        record_file_write(&mut store, id, "w-a1", "a.txt", "A1");
+        let content_hash = stable_hash_hex("A1");
+        store
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: id,
+                cut_id: "cut-1",
+                transcript_ref: None,
+                idempotency_key: Some("checkpoint-cut-1"),
+            })
+            .expect("checkpoint captures");
+        // Evict the referenced content blob: the manifest is now dangling.
+        store
+            .connection
+            .execute(
+                "DELETE FROM content_blobs WHERE id = ?1",
+                [content_hash.as_str()],
+            )
+            .expect("evict blob");
+        assert!(
+            matches!(
+                store.plan_restore(id, "cut-1").expect("plan resolves"),
+                RestoreDecision::Refused { .. }
+            ),
+            "dangling manifest refuses (INV-4 coherence)"
         );
     }
 
