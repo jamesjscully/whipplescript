@@ -345,6 +345,22 @@ CREATE TABLE compute_result_cache (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Content-addressed file-history blobs (restorable-context RC-1). Every file
+-- body durably written through the runtime file effect is ALSO captured here,
+-- keyed by the SAME stable content hash the `file.write.completed` fact records,
+-- so a superseded version's bytes survive an overwrite (the live path->bytes
+-- store keeps only the current body). Identical bytes dedupe to one row
+-- (content-addressed). This is the byte-preservation floor a later restore slice
+-- reads through; it shares its shape with the recall content store on purpose.
+-- Captured BEFORE the write's fact commits, so no manifest hash is ever
+-- referenced without its bytes present (restorable-context INV-4 coherence).
+CREATE TABLE content_blobs (
+    id         TEXT PRIMARY KEY,
+    body       TEXT NOT NULL,
+    byte_len   INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Operator-pinned script capabilities (compute plane P8): store-backed mirror
 -- of the filesystem script manifest for hosts without a filesystem. body =
 -- full script text; sha256 = the operator pin verified at registration and

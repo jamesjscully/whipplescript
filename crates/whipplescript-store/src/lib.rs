@@ -3143,6 +3143,37 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
+    /// Capture `body` content-addressed into the file-history blob table
+    /// (restorable-context RC-1), returning its content id — the SAME
+    /// `stable_hash_hex` the `file.write.completed` fact records. Idempotent:
+    /// identical bytes dedupe to one row (`INSERT OR IGNORE`), so overwriting a
+    /// file with new bytes preserves BOTH the old and new versions by hash. The
+    /// blob lives in the same database as the write's fact, and is captured
+    /// before that fact commits, so no manifest hash is ever referenced without
+    /// its bytes present (restorable-context INV-4 coherence).
+    pub fn put_content(&self, body: &str) -> StoreResult<String> {
+        let id = stable_hash_hex(body);
+        self.connection.execute(
+            "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+            params![id, body, body.len() as i64],
+        )?;
+        Ok(id)
+    }
+
+    /// Read the full stored bytes for a file-history content id, or `None` if the
+    /// blob store never held it. The restore write-back slice (RC-4) reads through
+    /// this to reconstruct a superseded file body.
+    pub fn get_content(&self, id: &str) -> StoreResult<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT body FROM content_blobs WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
     pub fn list_skills(&self) -> StoreResult<Vec<SkillView>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -5597,6 +5628,14 @@ pub trait RuntimeStore {
         registration: ComputeResultRegistration<'_>,
     ) -> StoreResult<bool>;
     fn lookup_compute_result(&self, content_key: &str) -> StoreResult<Option<ComputeCachedResult>>;
+    /// Capture a file body content-addressed into the file-history blob store
+    /// (restorable-context RC-1), returning its content id (`stable_hash_hex`).
+    /// Idempotent — identical bytes dedupe — so an overwrite preserves both the
+    /// superseded and the new body by hash. Captured in the same store as the
+    /// write's fact and before that fact commits (INV-4 coherence).
+    fn put_content(&self, body: &str) -> StoreResult<String>;
+    /// Read a captured file body back by content id, or `None` if never held.
+    fn get_content(&self, id: &str) -> StoreResult<Option<String>>;
     fn register_script_capability(
         &self,
         registration: ScriptCapabilityRegistration<'_>,
@@ -5887,6 +5926,14 @@ impl RuntimeStore for SqliteStore {
 
     fn lookup_compute_result(&self, content_key: &str) -> StoreResult<Option<ComputeCachedResult>> {
         SqliteStore::lookup_compute_result(self, content_key)
+    }
+
+    fn put_content(&self, body: &str) -> StoreResult<String> {
+        SqliteStore::put_content(self, body)
+    }
+
+    fn get_content(&self, id: &str) -> StoreResult<Option<String>> {
+        SqliteStore::get_content(self, id)
     }
 
     fn register_script_capability(
@@ -9975,6 +10022,7 @@ mod tests {
             "capability_bindings",
             "inbox_items",
             "compute_result_cache",
+            "content_blobs",
         ] {
             assert!(store.table_exists(table).expect("table lookup"), "{table}");
         }
@@ -10028,6 +10076,47 @@ mod tests {
             store.lookup_compute_result("key-2").expect("other key"),
             None
         );
+    }
+
+    /// Restorable-context RC-1: the file-history blob seam is content-addressed,
+    /// dedups, and — the load-bearing property — a superseded body SURVIVES being
+    /// overwritten. Capturing body Y after body X leaves BOTH retrievable by hash,
+    /// which is exactly what a later restore slice reads through. The returned id
+    /// is the same `stable_hash_hex` the `file.write.completed` fact records, so a
+    /// manifest hash always resolves to its bytes (INV-4 coherence).
+    #[test]
+    fn content_blob_seam_dedups_and_preserves_superseded_bodies() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+
+        assert_eq!(
+            store.get_content("deadbeef").expect("get on empty store"),
+            None
+        );
+
+        // First write of a path: body X is captured, retrievable by its hash.
+        let id_x = store.put_content("body X").expect("capture X");
+        assert_eq!(id_x, stable_hash_hex("body X"), "id is the content hash");
+        assert_eq!(
+            store.get_content(&id_x).expect("get X").as_deref(),
+            Some("body X")
+        );
+
+        // Overwriting the path with body Y captures Y WITHOUT losing X — history
+        // survives the overwrite (the whole point of RC-1).
+        let id_y = store.put_content("body Y").expect("capture Y");
+        assert_ne!(id_x, id_y);
+        assert_eq!(
+            store.get_content(&id_x).expect("get X after Y").as_deref(),
+            Some("body X")
+        );
+        assert_eq!(
+            store.get_content(&id_y).expect("get Y").as_deref(),
+            Some("body Y")
+        );
+
+        // Writing the same bytes again dedups to one row / one id.
+        let id_x_again = store.put_content("body X").expect("recapture X");
+        assert_eq!(id_x, id_x_again, "identical bytes dedupe to one id");
     }
 
     #[cfg(unix)]

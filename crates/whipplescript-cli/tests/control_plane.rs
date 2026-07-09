@@ -1121,6 +1121,126 @@ rule pick
     let _ = fs::remove_dir_all(mv_root);
 }
 
+/// Restorable-context RC-1: every file body durably written through the file
+/// effect is ALSO captured content-addressed into the runtime store's history
+/// blob table, keyed by the same `stable_hash_hex` the `file.write.completed`
+/// fact records. The live path->bytes store overwrites in place, so this proves
+/// the sidecar preserves the superseded version: write body X to a path, then
+/// overwrite the SAME path with body Y, and BOTH bodies remain retrievable by
+/// hash — history survived the overwrite. (Later slices restore from these.)
+#[test]
+fn dev_file_write_captures_content_addressed_history_that_survives_overwrite() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+
+    // One store + one root shared across both runs, so the blob table accumulates
+    // (it is workspace-scoped, not instance-scoped). The path is written twice.
+    let store_path = temp_store_path();
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let root = unique_temp_dir("file-history-root");
+
+    let body_x = "history body X";
+    let body_y = "history body Y";
+
+    let run = |body: &str, mode: &str| {
+        let src = temp_workflow_path("file-history");
+        fs::write(
+            &src,
+            format!(
+                r#"
+workflow WriteHistory
+
+output result Result
+
+class Result {{
+  status string
+}}
+
+file store out_files {{
+  root "{}"
+}}
+
+rule pick
+  when started
+=> {{
+  write text to out_files at "note.md" {{
+    body "{body}"
+    mode {mode}
+  }} as written
+  after written succeeds as result {{
+    complete result {{
+      status "wrote"
+    }}
+  }}
+}}
+"#,
+                root.display()
+            ),
+        )
+        .expect("write history source");
+        let dev = run_json(
+            bin,
+            &[
+                "--store",
+                store,
+                "--json",
+                "dev",
+                src.to_str().expect("utf-8 source path"),
+                "--provider",
+                "fixture",
+                "--until",
+                "idle",
+            ],
+        );
+        let instance_id = dev
+            .get("instance_id")
+            .and_then(Value::as_str)
+            .expect("instance id")
+            .to_owned();
+        let status = run_json(bin, &["--store", store, "--json", "status", &instance_id]);
+        assert_eq!(
+            status.pointer("/instance/status").and_then(Value::as_str),
+            Some("completed"),
+            "write drives the workflow to completion: {status}"
+        );
+        let _ = fs::remove_file(src);
+    };
+
+    // 1) First write: body X. 2) Overwrite the SAME path with body Y (mode
+    //    replace requires the file to already exist — it does after run 1).
+    run(body_x, "create");
+    assert_eq!(
+        fs::read_to_string(root.join("note.md")).ok(),
+        Some(body_x.to_owned()),
+        "live store holds the first body"
+    );
+    run(body_y, "replace");
+    assert_eq!(
+        fs::read_to_string(root.join("note.md")).ok(),
+        Some(body_y.to_owned()),
+        "live store now holds the overwriting body (path->bytes unchanged)"
+    );
+
+    // The blob table (same runtime store DB) must hold BOTH versions, keyed by
+    // the same FNV-1a content hash the file.write.completed fact records — so the
+    // superseded body X survived even though the live file is now Y.
+    let store_db = SqliteStore::open(&store_path).expect("reopen runtime store");
+    let hash_x = whipplescript_kernel::rule_lowering::stable_hash_hex(body_x);
+    let hash_y = whipplescript_kernel::rule_lowering::stable_hash_hex(body_y);
+    assert_eq!(
+        store_db.get_content(&hash_x).expect("get X").as_deref(),
+        Some(body_x),
+        "superseded body X survives the overwrite in the history blob store"
+    );
+    assert_eq!(
+        store_db.get_content(&hash_y).expect("get Y").as_deref(),
+        Some(body_y),
+        "the overwriting body Y is captured too"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_dir_all(root);
+}
+
 /// A `file store`'s `allow read [...]` policy narrows which paths a `read` may
 /// touch (beyond root containment): a path matching a glob reads, a path inside
 /// the root but outside the policy fails. An empty policy means any path in the

@@ -4691,6 +4691,29 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         }))
     }
 
+    fn put_content(&self, body: &str) -> StoreResult<String> {
+        // RC-1 file-history capture over DO SQLite: same content id + same
+        // dedup (INSERT OR IGNORE) as the native/recall content store, in the
+        // same DO SQLite as the write's fact and before that fact commits, so no
+        // manifest hash is ever referenced without its bytes (INV-4 coherence).
+        let id = stable_hash_hex(body);
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+                &[text(&id), text(body), int(body.len() as i64)],
+            )
+            .map_err(sql_err)?;
+        Ok(id)
+    }
+
+    fn get_content(&self, id: &str) -> StoreResult<Option<String>> {
+        let rows = self
+            .sql
+            .query("SELECT body FROM content_blobs WHERE id = ?1", &[text(id)])
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+
     fn register_script_capability(
         &self,
         registration: ScriptCapabilityRegistration<'_>,
@@ -7472,6 +7495,10 @@ pub(crate) mod test_support {
                 content_key TEXT PRIMARY KEY, effect_kind TEXT NOT NULL,
                 result_json TEXT NOT NULL, source_instance_id TEXT NOT NULL,
                 source_effect_id TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE content_blobs (
+                id TEXT PRIMARY KEY, body TEXT NOT NULL, byte_len INTEGER NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE script_capabilities (

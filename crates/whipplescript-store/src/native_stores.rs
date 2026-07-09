@@ -286,6 +286,14 @@ impl RuntimeStore for NativeStores {
         self.runtime.lookup_compute_result(content_key)
     }
 
+    fn put_content(&self, body: &str) -> StoreResult<String> {
+        self.runtime.put_content(body)
+    }
+
+    fn get_content(&self, id: &str) -> StoreResult<Option<String>> {
+        self.runtime.get_content(id)
+    }
+
     fn register_script_capability(
         &self,
         registration: ScriptCapabilityRegistration<'_>,

@@ -631,6 +631,17 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
         };
     match write_outcome {
         Ok(()) => {
+            // Restorable-context RC-1: capture the written body content-addressed
+            // into the runtime store's file-history blob table, keyed by the SAME
+            // `stable_hash_hex` the `file.write.completed` fact records below. The
+            // live path->bytes store overwrites in place; this sidecar preserves
+            // the superseded version so a later restore slice can `get_content`
+            // the bytes back. Captured BEFORE the fact commits (and, natively, in
+            // the same SQLite as the fact), so no committed manifest hash is ever
+            // referenced without its bytes present (restorable-context INV-4). A
+            // capture failure aborts before the fact, never leaving a dangling
+            // hash. Identical bytes dedupe; an overwrite keeps both versions.
+            kernel.store().put_content(&body)?;
             let value = json!({
                 "store": store_name,
                 "path": path,
