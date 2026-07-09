@@ -432,7 +432,7 @@ captures:
   hash, and pattern span
 
 The `Completed` payload type is the effect's success output type `O`, such as a
-schema-coercion result class, `AgentTurn`, `LoftClaim`, or `HumanAnswer`. The
+schema-coercion result class, `AgentTurn` or `HumanAnswer`. The
 failure-like alternatives use structured payload schemas. `Failed`'s payload is
 the effect's `E`: when an effect declares a richer failure type (e.g. a
 `coerce`'s `SchemaCoerceFailed`), `E` is that type; otherwise it defaults to the

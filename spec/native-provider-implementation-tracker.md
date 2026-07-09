@@ -187,7 +187,7 @@ tool-denial event shape to gate yet.
 
 | Task | Status | Description | Validation |
 | --- | --- | --- | --- |
-| NP-091 | [x] | Extend `scripts/check-real-providers.sh` with native-provider strict mode. | `WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_STRICT=1` defaults to Codex/Claude/Pi, rejects Loft/coerce command-wrapper selections, requires native provider configs, and runs native surface probes instead of command-wrapper smoke gates. |
+| NP-091 | [x] | Extend `scripts/check-real-providers.sh` with native-provider strict mode. | `WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_STRICT=1` defaults to Codex/Claude/Pi, rejects coerce command-wrapper selections, requires native provider configs, and runs native surface probes instead of command-wrapper smoke gates. |
 | NP-092 | [x] | Add isolated fixture requirements for destructive provider tests. | `scripts/check-real-providers.sh` now refuses destructive provider suites unless global or provider-specific disposable target markers are present with the exact acknowledgement string; reports record marker posture without values. |
 | NP-093 | [x] | Emit per-provider validation reports with redacted environment posture and evidence refs. | `scripts/check-real-providers-report.sh` writes `target/real-provider-reports/<provider>.json` with set/unset environment posture, evidence refs, check summaries, and redacted preflight records. |
 | NP-094 | [x] | Add optional CI matrix for native Codex, Claude, and Pi validation. | `.github/workflows/native-provider-validation.yml` provides a workflow-dispatch Codex/Claude/Pi matrix in native-surface mode, uploads per-provider reports, and has a strict job that fails when required native configs or live prerequisites are absent. |

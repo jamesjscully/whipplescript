@@ -60,8 +60,6 @@ model_request
 model_response
 coerce_source
 coerce_output
-loft_command
-loft_result
 memory_query
 memory_result
 patch
@@ -320,7 +318,7 @@ latest run per logical agent
 queued/running/failed effects
 pending inbox items
 recent capability blocks
-recent Loft claims
+recent tracker claims
 recent evidence summaries
 active revision plus recent revision history
 cancellation requests with terminal outcome when known

@@ -187,7 +187,6 @@ record_artifact_capture_failure
 recover_provider_terminal_from_evidence
 recover_running_provider_runs
 run_coerce
-run_loft_effect
 run_human_ask
 ```
 
@@ -202,7 +201,6 @@ Provider traits and helpers:
 | `PiStyleAgentHarness` | Pi-style adapter wrapper over command launch plan. |
 | `MockAgentHarness` | Deterministic test harness. |
 | `CoerceClient` / `FakeCoerceClient` | coerce provider abstraction. |
-| `LoftClient` / `CommandLoftClient` / `FakeLoftClient` | Loft effect provider abstraction. |
 
 Native provider modules:
 

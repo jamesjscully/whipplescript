@@ -15,7 +15,7 @@ Priority order (1 and 4 remove lies; 2, 3, 5, 6 add promised primitives):
 1. Harden the soft middle (parser/evaluator unification)
 2. `flow` — a sequential surface that lowers to rules
 3. Time — effect timeouts and timer effects
-4. Regular event matching; evict Loft from the parser
+4. Regular event matching; work queues
 5. Inline `decide` + `case` over choices
 6. Capability-gated `exec` effect
 
@@ -44,8 +44,8 @@ design and spec are done, build pending.
 | 1 | Soft middle: body AST + unified evaluator ([B1](#b1-harden-the-soft-middle-priority-1)) | — | — | **done** (`tests/soft_middle.rs`) | **done** | **done** |
 | 2 | `flow` ([A1](#a1-flow-surface-shape--decided-2026-06-09)) | **done** | **done** ([flow.md](../flow.md)) | **done** (lowering-equivalence tests in `flow_expand.rs`; approve/reject/fan-out e2e) | **done** | **done** (review found+fixed 3 bugs: trigger rename in branch conditions, multi-flow ask-binding isolation, string-literal rename; regression tests added) |
 | 3 | Time: timeout, timer, cancel ([A2](#a2-time--decided-2026-06-09)) | **done** | **done** ([time.md](../time.md)) | **done** (exactly-once race/expiry tests in `soft_middle.rs`) | **done** | **done** |
-| 4 | Event matching: `when fact` + sugar ([A3a–c](#a3-regular-event-matching-work-queues-evict-loft--decided-2026-06-09)) | **done** | **done** (`spec/language.md` surface revisions) | — | **done** | **done** |
-| 5 | Work queues + Loft eviction ([A3d–e](#a3-regular-event-matching-work-queues-evict-loft--decided-2026-06-09)) | **done** | **done** ([work-queues.md](../work-queues.md)) | **done** (claim-atomicity property tests in `items.rs`; e2e chain tests) | **done** | **done** |
+| 4 | Event matching: `when fact` + sugar ([A3a–c](#a3-regular-event-matching-work-queues--decided-2026-06-09)) | **done** | **done** (`spec/language.md` surface revisions) | — | **done** | **done** |
+| 5 | Work queues ([A3d–e](#a3-regular-event-matching-work-queues--decided-2026-06-09)) | **done** | **done** ([work-queues.md](../work-queues.md)) | **done** (claim-atomicity property tests in `items.rs`; e2e chain tests) | **done** | **done** |
 | 6 | Inline `decide` + `case` over choices ([A4](#a4-inline-decide--case-over-choices--decided-2026-06-09)) | **done** | **done** (`spec/language.md` surface revisions) | **done** (`inline_decide_completes`) | **done** | **done** |
 | 7 | Gated `exec` effect ([A5](#a5-capability-gated-exec-effect--decided-2026-06-09)) | **done** | **done** (`spec/language.md` surface revisions) | **done** (`exec_is_gated_by_operator_grants`) | **done** | **done** |
 | 8 | Small cuts: `emit`, `harness`, `pattern` ([A6](#a6-small-cuts--decided-2026-06-09)) | **done** | — | — | **done** (`emit` rejected; `consume` warns) | **done** |
@@ -173,7 +173,7 @@ flow triage
 - [x] **A2d.** Dissolved: `timeout` is uniform across effect kinds, so
       `askHuman as signoff timeout 24h` works with zero special-casing.
 
-### A3. Regular event matching; work queues; evict Loft — DECIDED 2026-06-09
+### A3. Regular event matching; work queues — DECIDED 2026-06-09
 
 - [x] **A3a.** General form: `when fact <dotted.name> as x [where ...]`.
       Runtime events are stored and matched as facts, so `fact` is the
@@ -183,13 +183,13 @@ flow triage
       general form: `started`, `<agent> is available`,
       `human answered ... as x`, `<agent> completed turn ... as x`, plus
       `<queue> has ready item as x` (new, from the queue design). Dropped:
-      `manual review requested` (undocumented, unused) and all Loft phrases.
+      `manual review requested` (undocumented, unused).
 - [x] **A3c.** The `human answered <label>` label is documentary. Flows
       auto-correlate ask -> answer (A1); hand-written rules discriminate
       with guards on the answer payload. No false promise of reference
       semantics.
-- [x] **A3d.** Superseded by the **work-queue design** — evict the vendor,
-      install the concept. Full spec: [`work-queues.md`](../work-queues.md).
+- [x] **A3d.** Superseded by the **work-queue design**.
+      Full spec: [`work-queues.md`](../work-queues.md).
       Summary: `queue <name> { tracker <kind> }` declarations mirroring
       agent/provider; status categories `open | in_progress | done |
       cancelled` (the layer GitHub/Linear/Jira share); `ready` is a derived
@@ -202,9 +202,7 @@ flow triage
       default and reference implementation; tracker-native opaque identity
       (builtin issues sequential `WS-n`); polling projection on worker
       passes; agents file mid-turn via `whip items add` with run-identity
-      provenance injected into turn environments. Parser loses every Loft
-      token; the Loft binding is deferred indefinitely (interface shaped so
-      it can bind, which is sufficient).
+      provenance injected into turn environments.
 - [x] **A3e.** Builtin `AgentTurn` drops the never-populated `issue` /
       `changedFiles` fields; affected examples rewritten honestly; turn
       enrichment becomes a documented capability a tracker binding may
@@ -353,17 +351,14 @@ Work queues (A3d–e), per [`work-queues.md`](../work-queues.md):
       `<queue> has ready item` sugar.
 - [ ] CLI: `whip items [add|show|list]`; run-identity env injection into
       turns; provenance stamping.
-- [ ] Loft eviction: remove Loft tokens/schemas/effects from parser and
-      builtins; drop `AgentTurn.issue`/`changedFiles`; keep the curated queue
-      examples as the authoring surface; retire loft fixtures or rehost behind
-      a binding stub.
+- [ ] Drop `AgentTurn.issue`/`changedFiles`; keep the curated queue
+      examples as the authoring surface.
 
 ### B3. Carry-overs from the previous plan
 
 - [ ] Dynamic rule-coverage CI: every rule in every shipped example commits
       at least once in some fixture run.
 - [ ] Remove `consume` after its deprecation window.
-- [ ] Loft turn enrichment (subsumed by A3d/A3e decision).
 
 ---
 

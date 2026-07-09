@@ -71,7 +71,7 @@ for capability form). Those four gaps ARE this design.
   names `std.script` as its escape hatch ("Non-Goals" in `spec/files.md`)
   — a reference, not a dependency.
 - **Provider expectations.** One provider, `exec`, seam class = subprocess
-  adapter per M2 (the loft `CommandLoftClient` precedent); native-only;
+  adapter per M2; native-only;
   fixture behavior = the test-harness stub surface (spec-only, see Deferred).
 - **Open naming/boundary questions.** (1) Effect kind stays `exec.command` —
   M3's id==kind rule applies to 1:1 operations, and this operation's
@@ -238,8 +238,8 @@ recorded hole):
 
 ## Providers
 
-Per M2 seam classification: **subprocess adapter** (seam 2, the loft
-precedent). One provider row, id `exec`, native-only (worker id `whip-exec`).
+Per M2 seam classification: **subprocess adapter** (seam 2). One provider
+row, id `exec`, native-only (worker id `whip-exec`).
 It is NOT an HTTP step machine and NOT a native adapter trait; no DO
 counterpart exists or is designed here (DO tracker Phase 8 owns the
 container-sidecar compute plane). The CapabilityProvider host-projection seam

@@ -15,7 +15,7 @@ v0.4 = improve/evals + version control.
 **Code baseline: GREEN and verified.** `WHIPPLESCRIPT_RELEASE_READINESS_FULL=1
 scripts/check-release-readiness.sh` exits 0 at commit `2bafd44` — Required checks
 failed: 0 (shell, trackers, docs snippets/site, IR goldens, report schemas,
-artifact admission, fmt, clippy `-D warnings`, whitespace, Loft fixtures, native
+artifact admission, fmt, clippy `-D warnings`, whitespace, native
 adapters/contract/policy-denials, control-plane, workspace records, provider
 scheduling, expression routing, incident UX, cancellation matrix, store replay,
 provider doctor, artifact redaction, and — under FULL — workspace tests, Maude,
@@ -97,8 +97,7 @@ e2e surface.
 | G-002 | Language | Partially fixed | WhippleScript language maintainer | Full expression-kernel guard typing is incomplete. | Equality guards in `when` clauses now parse and run for the provider-routing validation path, and assertions can check fact/effect projections. Remaining work is tracked in `spec/expression-kernel-tracker.md`: typed expression AST, boolean logic, ordering, membership, exists/empty, optional presence proofs, enum/literal domain checks, shared guard/assertion evaluation, and generated guard-gated Maude checks. |
 | G-003 | Language | Already fixed | WhippleScript language maintainer | `as binding` after a closing multiline string is unsupported. | The parser now emits a targeted diagnostic that tells authors to move `as <binding>` onto the effect line. |
 | G-004 | Companion skill | Already fixed | WhippleScript maintainer | Companion skill package/install automation is not implemented. | First-party skill content exists at `skills/whipplescript-author/SKILL.md`, with local install automation in `scripts/install-whipplescript-skill.sh` and package automation in `scripts/package-whipplescript-skill.sh`. |
-| G-005 | Loft | Already fixed | WhippleScript maintainer, Loft maintainer | Loft repo was not added as a submodule with conformance fixtures. | Loft is public at `https://github.com/jamesjscully/loft`, `vendor/loft` is registered as the source-of-truth submodule, and CI plus release validation fetch it with recursive checkout. `scripts/check-loft-submodule-readiness.sh` and `WHIPPLESCRIPT_REQUIRE_LOFT_SUBMODULE_FIXTURES=1 scripts/check-loft-fixtures.sh` validate the tracked Loft v0.1 spec and conformance fixtures from the submodule. |
-| G-006 | Real providers | Deferred with rationale | WhippleScript integration maintainer | Real-provider destructive e2e flows remain manual. | `scripts/check-real-providers.sh` gates and documents prerequisites, supports selected provider smoke runs with `WHIPPLESCRIPT_REAL_PROVIDERS`, probes tool versions, checks Loft fixture readiness through `scripts/check-loft-source-repo.sh` when Loft is selected, verifies coerce endpoint reachability when coerce is selected, and runs no-mock read-only Loft show plus coerce smoke tests when configured. `scripts/check-real-providers-report.sh` records smoke output and set/unset environment posture without exposing values, and `scripts/check-release-readiness.sh` records real-provider and Loft handoff reports as CI artifacts. Automated destructive Loft flows still need isolated external fixtures. Follow up in `spec/e2e.md` and Stage 11/DoD of `spec/implementation-plan.md`. |
+| G-006 | Real providers | Deferred with rationale | WhippleScript integration maintainer | Real-provider destructive e2e flows remain manual. | `scripts/check-real-providers.sh` gates and documents prerequisites, supports selected provider smoke runs with `WHIPPLESCRIPT_REAL_PROVIDERS`, probes tool versions, verifies coerce endpoint reachability when coerce is selected, and runs no-mock read-only coerce smoke tests when configured. `scripts/check-real-providers-report.sh` records smoke output and set/unset environment posture without exposing values, and `scripts/check-release-readiness.sh` records real-provider handoff reports as CI artifacts. Automated destructive real-provider flows still need isolated external fixtures. Follow up in `spec/e2e.md` and Stage 11/DoD of `spec/implementation-plan.md`. |
 | G-007 | Control plane | Already fixed | WhippleScript runtime maintainer | `whip run` started an instance but did not drive ready rules into durable facts/effects. | `whip step`, `whip worker`, and `whip dev` now share a durable rule/effect driver that materializes source rules into facts/effects before provider workers start runs. `scripts/check-control-plane-driver.sh` covers startup, step materialization, worker execution, provider-matrix dev routing, and source workflow execution through the native fixture bridge. |
 | G-008 | Agent harnesses | Partially fixed | WhippleScript integration maintainer | Codex, Claude, and Pi real adapters were overspecified as simple command wrappers. | Native Codex app-server, Claude Agent SDK, and Pi RPC adapter paths now exist with deterministic validation, redacted lifecycle evidence, cancellation, artifact metadata, and source workflow bridge coverage. Live isolated provider smokes are environment-gated and remain a strict external release gate before advertising production native-provider support. Track remaining live/provider-specific work in `spec/real-provider-validation-tracker.md`. |
 | G-009 | Harness failures | Already fixed | WhippleScript runtime maintainer | Harness boundary failures were only partially implemented. | Command-backed and native-provider paths now classify boundary failures, artifact-capture failures, provider-native cancellation, terminal-event append recovery, and restart recovery into durable diagnostics without leaking raw secrets. Validation is covered by `scripts/check-real-provider-report-redaction.sh`, `scripts/check-native-provider-contract.sh`, `scripts/check-cancellation-policy-matrix.sh`, and `scripts/check-store-replay-conformance.sh`. |
@@ -145,16 +144,15 @@ store benchmarks are future hardening work.
 ## Distributed-Systems Integrity
 
 - Idempotency keys are used for program events, rule commits, provider terminal
-  events, human review, Loft, coerce, skills, and retry paths.
+  events, human review, coerce, skills, and retry paths.
 - Duplicate terminal completion is rejected atomically.
 - Lease expiry, retry, and recovery are covered by unit and e2e tests.
 - Dependency release correctness is covered by store tests, trace conformance,
   generated Maude searches, and repeated e2e stress.
 - Pause/resume/cancel now gate provider starts at the store boundary.
 - Multi-instance isolation is covered by CLI and kernel e2e tests.
-- Loft/coerce integration semantics use deterministic fake clients and command
-  contract tests, including Loft claim/renew/release, structured evidence,
-  resource intent, complete, and fail command shapes.
+- Coerce integration semantics use deterministic fake clients and command
+  contract tests, including structured evidence and fail command shapes.
 
 Result: no blocking distributed-systems gaps identified. Destructive external
 provider fixture coverage remains deferred under G-006.

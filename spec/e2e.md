@@ -142,7 +142,6 @@ Real-provider checks are opt-in:
 
 ```sh
 WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 \
-WHIPPLESCRIPT_LOFT_TEST_ISSUE=iss_... \
 WHIPPLESCRIPT_COERCE_TEST_ENDPOINT=http://127.0.0.1:... \
 WHIPPLESCRIPT_COERCE_TEST_FUNCTION=classifyMessage \
 WHIPPLESCRIPT_COERCE_TEST_ARGUMENTS_JSON='{"title":"Smoke","body":"Check"}' \
@@ -150,10 +149,13 @@ WHIPPLESCRIPT_COERCE_TEST_OUTPUT_TYPE=MessageClassification \
 scripts/check-real-providers.sh
 ```
 
-Set `WHIPPLESCRIPT_REAL_PROVIDERS=loft`, `WHIPPLESCRIPT_REAL_PROVIDERS=coerce`, or
+Set `WHIPPLESCRIPT_REAL_PROVIDERS=coerce` or
 `WHIPPLESCRIPT_REAL_PROVIDERS=codex` to run a selected subset of no-mock smoke
-tests. Comma-separated subsets such as `loft,coerce,codex` are accepted. The
-default is `loft,coerce`.
+tests. Comma-separated subsets such as `coerce,codex` are accepted. The
+default is `coerce`.
+
+Set `WHIPPLESCRIPT_COERCE_HEALTH_PATH` to add an optional HTTP health-path probe
+(relative to the coerce endpoint) on top of the endpoint TCP reachability check.
 
 For the smallest real Codex provider smoke check, run:
 
@@ -165,32 +167,11 @@ That sends one read-only, non-interactive `codex exec` prompt, requires the
 final message and a `turn.completed` JSONL event, and records
 `target/codex-message-smoke-report.md`.
 
-For local Loft validation against a sibling checkout, run:
-
-```sh
-scripts/check-local-loft-cli.sh ../loft
-```
-
-That installs the Loft checkout into `target/loft-cli-venv`, creates an
-isolated temporary Loft workspace, exercises create/show/ready/claim/note/
-evidence/resource-intent/release through the real CLI, then runs WhippleScript's
-no-mock `loft.show` smoke through `scripts/check-real-providers-report.sh`.
-
-Optional knobs:
-
-```text
-WHIPPLESCRIPT_LOFT_REPO=/path/to/tracked/loft
-WHIPPLESCRIPT_LOFT_CLI=/path/to/loft-wrapper
-WHIPPLESCRIPT_LOFT_SKIP_REPO_PREFLIGHT=1
-WHIPPLESCRIPT_COERCE_HEALTH_PATH=/health
-```
-
 Destructive provider tests are refused unless the target is explicitly marked
 disposable. Set `WHIPPLESCRIPT_REAL_PROVIDER_DESTRUCTIVE_TESTS=1` for all
 selected providers, or `WHIPPLESCRIPT_CODEX_DESTRUCTIVE_TESTS=1`,
 `WHIPPLESCRIPT_CLAUDE_DESTRUCTIVE_TESTS=1`,
-`WHIPPLESCRIPT_PI_DESTRUCTIVE_TESTS=1`,
-`WHIPPLESCRIPT_LOFT_DESTRUCTIVE_TESTS=1`, or
+`WHIPPLESCRIPT_PI_DESTRUCTIVE_TESTS=1`, or
 `WHIPPLESCRIPT_COERCE_DESTRUCTIVE_TESTS=1` for one provider. The matching run must
 also set either provider-specific disposable marker variables, such as
 `WHIPPLESCRIPT_CODEX_DISPOSABLE_TARGET` and
@@ -210,12 +191,6 @@ provider-native structured outputs (OpenAI Responses / Anthropic Messages),
 a separate credential-gated build (see `spec/coerce.md`). Until it lands, coerce
 is validated deterministically through `FakeCoerceClient` under the fixture
 provider.
-
-Required tools:
-
-```text
-loft
-```
 
 To capture the real-provider smoke result as a local artifact while preserving
 the underlying check exit code, run:
@@ -249,23 +224,8 @@ Codex/Claude/Pi matrix in that mode and uploads the generated reports. Its
 provider config paths or required live prerequisites then fail the workflow.
 
 The real-provider script verifies prerequisite tools, required environment,
-Loft fixture repo readiness when Loft is selected, including tracked spec
-and fixture files, non-destructive coerce endpoint reachability when coerce is
-selected, `doctor`, example compilation, a read-only no-mock `loft.show`
-smoke call, a no-mock schema-coercion smoke call against the configured
-endpoint, and a one-message Codex smoke when `codex` is selected. Provider-destructive
-flows must pass the disposable-target marker gate before any provider test is
-allowed to run.
-
-Loft fixture shape checks are available separately:
-
-```sh
-scripts/check-loft-fixtures.sh
-```
-
-The script prefers `WHIPPLESCRIPT_LOFT_FIXTURE_DIR`, then
-`vendor/loft/fixtures/whipplescript/v0.1`, then the local compatibility fixtures in
-`examples/loft-fixtures/v0.1`. It skips only when no fixture source is
-available unless `WHIPPLESCRIPT_REQUIRE_LOFT_FIXTURES=1` is set. Set
-`WHIPPLESCRIPT_REQUIRE_LOFT_SUBMODULE_FIXTURES=1` to require the source-of-truth
-submodule fixture path and reject compatibility-fixture fallback.
+non-destructive coerce endpoint reachability when coerce is
+selected, `doctor`, example compilation, a no-mock schema-coercion smoke call
+against the configured endpoint, and a one-message Codex smoke when `codex` is
+selected. Provider-destructive flows must pass the disposable-target marker gate
+before any provider test is allowed to run.

@@ -148,7 +148,7 @@ flag.
 provider class — no unification: (1) **HTTP sans-IO step machine** for
 network providers (the CoerceStepMachine/BrokeredTurnMachine precedent;
 DO-compatible by construction); (2) **subprocess adapter** for local tooling
-(the loft precedent; native-only, DO counterpart = DO tracker Phase 8);
+(native-only, DO counterpart = DO tracker Phase 8);
 (3) **native adapter trait behind a cargo feature** for deep session
 protocols (codex/claude/pi). One NEW seam lands now: a `CapabilityProvider`
 host-projection trait replacing the fixture else-branch at

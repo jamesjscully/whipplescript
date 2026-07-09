@@ -129,8 +129,8 @@ All items above are implemented, with these scope notes:
   (list commands return arrays; report commands return objects); no CLI change
   was made.
 - **`claim` stays bindable** despite the reserved-keyword decision: `claim
-  issue with loft as claim` is the established loft idiom and the trailing
-  binding position is unambiguous. All other operation keywords are reserved.
+  issue with X as claim` is an established idiom and the trailing binding
+  position is unambiguous. All other operation keywords are reserved.
 - **Facts index** landed as an `ensure_lookup_indexes` pass on store open
   (matching the existing `ensure_*` pattern) rather than a numbered migration,
   because legacy fixture stores may predate the `facts` table.
@@ -148,6 +148,6 @@ is `closed`; work these there:
 - **Dynamic rule-coverage CI (5.18 full version)** → language-ergonomics B3.
   `scripts/check-rule-coverage.sh` exists (static dead-rule lint shipped); the
   dynamic per-run committed-rule reporting is the open remainder.
-- **Agent turn enrichment** → language-ergonomics A3e / B2 (loft turn enrichment).
+- **Agent turn enrichment** → language-ergonomics A3e / B2.
 - **Move rule lowering out of the CLI crate (4.11)** → language-ergonomics B1a.
 - **Remove `consume`** after its deprecation window → language-ergonomics B3.

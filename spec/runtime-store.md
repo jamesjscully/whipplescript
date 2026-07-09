@@ -466,7 +466,7 @@ source_span_link
 
 Evidence is not workflow truth. It is an observability layer over truth in the
 event log, fact projection, effect outbox, runs, artifacts, and external
-kernels such as Loft.
+kernels.
 
 Active fact projection rows include a nullable `consumed_at` timestamp. A
 `rule.committed` payload records both produced facts and `consumed_facts`; replay

@@ -25,7 +25,6 @@ agent harness interface
 capability registry
 skill registry
 schema-coercion effects, with coerce as a current backend
-Loft work kernel integration
 human review inbox
 artifact/evidence store
 observability/status views
@@ -165,7 +164,5 @@ The architecture depends on these supporting specs:
 - [agent-harness.md](agent-harness.md) defines provider adapters for real
   coding-agent turns.
 - [coerce.md](coerce.md) defines typed schema-coercion as a durable effect.
-- [loft-integration.md](loft-integration.md) defines the separate work
-  kernel WhippleScript relies on for serious repo execution.
 - [human-review.md](human-review.md) defines human inbox semantics.
 - [observability.md](observability.md) defines evidence and trace UX.

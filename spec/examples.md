@@ -433,7 +433,7 @@ agent planner {
 agent worker {
   profile "repo-writer"
   capacity 2
-  skills ["whipplescript-author", "loft-user"]
+  skills ["whipplescript-author", "tracker-user"]
 }
 
 rule seed_fixture_tick
@@ -513,7 +513,7 @@ rule request_human_trace_review
 ```
 
 The important part is not the name. The important part is that skills,
-heartbeat scheduling, agent turns, Loft work claims, memory access, human
+heartbeat scheduling, agent turns, memory access, human
 review, and evidence tracing are composed through the same small rule/effect
 kernel.
 

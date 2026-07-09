@@ -79,7 +79,7 @@ Current checked coverage includes invalid fixtures for unknown schemas, bad
 records, effect-output scope leaks, effectful self-loops, bad effect payloads,
 and expression-function/query diagnostics. Parser and CLI tests also cover
 finite-domain comparison typos, optional presence proofs, duration/time literal
-validation, `coerce` argument type validation, `claim ... with loft` payload
+validation, `coerce` argument type validation, `claim` payload
 typing, dynamic `AgentRef` target/capability checks, terminal-output branch
 tag validation, and branch-binding context safety.
 

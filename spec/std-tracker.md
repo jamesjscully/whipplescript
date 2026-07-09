@@ -40,8 +40,7 @@ does not restate them; it packages what shipped and records the seam to the rebu
   `tracker.*` capability ids on all contracts (M3) + `renew` parsing and
   executing with optional claim TTL + claim/renew/release privilege rows
   exercised through the embedded manifest and built-in registrations + minimal
-  `whip issue` CLI covering the lifecycle the language can express + loft
-  fossil purge.
+  `whip issue` CLI covering the lifecycle the language can express.
 - **Dependencies.** Core: effect lifecycle + idempotency, sum-type
   exhaustiveness, the `WorkItems` store trait, worker-pass projection, IFC
   engine, terminal auto-release hook. Substrate slices: S3 (rename C — this
@@ -168,13 +167,6 @@ vocabulary (control_plane.rs:7411) and is untouched.
   with a declared claim-strength (strong / best-effort / advisory /
   unsupported) per DR-0002 "External Providers", so readiness projections
   expose uncertainty instead of pretending atomic leases.
-- **loft — PURGED in v1.** The pre-std.tracker subprocess integration survives
-  only as a fossil: `claim <x> with loft as y` still parses
-  (parser/lib.rs:9645-9647), `IrEffectKind::LoftClaim` is attributed to
-  std.tracker, and its handler hardcodes `FakeLoftClient`
-  (kernel/effect_handlers.rs:151-215). spec/loft-integration.md is already
-  historical; DR-0002 "Loft Comparison" keeps the product lessons, not the
-  surface.
 
 ## Manifest (M5 contribution)
 
@@ -267,13 +259,6 @@ a second model.
 
 Each slice is independently gateable under the per-piece review discipline.
 
-- **T1 — loft purge.** Remove the `claim <x> with loft as y` parse arm,
-  `IrEffectKind::LoftClaim` (parser/lib.rs:3400-3408, 9645-9647), the loft
-  dispatch arms (cli/main.rs:20095, 20518), `run_loft_effect_generic` +
-  FakeLoftClient wiring (kernel/effect_handlers.rs:151-215), kernel/loft.rs,
-  and examples/loft-fixtures. One-way, pre-release, no back-compat. Tests: a
-  grep gate proving zero loft tokens outside historical specs; full suites
-  green. No model (deletion). Independent of all substrate.
 - **T2 — capability ids on contracts** (after S3, with S4). Set
   `required_capabilities = [kind]` on all five `std.tracker` contracts;
   manifest capabilities[] rows match; S4 subset check green. Tests:
@@ -390,8 +375,6 @@ Each slice is independently gateable under the per-piece review discipline.
    `tracker.renew` arrives effect-plane-only with T3 (grant op pending the
    naming-boundary question below); todo-tool status rendering follows the
    post-rename status set.
-4. **loft-integration.md** — already historical; note that T1 removes the last
-   code counterpart (legacy claim form, LoftClaim, FakeLoftClient).
 
 ## Open naming-boundary questions
 

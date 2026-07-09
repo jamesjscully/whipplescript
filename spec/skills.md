@@ -27,7 +27,7 @@ The canonical file format may follow the `SKILL.md` convention:
 
 ```text
 skills/
-  loft/
+  issue-triage/
     SKILL.md
   repo-worker/
     SKILL.md
@@ -70,7 +70,7 @@ Skills may be attached to agents:
 ```whipplescript
 agent worker {
   profile "repo-writer"
-  skills ["repo-worker", "loft"]
+  skills ["repo-worker", "issue-triage"]
 }
 ```
 
@@ -81,7 +81,7 @@ attachment.
 Or to individual turns:
 
 ```whipplescript
-tell worker with skills ["loft"] """markdown
+tell worker with skills ["issue-triage"] """markdown
 Claim one ready issue and implement it.
 """
 ```
@@ -112,7 +112,7 @@ grant capabilities.
 
 ```text
 whipplescript-author
-loft-user
+issue-triage-user
 human-review-user
 ```
 

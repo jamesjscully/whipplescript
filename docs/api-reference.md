@@ -72,7 +72,6 @@ coerce-cli or coerce
 codex
 claude
 pi
-loft
 ```
 
 The formal/report helper scripts use Python `jsonschema`. From a checkout, use

@@ -128,7 +128,6 @@ timeouts, and replay. The language owns policy.
 - [std-telemetry.md](std-telemetry.md): `std.telemetry`, read-side event/evidence
   export, OTLP provider scope, cursor policy, and structural-by-default content
   rules
-- [loft-integration.md](loft-integration.md): Loft as a separate core work kernel
 - [human-review.md](human-review.md): historical/current human-review effect
   notes; target package design moves this use case under `std.messaging`
 - [observability.md](observability.md): artifact/evidence store and status UX

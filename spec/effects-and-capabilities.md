@@ -25,23 +25,7 @@ signal.emit      inject a typed signal fact
 Current implementations may still emit the legacy effect kind `coerce`;
 the target contract is `schema.coerce`, with coerce registered as one backend.
 
-Core integrations may expose namespaced effects directly when the compiler or
-runtime needs to understand their ordering:
-
-```text
-loft.show
-loft.claim
-loft.renew
-loft.release
-loft.note
-loft.transition
-loft.evidence
-loft.resource_intent
-loft.complete
-loft.fail
-```
-
-Packages may also expose namespaced effect contracts:
+Packages may expose namespaced effect contracts:
 
 ```text
 memory.query
@@ -193,7 +177,7 @@ agent worker {
 }
 ```
 
-Built-in effects such as `tell`, `coerce`, `askHuman`, and Loft operations
+Built-in effects such as `tell`, `coerce`, and `askHuman`
 still require runtime bindings, but they do not need custom capability
 declarations unless policy requires stricter naming.
 

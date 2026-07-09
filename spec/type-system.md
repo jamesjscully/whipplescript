@@ -632,9 +632,8 @@ The `record` body is checked against the class:
 - optional fields may be omitted or set to `null`
 - classes are closed by default
 
-Built-in and integration facts, such as agent turn completions and Loft ready
-issues, also expose class-like schemas even when their source syntax is
-conversational.
+Built-in and integration facts, such as agent turn completions, also expose
+class-like schemas even when their source syntax is conversational.
 
 ## Diagnostics And Desire Paths
 

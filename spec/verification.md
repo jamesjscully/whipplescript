@@ -661,6 +661,6 @@ The strategy is based on:
 2. Hand-write the TLA+ control-plane lifecycle model.
 3. Add a lightweight trace-conformance contract to the runtime-store and
    observability specs.
-4. Encode Ralph loop and Loft-claim-before-agent-turn examples.
+4. Encode Ralph loop and claim-before-agent-turn examples.
 5. Add generated Maude from typed rule IR once the parser/IR exists.
 6. Reevaluate Veil after the kernel semantics stop moving.

@@ -221,7 +221,7 @@ Skills are Claude-style agent context bundles. They are assigned to agents:
 ```whip
 agent worker {
   profile "repo-writer"
-  skills ["loft-user", "repo-worker"]
+  skills ["tracker-user", "repo-worker"]
 }
 ```
 
@@ -1206,7 +1206,7 @@ and the claimed item. Later completion facts can therefore support patterns
 like:
 
 ```whipplescript
-when worker completed turn for loft issue as turn
+when worker completed turn for issue as turn
 ```
 
 without asking the compiler to infer meaning from prompt text.
@@ -1570,8 +1570,7 @@ has a defined lowering, none is magic:
 | `when <agent> completed turn ... as x` | `when fact agent.turn.completed as x` (+ agent guard when `<agent>` names a declared agent; the word `worker` is generic) |
 | `when <queue> has ready item as x` | ready-item projection match for the queue ([work-queues.md](work-queues.md)) |
 
-`manual review requested` is removed (undocumented, unused). All Loft
-phrases are removed with the work-queue design.
+`manual review requested` is removed (undocumented, unused).
 
 ### Sequencing sugar: superseded
 

@@ -51,7 +51,7 @@ Examples:
 
 ```text
 agent.turn.completed
-loft.claim.succeeded
+tracker.claim.succeeded
 schema.coerce.succeeded
 coerce.succeeded
 human.ask.created
@@ -70,13 +70,14 @@ Projected from external kernels or systems through registered capabilities.
 Examples:
 
 ```text
-loft.readyIssue
-loft.unfinishedIssue
-loft.conflict
+tracker.readyIssue
+tracker.unfinishedIssue
+tracker.conflict
 ```
 
-Loft remains the source of truth for Loft facts. WhippleScript may cache or
-project them for rule matching, but the provenance must remain visible.
+The external kernel remains the source of truth for its facts. WhippleScript
+may cache or project them for rule matching, but the provenance must remain
+visible.
 
 ### Package/Provider Projection Facts
 

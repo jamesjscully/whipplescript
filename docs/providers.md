@@ -255,7 +255,7 @@ Real-provider smoke tests are opt-in:
 
 ```sh
 WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 \
-WHIPPLESCRIPT_REAL_PROVIDERS=loft,coerce,codex \
+WHIPPLESCRIPT_REAL_PROVIDERS=coerce,codex \
 scripts/check-real-providers.sh
 ```
 

@@ -161,7 +161,7 @@ Track R (runtime loop, builds on Stage R0):
 
 Track R:
 
-7. **Stage 7 provider bindings** (Codex / Claude / Pi / coerce / Loft / human config,
+7. **Stage 7 provider bindings** (Codex / Claude / Pi / coerce / human config,
    health checks, explainable selection, blocked-effect status). After Stage 6.
 8. **Stage 8 real adapters** (Codex / Claude / Pi adapters; transcript / artifact /
    failure-evidence capture; `agent.turn.*` normalization; control-plane driver;
@@ -195,7 +195,7 @@ Track C:
 
 ### Phase 5 — Release hardening (parked; external-prerequisite-gated)
 
-15. Real-provider smoke with isolated Loft/coerce fixtures; deferred audit gaps
+15. Real-provider smoke with isolated coerce fixtures; deferred audit gaps
     (`final-audit.md`); package the companion skill.
 
 ### Critical path and recommendation
@@ -221,7 +221,7 @@ WhippleScript v0 should provide:
 - an event-sourced runtime kernel backed by SQLite
 - a control plane for compiling, starting, inspecting, pausing, resuming, and
   cancelling workflow instances
-- first-party effects for agent turns, schema coercion, Loft claims,
+- first-party effects for agent turns, schema coercion,
   human review, skills, and evidence capture
 - adapter support for at least Codex, Claude Code, and Pi-style harnesses
 - formal checks and trace-conformance checks that catch orchestration bugs
@@ -241,10 +241,10 @@ WhippleScript v0 should provide:
   `whip instances`/`status`/`facts`/`effects`/`pause`/`resume`/`cancel`/`retry`
   manage them — see Stage 5.)
 - [x] M5: Capability registry, skills, real agent harnesses,
-  schema-coercion backends, Loft, human review, and observability are wired
+  schema-coercion backends, human review, and observability are wired
   through typed effect contracts. (Verified 2026-06-18: all components ship — capability
   registry/skills (Stage 7), Codex/Claude/Pi adapters (implemented + green native-adapter
-  checks), coerce, Loft, human-review/inbox, otel/trace — and the wiring is validated by
+  checks), coerce, human-review/inbox, otel/trace — and the wiring is validated by
   the green required `native provider contract` check. Live execution against real
   provider SDKs is validated separately and remains env-gated — see M7.)
 - [x] M6: Static analysis and generated Maude checks protect user programs.
@@ -297,7 +297,6 @@ Goal: validate the core execution model before and during implementation.
   release.
 - [x] Add hand-written dependency tests for `succeeds`, `fails`, and
   `completes`.
-- [x] Add a Loft-claim-gated agent-turn model test.
 - [x] Make `scripts/check-formal-models.sh` assert expected Maude search
   outcomes.
 - [x] Extend the Maude model with durable event log, fact projection, effect
@@ -610,7 +609,7 @@ Goal: reject programs that would produce hidden distributed-system bugs.
 Acceptance:
 
 - [x] Unsafe examples are rejected with specific explanations.
-- [x] Safe Ralph, Loft, coerce, and human-review examples pass.
+- [x] Safe Ralph, coerce, and human-review examples pass.
 - [x] Static analysis outputs enough metadata for generated Maude checks.
 
 ## Stage 4: Runtime Store
@@ -787,9 +786,9 @@ Goal: safely bind authority at runtime without bloating the core.
   - [x] human-review
 - [x] Implement custom profile loading from config.
 - [x] Implement provider binding config for Codex, Claude, Pi, fixture, coerce,
-  Loft, and human inbox providers. (Verified 2026-06-18: `provider_selection.kind`
-  binds codex/claude/pi/fixture; coerce/Loft/inbox have their own provider paths; the
-  native Codex/Claude/Pi adapter + coerce + Loft checks are green required checks.)
+  and human inbox providers. (Verified 2026-06-18: `provider_selection.kind`
+  binds codex/claude/pi/fixture; coerce/inbox have their own provider paths; the
+  native Codex/Claude/Pi adapter + coerce checks are green required checks.)
 - [x] Implement provider health checks and explainable provider selection. Provider
   health checks: `doctor_providers_reports_deterministic_health_posture` (green
   required "provider doctor posture"). Explainable selection (implemented 2026-06-18):
@@ -1105,46 +1104,6 @@ Goal: wire the built-in effect families through the same contract system.
   reusing a subscription OAuth token for programmatic coerce may fall under the
   issuing product's terms — prefer a dedicated API key for production.
 
-### Loft
-
-- [x] Add the Loft repository as a git submodule, for example under
-  `vendor/loft` or `external/loft`.
-  - `scripts/add-loft-submodule.sh` now performs the guarded add only once
-    the Loft repo has tracked spec and fixture files.
-  - `scripts/check-loft-source-repo.sh` centralizes the local Loft repo
-    preflight used by submodule and real-provider readiness.
-  - `scripts/stage-loft-fixtures.sh` stages WhippleScript's compatibility fixtures
-    into a local Loft repo for review and Loft-side commit.
-  - `scripts/export-loft-source-patch.sh` produces a reviewable Loft patch
-    artifact for the staged spec and fixtures without committing in Loft.
-  - `scripts/loft-handoff-report.sh` summarizes Loft-side blockers and next
-    commands without mutating either repository.
-- [x] Import and reference the Loft repo specs/fixtures as the source of truth
-  for issue IDs, issue state, leases, commands, JSON shapes, and failure modes.
-- [x] Replace local placeholder assumptions with the Loft v0.1 CLI/API
-  contract.
-- [x] Implement Loft capability binding.
-- [x] Implement show, claim, renew, release, note, transition, evidence,
-  resource-intent, complete, and fail command shapes.
-- [x] Model claim success/failure as typed facts.
-- [x] Add Loft contract/conformance tests against submodule fixtures.
-  - `scripts/check-loft-fixtures.sh` and
-    `loft_submodule_fixture_shapes_are_compatible` validate the
-    manifest-driven fixture JSON contract against an explicit fixture override,
-    future submodule fixtures, or local compatibility fixtures in
-    `examples/loft-fixtures/v0.1`.
-  - The fixture manifest now covers rich issue shape, `issue_status`, lease
-    claim/renew/release, lease-scoped mutation failures, structured evidence,
-    resource intent, lifecycle complete/fail, retryable error details, and
-    partial lifecycle recovery.
-  - `WHIPPLESCRIPT_REQUIRE_LOFT_SUBMODULE_FIXTURES=1` requires the future
-    source-of-truth submodule fixture path and rejects local fallback fixtures.
-  - `scripts/check-loft-submodule-readiness.sh` validates the future
-    `vendor/loft` source-of-truth wiring end to end once the submodule exists.
-  - `scripts/loft-fixtures-lib.sh` centralizes the Loft fixture manifest
-    path and manifest parsing used by all Loft readiness and staging scripts.
-- [x] Add e2e claim-before-agent-turn workflow.
-
 ### Human Review
 
 - [x] Implement human inbox store tables.
@@ -1157,14 +1116,12 @@ Goal: wire the built-in effect families through the same contract system.
 - [x] Implement artifact/evidence store.
 - [x] Link evidence to events, effects, runs, facts, and rule commits.
 - [x] Add trace export for external observability systems.
-- [x] Audit Stage 8 against the skills, agent harness, coerce, Loft, human
+- [x] Audit Stage 8 against the skills, agent harness, coerce, human
   review, and observability specs; record gaps for the final audit stage.
-  - Mock harnesses, fake coerce, local Loft contract behavior, human review,
-    skills, and evidence capture are covered in kernel e2e tests.
+  - Mock harnesses, fake coerce, human review, skills, and evidence capture
+    are covered in kernel e2e tests.
   - No-mock schema-coercion smoke coverage is available when a coerce-compatible
     external endpoint and function contract are configured.
-  - Final-audit gaps: destructive Loft provider flows and Loft submodule
-    fixtures remain external-prerequisite work.
 
 Acceptance:
 
@@ -1217,7 +1174,6 @@ Goal: prove the language is ergonomic before we harden syntax.
 - [x] Add examples:
   - [x] minimal no-op rule
   - [x] Ralph loop
-  - [x] Loft claim before agent turn
   - [x] coerce classification then branch
   - [x] human review fallback
   - [x] multi-agent bounded concurrency
@@ -1380,8 +1336,6 @@ Goal: test the real system from source file to provider outcome.
 - [x] Add e2e coverage for:
   - [x] compile and run minimal workflow
   - [x] Ralph loop one-turn bounded test mode
-  - [x] Loft claim success before agent turn
-  - [x] Loft claim failure to human review
   - [x] coerce success branch
   - [x] coerce failure branch
   - [x] effect retry after transient failure
@@ -1401,17 +1355,16 @@ Goal: test the real system from source file to provider outcome.
   - Optional real-provider prerequisites are gated by
     `WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1` in `scripts/check-real-providers.sh`.
   - Selected no-mock provider smoke runs are supported with
-    `WHIPPLESCRIPT_REAL_PROVIDERS=loft`, `coerce`, or `loft,coerce`.
-  - Real-provider readiness now checks provider tools, required environment,
-    Loft fixture repo cleanliness/tracked spec when Loft is selected, and
+    `WHIPPLESCRIPT_REAL_PROVIDERS=coerce`.
+  - Real-provider readiness now checks provider tools, required environment, and
     coerce endpoint reachability when coerce is selected before any destructive flow
     is attempted. It also writes `target/real-provider-preflight.jsonl` with
     structured boundary classifications.
-  - Read-only no-mock Loft `show` and no-mock coerce-backed schema-coercion smoke
+  - Read-only no-mock coerce-backed schema-coercion smoke
     tests run when real-provider prerequisites are configured.
   - Kernel e2e tests export temp trace artifacts before checking conformance.
-  - Final-audit gap: real-provider destructive flows remain manual until Loft
-    and coerce fixtures are isolated from real workspaces.
+  - Final-audit gap: real-provider destructive flows remain manual until coerce
+    fixtures are isolated from real workspaces.
 
 Acceptance:
 
@@ -1422,8 +1375,6 @@ Acceptance:
 - [x] Release readiness can emit an aggregate audit artifact with external
   prerequisite checks recorded separately from local required checks.
   - CI runs fast release readiness and uploads the generated report artifact.
-  - Release readiness also emits the Loft handoff report for external
-    prerequisite tracking.
 - [x] A failed e2e run leaves artifacts useful enough to debug without
   rerunning immediately.
 - [x] validation workflow `openclaw-lite.whip` can create heartbeat facts,
@@ -1513,7 +1464,7 @@ Goal: close every gap found by stage audits before declaring v0 complete.
   - [x] dependency release correctness
   - [x] pause/resume/cancel race behavior
   - [x] multi-instance isolation
-  - [x] external kernel integration semantics for Loft and future plugins
+  - [x] external kernel integration semantics for plugins
 - [x] Audit reliability and operability:
   - [x] crash recovery from every critical transaction boundary
   - [x] actionable diagnostics and status for blocked/failed effects
@@ -1561,7 +1512,7 @@ Parked v0 remainder, gated on external prerequisites, not blocking Cycle 2:
 
 1. Resolve deferred audit gaps in `spec/final-audit.md` when their external
    prerequisites are ready.
-2. Run optional real-provider smoke tests with isolated Loft/coerce fixtures.
+2. Run optional real-provider smoke tests with isolated coerce fixtures.
 3. Package the `whipplescript-author` companion skill for the chosen distribution
    mechanism.
    - Local package automation exists at `scripts/package-whipplescript-skill.sh`.

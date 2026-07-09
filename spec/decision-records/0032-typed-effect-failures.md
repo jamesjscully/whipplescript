@@ -167,7 +167,7 @@ Model-first, each piece through the per-piece review gate:
    extras-behind-narrowing, additivity; no proof holes).
 3. **Wire base-unification** ✅ DONE — every `.failed` fact carries
    `value:{reason,summary,effect_id,run_id,kind}` across all ~9 sites (kernel
-   Coerce/Loft/AgentTell + cli Capability×2/File×4/Exec/Queue/WorkflowInvoke) via
+   Coerce/AgentTell + cli Capability×2/File×4/Exec/Queue/WorkflowInvoke) via
    `effect_failure_base`; the `value:null` shadow (Coerce/Capability) is fixed; the
    EventNotify failure-fact gap is closed. `.ir` goldens regenerated (3 migrated
    examples; `kind` added no churn).
@@ -195,10 +195,10 @@ shape of step D2. Findings:
   `effect_completion_payload` (store/lib.rs:7599) builds the `effect.terminal`
   *event*, but the `.failed` *fact* that `after x fails as f` binds is built
   per-handler: CapabilityCall, the 4 File handlers, Exec, Queue, WorkflowInvoke (in
-  cli/main.rs) + Coerce, Loft, AgentTell (in kernel/lib.rs).
+  cli/main.rs) + Coerce, AgentTell (in kernel/lib.rs).
 - **The human-facing text is nested and inconsistently named**, not just
   `message`-vs-`reason`: `error.message` (Exec, File×4, Queue, Capability),
-  `error.reason` (Coerce, Loft), `value.reason` (WorkflowInvoke, author-typed),
+  `error.reason` (Coerce), `value.reason` (WorkflowInvoke, author-typed),
   `failure.message` (AgentTell). `reason` is **never top-level**; `kind` is **never a
   field** (only in the fact name); `summary`/`effect_id`/`run_id` are present
   unevenly and hand-repeated.

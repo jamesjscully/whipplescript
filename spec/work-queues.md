@@ -35,9 +35,9 @@ intelligence on scheduling decisions that should be deterministic.
 
 The dispatch loop — *take the next ready item the moment capacity frees* —
 is WhippleScript's core competency. This spec gives that loop a standard,
-vendor-neutral vocabulary, replacing the Loft tokens currently baked into
-the parser. The design mirrors the agent/provider split the language already
-has: source declares a logical queue; configuration binds it to a tracker.
+vendor-neutral vocabulary. The design mirrors the agent/provider split the
+language already has: source declares a logical queue; configuration binds it
+to a tracker.
 
 ```text
 agent  : provider  =  queue : tracker
@@ -50,7 +50,7 @@ turn   : agent     =  item  : queue
 
 ```whip
 queue backlog {
-  tracker builtin        // or: loft, github, linear, jira (bindings)
+  tracker builtin        // or: github, linear, jira (bindings)
 }
 ```
 
@@ -216,20 +216,15 @@ during the run and are picked up by dispatch flows on the next worker pass —
 the self-feeding loop (Ralph pattern) with a real backlog instead of a
 prompt convention.
 
-## Loft eviction
+## Turn enrichment
 
-The parser loses every Loft token: the `loft has ready issue` pattern,
-`claim issue with loft`, the `LoftIssue`/`LoftClaim` builtin schemas, and
-loft effect kinds. Loft becomes a deferred tracker binding behind this
-interface (not built now; the interface is shaped so it can bind, which is
-sufficient). The builtin `AgentTurn` type drops the never-populated
-`issue`/`changedFiles` fields; the examples referencing them are rewritten
-honestly; turn enrichment becomes a documented capability a tracker binding
-may provide later.
+The builtin `AgentTurn` type carries no tracker-issue fields; turn enrichment
+(attributing a turn to a specific issue) becomes a documented capability a
+tracker binding may provide later.
 
 ## Out of scope (v1)
 
-- Loft/GitHub/Linear/Jira bindings (interface only; builtin is the proof).
+- GitHub/Linear/Jira bindings (interface only; builtin is the proof).
 - `cancel` / `comment` verbs (v1.5).
 - Dependency/relation modeling, priorities, sprints (metadata).
 - Webhook/push sync (polling on worker passes only).

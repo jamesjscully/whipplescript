@@ -22,7 +22,7 @@ The skill teaches agents:
 - WhippleScript is a restricted event-sourced rule machine.
 - Rules produce facts and durable effects; effects do not run inline.
 - Source order does not sequence effects; use `after` for explicit dependency.
-- Use Loft for project work tracking when available.
+- Use `std.tracker` for project work tracking when available.
 - Use `coerce` for typed schema coercion; coerce is a backend, not workflow logic.
 - Use skills and capabilities instead of inventing shell scripts.
 - Choose profiles by authority intent, not provider brand.
@@ -40,7 +40,7 @@ The skill should include:
 ```text
 minimal workflow example
 Ralph loop example
-Loft-driven implementation loop example
+tracker-driven implementation loop example
 coerce example
 human review example
 dependent-effect / `after` example
@@ -100,9 +100,9 @@ The skill should warn against:
 ```text
 writing arbitrary TypeScript control loops
 using shell scripts as hidden workflow engines
-encoding issue tracking inside WhippleScript facts when Loft is available
+encoding issue tracking inside WhippleScript facts when `std.tracker` is available
 silently injecting memory/context without provenance
-starting agent turns before Loft claims and capability checks are accepted
+starting agent turns before tracker claims and capability checks are accepted
 depending on source order to sequence effects
 depending on prompt text as a completion condition
 using one powerful profile for unrelated research and write tasks

@@ -53,8 +53,8 @@ append completion/failure event
 release or renew leases
 ```
 
-The player is not a workflow engine. It does not choose new work, inspect
-Loft readiness, retry policy, or decide when the loop is done. Those decisions
+The player is not a workflow engine. It does not choose new work, set
+retry policy, or decide when the loop is done. Those decisions
 belong to rules and external kernels.
 
 ## Responsibilities
@@ -413,7 +413,7 @@ a provider run starts are provider runtime failures and should produce
 
 For convenience patterns, the runtime may also derive profile-specific aliases
 such as `worker completed turn` or relationship facts such as `worker completed
-turn for loft issue` when the originating effect carries enough correlation
+turn for issue` when the originating effect carries enough correlation
 metadata. These aliases must be deterministic projections over recorded effect
 input, run output, and related facts; they must not depend on prompt text.
 

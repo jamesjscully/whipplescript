@@ -445,7 +445,7 @@ linear undo chain). No phase work now.
                 `*_generic<S>(kernel, …)` core the DO step machine calls.
                 **IN PROGRESS.** Store-only handlers converted so far (wrapper +
                 `*_generic<S: RuntimeStore>` core): `run_event_effect`,
-                `run_capability_effect` (3a, 2b1b255), `run_loft_effect`,
+                `run_capability_effect` (3a, 2b1b255),
                 `run_human_effect` + the shared read-only helper
                 `resolve_effect_input_after_bindings` (3b, 93ffefd), and all four
                 file handlers `run_file_effect`/`_write`/`_import`/`_export` via the
@@ -494,7 +494,7 @@ linear undo chain). No phase work now.
                 { provider, outcome_failed }` (Option A, projection form — no 155-site
                 split). `WorkerOptions::effect_config()` projects it natively; a DO
                 builds one from bindings. The 5 store-only cores now take
-                `&EffectConfig`; event/loft/human/queue are fully WorkerOptions-free
+                `&EffectConfig`; event/human/queue are fully WorkerOptions-free
                 (capability still carries `LoadedPackageLock`). REMAINING for (4):
                 relocate the store-only cores + their ~2.4k-line pure-helper closure
                 (`effect_failure_base` / `file_path_policy_error` /
@@ -575,7 +575,7 @@ linear undo chain). No phase work now.
             (5b) **DO-reachable effect handler cores — STARTED (commit 9124f67).**
             Pattern established: lift each store-only core into
             `kernel::effect_handlers` (host-neutral, `EffectConfig`-only) so both
-            `InstanceDriver` bindings dispatch it. event+loft+human+queue+coordination+file(read/write/import) cores lifted to kernel::effect_handlers (9124f67,8bdfe2c,36422c7); DO dispatches ALL 8 store-only families incl. file (via FileStore seam, b106095). notify lifted via DeliveryGovernance projection (27b5637); capability lifted via CapabilityContract projection (d88630d) — ALL 10 store-only families execute on the DO. **coerce HTTP effect DONE + PROVEN (6c52884):** DoInstanceDriver dispatches `coerce` — build_coerce_call_parts+build_request→EffectStep::NeedsHttp→(fetch)→parse_response→settle_coerce_result, every piece host-neutral in the kernel (c543428/659c933); test drives a when-started→coerce→complete workflow to Terminal with a fake Anthropic fetch response. The DO SUSPENDS a real provider effect on fetch + RESUMES to terminal — DR-0033's crux, proven in-repo. coerce PROVEN (6c52884) + agent PROVEN (d89089a: snapshot/restore eviction-safe multi-round, DoInstanceDriver dispatch). THE DO EXECUTES ALL EFFECT FAMILIES. **agent turn model client DONE (commit 42194cf):** `MessagesApiClient`
+            `InstanceDriver` bindings dispatch it. event+human+queue+coordination+file(read/write/import) cores lifted to kernel::effect_handlers (9124f67,8bdfe2c,36422c7); DO dispatches ALL 8 store-only families incl. file (via FileStore seam, b106095). notify lifted via DeliveryGovernance projection (27b5637); capability lifted via CapabilityContract projection (d88630d) — ALL 10 store-only families execute on the DO. **coerce HTTP effect DONE + PROVEN (6c52884):** DoInstanceDriver dispatches `coerce` — build_coerce_call_parts+build_request→EffectStep::NeedsHttp→(fetch)→parse_response→settle_coerce_result, every piece host-neutral in the kernel (c543428/659c933); test drives a when-started→coerce→complete workflow to Terminal with a fake Anthropic fetch response. The DO SUSPENDS a real provider effect on fetch + RESUMES to terminal — DR-0033's crux, proven in-repo. coerce PROVEN (6c52884) + agent PROVEN (d89089a: snapshot/restore eviction-safe multi-round, DoInstanceDriver dispatch). THE DO EXECUTES ALL EFFECT FAMILIES. **agent turn model client DONE (commit 42194cf):** `MessagesApiClient`
             (transport-free `HttpModelClient`, reuses native build/parse) is wired
             through `create`'s `agent_config_json`; a no-tool agent turn suspends on
             the real `/v1/messages` request + resumes to terminal, live-validated

@@ -119,26 +119,9 @@ convenience command such as `claim --mark in_progress`, that combined operation
 must expose both authority requirements and partial-failure behavior in the
 effect contract.
 
-## Loft Comparison
+## Storage Authority
 
-Loft has the right shape for the builtin provider:
-
-```text
-authoritative immutable transactions
-disposable relational projection
-command-mediated mutation
-semantic conflicts
-local execution leases
-direct CLI and local API
-schema/capability discovery
-export/import and repair tools
-```
-
-`std.tracker` should adopt those product lessons without preserving Loft as a
-separate language concept. Loft-specific names become provider details or
-implementation inspiration, not compatibility obligations.
-
-The most important Loft distinction is storage authority:
+The builtin provider separates durable authority from disposable projection:
 
 ```text
 durable issue history: committed transaction/event records
@@ -183,8 +166,8 @@ conflicted / field_conflicts
 `id` is the canonical opaque issue identifier. The local provider may also
 maintain a human-speakable `alias` such as `WS-7` for CLI and prompt ergonomics,
 but aliases are not transaction identity and must not be used for causal
-parents, hashes, or import/export identity. This preserves Loft-style
-merge-friendly IDs without losing the ability to tell an agent "take WS-7".
+parents, hashes, or import/export identity. This preserves merge-friendly IDs
+without losing the ability to tell an agent "take WS-7".
 
 `metadata` is where provider-specific richness lives. Fields should become
 portable only when workflows need them frequently and external providers can map

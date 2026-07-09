@@ -130,7 +130,7 @@ If ordering matters, the source must express it:
 Lowering:
 
 ```text
-effect e1 = loft.claim(issue)
+effect e1 = tracker.claim(issue)
 effect e2 = agent.tell(worker, prompt)
 edge e1 --succeeds--> e2
 ```
@@ -213,7 +213,7 @@ type. Inside `after effect fails`, it has the failure output type. Inside
 
 The lifecycle predicates are generic. The payload shape is effect-specific.
 For example, `after claim succeeds` uses the generic success predicate, but the
-fields available on `claim` come from the `loft.claim` success contract.
+fields available on `claim` come from the `tracker.claim` success contract.
 
 ## Branching
 
@@ -223,7 +223,7 @@ Effect graphs may branch:
 coerce classifyWork(result.summary) as classification
 
 after classification succeeds {
-  loft.note "Classification: {{ classification.status }}"
+  tracker.note "Classification: {{ classification.status }}"
   tell reviewer "Review this result"
 }
 ```
@@ -280,9 +280,9 @@ agent.turn.completed
 agent.turn.failed
 agent.turn.timed_out
 agent.turn.cancelled
-loft.claim.succeeded
-loft.claim.failed
-loft.claim.timed_out
+tracker.claim.succeeded
+tracker.claim.failed
+tracker.claim.timed_out
 schema.coerce.succeeded
 schema.coerce.failed
 schema.coerce.timed_out
