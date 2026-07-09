@@ -1635,6 +1635,11 @@ impl NativeHttpDriver {
         Self {
             agent: ureq::AgentBuilder::new()
                 .timeout(timeout)
+                // A governed provider binding names the exact egress endpoint.
+                // Following a provider-controlled redirect would widen that
+                // capability (and could replay prompt content to another host),
+                // so redirects fail closed and must be resolved by the host.
+                .redirects(0)
                 .user_agent("whipplescript-host-runtime")
                 .build(),
         }
