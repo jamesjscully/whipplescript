@@ -124,6 +124,13 @@ impl<S: DoSql> crate::DoStorage for DoSqlStorage<S> {
             .map(|rows| !rows.is_empty())
             .unwrap_or(false)
     }
+
+    fn delete_file(&self, key: &str) -> std::io::Result<()> {
+        self.sql
+            .execute("DELETE FROM files WHERE key = ?1", &[text(key)])
+            .map_err(io_err)?;
+        Ok(())
+    }
 }
 
 /// `RuntimeStore` over a `DoSql` backend — the durable-object store impl.
@@ -8033,6 +8040,10 @@ mod tests {
         // A write REPLACES (does not append) — the live path->bytes semantics.
         files.write(path, b"fresh").expect("rewrite");
         assert_eq!(files.read_to_string(path).expect("read"), "fresh");
+        // P2: remove drops the file; removing an absent path is a no-op.
+        files.remove(path).expect("remove");
+        assert!(!files.exists(path), "removed file is gone");
+        files.remove(path).expect("remove absent is idempotent");
     }
 
     #[test]

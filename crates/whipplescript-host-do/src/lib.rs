@@ -74,6 +74,9 @@ pub trait DoStorage {
     fn write_file(&self, key: &str, content: &str) -> io::Result<()>;
     fn append_file(&self, key: &str, content: &str) -> io::Result<()>;
     fn file_exists(&self, key: &str) -> bool;
+    /// Remove the file at `key` (P2, for restore's reconcile). A no-op on an
+    /// absent key.
+    fn delete_file(&self, key: &str) -> io::Result<()>;
 }
 
 /// The file seam ([`FileStore`]) backed by DO storage: the DO binding's answer to
@@ -122,6 +125,10 @@ impl<S: DoStorage> FileStore for DoFileStore<S> {
     fn append(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         self.storage
             .append_file(&storage_key(path), &String::from_utf8_lossy(bytes))
+    }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        self.storage.delete_file(&storage_key(path))
     }
 }
 
@@ -251,6 +258,17 @@ impl<S: DoStorage, O: ObjectStore> FileStore for TieredFileStore<S, O> {
         self.storage
             .append_file(&storage_key(path), &String::from_utf8_lossy(bytes))
     }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        // Each file lives in exactly one tier, but a paranoid delete clears
+        // both so no stale copy survives in the other.
+        let key = storage_key(path);
+        self.storage.delete_file(&key)?;
+        if self.objects.exists(&key) {
+            self.objects.delete(&key)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -342,6 +360,10 @@ mod tests {
         }
         fn file_exists(&self, key: &str) -> bool {
             self.files.borrow().contains_key(key)
+        }
+        fn delete_file(&self, key: &str) -> io::Result<()> {
+            self.files.borrow_mut().remove(key);
+            Ok(())
         }
     }
 

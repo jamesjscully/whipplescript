@@ -32,6 +32,11 @@ pub trait FileStore {
 
     /// Append `bytes` to `path`, creating it if absent.
     fn append(&self, path: &Path, bytes: &[u8]) -> io::Result<()>;
+
+    /// Remove the file at `path`. Restorable-context restore (RC-5) uses this to
+    /// drop mediated files created after a cut so the file plane equals exactly
+    /// the cut manifest. Removing an absent path is a no-op (idempotent).
+    fn remove(&self, path: &Path) -> io::Result<()>;
 }
 
 /// Native backing: files live on the local filesystem (the workspace root is
@@ -63,17 +68,11 @@ impl FileStore for NativeFileStore {
             .open(path)?
             .write_all(bytes)
     }
-}
 
-impl NativeFileStore {
-    /// Remove the file at `path`. Restorable-context restore (RC-5) uses this to
-    /// drop mediated files created after a cut so the file plane equals exactly
-    /// the cut manifest. Inherent (not on the `FileStore` trait) because the DO
-    /// storage backends have no delete primitive yet and restore is native-only;
-    /// removing an absent path is a no-op (idempotent).
-    pub fn remove(&self, path: &Path) -> io::Result<()> {
+    fn remove(&self, path: &Path) -> io::Result<()> {
         match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
+            // Idempotent: an already-absent file is not an error.
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }

@@ -902,6 +902,9 @@ mod tests {
         fn append(&self, _path: &std::path::Path, _bytes: &[u8]) -> std::io::Result<()> {
             Err(std::io::Error::other("no files in this test"))
         }
+        fn remove(&self, _path: &std::path::Path) -> std::io::Result<()> {
+            Err(std::io::Error::other("no files in this test"))
+        }
     }
 
     // The DO drives an effect-free workflow's rule pass to its terminal through the
