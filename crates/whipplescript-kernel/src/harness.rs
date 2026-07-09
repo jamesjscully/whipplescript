@@ -865,7 +865,7 @@ mod tests {
             agent: "worker".to_owned(),
             profile: Some("repo-writer".to_owned()),
             input_json: r#"{"prompt":"go"}"#.to_owned(),
-            skill_names: vec!["loft-user".to_owned()],
+            skill_names: vec!["repo-user".to_owned()],
         });
 
         assert_eq!(result.status, ProviderRunStatus::Completed);

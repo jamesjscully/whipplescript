@@ -15822,10 +15822,6 @@ fn check_rejects_bad_effect_payload_arguments() {
         stderr.contains("field `coerce `reviewPayload`.score` expects `int`"),
         "stderr:\n{stderr}"
     );
-    assert!(
-        stderr.contains("field `loft claim.issue` receives incompatible expression type"),
-        "stderr:\n{stderr}"
-    );
 }
 
 #[test]

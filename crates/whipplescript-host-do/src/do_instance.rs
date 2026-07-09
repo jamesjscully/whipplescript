@@ -9,7 +9,7 @@
 //!
 //! What is wired: the rule pass (`advance_rules`), ready-effect discovery
 //! (`next_ready_effect`), and `run_effect` dispatch of the lifted store-only
-//! handler cores over the DO store — `event.emit`, `loft.claim`, `human.ask`, the
+//! handler cores over the DO store — `event.emit`, `human.ask`, the
 //! `queue.*` family (via `WorkItems`), the lease/ledger/counter coordination family
 //! (via `Coordination`), and the `file.*` family (via the `FileStore` seam). The
 //! HTTP effects (coerce/agent) will suspend with `EffectStep::NeedsHttp` and be
@@ -28,8 +28,8 @@ use whipplescript_kernel::effect_config::EffectConfig;
 use whipplescript_kernel::effect_handlers::{
     run_capability_effect_generic, run_coordination_effect_generic, run_event_effect_generic,
     run_file_effect_generic, run_file_import_effect_generic, run_file_write_effect_generic,
-    run_human_effect_generic, run_loft_effect_generic, run_notify_effect_generic,
-    run_queue_effect_generic, CapabilityContract, DeliveryGovernance, FixtureCapabilityProvider,
+    run_human_effect_generic, run_notify_effect_generic, run_queue_effect_generic,
+    CapabilityContract, DeliveryGovernance, FixtureCapabilityProvider,
 };
 use whipplescript_kernel::exec_http::{
     build_executor_exec_request, decode_cached_exec_result, exec_content_key, ingest_exec_stdout,
@@ -225,9 +225,6 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
         let event = match effect.kind.as_str() {
             "event.emit" => {
                 run_event_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
-            }
-            "loft.claim" => {
-                run_loft_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
             }
             "human.ask" => {
                 run_human_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?

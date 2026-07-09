@@ -52,9 +52,3 @@ error: field `coerce `reviewPayload`.score` expects `int`
 29 | => {
    |    ^
    = help: record a value compatible with `int`
-error: field `loft claim.issue` receives incompatible expression type
-   --> examples/invalid/bad-effect-payload.whip:45:4
-   |
-45 | => {
-   |    ^
-   = help: record a value compatible with `LoftIssue`

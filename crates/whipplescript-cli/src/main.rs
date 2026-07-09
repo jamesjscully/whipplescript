@@ -1249,13 +1249,6 @@ fn doctor_tool_checks() -> Vec<ToolCheck> {
             false,
             "needed for Pi RPC provider runs",
         ),
-        (
-            "loft",
-            "provider",
-            &["loft"][..],
-            false,
-            "needed for no-mock Loft claim/release/note/status effects",
-        ),
     ]
     .into_iter()
     .map(|(id, category, candidates, required, note)| {
@@ -18899,7 +18892,6 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
         let kernel = &mut self.kernel;
         let event = match effect.kind.as_str() {
             "event.emit" => run_event_effect_generic(kernel, id, effect, &config)?,
-            "loft.claim" => run_loft_effect_generic(kernel, id, effect, &config)?,
             "human.ask" => run_human_effect_generic(kernel, id, effect, &config)?,
             // Local mailbox is a native-only, file-based provider; the DO/sans-IO
             // InstanceStepMachine path stays on the fixture provider (out of scope).
@@ -19419,7 +19411,6 @@ fn run_claimable_effect(
     let result = match effect.kind.as_str() {
         "agent.tell" => run_agent_effect(store_path, instance_id, effect, options),
         "schema.coerce" => run_coerce_effect(store_path, instance_id, effect, options),
-        "loft.claim" => run_loft_effect(store_path, instance_id, effect, options),
         "human.ask" => run_human_effect(store_path, instance_id, effect, options),
         "capability.call" => {
             run_capability_effect(store_path, instance_id, effect, options, package_lock)
@@ -21799,16 +21790,6 @@ fn cancel_coerce_effect(
         ])),
     )?;
     Ok(terminal)
-}
-
-fn run_loft_effect(
-    store_path: &Path,
-    instance_id: &str,
-    effect: &ClaimableEffect,
-    options: &WorkerOptions,
-) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_loft_effect_generic(&mut kernel, instance_id, effect, &options.effect_config())
 }
 
 fn run_human_effect(
@@ -31390,15 +31371,13 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
             }
             let first = pattern.split_whitespace().next().unwrap_or_default();
             if !first.chars().next().is_some_and(char::is_uppercase) {
-                // Remaining lowercase patterns (loft, manual review) are fed
+                // Remaining lowercase patterns (manual review) are fed
                 // by external systems the lint cannot see.
                 continue;
             }
             let builtin = matches!(
                 first,
                 "AgentTurn"
-                    | "LoftIssue"
-                    | "LoftClaim"
                     | "WorkItem"
                     | "Evidence"
                     | "HumanAnswer"

@@ -15,7 +15,6 @@ pub mod harness;
 pub mod harness_loop;
 pub mod harness_model;
 pub mod instance_machine;
-pub mod loft;
 pub mod lowering;
 pub mod native_lifecycle;
 pub mod package_registry;
@@ -35,7 +34,6 @@ use coerce::{CoerceClient, CoerceRequest, CoerceResult, CoerceStatus};
 use harness::{
     AgentHarness, AgentTurnRequest, ProviderFailure, ProviderRunResult, ProviderRunStatus,
 };
-use loft::{LoftAction, LoftClient, LoftEffectRequest, LoftEffectResult, LoftEffectStatus};
 use native_lifecycle::{AgentTurnLifecycleKind, NativeAgentTurnObservation};
 use provider::{
     NativeProviderAdapter, NativeProviderArtifactRef, NativeProviderCancellation,
@@ -121,18 +119,6 @@ pub struct CoerceExecution<'a> {
     /// (DR-0014). `None` for the fixture path and any run without a resolved
     /// model — fingerprint stays model-insensitive, exactly as before.
     pub model: Option<&'a str>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LoftEffectExecution<'a> {
-    pub instance_id: &'a str,
-    pub effect_id: &'a str,
-    pub run_id: &'a str,
-    pub provider: &'a str,
-    pub worker_id: &'a str,
-    pub lease_id: &'a str,
-    pub lease_expires_at: &'a str,
-    pub request: &'a LoftEffectRequest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1894,74 +1880,6 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         Ok(event)
     }
 
-    pub fn run_loft_effect(
-        &mut self,
-        execution: LoftEffectExecution<'_>,
-        client: &dyn LoftClient,
-    ) -> StoreResult<StoredEvent> {
-        self.start_run(RunStart {
-            instance_id: execution.instance_id,
-            effect_id: execution.effect_id,
-            run_id: execution.run_id,
-            provider: execution.provider,
-            worker_id: execution.worker_id,
-            lease_id: execution.lease_id,
-            lease_expires_at: execution.lease_expires_at,
-            metadata_json: "{}",
-        })?;
-
-        let result = client.execute(execution.request);
-        let evidence = self.record_loft_result(execution, &result)?;
-        let metadata_json = loft_metadata(&result);
-        let safe_summary = redacted_provider_summary(&result.summary);
-        self.emit_provider_diagnostic(
-            execution.run_id,
-            execution.effect_id,
-            execution.provider,
-            loft_effect_status(&result.status),
-            &safe_summary,
-            &metadata_json,
-        );
-        let completion = EffectCompletion {
-            instance_id: execution.instance_id,
-            effect_id: execution.effect_id,
-            run_id: execution.run_id,
-            provider: execution.provider,
-            worker_id: execution.worker_id,
-            status: loft_status(&result.status),
-            exit_code: loft_exit_code(&result.status),
-            summary: Some(&safe_summary),
-            metadata_json: &metadata_json,
-            idempotency_key: Some(&idempotency_key(&[
-                execution.instance_id,
-                execution.run_id,
-                "loft-terminal",
-            ])),
-        };
-        let diagnostic_code = loft_fact_name(execution.request.action, &result.status);
-        let diagnostic = self.provider_terminal_diagnostic(
-            execution.instance_id,
-            execution.effect_id,
-            execution.run_id,
-            execution.provider,
-            loft_effect_status(&result.status),
-            &result.summary,
-            Some(&diagnostic_code),
-            &metadata_json,
-            &evidence,
-        );
-
-        let event = match result.status {
-            LoftEffectStatus::Succeeded => self.complete_run(completion)?,
-            LoftEffectStatus::Failed => self.fail_run_with_diagnostic(completion, diagnostic)?,
-            LoftEffectStatus::TimedOut => {
-                self.timeout_run_with_diagnostic(completion, diagnostic)?
-            }
-        };
-        self.append_loft_fact(execution, &result)?;
-        Ok(event)
-    }
-
     pub fn run_human_ask(&mut self, execution: HumanAskExecution<'_>) -> StoreResult<StoredEvent> {
         self.start_run(RunStart {
             instance_id: execution.instance_id,
@@ -2079,128 +1997,6 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 key: execution.inbox_item_id,
                 value_json: &value,
                 schema_id: Some("HumanAsk"),
-                provenance_class: "effect",
-                correlation_id: Some(execution.effect_id),
-                source_span_json: None,
-            },
-            source: "kernel",
-            causation_id: Some(execution.run_id),
-            idempotency_key: Some(&fact_key),
-        })?;
-        Ok(())
-    }
-
-    fn record_loft_result(
-        &self,
-        execution: LoftEffectExecution<'_>,
-        result: &LoftEffectResult,
-    ) -> StoreResult<ProviderEvidence> {
-        let metadata = json!({
-            "effect_id": execution.effect_id,
-            "action": execution.request.action.effect_kind(),
-            "issue_id": execution.request.issue_id,
-            "lease_id": execution.request.lease_id,
-            "claim_ready": execution.request.claim_ready,
-            "issue_version": execution.request.issue_version,
-            "actor": execution.request.actor,
-            "lease_duration_seconds": execution.request.lease_duration_seconds,
-            "command_id": execution.request.command_id,
-            "note": execution.request.note.as_deref().map(redacted_text_metadata),
-            "target_status": execution.request.target_status,
-            "evidence": execution.request.evidence_json.as_deref().map(json_payload_summary),
-            "evidence_kind": execution.request.evidence_kind,
-            "evidence_artifact": execution.request.evidence_artifact,
-            "evidence_data_path": execution.request.evidence_data_path,
-            "resource_intent": execution.request.resource_intent_json.as_deref().map(json_payload_summary),
-            "release_after_failure": execution.request.release_after_failure,
-            "expect_heads": execution.request.expect_heads,
-            "request_metadata": json_payload_summary(&execution.request.metadata_json),
-            "value": result.value_json.as_deref().map(json_payload_summary),
-            "error": result_error_payload(result.error_json.as_deref()),
-            "transcript": redacted_text_metadata(&result.transcript),
-        })
-        .to_string();
-        let evidence_id = self.store.record_evidence(EvidenceRecord {
-            instance_id: execution.instance_id,
-            kind: &format!("{}.provider", execution.request.action.effect_kind()),
-            subject_type: "run",
-            subject_id: execution.run_id,
-            causation_id: Some(execution.effect_id),
-            correlation_id: Some(&idempotency_key(&[
-                execution.instance_id,
-                execution.run_id,
-                "loft-provider",
-            ])),
-            summary: Some(&redacted_provider_summary(&result.summary)),
-            metadata_json: &metadata,
-        })?;
-        Ok(ProviderEvidence {
-            evidence_id: Some(evidence_id),
-            artifact_ids: Vec::new(),
-        })
-    }
-
-    fn append_loft_fact(
-        &mut self,
-        execution: LoftEffectExecution<'_>,
-        result: &LoftEffectResult,
-    ) -> StoreResult<()> {
-        let status = loft_status(&result.status);
-        let fact_name = loft_fact_name(execution.request.action, &result.status);
-        let succeeded = matches!(result.status, LoftEffectStatus::Succeeded);
-        let summary = redacted_provider_summary(&result.summary);
-        // DR-0032: failure `value` is the EffectError base; success keeps the op
-        // output.
-        let value_field = if succeeded {
-            result_value_payload(true, result.value_json.as_deref())
-        } else {
-            // DR-0032 + redaction (D4): loft is provider-backed, so the raw
-            // `error_json` is confidential. The base `reason` is the already-redacted
-            // summary, not the raw-error-derived text (which would leak into the fact).
-            Some(effect_failure_base(
-                execution.request.action.effect_kind(),
-                &summary,
-                &summary,
-                execution.effect_id,
-                execution.run_id,
-            ))
-        };
-        let value = json!({
-            "effect_id": execution.effect_id,
-            "run_id": execution.run_id,
-            "action": execution.request.action.effect_kind(),
-            "issue_id": execution.request.issue_id,
-            "lease_id": execution.request.lease_id,
-            "command_id": execution.request.command_id,
-            "status": status,
-            "value": value_field,
-            "error": result_error_payload(result.error_json.as_deref()),
-            "summary": summary,
-        })
-        .to_string();
-        self.store.append_event(NewEvent {
-            instance_id: execution.instance_id,
-            event_type: &fact_name,
-            payload_json: &value,
-            source: "kernel",
-            causation_id: Some(execution.run_id),
-            correlation_id: Some(execution.effect_id),
-            idempotency_key: Some(&idempotency_key(&[
-                execution.instance_id,
-                execution.run_id,
-                "loft-event",
-            ])),
-        })?;
-        let fact_id = idempotency_key(&[execution.instance_id, "loft", execution.run_id]);
-        let fact_key = idempotency_key(&[execution.instance_id, execution.run_id, "loft-fact"]);
-        self.store.derive_fact(DerivedFact {
-            instance_id: execution.instance_id,
-            fact: NewFact {
-                fact_id: &fact_id,
-                name: &fact_name,
-                key: execution.run_id,
-                value_json: &value,
-                schema_id: loft_schema(execution.request.action, &result.status),
                 provenance_class: "effect",
                 correlation_id: Some(execution.effect_id),
                 source_span_json: None,
@@ -4048,87 +3844,6 @@ fn coerce_metadata(result: &CoerceResult) -> String {
     .to_string()
 }
 
-fn loft_status(status: &LoftEffectStatus) -> &'static str {
-    match status {
-        LoftEffectStatus::Succeeded => "completed",
-        LoftEffectStatus::Failed => "failed",
-        LoftEffectStatus::TimedOut => "timed_out",
-    }
-}
-
-fn loft_effect_status(status: &LoftEffectStatus) -> EffectStatus {
-    match status {
-        LoftEffectStatus::Succeeded => EffectStatus::Completed,
-        LoftEffectStatus::Failed => EffectStatus::Failed,
-        LoftEffectStatus::TimedOut => EffectStatus::TimedOut,
-    }
-}
-
-fn loft_exit_code(status: &LoftEffectStatus) -> Option<i64> {
-    match status {
-        LoftEffectStatus::Succeeded => Some(0),
-        LoftEffectStatus::Failed => Some(1),
-        LoftEffectStatus::TimedOut => None,
-    }
-}
-
-fn loft_metadata(result: &LoftEffectResult) -> String {
-    json!({
-        "value": result.value_json.as_deref().map(json_payload_summary),
-        "error": result_error_payload(result.error_json.as_deref()),
-        "transcript": redacted_text_metadata(&result.transcript),
-    })
-    .to_string()
-}
-
-fn loft_fact_name(action: LoftAction, status: &LoftEffectStatus) -> String {
-    let suffix = match status {
-        LoftEffectStatus::Succeeded => "succeeded",
-        LoftEffectStatus::Failed => "failed",
-        LoftEffectStatus::TimedOut => "timed_out",
-    };
-    format!("{}.{}", action.effect_kind(), suffix)
-}
-
-fn loft_schema(action: LoftAction, status: &LoftEffectStatus) -> Option<&'static str> {
-    match (action, status) {
-        (LoftAction::Show, LoftEffectStatus::Succeeded) => Some("LoftShowSucceeded"),
-        (LoftAction::Show, LoftEffectStatus::Failed) => Some("LoftShowFailed"),
-        (LoftAction::Show, LoftEffectStatus::TimedOut) => Some("LoftShowTimedOut"),
-        (LoftAction::Claim, LoftEffectStatus::Succeeded) => Some("LoftClaimSucceeded"),
-        (LoftAction::Claim, LoftEffectStatus::Failed) => Some("LoftClaimFailed"),
-        (LoftAction::Claim, LoftEffectStatus::TimedOut) => Some("LoftClaimTimedOut"),
-        (LoftAction::Renew, LoftEffectStatus::Succeeded) => Some("LoftRenewSucceeded"),
-        (LoftAction::Renew, LoftEffectStatus::Failed) => Some("LoftRenewFailed"),
-        (LoftAction::Renew, LoftEffectStatus::TimedOut) => Some("LoftRenewTimedOut"),
-        (LoftAction::Release, LoftEffectStatus::Succeeded) => Some("LoftReleaseSucceeded"),
-        (LoftAction::Release, LoftEffectStatus::Failed) => Some("LoftReleaseFailed"),
-        (LoftAction::Release, LoftEffectStatus::TimedOut) => Some("LoftReleaseTimedOut"),
-        (LoftAction::Note, LoftEffectStatus::Succeeded) => Some("LoftNoteSucceeded"),
-        (LoftAction::Note, LoftEffectStatus::Failed) => Some("LoftNoteFailed"),
-        (LoftAction::Note, LoftEffectStatus::TimedOut) => Some("LoftNoteTimedOut"),
-        (LoftAction::Transition, LoftEffectStatus::Succeeded) => Some("LoftTransitionSucceeded"),
-        (LoftAction::Transition, LoftEffectStatus::Failed) => Some("LoftTransitionFailed"),
-        (LoftAction::Transition, LoftEffectStatus::TimedOut) => Some("LoftTransitionTimedOut"),
-        (LoftAction::Evidence, LoftEffectStatus::Succeeded) => Some("LoftEvidenceSucceeded"),
-        (LoftAction::Evidence, LoftEffectStatus::Failed) => Some("LoftEvidenceFailed"),
-        (LoftAction::Evidence, LoftEffectStatus::TimedOut) => Some("LoftEvidenceTimedOut"),
-        (LoftAction::ResourceIntent, LoftEffectStatus::Succeeded) => {
-            Some("LoftResourceIntentSucceeded")
-        }
-        (LoftAction::ResourceIntent, LoftEffectStatus::Failed) => Some("LoftResourceIntentFailed"),
-        (LoftAction::ResourceIntent, LoftEffectStatus::TimedOut) => {
-            Some("LoftResourceIntentTimedOut")
-        }
-        (LoftAction::Complete, LoftEffectStatus::Succeeded) => Some("LoftCompleteSucceeded"),
-        (LoftAction::Complete, LoftEffectStatus::Failed) => Some("LoftCompleteFailed"),
-        (LoftAction::Complete, LoftEffectStatus::TimedOut) => Some("LoftCompleteTimedOut"),
-        (LoftAction::Fail, LoftEffectStatus::Succeeded) => Some("LoftFailSucceeded"),
-        (LoftAction::Fail, LoftEffectStatus::Failed) => Some("LoftFailFailed"),
-        (LoftAction::Fail, LoftEffectStatus::TimedOut) => Some("LoftFailTimedOut"),
-    }
-}
-
 fn json_from_str(source: &str) -> Value {
     serde_json::from_str(source).unwrap_or_else(|_| Value::String(source.to_owned()))
 }
@@ -4159,7 +3874,6 @@ mod tests {
         ClaudeCodeAgentHarness, CodexAgentHarness, CommandLaunchPlan, MockAgentHarness,
         PiStyleAgentHarness,
     };
-    use loft::{FakeLoftClient, LoftAction, LoftEffectRequest};
     use native_lifecycle::{normalize_pi_rpc_event, AgentTurnLifecycleKind};
     use provider::{
         builtin_provider_capabilities, AdapterSurface, CancellationDepth,
@@ -5468,14 +5182,14 @@ rule wait
         let store = SqliteStore::open_in_memory().expect("store opens");
         store
             .register_skill(SkillRegistration {
-                skill_id: "skill-loft-user",
-                name: "loft-user",
+                skill_id: "skill-repo-user",
+                name: "repo-user",
                 version: "1.0.0",
-                source: "# Loft User\n",
-                source_path: "skills/loft-user/SKILL.md",
-                body: "# Loft User\nUse Loft carefully.\n",
-                description: "Loft instructions",
-                required_capabilities_json: r#"["loft.claim"]"#,
+                source: "# Repo User\n",
+                source_path: "skills/repo-user/SKILL.md",
+                body: "# Repo User\nUse the repo carefully.\n",
+                description: "Repo instructions",
+                required_capabilities_json: r#"["repo.write"]"#,
                 metadata_json: "{}",
             })
             .expect("skill registers");
@@ -5540,7 +5254,7 @@ rule wait
                     agent: "worker",
                     profile: Some("repo-writer"),
                     input_json: r#"{"prompt":"go"}"#,
-                    skill_names: &["loft-user"],
+                    skill_names: &["repo-user"],
                 },
                 &MockAgentHarness::completed("done"),
                 &run_metadata_json,
@@ -5565,7 +5279,7 @@ rule wait
         assert!(evidence
             .iter()
             .any(|evidence| evidence.kind == "skills.injected"
-                && evidence.metadata_json.contains("loft-user")));
+                && evidence.metadata_json.contains("repo-user")));
         let provider_evidence = evidence
             .iter()
             .find(|evidence| evidence.kind == "agent.turn.provider")
@@ -7820,316 +7534,6 @@ rule wait
             .expect("failed coerce fact");
         assert!(failed_fact.value_json.contains("\"redacted\":true"));
         assert!(!failed_fact.value_json.contains("invalid output"));
-    }
-
-    #[test]
-    fn fake_loft_claim_records_evidence_and_success_fact() {
-        let store = SqliteStore::open_in_memory().expect("store opens");
-        let mut kernel = RuntimeKernel::new(store);
-        let version = kernel
-            .create_program_version(ProgramVersionInput {
-                program_name: "LoftClaim",
-                source_hash: "source",
-                ir_hash: "ir",
-                compiler_version: "test",
-            })
-            .expect("program version creates");
-        let instance_id = kernel
-            .create_instance(&version, "{}")
-            .expect("instance creates");
-        let effects = [NewEffect {
-            timeout_seconds: None,
-            effect_id: "claim",
-            kind: "loft.claim",
-            target: None,
-            input_json: r#"{"issue_id":"iss_abc"}"#,
-            status: "queued",
-            idempotency_key: "rule=start;effect=claim",
-            required_capabilities_json: r#"["loft.claim"]"#,
-            profile: Some("repo-writer"),
-            correlation_id: None,
-            source_span_json: None,
-        }];
-        kernel
-            .commit_rule(RuleCommit {
-                instance_id: &instance_id,
-                rule: "start",
-                trigger_event_id: None,
-                facts: &[],
-                consumed_fact_ids: &[],
-                effects: &effects,
-                dependencies: &[],
-                terminal: None,
-                idempotency_key: Some("commit-start"),
-            })
-            .expect("rule commits");
-
-        let request = LoftEffectRequest {
-            action: LoftAction::Claim,
-            issue_id: "iss_abc".to_owned(),
-            lease_id: None,
-            claim_ready: false,
-            issue_version: None,
-            actor: Some("agent-a".to_owned()),
-            lease_duration_seconds: Some(1800),
-            command_id: "cmd-claim".to_owned(),
-            note: None,
-            target_status: None,
-            evidence_json: None,
-            evidence_kind: None,
-            evidence_artifact: None,
-            evidence_data_path: None,
-            resource_intent_json: None,
-            release_after_failure: false,
-            expect_heads: vec!["evt_head".to_owned()],
-            metadata_json: "{}".to_owned(),
-        };
-        let terminal = kernel
-            .run_loft_effect(
-                LoftEffectExecution {
-                    instance_id: &instance_id,
-                    effect_id: "claim",
-                    run_id: "run-claim",
-                    provider: "fake-loft",
-                    worker_id: "worker-1",
-                    lease_id: "lease-whipplescript-claim",
-                    lease_expires_at: "2030-01-01T00:00:00Z",
-                    request: &request,
-                },
-                &FakeLoftClient::succeeds(
-                    r#"{"lease_id":"lea_abc","issue":{"id":"iss_abc","state_token":"b3:ok"},"expires_at":"2030-01-01T00:00:00Z"}"#,
-                ),
-            )
-            .expect("loft claim runs");
-
-        assert_eq!(terminal.sequence, 3);
-        check_trace(kernel.trace()).expect("kernel trace conforms");
-        let store = kernel.into_store();
-        let evidence = store.list_evidence(&instance_id).expect("evidence lists");
-        assert_eq!(evidence.len(), 2);
-        assert!(evidence
-            .iter()
-            .any(|evidence| evidence.kind == "loft.claim.provider"
-                && evidence.metadata_json.contains("cmd-claim")
-                && evidence.metadata_json.contains("evt_head")));
-        let facts = store.list_facts(&instance_id).expect("facts list");
-        assert!(
-            facts
-                .iter()
-                .any(|fact| fact.name == "loft.claim.succeeded"
-                    && fact.value_json.contains("lea_abc"))
-        );
-    }
-
-    #[test]
-    fn fake_loft_claim_failure_records_failed_fact() {
-        let store = SqliteStore::open_in_memory().expect("store opens");
-        let mut kernel = RuntimeKernel::new(store);
-        let version = kernel
-            .create_program_version(ProgramVersionInput {
-                program_name: "LoftClaimFail",
-                source_hash: "source",
-                ir_hash: "ir",
-                compiler_version: "test",
-            })
-            .expect("program version creates");
-        let instance_id = kernel
-            .create_instance(&version, "{}")
-            .expect("instance creates");
-        let effects = [NewEffect {
-            timeout_seconds: None,
-            effect_id: "claim",
-            kind: "loft.claim",
-            target: None,
-            input_json: r#"{"issue_id":"iss_abc"}"#,
-            status: "queued",
-            idempotency_key: "rule=start;effect=claim",
-            required_capabilities_json: r#"["loft.claim"]"#,
-            profile: Some("repo-writer"),
-            correlation_id: None,
-            source_span_json: None,
-        }];
-        kernel
-            .commit_rule(RuleCommit {
-                instance_id: &instance_id,
-                rule: "start",
-                trigger_event_id: None,
-                facts: &[],
-                consumed_fact_ids: &[],
-                effects: &effects,
-                dependencies: &[],
-                terminal: None,
-                idempotency_key: Some("commit-start"),
-            })
-            .expect("rule commits");
-
-        let request = LoftEffectRequest {
-            action: LoftAction::Claim,
-            issue_id: "iss_abc".to_owned(),
-            lease_id: None,
-            claim_ready: false,
-            issue_version: None,
-            actor: Some("agent-a".to_owned()),
-            lease_duration_seconds: None,
-            command_id: "cmd-claim".to_owned(),
-            note: None,
-            target_status: None,
-            evidence_json: None,
-            evidence_kind: None,
-            evidence_artifact: None,
-            evidence_data_path: None,
-            resource_intent_json: None,
-            release_after_failure: false,
-            expect_heads: Vec::new(),
-            metadata_json: "{}".to_owned(),
-        };
-        kernel
-            .run_loft_effect(
-                LoftEffectExecution {
-                    instance_id: &instance_id,
-                    effect_id: "claim",
-                    run_id: "run-claim",
-                    provider: "fake-loft",
-                    worker_id: "worker-1",
-                    lease_id: "lease-whipplescript-claim",
-                    lease_expires_at: "2030-01-01T00:00:00Z",
-                    request: &request,
-                },
-                &FakeLoftClient::fails("issue already leased"),
-            )
-            .expect("failed claim records terminal event");
-
-        assert!(kernel.trace().iter().any(|record| matches!(
-            &record.event,
-            TraceEvent::ProviderDiagnostic {
-                run_id,
-                effect_id,
-                provider,
-                status,
-                diagnostics_json,
-                ..
-            } if run_id == "run-claim"
-                && effect_id == "claim"
-                && provider == "fake-loft"
-                && *status == EffectStatus::Failed
-                && diagnostics_json.contains("\"redacted\":true")
-                && !diagnostics_json.contains("issue already leased")
-        )));
-        check_trace(kernel.trace()).expect("kernel trace conforms");
-        let store = kernel.into_store();
-        let diagnostics = store
-            .list_diagnostics(Some(&instance_id))
-            .expect("diagnostics list");
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code.as_deref(), Some("loft.claim.failed"));
-        assert_eq!(diagnostics[0].subject_id.as_deref(), Some("claim"));
-        assert_eq!(diagnostics[0].run_id.as_deref(), Some("run-claim"));
-        assert!(!diagnostics[0].message.contains("issue already leased"));
-
-        let facts = store.list_facts(&instance_id).expect("facts list");
-        let failed_fact = facts
-            .iter()
-            .find(|fact| fact.name == "loft.claim.failed")
-            .expect("failed loft fact");
-        assert!(failed_fact.value_json.contains("\"redacted\":true"));
-        assert!(!failed_fact.value_json.contains("issue already leased"));
-    }
-
-    #[test]
-    fn fake_loft_renew_records_evidence_and_success_fact() {
-        let store = SqliteStore::open_in_memory().expect("store opens");
-        let mut kernel = RuntimeKernel::new(store);
-        let version = kernel
-            .create_program_version(ProgramVersionInput {
-                program_name: "LoftRenew",
-                source_hash: "source",
-                ir_hash: "ir",
-                compiler_version: "test",
-            })
-            .expect("program version creates");
-        let instance_id = kernel
-            .create_instance(&version, "{}")
-            .expect("instance creates");
-        let effects = [NewEffect {
-            timeout_seconds: None,
-            effect_id: "renew",
-            kind: "loft.renew",
-            target: None,
-            input_json: r#"{"lease_id":"lea_abc"}"#,
-            status: "queued",
-            idempotency_key: "rule=maintain;effect=renew",
-            required_capabilities_json: r#"["loft.renew"]"#,
-            profile: Some("repo-writer"),
-            correlation_id: None,
-            source_span_json: None,
-        }];
-        kernel
-            .commit_rule(RuleCommit {
-                instance_id: &instance_id,
-                rule: "maintain",
-                trigger_event_id: None,
-                facts: &[],
-                consumed_fact_ids: &[],
-                effects: &effects,
-                dependencies: &[],
-                terminal: None,
-                idempotency_key: Some("commit-maintain"),
-            })
-            .expect("rule commits");
-
-        let request = LoftEffectRequest {
-            action: LoftAction::Renew,
-            issue_id: "iss_abc".to_owned(),
-            lease_id: Some("lea_abc".to_owned()),
-            claim_ready: false,
-            issue_version: None,
-            actor: None,
-            lease_duration_seconds: Some(1800),
-            command_id: "cmd-renew".to_owned(),
-            note: None,
-            target_status: None,
-            evidence_json: None,
-            evidence_kind: None,
-            evidence_artifact: None,
-            evidence_data_path: None,
-            resource_intent_json: None,
-            release_after_failure: false,
-            expect_heads: Vec::new(),
-            metadata_json: "{}".to_owned(),
-        };
-        let terminal = kernel
-            .run_loft_effect(
-                LoftEffectExecution {
-                    instance_id: &instance_id,
-                    effect_id: "renew",
-                    run_id: "run-renew",
-                    provider: "fake-loft",
-                    worker_id: "worker-1",
-                    lease_id: "lease-whipplescript-renew",
-                    lease_expires_at: "2030-01-01T00:00:00Z",
-                    request: &request,
-                },
-                &FakeLoftClient::succeeds(
-                    r#"{"lease_id":"lea_abc","expires_at":"2030-01-01T00:30:00Z"}"#,
-                ),
-            )
-            .expect("loft renew runs");
-
-        assert_eq!(terminal.sequence, 3);
-        check_trace(kernel.trace()).expect("kernel trace conforms");
-        let store = kernel.into_store();
-        let evidence = store.list_evidence(&instance_id).expect("evidence lists");
-        assert!(evidence
-            .iter()
-            .any(|evidence| evidence.kind == "loft.renew.provider"
-                && evidence.metadata_json.contains("cmd-renew")));
-        let facts = store.list_facts(&instance_id).expect("facts list");
-        assert!(
-            facts
-                .iter()
-                .any(|fact| fact.name == "loft.renew.succeeded"
-                    && fact.value_json.contains("lea_abc"))
-        );
     }
 
     #[test]

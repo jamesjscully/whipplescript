@@ -10219,7 +10219,7 @@ mod tests {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let facts = [test_fact("fact-ready", "issue", "issue-1")];
         let effects = [
-            test_effect("claim", "loft.claim", "rule=start;effect=claim"),
+            test_effect("claim", "tracker.claim", "rule=start;effect=claim"),
             test_effect("tell", "agent.tell", "rule=start;effect=tell"),
         ];
         let dependencies = [NewEffectDependency {
@@ -10313,7 +10313,7 @@ mod tests {
     fn failed_rule_commit_rolls_back_partial_writes() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let effects = [
-            test_effect("same-effect", "loft.claim", "rule=bad;effect=one"),
+            test_effect("same-effect", "tracker.claim", "rule=bad;effect=one"),
             test_effect("same-effect", "agent.tell", "rule=bad;effect=two"),
         ];
         let result = store.commit_rule(RuleCommit {
@@ -10460,7 +10460,7 @@ mod tests {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let facts = [test_fact("fact-ready", "issue", "issue-1")];
         let effects = [
-            test_effect("claim", "loft.claim", "rule=start;effect=claim"),
+            test_effect("claim", "tracker.claim", "rule=start;effect=claim"),
             test_effect("tell", "agent.tell", "rule=start;effect=tell"),
         ];
         let dependencies = [NewEffectDependency {
@@ -10878,7 +10878,7 @@ mod tests {
     fn scheduler_claims_only_dependency_satisfied_effects() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let effects = [
-            test_effect("claim", "loft.claim", "rule=start;effect=claim"),
+            test_effect("claim", "tracker.claim", "rule=start;effect=claim"),
             NewEffect {
                 timeout_seconds: None,
                 effect_id: "tell",
@@ -11030,7 +11030,7 @@ mod tests {
     fn start_run_rejects_blocked_dependency_without_partial_event() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let effects = [
-            test_effect("claim", "loft.claim", "rule=start;effect=claim"),
+            test_effect("claim", "tracker.claim", "rule=start;effect=claim"),
             NewEffect {
                 timeout_seconds: None,
                 effect_id: "tell",
@@ -14742,54 +14742,54 @@ mod tests {
             .expect("instance creates");
         store
             .register_skill(SkillRegistration {
-                skill_id: "skill-loft-user",
-                name: "loft-user",
+                skill_id: "skill-repo-user",
+                name: "repo-user",
                 version: "1.0.0",
-                source: "# Loft User\nUse Loft carefully.\n",
-                source_path: "skills/loft-user/SKILL.md",
-                body: "# Loft User\nUse Loft carefully.\n",
-                description: "Loft workflow instructions",
-                required_capabilities_json: r#"["loft.claim"]"#,
+                source: "# Repo User\nUse Repo carefully.\n",
+                source_path: "skills/repo-user/SKILL.md",
+                body: "# Repo User\nUse Repo carefully.\n",
+                description: "Repo workflow instructions",
+                required_capabilities_json: r#"["tracker.claim"]"#,
                 metadata_json: r#"{"package":"core"}"#,
             })
             .expect("skill registers");
         store
             .attach_skill(SkillAttachment {
-                attachment_id: "attach-program-loft",
+                attachment_id: "attach-program-repo",
                 scope_type: "program",
                 scope_id: &version.program_id,
-                skill_name: "loft-user",
+                skill_name: "repo-user",
             })
             .expect("program skill attaches");
         store
             .attach_skill(SkillAttachment {
-                attachment_id: "attach-agent-loft",
+                attachment_id: "attach-agent-repo",
                 scope_type: "agent",
                 scope_id: "Ralph/worker",
-                skill_name: "loft-user",
+                skill_name: "repo-user",
             })
             .expect("agent skill attaches");
         store
             .attach_skill(SkillAttachment {
-                attachment_id: "attach-run-loft",
+                attachment_id: "attach-run-repo",
                 scope_type: "run",
                 scope_id: "run-tell",
-                skill_name: "loft-user",
+                skill_name: "repo-user",
             })
             .expect("run skill attaches");
 
         let skills = store.list_skills().expect("skills list");
         assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "loft-user");
+        assert_eq!(skills[0].name, "repo-user");
         assert_eq!(skills[0].version, "1.0.0");
-        assert_eq!(skills[0].source_path, "skills/loft-user/SKILL.md");
+        assert_eq!(skills[0].source_path, "skills/repo-user/SKILL.md");
         assert!(skills[0].content_hash.len() >= 16);
 
         let program_attachments = store
             .list_skill_attachments("program", &version.program_id)
             .expect("program attachments load");
         assert_eq!(program_attachments.len(), 1);
-        assert_eq!(program_attachments[0].skill.name, "loft-user");
+        assert_eq!(program_attachments[0].skill.name, "repo-user");
         let agent_attachments = store
             .list_skill_attachments("agent", "Ralph/worker")
             .expect("agent attachments load");
@@ -14804,7 +14804,7 @@ mod tests {
                 instance_id: &instance.instance_id,
                 run_id: "run-tell",
                 effect_id: "tell",
-                skill_names: &["loft-user"],
+                skill_names: &["repo-user"],
                 idempotency_key: Some("skills-run-tell"),
             })
             .expect("skill evidence records");
@@ -14816,13 +14816,13 @@ mod tests {
         assert_eq!(evidence[0].kind, "skills.injected");
         assert!(evidence[0]
             .metadata_json
-            .contains("skills/loft-user/SKILL.md"));
+            .contains("skills/repo-user/SKILL.md"));
         assert!(evidence[0].metadata_json.contains("content_hash"));
         assert!(evidence[0]
             .summary
             .as_deref()
             .expect("summary")
-            .contains("loft-user@1.0.0"));
+            .contains("repo-user@1.0.0"));
     }
 
     #[test]

@@ -2073,7 +2073,6 @@ impl ParsedEffect {
     pub fn required_capabilities_json(&self) -> String {
         let mut capabilities = match self.kind.as_str() {
             "schema.coerce" => vec!["schema.coerce".to_owned()],
-            "loft.claim" => vec!["loft.claim".to_owned()],
             "human.ask" => vec!["human.ask".to_owned()],
             "capability.call" => Vec::new(),
             "event.emit" => vec!["event.emit".to_owned()],
@@ -2937,19 +2936,6 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 after: current_after,
             });
             index = next_index;
-        } else if trimmed.starts_with("claim ") && trimmed.contains(" with loft") {
-            effects.push(ParsedEffect {
-                timeout_seconds: parse_timeout_clause_seconds(trimmed),
-                kind: "loft.claim".to_owned(),
-                target: Some("loft".to_owned()),
-                name: Some("claim".to_owned()),
-                binding: binding_after_as(trimmed),
-                args: Vec::new(),
-                prompt: None,
-                prompt_content_type: None,
-                required_capabilities: Vec::new(),
-                after: current_after,
-            });
         } else if trimmed.starts_with("askHuman ") {
             let (prompt, next_index) = parse_prompt_from_lines(&lines, index, trimmed);
             // Typed choices declared in source drive the inbox options.
@@ -3509,11 +3495,6 @@ pub fn parsed_effect_input_json(
             }
             input
         }
-        "loft.claim" => json!({
-            "action": "claim",
-            "issue": context_bindings_json(context),
-            "rule": rule.name,
-        }),
         "human.ask" => {
             let choices = if effect.args.is_empty() {
                 json!(["accept", "revise", "block"])

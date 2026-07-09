@@ -1454,7 +1454,6 @@ pub struct IrConstructUse {
 pub enum IrEffectKind {
     AgentTell,
     SchemaCoerce,
-    LoftClaim,
     HumanAsk,
     CapabilityCall,
     EventEmit,
@@ -3479,16 +3478,6 @@ fn effect_contract_for_kind(
             strings(&["effect.output"]),
             TypedOutputValidation::RuntimeBoundary,
         ),
-        IrEffectKind::LoftClaim => (
-            "std.tracker",
-            strings(&["claim with"]),
-            Some("tracker.claim.input"),
-            Some("LoftClaim"),
-            Vec::new(),
-            strings(&["tracker"]),
-            strings(&["effect.output"]),
-            TypedOutputValidation::RuntimeBoundary,
-        ),
         IrEffectKind::HumanAsk => (
             "std.human",
             strings(&["askHuman"]),
@@ -3705,7 +3694,6 @@ impl IrEffectKind {
         match self {
             Self::AgentTell => "agent.tell",
             Self::SchemaCoerce => "schema.coerce",
-            Self::LoftClaim => "loft.claim",
             Self::HumanAsk => "human.ask",
             Self::CapabilityCall => "capability.call",
             Self::EventEmit => "event.emit",
@@ -6091,15 +6079,6 @@ fn array_ty(inner: TypeSyntax) -> TypeSyntax {
     }
 }
 
-fn ref_ty(name: &str) -> TypeSyntax {
-    TypeSyntax::Ref {
-        name: Ident {
-            name: name.to_owned(),
-            span: zero_span(),
-        },
-    }
-}
-
 fn schema_name_for_path(ty: &TypeSyntax) -> Option<String> {
     match ty {
         TypeSyntax::Ref { name } => Some(name.name.clone()),
@@ -6154,7 +6133,7 @@ fn lower_tracker(tracker: TrackerDecl, ir: &mut IrProgram, diagnostics: &mut Vec
                 tracker.name.name, tracker.provider.name
             ),
             suggestion: Some(
-                "`builtin` is the available provider; loft/github/linear/jira are deferred bindings"
+                "`builtin` is the available provider; github/linear/jira are deferred bindings"
                     .to_owned(),
             ),
         });
@@ -9138,7 +9117,6 @@ fn terminal_completed_payload_type(
             .cloned()
             .map(lower_type)
             .unwrap_or_else(terminal_unknown_payload_type),
-        IrEffectKind::LoftClaim => IrType::Ref("LoftClaim".to_owned()),
         IrEffectKind::HumanAsk => IrType::Ref("HumanAnswer".to_owned()),
         IrEffectKind::AgentTell => IrType::Ref("AgentTurn".to_owned()),
         IrEffectKind::CapabilityCall
@@ -10200,10 +10178,6 @@ fn validate_effect_payloads(
                 known_roots,
                 diagnostics,
             );
-        } else if trimmed.starts_with("claim ") && trimmed.contains(" with ") {
-            // Legacy loft form only; plain `claim <item>` is a queue verb
-            // validated by the body AST.
-            validate_loft_claim_payload(rule, trimmed, semantic, binding_types, diagnostics);
         }
     }
 }
@@ -10331,34 +10305,6 @@ fn validate_workflow_invocations(
             });
         }
     }
-}
-
-fn validate_loft_claim_payload(
-    rule: &RuleDecl,
-    line: &str,
-    semantic: &SemanticContext,
-    binding_types: &BTreeMap<String, String>,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let Some(issue_expr) = parse_loft_claim_issue_expr(line) else {
-        diagnostics.push(Diagnostic {
-            related: Vec::new(),
-            span: rule.body.span,
-            message: format!("rule `{}` has malformed loft claim", rule.name.name),
-            suggestion: Some("write `claim issueBinding with loft as claim`".to_owned()),
-        });
-        return;
-    };
-    validate_expr_source_against_type(
-        rule,
-        "loft claim",
-        "issue",
-        &ref_ty("LoftIssue"),
-        issue_expr,
-        semantic,
-        &ExprScope::from_bindings(binding_types),
-        diagnostics,
-    );
 }
 
 fn validate_agent_tell_target(
@@ -12716,7 +12662,6 @@ fn effect_binding_schema(
     semantic: &SemanticContext,
 ) -> Option<String> {
     match kind {
-        IrEffectKind::LoftClaim => Some("LoftClaim".to_owned()),
         IrEffectKind::HumanAsk => Some("HumanAnswer".to_owned()),
         IrEffectKind::SchemaCoerce => parse_coerce_call_name(line).and_then(|name| {
             semantic
@@ -12789,13 +12734,6 @@ fn split_expression_args(args: &str) -> Vec<&str> {
         values.push(value);
     }
     values
-}
-
-fn parse_loft_claim_issue_expr(line: &str) -> Option<&str> {
-    let rest = line.strip_prefix("claim ")?;
-    let (issue_expr, _) = rest.split_once(" with loft")?;
-    let issue_expr = issue_expr.trim();
-    (!issue_expr.is_empty()).then_some(issue_expr)
 }
 
 fn effect_payload_statements(body: &str) -> Vec<String> {
@@ -16374,7 +16312,7 @@ fn parse_effect_line(line: &str) -> Option<(IrEffectKind, Option<String>)> {
     } else if line.starts_with("coerce ") || line.starts_with("prompt ") {
         IrEffectKind::SchemaCoerce
     } else if line.starts_with("claim ") {
-        IrEffectKind::LoftClaim
+        IrEffectKind::TrackerClaim
     } else if line.starts_with("askHuman") {
         IrEffectKind::HumanAsk
     } else if line.starts_with("call ")
@@ -22014,7 +21952,7 @@ agent worker {
   provider fixture
   profile "repo-writer"
   capacity 1
-  skills ["loft-user"]
+  skills ["repo-user"]
 }
 
 rule start_ready_item
@@ -22417,7 +22355,7 @@ class Task {
             "`use plugin` is no longer supported"
         );
 
-        let removed_skill = parse_program("workflow Imports\n\nuse skill \"loft-user\"\n");
+        let removed_skill = parse_program("workflow Imports\n\nuse skill \"repo-user\"\n");
         assert_eq!(removed_skill.diagnostics.len(), 1);
         assert_eq!(
             removed_skill.diagnostics[0].message,
@@ -24437,7 +24375,7 @@ agent worker {
   provider fixture
   profile "repo-writer"
   capacity 2
-  skills ["loft-user"]
+  skills ["repo-user"]
 }
 
 rule start
@@ -24477,7 +24415,7 @@ schemas
     title string
     files array<string>
 agents
-  agent worker harness=<fallback> provider=fixture profile=repo-writer capacity=2 skills=[loft-user] capabilities=[] tools=[]
+  agent worker harness=<fallback> provider=fixture profile=repo-writer capacity=2 skills=[repo-user] capabilities=[] tools=[]
 rules
   rule start
     when Work as work
@@ -29015,12 +28953,6 @@ rule bad_coerce
     "high"
   ) as review
 }
-
-rule bad_claim
-  when Task as task
-=> {
-  claim task.title with loft as claim
-}
 "#;
         let compiled = compile_program(source);
 
@@ -29049,9 +28981,6 @@ rule bad_claim
         assert!(messages.iter().any(|message| {
             message.contains("field `coerce `reviewPayload`.score` expects `int`")
         }));
-        assert!(messages
-            .iter()
-            .any(|message| message.contains("field `loft claim.issue` receives incompatible")));
     }
 
     #[test]
