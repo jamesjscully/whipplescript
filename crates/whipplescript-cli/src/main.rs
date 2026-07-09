@@ -37771,8 +37771,7 @@ coerce review() -> Review {
           "provides": [
             {"kind": "EffectHandle"}
           ],
-          "lowering_target": "capability_call",
-          "target_capability": "tracker.claim"
+          "lowering_target": "typed_effect_call"
         }
       ]
     }
@@ -37789,7 +37788,7 @@ coerce review() -> Review {
         assert!(manifest.registry.constructs.iter().any(|form| {
             form.library_id == "std.tracker"
                 && form.keyword == "claim"
-                && form.lowering_target == "capability_call"
+                && form.lowering_target == "typed_effect_call"
         }));
     }
 

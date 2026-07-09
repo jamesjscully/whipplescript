@@ -733,21 +733,21 @@ pub const PLATFORM_CONSTRUCT_CATALOG: PlatformConstructCatalog = PlatformConstru
             library_id: "std.tracker",
             construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION,
             scope: CONSTRUCT_SCOPE_RULE_BODY,
-            lowering_target: CONSTRUCT_LOWERING_CAPABILITY_CALL,
+            lowering_target: CONSTRUCT_LOWERING_TYPED_EFFECT_CALL,
         },
         PlatformReservedKeywordPrivilege {
             keyword: "renew",
             library_id: "std.tracker",
             construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION,
             scope: CONSTRUCT_SCOPE_RULE_BODY,
-            lowering_target: CONSTRUCT_LOWERING_CAPABILITY_CALL,
+            lowering_target: CONSTRUCT_LOWERING_TYPED_EFFECT_CALL,
         },
         PlatformReservedKeywordPrivilege {
             keyword: "release",
             library_id: "std.tracker",
             construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION,
             scope: CONSTRUCT_SCOPE_RULE_BODY,
-            lowering_target: CONSTRUCT_LOWERING_CAPABILITY_CALL,
+            lowering_target: CONSTRUCT_LOWERING_TYPED_EFFECT_CALL,
         },
         // The migrating declaration-family keywords (DR-0011 decl-migration):
         // each is a platform-reserved word whose top-level `declaration_block`
@@ -1580,6 +1580,18 @@ mod tests {
 
         assert!(PLATFORM_CONSTRUCT_CATALOG.contains_reserved_keyword("claim"));
         assert!(PLATFORM_CONSTRUCT_CATALOG.contains_reserved_keyword("lease"));
+        // Tracker verbs are typed dedicated effect kinds, so their reserved-keyword
+        // privilege authorizes `typed_effect_call` (not `capability_call`, which is
+        // for plain request/response). The old `capability_call` privilege is gone.
+        assert!(PLATFORM_CONSTRUCT_CATALOG
+            .reserved_keyword_privilege(
+                "std.tracker",
+                "claim",
+                CONSTRUCT_FAMILY_EFFECT_OPERATION,
+                CONSTRUCT_SCOPE_RULE_BODY,
+                CONSTRUCT_LOWERING_TYPED_EFFECT_CALL,
+            )
+            .is_some());
         assert!(PLATFORM_CONSTRUCT_CATALOG
             .reserved_keyword_privilege(
                 "std.tracker",
@@ -1588,14 +1600,14 @@ mod tests {
                 CONSTRUCT_SCOPE_RULE_BODY,
                 CONSTRUCT_LOWERING_CAPABILITY_CALL,
             )
-            .is_some());
+            .is_none());
         assert!(PLATFORM_CONSTRUCT_CATALOG
             .reserved_keyword_privilege(
                 "memory",
                 "claim",
                 CONSTRUCT_FAMILY_EFFECT_OPERATION,
                 CONSTRUCT_SCOPE_RULE_BODY,
-                CONSTRUCT_LOWERING_CAPABILITY_CALL,
+                CONSTRUCT_LOWERING_TYPED_EFFECT_CALL,
             )
             .is_none());
     }
