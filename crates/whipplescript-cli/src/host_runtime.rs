@@ -25,7 +25,8 @@ use whipplescript_kernel::{
 };
 use whipplescript_parser::IrProgram;
 use whipplescript_store::{
-    EvidenceRecord, NewEffect, NewEvent, RuleCommit, SqliteStore, StoreError,
+    EffectCancellationRequest, EvidenceRecord, NewEffect, NewEvent, RuleCommit, SqliteStore,
+    StoreError,
 };
 
 use crate::host_protocol::{
@@ -678,9 +679,44 @@ pub struct TurnExecution {
     pub output: Option<LabeledTurnOutput>,
 }
 
+/// Out-of-band cooperative cancellation capability for one admitted host
+/// command. It opens an independent store connection, so an embedding UI can
+/// request cancellation while the runtime-owning thread is blocked in provider
+/// I/O. The owned loop observes it between model rounds.
+#[derive(Clone, Debug)]
+pub struct HostCancellationHandle {
+    store_path: PathBuf,
+    instance_ref: String,
+    command_id: String,
+}
+
+impl HostCancellationHandle {
+    pub fn request(&self) -> Result<(), HostRuntimeError> {
+        let mut store = SqliteStore::open(&self.store_path).map_err(HostRuntimeError::Store)?;
+        let idempotency = idempotency_key(&[
+            &self.instance_ref,
+            &self.command_id,
+            "host-cancellation-request",
+        ]);
+        store
+            .request_effect_cancellation(EffectCancellationRequest {
+                instance_id: &self.instance_ref,
+                effect_id: &self.command_id,
+                revision_id: None,
+                reason: Some("embedding host requested cancellation"),
+                requested_by: "embedding-host",
+                causation_event_id: None,
+                idempotency_key: Some(&idempotency),
+            })
+            .map(|_| ())
+            .map_err(HostRuntimeError::Store)
+    }
+}
+
 /// A persistent, policy-bound native WhippleScript runtime.
 pub struct GovernedHostRuntime {
     kernel: RuntimeKernel<SqliteStore>,
+    store_path: PathBuf,
     policy: PolicyEpochRef,
     envelope: VerifiedEnvelope,
 }
@@ -718,9 +754,11 @@ impl GovernedHostRuntime {
         envelope: VerifiedEnvelope,
     ) -> Result<Self, HostRuntimeError> {
         let policy = PolicyEpochRef::from_verified(epoch, &envelope)?;
-        let store = SqliteStore::open(store_path).map_err(HostRuntimeError::Store)?;
+        let store_path = store_path.as_ref().to_path_buf();
+        let store = SqliteStore::open(&store_path).map_err(HostRuntimeError::Store)?;
         Ok(Self {
             kernel: RuntimeKernel::new(store),
+            store_path,
             policy,
             envelope,
         })
@@ -728,6 +766,20 @@ impl GovernedHostRuntime {
 
     pub fn policy_ref(&self) -> &PolicyEpochRef {
         &self.policy
+    }
+
+    /// Mint the out-of-band cancel capability for a command before driving it.
+    /// The handle contains no provider secret or resource body.
+    pub fn cancellation_handle(
+        &self,
+        instance_ref: impl Into<String>,
+        command_id: impl Into<String>,
+    ) -> HostCancellationHandle {
+        HostCancellationHandle {
+            store_path: self.store_path.clone(),
+            instance_ref: instance_ref.into(),
+            command_id: command_id.into(),
+        }
     }
 
     /// Create the durable WhippleScript instance for a chat. The returned opaque
@@ -1862,6 +1914,33 @@ workflow UnsafeHostChat {
         }
     }
 
+    struct CancellingDriver {
+        handle: HostCancellationHandle,
+        fired: Cell<bool>,
+    }
+
+    impl HostDriver for CancellingDriver {
+        fn fulfill(&self, _request: &IoRequest) -> IoResult {
+            assert!(
+                !self.fired.replace(true),
+                "cancelled before a second request"
+            );
+            self.handle.request().expect("cancel request records");
+            IoResult::Http(Ok(HttpResponse {
+                status: 200,
+                body: json!({
+                    "output": [{
+                        "type": "function_call",
+                        "call_id": "call-before-cancel",
+                        "name": "read",
+                        "arguments": "{\"path\":\"README.md\"}"
+                    }],
+                    "usage": { "input_tokens": 10, "output_tokens": 2 }
+                }),
+            }))
+        }
+    }
+
     fn signed_policy() -> String {
         SignedEnvelope::sign_for_test(
             "grant file_store project -> file:/workspace readable by Operator\n\
@@ -2039,6 +2118,45 @@ workflow UnsafeHostChat {
         assert_eq!(secrets.calls.get(), 0);
         drop(runtime);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn out_of_band_handle_requests_cooperative_cancellation() {
+        let path = temp_store();
+        let policy_text = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 8, &policy_text).expect("runtime");
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-cancel-chat".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).expect("instance");
+        let command = turn(&instance.instance_ref, &open.policy, 1);
+        let driver = CancellingDriver {
+            handle: runtime.cancellation_handle(&command.instance_ref, &command.command_id),
+            fired: Cell::new(false),
+        };
+        let execution = runtime
+            .run_turn_with_driver(
+                &command,
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &Resources {
+                    calls: Cell::new(0),
+                },
+                &driver,
+            )
+            .expect("cancelled execution settles");
+        assert_eq!(execution.receipt.status, TurnStatus::Cancelled);
+        assert!(execution.receipt.output_handle.is_none());
+        assert!(driver.fired.get());
+        drop(runtime);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
     }
 
     #[test]
