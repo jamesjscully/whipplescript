@@ -152,6 +152,24 @@ pub trait ObjectStore {
     fn exists(&self, key: &str) -> bool;
 }
 
+/// Default small-file / large-file tier boundary (DR-0033 Decision 4), in bytes.
+///
+/// A file **below** this size inlines in DO SQLite (synchronous, transactional
+/// with fact-derivation); a file **at or above** it spills to the [`ObjectStore`].
+/// 128 KiB is chosen to keep the common structured-I/O case (config, transcripts,
+/// small JSON payloads) on the fast transactional path while staying comfortably
+/// under DO SQLite's practical per-value ceiling (Cloudflare caps a stored value
+/// around 2 MiB, and large inline blobs bloat the row cache and the write-amplified
+/// transaction), so the object-store round trip is paid only for genuinely large
+/// bytes. v1 keeps the boundary a single runtime constant, not a user-facing knob:
+/// per DR-0033 the size is known at write time, so the optional size *hint* is not
+/// exposed in v1 (revisit only if a workload needs to pre-place a file whose final
+/// size the writer can't yet see). Callers may still override [`threshold_bytes`]
+/// directly when constructing the store.
+///
+/// [`threshold_bytes`]: TieredFileStore::threshold_bytes
+pub const DEFAULT_TIER_THRESHOLD_BYTES: usize = 128 * 1024;
+
 /// Runtime-owned file tiering (DR-0033 Decision 4): small files inline in DO
 /// SQLite ([`DoStorage`]); files at or above `threshold_bytes` spill to the
 /// [`ObjectStore`]. One [`FileStore`] surface — the language never sees the
@@ -161,6 +179,21 @@ pub struct TieredFileStore<S: DoStorage, O: ObjectStore> {
     pub storage: S,
     pub objects: O,
     pub threshold_bytes: usize,
+}
+
+impl<S: DoStorage, O: ObjectStore> TieredFileStore<S, O> {
+    /// Build a tiered store with the v1 default spill threshold
+    /// ([`DEFAULT_TIER_THRESHOLD_BYTES`]). Set [`threshold_bytes`] afterwards to
+    /// override.
+    ///
+    /// [`threshold_bytes`]: TieredFileStore::threshold_bytes
+    pub fn new(storage: S, objects: O) -> Self {
+        Self {
+            storage,
+            objects,
+            threshold_bytes: DEFAULT_TIER_THRESHOLD_BYTES,
+        }
+    }
 }
 
 impl<S: DoStorage, O: ObjectStore> FileStore for TieredFileStore<S, O> {
@@ -379,6 +412,21 @@ mod tests {
         assert!(store.storage.file_exists("b.bin"));
         assert!(!store.objects.exists("b.bin"));
         assert_eq!(store.read_to_string(big).expect("read shrunk"), "tiny");
+    }
+
+    #[test]
+    fn tiered_file_store_new_uses_the_default_threshold() {
+        let store = TieredFileStore::new(MemStorage::default(), MemObjects::default());
+        assert_eq!(store.threshold_bytes, DEFAULT_TIER_THRESHOLD_BYTES);
+
+        // A payload just under the default inlines; the default is a real boundary
+        // (not the 8-byte test value), so an ordinary small file stays transactional.
+        let small = Path::new("cfg.json");
+        store
+            .write(small, &vec![b'x'; DEFAULT_TIER_THRESHOLD_BYTES - 1])
+            .expect("under-threshold write");
+        assert!(store.storage.file_exists("cfg.json"));
+        assert!(!store.objects.exists("cfg.json"));
     }
 
     // -- alarms + secrets --------------------------------------------------

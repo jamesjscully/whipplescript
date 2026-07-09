@@ -648,11 +648,16 @@ linear undo chain). No phase work now.
       `ObjectStore`), keeping each file in exactly one tier so reads are
       unambiguous (DR-0033 Decision 4). Tested
       (`tiered_file_store_routes_by_size_and_keeps_one_tier`).
-- [ ] Back `ObjectStore` with a real platform store (content-addressed keys,
+- [~] Back `ObjectStore` with a real platform store (content-addressed keys,
       streamed import/export via a data-plane worker, presigned URLs for
-      client↔storage transfer, isolate never buffers bytes). Enterprise-tier
-      deliverable; native/OSS backs files with local fs. *(Needs the platform
-      object store.)*
+      client↔storage transfer, isolate never buffers bytes).
+      **Deferred-by-design (enterprise-tier / later).** The `ObjectStore` +
+      `TieredFileStore` seam is landed and tested (native + wasm), with the v1
+      default threshold now wired (see the open-question above). The real backend
+      is gated on the platform object store + the versioned workspace
+      (un-tie P1) — until those exist there is nothing to bind it to, and native /
+      OSS backs files with local fs by design. **When:** enterprise object-store +
+      un-tie P1.
 
 ### Phase 8 — Sidecar compute plane (designed 2026-07-04; NOT built)
 
@@ -727,10 +732,15 @@ fixed-size `getRandom` pools). Open build work:
       script spawns once. Residual: DO-side serve path lands with the Class-A
       executor box (no DO exec exists yet); eviction = retention policy (by
       design); image-digest→env-hash wiring = its own box below.
-- [ ] Materialization protocol endpoints: pull-missing-blobs → run →
+- [~] Materialization protocol endpoints: pull-missing-blobs → run →
       diff-back keyed by effect id (atomic/recorded/complete; idempotent
       by Decisions 3/4); Class-A batching (several execs per manifest
       request); branch marker + scoped secrets (P6) in the request.
+      **v1 shape shipped; full pull/diff-back form deferred-by-design.**
+      The remaining full pull-missing-blobs/diff-back form is gated on the
+      object tier + versioned workspace (P7 / un-tie P1 — later by design);
+      batching is an economics refinement gated on real contention. **When:**
+      P7 object tier + un-tie P1.
       v1 SHAPE SHIPPED 2026-07-08 inside whip-executor/1 + whip-turn/1:
       Class-A materialization = sha-pinned script bytes inline, keyed by
       effect id, idempotent (cache first-writer-wins + registry re-attach);
@@ -777,21 +787,40 @@ fixed-size `getRandom` pools). Open build work:
       hibernation wiring, settle path, per-turn container class.
       Workspace/branch materialization joins when the versioned workspace
       exists (scratch-dir turns are the v1 posture).
-- [ ] **Image digest = environment hash** wiring: workspace image
+- [~] **Image digest = environment hash** wiring: workspace image
       declaration → digest into generator-hash ambient config; rolling
       redeploy surfaces as a warm-start epoch.
-- [ ] IFC span enforcement: default-deny egress + allowlists derived from
+      **Deferred-by-design: gated on the production container build/push.**
+      The real image-digest wiring needs the workspace container image to be
+      actually built and pushed to a registry (which produces the digest). The
+      v1 proxy is in place — `WHIPPLESCRIPT_COMPUTE_ENV_HASH`
+      (sha256 of the Dockerfile + staged whip binary) already feeds the
+      compute-result-cache content key (P8-1) and stands in for the image
+      digest. **When:** production container enable — the digest replaces the
+      proxy hash at that point; no in-repo engineering blocks it, only the
+      registry push.
+- [~] IFC span enforcement: default-deny egress + allowlists derived from
       the exec-grant declarations; verify counterfactual execs are
       network-denied by default on this host.
-      POSTURE 2026-07-08 (partial): the executor already enforces what whip
+      **Split: whip-side isolation DONE; platform egress-deny deferred to
+      production container enable.** The executor already enforces what whip
       CAN see — cleaned child environment (declared env + PATH only,
       stronger than native exec), sha-pinned bytes, no ambient secrets in
       the container beyond the request's scoped values. Network egress
       default-deny is a PLATFORM property (containers have outbound network
       by default; Cloudflare per-container egress policy is the enforcement
       point when exposed) — the design note's recorded asymmetry stands:
-      sidecar network residual contained-but-not-denied in v1; revisit at
-      production container enable.
+      sidecar network residual contained-but-not-denied in v1. **Whip-side
+      allowlist-derivation call (assessed 2026-07-09): NOT built — documented
+      only.** Computing the egress allowlist from the exec-grant declarations
+      and recording it (so a Cloudflare policy could consume it later) is
+      *decorative without a platform enforcement point*: nothing on the DO
+      host reads or enforces such an allowlist today, so deriving+storing it now
+      would be dead metadata that can drift from the grants before the enforcer
+      exists. The honest v1 posture is: whip-side isolation done; the allowlist
+      is derived *at* production container enable, from the same exec-grant
+      declarations, wired directly into the Cloudflare per-container egress
+      policy that will enforce it. **When:** production container enable.
 - [x] `whip deploy` v1: one zero-config command (wasm kernel + image +
       DO/bucket/pool provisioning + secrets; wrangler underneath, never
       surfaced).
@@ -811,15 +840,98 @@ fixed-size `getRandom` pools). Open build work:
 
 ## Open questions / risks
 
-- [ ] Per-alarm CPU budget: large rule evaluations may need chunking across
-      alarms (the pass model already supports it — confirm on real workloads).
-- [ ] Provider idempotency-key coverage matrix (Anthropic vs OpenAI endpoints):
-      where a key is unavailable, the residual duplicate-on-eviction risk must be
-      documented in the guarantee report (Decision 3).
-- [ ] Threshold + spill policy for file tiering: default value, whether the
-      optional size hint is worth exposing in v1 (Decision 4).
-- [ ] workflow-invoke is already cross-pass/store-only — confirm it needs no step-
-      machine treatment (child observed across passes, no external I/O).
-- [ ] Checkpoint cut × coordination store: decide where coordination-state
+- [~] Per-alarm CPU budget: large rule evaluations may need chunking across
+      alarms. **Mechanism confirmed, threshold deferred to production load.** The
+      pass model is already re-entrant and resumable: the DO's `alarm()` handler
+      re-enters `WasmDurableInstance::step`, which drives `InstanceStepMachine`
+      (`kernel::instance_machine`) forward from durable state; a pass that parks
+      at a fixpoint (`InstanceOutcome::Parked{next_due_unix_ms}`) records a
+      wake-up and the next alarm continues it (`do_worker.rs` timer re-entry,
+      proven by `timer_workflow_parks_with_next_due_then_alarm_reentry_completes`).
+      So a rule evaluation that must be split across alarms *can* be — the
+      machinery to suspend/resume between alarms exists and is exercised. What is
+      NOT settled is the *chunk threshold* (how many rules/effects to run before
+      voluntarily parking to stay inside a wall-clock/CPU budget): that is an
+      operational tuning value that only real-workload profiling on the edge can
+      set, so it is **deferred-with-cause to production load** — no in-repo
+      code decision remains.
+- [x] Provider idempotency-key coverage matrix (Anthropic vs OpenAI endpoints).
+      **Investigated 2026-07-09; matrix recorded here — the tracker open-questions
+      list is the home DR-0033 Decision 3 points to** ("stated in the guarantee
+      report (see the tracker's open-questions matrix)"). Finding: **no provider
+      HTTP path currently sends a provider-level idempotency key.** Per endpoint:
+
+      | Effect | Provider endpoint | Builder | Provider idempotency key? | Residual on eviction+resume |
+      |---|---|---|---|---|
+      | coerce Anthropic | `POST {base}/v1/messages` | `coerce_native::build_anthropic_request` | **No** (`x-api-key`, `anthropic-version`, `content-type` only) | duplicate provider call possible |
+      | coerce OpenAI | `POST {base}/v1/responses` | `coerce_native::build_openai_request` | **No** (`authorization`, `content-type`) | duplicate provider call possible |
+      | coerce OpenAI/codex | `POST {base}/backend-api/codex/responses` | `coerce_native::build_codex_request` | **No** (codex/session headers, no idempotency) | duplicate provider call possible |
+      | agent Anthropic | `POST {base}/v1/messages` | `harness_model::build_anthropic_request` | **No**; a `cache_control` breakpoint rides the system block, but that is *prompt caching* (cost), not request dedup | duplicate provider call possible |
+      | agent OpenAI | `POST {base}/v1/responses` | `harness_model::build_openai_request` | **No**; `prompt_cache_key` in the body is *prompt caching* (cost), not request dedup | duplicate provider call possible |
+
+      The sync Messages / Responses APIs do not expose a request-level
+      idempotency-key header (idempotency keys are not part of `POST /v1/messages`;
+      `cache_control` / `prompt_cache_key` are cost optimizations, not dedup), so
+      the DR's aspirational "Anthropic header" is **not** wired. The residual is
+      therefore the honest **at-least-once external delivery** stated in DR-0033
+      Decision 3 and proven in `ResumableEffectLifecycle.tla`
+      (`AtLeastOnceLowerBounds`): if an isolate is evicted after `fetch` reaches
+      the provider but before the response is durably recorded, the resume
+      re-dispatches and the provider may execute the round a **second time**
+      (double billing / double side effect). The store-side effect idempotency key
+      (`idempotency_key([instance, effect, ...])`, e.g. `do_store.rs`) bounds this
+      only to **exactly-once settle** — the ledger records one terminal regardless
+      of duplicate dispatches — it does *not* dedup the provider call itself.
+      Closing the residual requires a provider that accepts an idempotency header
+      (none of the above do today); content-addressed writes (Decision 4) are the
+      only class idempotent by construction. **No mitigation is silently missing —
+      the residual is named, bounded (settle is exactly-once), and modeled.**
+- [x] Threshold + spill policy for file tiering (Decision 4). **Decided +
+      wired 2026-07-09.** `TieredFileStore` previously took a caller-supplied
+      `threshold_bytes` with no default (only the 8-byte test value ever set it).
+      Added `DEFAULT_TIER_THRESHOLD_BYTES = 128 * 1024` and a
+      `TieredFileStore::new(storage, objects)` constructor that uses it
+      (`crates/whipplescript-host-do/src/lib.rs`). **v1 default = 128 KiB:** keeps
+      the common small structured-I/O case (config, transcripts, small JSON) on the
+      fast transactional DO-SQLite path, while staying well under DO SQLite's
+      practical per-value ceiling (~2 MiB) so large inline blobs don't bloat the
+      row cache / write-amplified transaction. **Optional size hint NOT exposed in
+      v1** (recommended, documented on the constant): the byte length is known at
+      write time, so the writer never needs to pre-declare it; the hint is only
+      worth adding if a workload must pre-place a file whose final size the writer
+      can't yet see — revisit then. `threshold_bytes` stays a public field so a
+      caller can still override. Tested
+      (`tiered_file_store_new_uses_the_default_threshold`).
+- [x] workflow-invoke is already cross-pass/store-only — **confirmed 2026-07-09:
+      needs no step-machine treatment.** Traced `run_workflow_invoke_effect`
+      (`crates/whipplescript-cli/src/main.rs:23296`): the handler performs **no
+      external I/O** — no `fetch` / `ureq` / `NeedsIo` / `NeedsHttp`. It resolves
+      the target from bindings, starts/looks-up the child instance
+      (`start_child_workflow_instance_in_package`, `record_workflow_invocation`),
+      then drives the child across passes with `step_instance` (rule pass) +
+      `run_worker_once` (effect executor) and observes the terminal purely through
+      store reads (`get_instance`, `workflow_terminal_summary_from_store`). This
+      matches DR-0033 Decision 2, which classifies `workflow-invoke` among the
+      store-only "never HTTP" effects. The child's *own* HTTP effects are the
+      child instance's effects, driven by the child scheduler's passes — they do
+      not make the parent's workflow-invoke effect suspend on a `fetch`. (Distinct,
+      separately-tracked concern: how the *child's* HTTP effects get driven on the
+      DO — the Phase-5 chunk-3/4 recursion note; that is about child effect
+      dispatch, not about workflow-invoke needing a step machine, and does not
+      reopen this item.)
+- [~] Checkpoint cut × coordination store: decide where coordination-state
       snapshot/restore lives in the Phase 3 traits so the restorable-context
       consistent cut can pin it (see Downstream-customer note above).
+      **Deferred-with-cause: design-placement decision, gated on the checkpoint
+      mechanism landing.** This is the same remnant as the Phase-3 `[~]`
+      snapshot/manifest item (line ~250) and belongs to a separate DR
+      (`decision-records/restorable-context.md`, pre-ADR). No checkpoint/undo
+      mechanism is built yet, so there is no real consumer to shape the capability
+      against — building a snapshot API now would be speculative. **Where it will
+      land when the checkpoint mechanism arrives:** a cheap *position-capture*
+      capability on the `Coordination`/`WorkItems`/`RuntimeStore` traits (per the
+      Downstream-customer note's "cut spans both planes — workspace-plane stores by
+      position / high-water mark, which their monotonicity makes a per-store
+      integer" — a snapshot capability shaped as high-water-mark capture, not deep
+      copy), joining the manifest + event-log-index cut. Do NOT build a checkpoint
+      system here.

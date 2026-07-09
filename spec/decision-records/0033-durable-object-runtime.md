@@ -100,6 +100,24 @@ sharpest is `ProviderExecBoundedByRounds`: make the key attempt-dependent and th
 provider double-executes a round — that is exactly the bug the durable identity
 key exists to prevent.
 
+**Recorded residual — provider idempotency-key coverage (verified 2026-07-09).**
+The wording above ("Where a provider exposes an idempotency header (Anthropic;
+OpenAI is uneven) the duplicate is absorbed provider-side") describes the intended
+posture, not the wired state. A code audit of every provider HTTP builder
+(`coerce_native::build_{anthropic,openai,codex}_request`,
+`harness_model::build_{anthropic,openai}_request`) found that **no provider path
+currently sends a provider-level idempotency key** — the sync Messages
+(`/v1/messages`) and Responses (`/v1/responses`) APIs do not expose a request-level
+idempotency header, and `cache_control` / `prompt_cache_key` are prompt-caching
+(cost) controls, not request dedup. The residual is therefore the honest
+at-least-once external delivery this decision already states: on eviction after a
+`fetch` reaches the provider but before the response is recorded, the resume may
+cause a **duplicate provider execution**. The store-side effect idempotency key
+bounds this to **exactly-once settle** (one terminal in the ledger), not
+exactly-once provider execution. The full per-endpoint matrix is recorded in the
+tracker's open-questions list (`spec/durable-object-runtime-tracker.md`), which is
+the home this decision points to.
+
 ## Decision 4 — One file construct; the runtime owns storage tiering
 
 There is **no user-facing file split.** A file is a **content-hash handle**; its
