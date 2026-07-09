@@ -23,6 +23,7 @@ not resource bodies or credentials.
 | Item | Meaning |
 | --- | --- |
 | `open(store_path, epoch, signed_envelope)` | Open/reopen SQLite and bind the runtime to the exact verified policy epoch. |
+| `open_with_verifier(store_path, epoch, signed_envelope, verifier)` | Open an embedded runtime under an externally signed envelope; requires the host's pinned `GovernanceAttestationVerifier` and never consults process-global admin state. |
 | `open_instance(command, packages)` | Resolve a pinned package and issue a durable WhippleScript instance ref. |
 | `run_turn(...)` | Run the owned brokered loop with the native HTTP driver, persistent transcript, evidence projection, and terminal receipt. |
 | `run_turn_with_driver(...)` | Drive the same sans-I/O machine with a host-supplied transport (tests and remote placements). |
@@ -37,6 +38,15 @@ over that IR under the verified envelope before any secret is resolved. The
 facade binds instances to package content hashes and policy identity, rejects
 cross-binding reuse, and persists only references/evidence—not resolved
 provider secrets.
+
+Embedding authorities create the exact bytes to sign with
+`gov::external_signing_bytes`, attach the result with
+`SignedEnvelope::from_external_signature`, and verify through
+`GovernanceAttestationVerifier`. The external key id is carried on
+`PolicyEpochRef`, so command/event/receipt anti-mixup binds the cryptographic
+trust root as well as the envelope hash, epoch, and signer. The legacy
+hash-attested `whip gov` path remains root/admin gated and cannot verify an
+external artifact without its pinned verifier.
 
 ## `whipplescript-core`
 

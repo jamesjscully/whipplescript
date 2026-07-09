@@ -55,6 +55,7 @@ pub struct SignedEnvelope {
     pub canonical: String,
     pub envelope_hash: String,
     pub signer: String,
+    external: Option<ExternalAttestation>,
 }
 
 /// The identity proven by a successfully verified envelope attestation.
@@ -62,6 +63,28 @@ pub struct SignedEnvelope {
 pub struct VerifiedAttestation {
     pub envelope_hash: String,
     pub signer: String,
+    /// The external governance key that signed the envelope. `None` only for
+    /// the legacy root-only CLI governance agent.
+    pub key_id: Option<String>,
+}
+
+/// A cryptographic attestation supplied by an embedding governance authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalAttestation {
+    pub algorithm: String,
+    pub key_id: String,
+    pub signature: String,
+}
+
+/// Cryptographic agility seam for embedding governance authorities.
+///
+/// WhippleScript defines the canonical bytes and refuses an externally signed
+/// envelope unless this verifier accepts them. GaugeDesk implements this with
+/// its existing P-256 governance root; another host may use a KMS/HSM without
+/// changing WhippleScript's envelope or IFC semantics.
+pub trait GovernanceAttestationVerifier {
+    fn verify(&self, signing_bytes: &[u8], attestation: &ExternalAttestation)
+        -> Result<(), String>;
 }
 
 impl SignedEnvelope {
@@ -91,6 +114,40 @@ impl SignedEnvelope {
             canonical,
             envelope_hash,
             signer: signer.to_owned(),
+            external: None,
+        })
+    }
+
+    /// Assemble an envelope signed by an external governance authority. This
+    /// does not itself confer trust: consumers must use
+    /// [`verify_attestation_with`](Self::verify_attestation_with), which invokes
+    /// their pinned verifier. The signature must cover
+    /// [`external_signing_bytes`].
+    pub fn from_external_signature(
+        config_text: &str,
+        signer: &str,
+        algorithm: &str,
+        key_id: &str,
+        signature: &str,
+    ) -> Result<Self, String> {
+        if signer.trim().is_empty()
+            || algorithm.trim().is_empty()
+            || key_id.trim().is_empty()
+            || signature.trim().is_empty()
+        {
+            return Err("external governance attestation is incomplete".to_owned());
+        }
+        let canonical = canonicalize(config_text)?;
+        let envelope_hash = hash_hex(&canonical);
+        Ok(Self {
+            canonical,
+            envelope_hash,
+            signer: signer.to_owned(),
+            external: Some(ExternalAttestation {
+                algorithm: algorithm.to_owned(),
+                key_id: key_id.to_owned(),
+                signature: signature.to_owned(),
+            }),
         })
     }
 
@@ -109,13 +166,16 @@ impl SignedEnvelope {
         let mut value: serde_json::Value =
             serde_json::from_str(&self.canonical).unwrap_or_else(|_| serde_json::json!({}));
         if let Some(obj) = value.as_object_mut() {
-            obj.insert(
-                "attestation".to_owned(),
-                serde_json::json!({
-                    "envelope_hash": self.envelope_hash,
-                    "signer": self.signer,
-                }),
-            );
+            let mut attestation = serde_json::json!({
+                "envelope_hash": self.envelope_hash,
+                "signer": self.signer,
+            });
+            if let Some(external) = &self.external {
+                attestation["algorithm"] = serde_json::json!(external.algorithm);
+                attestation["key_id"] = serde_json::json!(external.key_id);
+                attestation["signature"] = serde_json::json!(external.signature);
+            }
+            obj.insert("attestation".to_owned(), attestation);
         }
         value.to_string()
     }
@@ -131,41 +191,145 @@ impl SignedEnvelope {
     /// to its policy epoch. This is the programmatic trust-boundary surface used by
     /// embedding hosts; it proves both signer and canonical envelope hash.
     pub fn verify_attestation(signed_json: &str) -> Result<VerifiedAttestation, String> {
-        let value: serde_json::Value = serde_json::from_str(signed_json)
-            .map_err(|err| format!("invalid signed envelope: {err}"))?;
-        let attestation = value
-            .get("attestation")
-            .ok_or_else(|| "envelope is not signed (no attestation)".to_owned())?;
-        let attested_hash = attestation
-            .get("envelope_hash")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "attestation has no envelope_hash".to_owned())?;
-        let signer = attestation
-            .get("signer")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-            .to_owned();
-        // recompute the canonical content hash from the FULL content (everything
-        // except the attestation), re-canonicalized through the envelope so ordering
-        // matches signing. A tamper to any covered field breaks the hash.
-        let mut content = value.clone();
-        if let Some(obj) = content.as_object_mut() {
-            obj.remove("attestation");
-        }
-        let recanonical = canonicalize(&content.to_string())?;
-        if hash_hex(&recanonical) == attested_hash {
-            Ok(VerifiedAttestation {
-                envelope_hash: attested_hash.to_owned(),
-                signer,
-            })
-        } else {
-            Err(
-                "signed envelope failed verification — content does not match its \
-                 attestation (tampered or re-edited without re-signing)"
+        let parsed = parse_attestation(signed_json)?;
+        if parsed.external.is_some() {
+            return Err(
+                "externally signed governance envelope requires its pinned attestation verifier"
                     .to_owned(),
-            )
+            );
         }
+        Ok(VerifiedAttestation {
+            envelope_hash: parsed.envelope_hash,
+            signer: parsed.signer,
+            key_id: None,
+        })
     }
+
+    /// Verify an externally signed envelope under the embedding host's pinned
+    /// governance verifier. Hash-only legacy envelopes are refused on this path.
+    pub fn verify_attestation_with<V: GovernanceAttestationVerifier + ?Sized>(
+        signed_json: &str,
+        verifier: &V,
+    ) -> Result<VerifiedAttestation, String> {
+        let parsed = parse_attestation(signed_json)?;
+        let external = parsed.external.ok_or_else(|| {
+            "trusted embedding requires an external cryptographic attestation".to_owned()
+        })?;
+        let signing_bytes = signing_bytes_from_hash(
+            &parsed.envelope_hash,
+            &parsed.signer,
+            &external.algorithm,
+            &external.key_id,
+        );
+        verifier.verify(&signing_bytes, &external)?;
+        Ok(VerifiedAttestation {
+            envelope_hash: parsed.envelope_hash,
+            signer: parsed.signer,
+            key_id: Some(external.key_id),
+        })
+    }
+}
+
+struct ParsedAttestation {
+    envelope_hash: String,
+    signer: String,
+    external: Option<ExternalAttestation>,
+}
+
+fn parse_attestation(signed_json: &str) -> Result<ParsedAttestation, String> {
+    let value: serde_json::Value = serde_json::from_str(signed_json)
+        .map_err(|err| format!("invalid signed envelope: {err}"))?;
+    let attestation = value
+        .get("attestation")
+        .ok_or_else(|| "envelope is not signed (no attestation)".to_owned())?;
+    let attested_hash = attestation
+        .get("envelope_hash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "attestation has no envelope_hash".to_owned())?;
+    let signer = attestation
+        .get("signer")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let external_fields = (
+        attestation
+            .get("algorithm")
+            .and_then(serde_json::Value::as_str),
+        attestation
+            .get("key_id")
+            .and_then(serde_json::Value::as_str),
+        attestation
+            .get("signature")
+            .and_then(serde_json::Value::as_str),
+    );
+    let external = match external_fields {
+        (None, None, None) => None,
+        (Some(algorithm), Some(key_id), Some(signature))
+            if !algorithm.is_empty() && !key_id.is_empty() && !signature.is_empty() =>
+        {
+            Some(ExternalAttestation {
+                algorithm: algorithm.to_owned(),
+                key_id: key_id.to_owned(),
+                signature: signature.to_owned(),
+            })
+        }
+        _ => return Err("external governance attestation is incomplete".to_owned()),
+    };
+    // recompute the canonical content hash from the FULL content (everything
+    // except the attestation), re-canonicalized through the envelope so ordering
+    // matches signing. A tamper to any covered field breaks the hash.
+    let mut content = value.clone();
+    if let Some(obj) = content.as_object_mut() {
+        obj.remove("attestation");
+    }
+    let recanonical = canonicalize(&content.to_string())?;
+    if hash_hex(&recanonical) == attested_hash {
+        Ok(ParsedAttestation {
+            envelope_hash: attested_hash.to_owned(),
+            signer,
+            external,
+        })
+    } else {
+        Err(
+            "signed envelope failed verification — content does not match its \
+                 attestation (tampered or re-edited without re-signing)"
+                .to_owned(),
+        )
+    }
+}
+
+/// The exact bytes an embedding governance authority signs. Length-prefixing
+/// makes the tuple unambiguous; the domain tag prevents cross-protocol reuse.
+pub fn external_signing_bytes(
+    config_text: &str,
+    signer: &str,
+    algorithm: &str,
+    key_id: &str,
+) -> Result<Vec<u8>, String> {
+    let canonical = canonicalize(config_text)?;
+    let envelope_hash = hash_hex(&canonical);
+    Ok(signing_bytes_from_hash(
+        &envelope_hash,
+        signer,
+        algorithm,
+        key_id,
+    ))
+}
+
+fn signing_bytes_from_hash(
+    envelope_hash: &str,
+    signer: &str,
+    algorithm: &str,
+    key_id: &str,
+) -> Vec<u8> {
+    let mut bytes = b"whipplescript-governance-envelope:v1;".to_vec();
+    for value in [envelope_hash, signer, algorithm, key_id] {
+        bytes.extend_from_slice(value.len().to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(b';');
+    }
+    bytes
 }
 
 /// An escalation request: the whip side asks the admin for a governance change
@@ -237,6 +401,28 @@ fn list_escalations_with_privilege(
 mod tests {
     use super::*;
 
+    struct ExactVerifier {
+        expected: Vec<u8>,
+    }
+
+    impl GovernanceAttestationVerifier for ExactVerifier {
+        fn verify(
+            &self,
+            signing_bytes: &[u8],
+            attestation: &ExternalAttestation,
+        ) -> Result<(), String> {
+            if signing_bytes == self.expected
+                && attestation.algorithm == "p256-sha256"
+                && attestation.key_id == "key-1"
+                && attestation.signature == "valid-signature"
+            {
+                Ok(())
+            } else {
+                Err("external signature rejected".to_owned())
+            }
+        }
+    }
+
     const CONFIG: &str = "\
 grant file_store ledger -> file:/srv/ledger.db readable by Operator\n\
 grant file_store outbox -> file:/srv/outbox public\n";
@@ -261,6 +447,44 @@ grant file_store outbox -> file:/srv/outbox public\n";
         let attestation = SignedEnvelope::verify_attestation(&json).expect("identity verifies");
         assert_eq!(attestation.signer, "alice@admin");
         assert_eq!(attestation.envelope_hash, signed.envelope_hash);
+        assert_eq!(attestation.key_id, None);
+    }
+
+    #[test]
+    fn external_attestation_requires_and_binds_the_pinned_verifier() {
+        let signing_bytes =
+            external_signing_bytes(CONFIG, "gaugedesk-root", "p256-sha256", "key-1")
+                .expect("canonical signing bytes");
+        let signed = SignedEnvelope::from_external_signature(
+            CONFIG,
+            "gaugedesk-root",
+            "p256-sha256",
+            "key-1",
+            "valid-signature",
+        )
+        .expect("artifact")
+        .to_json();
+
+        assert!(SignedEnvelope::verify_attestation(&signed).is_err());
+        let verified = SignedEnvelope::verify_attestation_with(
+            &signed,
+            &ExactVerifier {
+                expected: signing_bytes,
+            },
+        )
+        .expect("external signature");
+        assert_eq!(verified.signer, "gaugedesk-root");
+        assert_eq!(verified.key_id.as_deref(), Some("key-1"));
+
+        let forged = signed.replace("valid-signature", "forged-signature");
+        assert!(SignedEnvelope::verify_attestation_with(
+            &forged,
+            &ExactVerifier {
+                expected: external_signing_bytes(CONFIG, "gaugedesk-root", "p256-sha256", "key-1")
+                    .expect("bytes"),
+            }
+        )
+        .is_err());
     }
 
     #[test]
