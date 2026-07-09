@@ -910,13 +910,14 @@ pub fn envelope_path_from_env() -> Option<PathBuf> {
 
 /// An envelope that has crossed the trust boundary: a consumer may safely derive a
 /// trusted decision (enforce, or vouch in the guarantee report) from it. It is
-/// constructed ONLY by `VerifiedEnvelope::load_from_env`, which verifies a signed
+/// constructed only by the trust-boundary constructors, which verify a signed
 /// policy's attestation first; there is no public path from a signed artifact to a
-/// usable envelope that skips verification. So a new consumer cannot reintroduce the
-/// report-vs-check bug — it has nothing un-verified to consume. This is the Rust
+/// usable envelope that skips verification. So a new consumer cannot reintroduce
+/// the report-vs-check bug — it has nothing unverified to consume. This is the Rust
 /// realization of `models/lean/Whipple/Boundary.lean`.
 pub struct VerifiedEnvelope {
     envelope: Envelope,
+    attestation: Option<crate::gov::VerifiedAttestation>,
 }
 
 /// The outcome of crossing the trust boundary.
@@ -944,26 +945,49 @@ impl VerifiedEnvelope {
         Self::from_text(&text)
     }
 
-    /// Cross the boundary from envelope text (the testable core of `load_from_env`).
-    /// A signed policy (one carrying an `attestation`) must verify before it can be
-    /// wrapped; a tampered one is `Rejected` and never becomes a `VerifiedEnvelope`.
+    /// Cross the boundary from envelope text (the status-shaped core of
+    /// `load_from_env`). A malformed or tampered configured envelope is rejected,
+    /// never silently treated as ungoverned.
     fn from_text(text: &str) -> EnvelopeStatus {
-        if text.contains("\"attestation\"") {
-            if let Err(message) = crate::gov::SignedEnvelope::verify(text) {
-                return EnvelopeStatus::Rejected(message);
-            }
+        match Self::verify_text(text) {
+            Ok(envelope) => EnvelopeStatus::Verified(Box::new(envelope)),
+            Err(message) => EnvelopeStatus::Rejected(message),
         }
-        let parsed = if text.trim_start().starts_with('{') {
+    }
+
+    /// Verify and parse an envelope supplied by an embedding host. Unsigned input
+    /// is accepted for explicit development use, matching the CLI's gradual mode;
+    /// production hosts should call [`verify_signed_text`](Self::verify_signed_text).
+    pub fn verify_text(text: &str) -> Result<Self, String> {
+        let attestation = if text.contains("\"attestation\"") {
+            Some(crate::gov::SignedEnvelope::verify_attestation(text)?)
+        } else {
+            None
+        };
+        let envelope = if text.trim_start().starts_with('{') {
             Envelope::from_json(text)
         } else {
             Envelope::from_dsl(text)
-        };
-        match parsed {
-            Ok(envelope) => EnvelopeStatus::Verified(Box::new(VerifiedEnvelope { envelope })),
-            // A malformed envelope is the governance compiler's error to report, not
-            // the checker's; treat as ungoverned (the prior behavior).
-            Err(_) => EnvelopeStatus::Ungoverned,
+        }?;
+        Ok(Self {
+            envelope,
+            attestation,
+        })
+    }
+
+    /// Verify a production governance envelope. An attestation is mandatory and
+    /// its canonical hash + signer are retained for policy-epoch binding.
+    pub fn verify_signed_text(text: &str) -> Result<Self, String> {
+        if !text.contains("\"attestation\"") {
+            return Err("governance envelope is not signed (no attestation)".to_owned());
         }
+        Self::verify_text(text)
+    }
+
+    /// The verified attestation identity, absent only for explicit unsigned-dev
+    /// envelopes accepted by [`verify_text`](Self::verify_text).
+    pub fn attestation(&self) -> Option<&crate::gov::VerifiedAttestation> {
+        self.attestation.as_ref()
     }
 
     /// The verified envelope. Crate-internal: only the gated consumers in this
@@ -983,7 +1007,10 @@ impl VerifiedEnvelope {
     /// `gov::SignedEnvelope::sign_for_test`.
     #[cfg(test)]
     pub(crate) fn for_test(envelope: Envelope) -> Self {
-        Self { envelope }
+        Self {
+            envelope,
+            attestation: None,
+        }
     }
 }
 
@@ -4627,5 +4654,27 @@ rule triage
             EnvelopeStatus::Rejected(_) => {}
             _ => panic!("tampered signed envelope must be rejected"),
         }
+    }
+
+    #[test]
+    fn programmatic_signed_verifier_exposes_epoch_identity() {
+        let config = "grant file_store ledger -> file:/srv/ledger.db readable by Operator\n";
+        let signed = crate::gov::SignedEnvelope::sign_for_test(config, "gaugedesk-admin");
+        let verified = VerifiedEnvelope::verify_signed_text(&signed.to_json()).expect("verifies");
+        let attestation = verified.attestation().expect("signed identity");
+        assert_eq!(attestation.signer, "gaugedesk-admin");
+        assert_eq!(attestation.envelope_hash, signed.envelope_hash);
+        assert!(verified.governs("ledger"));
+    }
+
+    #[test]
+    fn production_verifier_requires_attestation_and_rejects_malformed_input() {
+        let unsigned = "grant file_store ledger -> file:/srv/ledger.db public\n";
+        assert!(VerifiedEnvelope::verify_text(unsigned).is_ok());
+        assert!(VerifiedEnvelope::verify_signed_text(unsigned).is_err());
+        assert!(matches!(
+            VerifiedEnvelope::from_text("{not-json"),
+            EnvelopeStatus::Rejected(_)
+        ));
     }
 }

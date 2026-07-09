@@ -57,6 +57,13 @@ pub struct SignedEnvelope {
     pub signer: String,
 }
 
+/// The identity proven by a successfully verified envelope attestation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedAttestation {
+    pub envelope_hash: String,
+    pub signer: String,
+}
+
 impl SignedEnvelope {
     /// Sign a governance config. PRIVILEGED (G1/G4): fails without governance
     /// privilege, so only the governance agent reaches a successful sign.
@@ -117,6 +124,13 @@ impl SignedEnvelope {
     /// of its canonical content. UNPRIVILEGED — the whip agent does this; a tamper
     /// breaks the hash. Returns the signer on success.
     pub fn verify(signed_json: &str) -> Result<String, String> {
+        Self::verify_attestation(signed_json).map(|attestation| attestation.signer)
+    }
+
+    /// Verify a loaded signed envelope and return the stable identity a host binds
+    /// to its policy epoch. This is the programmatic trust-boundary surface used by
+    /// embedding hosts; it proves both signer and canonical envelope hash.
+    pub fn verify_attestation(signed_json: &str) -> Result<VerifiedAttestation, String> {
         let value: serde_json::Value = serde_json::from_str(signed_json)
             .map_err(|err| format!("invalid signed envelope: {err}"))?;
         let attestation = value
@@ -140,7 +154,10 @@ impl SignedEnvelope {
         }
         let recanonical = canonicalize(&content.to_string())?;
         if hash_hex(&recanonical) == attested_hash {
-            Ok(signer)
+            Ok(VerifiedAttestation {
+                envelope_hash: attested_hash.to_owned(),
+                signer,
+            })
         } else {
             Err(
                 "signed envelope failed verification — content does not match its \
@@ -241,6 +258,9 @@ grant file_store outbox -> file:/srv/outbox public\n";
             SignedEnvelope::verify(&json).expect("verifies"),
             "alice@admin"
         );
+        let attestation = SignedEnvelope::verify_attestation(&json).expect("identity verifies");
+        assert_eq!(attestation.signer, "alice@admin");
+        assert_eq!(attestation.envelope_hash, signed.envelope_hash);
     }
 
     #[test]

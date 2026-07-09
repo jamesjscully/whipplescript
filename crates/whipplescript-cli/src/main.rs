@@ -85,14 +85,12 @@ use whipplescript_store::files::{FileStore, NativeFileStore};
 // The lifted rule pass holds one unified store handle; natively that is
 // `NativeStores` (runtime + coordination + work-items on one object), the native
 // counterpart to the DO's `DoSqliteStore` (DR-0033 instance-scheduler lift).
+use whipplescript::{gov, ifc};
 use whipplescript_store::native_stores::NativeStores;
 
 mod auth;
 mod coerce_runtime;
-mod gov;
 mod harness_tools;
-mod ifc;
-mod principal;
 mod project_context;
 mod skills_loader;
 
