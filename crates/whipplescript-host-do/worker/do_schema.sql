@@ -136,6 +136,9 @@
                 id TEXT PRIMARY KEY, body TEXT NOT NULL, byte_len INTEGER NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE files (
+                key TEXT PRIMARY KEY, content TEXT NOT NULL
+            );
             CREATE TABLE script_capabilities (
                 name TEXT PRIMARY KEY, argv_json TEXT NOT NULL, sha256 TEXT NOT NULL,
                 env_json TEXT NOT NULL DEFAULT '{}', hermetic INTEGER NOT NULL DEFAULT 0,

@@ -55,6 +55,77 @@ pub trait DoSql {
     fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String>;
 }
 
+/// Share ONE `DoSql` handle across the store and the file plane (P1). Both must
+/// hit the same DO SQLite; the test `RusqliteDoSql` wraps a non-`Clone`
+/// `Connection`, so we share the handle via `Rc` rather than requiring `Clone`.
+/// `DoSql` methods are `&self`, so `Rc<T>` forwards them directly.
+impl<T: DoSql + ?Sized> DoSql for std::rc::Rc<T> {
+    fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
+        (**self).execute(sql, params)
+    }
+    fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
+        (**self).query(sql, params)
+    }
+}
+
+/// The production `DoStorage` (P1): the DO file plane's byte store, over the
+/// same DO SQLite as the runtime store (shared via `Rc<DoSql>`). Small files
+/// inline in the `files` table (key = flattened workspace path -> content); the
+/// large-file spill tier is `TieredFileStore` layered on top. This is the live
+/// counterpart to the test-only in-memory `MemStorage`.
+pub struct DoSqlStorage<S: DoSql> {
+    sql: S,
+}
+
+impl<S: DoSql> DoSqlStorage<S> {
+    pub fn new(sql: S) -> Self {
+        Self { sql }
+    }
+}
+
+fn io_err(message: String) -> std::io::Error {
+    std::io::Error::other(message)
+}
+
+impl<S: DoSql> crate::DoStorage for DoSqlStorage<S> {
+    fn read_file(&self, key: &str) -> std::io::Result<Option<String>> {
+        let rows = self
+            .sql
+            .query("SELECT content FROM files WHERE key = ?1", &[text(key)])
+            .map_err(io_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+
+    fn write_file(&self, key: &str, content: &str) -> std::io::Result<()> {
+        self.sql
+            .execute(
+                "INSERT INTO files (key, content) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET content = excluded.content",
+                &[text(key), text(content)],
+            )
+            .map_err(io_err)?;
+        Ok(())
+    }
+
+    fn append_file(&self, key: &str, content: &str) -> std::io::Result<()> {
+        self.sql
+            .execute(
+                "INSERT INTO files (key, content) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET content = content || excluded.content",
+                &[text(key), text(content)],
+            )
+            .map_err(io_err)?;
+        Ok(())
+    }
+
+    fn file_exists(&self, key: &str) -> bool {
+        self.sql
+            .query("SELECT 1 FROM files WHERE key = ?1", &[text(key)])
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(false)
+    }
+}
+
 /// `RuntimeStore` over a `DoSql` backend — the durable-object store impl.
 pub struct DoSqliteStore<Sql: DoSql> {
     pub sql: Sql,
@@ -7797,6 +7868,9 @@ pub(crate) mod test_support {
                 id TEXT PRIMARY KEY, body TEXT NOT NULL, byte_len INTEGER NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE files (
+                key TEXT PRIMARY KEY, content TEXT NOT NULL
+            );
             CREATE TABLE script_capabilities (
                 name TEXT PRIMARY KEY, argv_json TEXT NOT NULL, sha256 TEXT NOT NULL,
                 env_json TEXT NOT NULL DEFAULT '{}', hermetic INTEGER NOT NULL DEFAULT 0,
@@ -7937,6 +8011,29 @@ mod tests {
     /// Backs `DoSql` with real in-memory SQLite, so the ported store SQL is
     /// checked against an actual engine.
     use super::test_support::store;
+
+    /// P1: the production `DoSqlStorage` drives the file plane over REAL DO
+    /// SQLite (the `files` table) through the `FileStore` seam — write, read,
+    /// append, overwrite-replaces, exists, and missing-errors.
+    #[test]
+    fn do_sql_storage_round_trips_the_file_plane_over_real_sqlite() {
+        use whipplescript_store::files::FileStore;
+        // `store()` applies the schema (now carrying the `files` table); take its
+        // real `RusqliteDoSql` and back the file plane with it.
+        let files = crate::DoFileStore::new(DoSqlStorage::new(store().sql));
+        let path = std::path::Path::new("notes/todo.txt");
+
+        assert!(!files.exists(path));
+        assert!(files.read_to_string(path).is_err(), "missing file errors");
+        files.write(path, b"hello").expect("write");
+        assert!(files.exists(path));
+        assert_eq!(files.read_to_string(path).expect("read"), "hello");
+        files.append(path, b" world").expect("append");
+        assert_eq!(files.read_to_string(path).expect("read"), "hello world");
+        // A write REPLACES (does not append) — the live path->bytes semantics.
+        files.write(path, b"fresh").expect("rewrite");
+        assert_eq!(files.read_to_string(path).expect("read"), "fresh");
+    }
 
     #[test]
     fn do_work_items_file_claim_release_finish_over_dosql() {

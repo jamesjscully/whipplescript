@@ -83,6 +83,12 @@ pub struct DoFileStore<S: DoStorage> {
     pub storage: S,
 }
 
+impl<S: DoStorage> DoFileStore<S> {
+    pub fn new(storage: S) -> Self {
+        Self { storage }
+    }
+}
+
 /// A workspace path becomes a flat storage key (the DO has no filesystem tree).
 fn storage_key(path: &Path) -> String {
     path.to_string_lossy().into_owned()

@@ -28,7 +28,9 @@ use whipplescript_store::{ClaimableEffect, NewInstanceAuthority, RuntimeStore, S
 use crate::do_instance::{
     CoerceProviderConfig, DoInstanceDriver, ExecutorSidecarConfig, TurnContainerConfig,
 };
-use crate::do_store::{DoSql, DoSqliteStore};
+use crate::do_store::{DoSql, DoSqlStorage, DoSqliteStore};
+use crate::DoFileStore;
+use std::rc::Rc;
 
 /// What one [`DurableInstance::step`] yields back to the worker shell.
 #[derive(Debug)]
@@ -72,33 +74,6 @@ pub fn unix_ms_to_iso8601(unix_ms: i64) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { year + 1 } else { year };
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-/// A no-op file store for instances whose workflows touch no file effects. A live
-/// worker passes a real `DoFileStore` (small files inline in DO SQLite).
-struct NoFileStore;
-impl FileStore for NoFileStore {
-    fn read_to_string(&self, _path: &std::path::Path) -> std::io::Result<String> {
-        Err(std::io::Error::other(
-            "no file store configured on this instance",
-        ))
-    }
-    fn exists(&self, _path: &std::path::Path) -> bool {
-        false
-    }
-    fn create_dir_all(&self, _path: &std::path::Path) -> std::io::Result<()> {
-        Ok(())
-    }
-    fn write(&self, _path: &std::path::Path, _bytes: &[u8]) -> std::io::Result<()> {
-        Err(std::io::Error::other(
-            "no file store configured on this instance",
-        ))
-    }
-    fn append(&self, _path: &std::path::Path, _bytes: &[u8]) -> std::io::Result<()> {
-        Err(std::io::Error::other(
-            "no file store configured on this instance",
-        ))
-    }
 }
 
 /// A tool executor that errors on any request (turns declaring no tools never hit
@@ -147,7 +122,7 @@ pub struct ScriptCapabilityInput {
 /// Owns the kernel over the DO's SQLite, the compiled program, and the currently
 /// in-flight effect (persisted across `step` calls / evictions).
 pub struct DurableInstance<Sql: DoSql> {
-    kernel: Option<RuntimeKernel<DoSqliteStore<Sql>>>,
+    kernel: Option<RuntimeKernel<DoSqliteStore<Rc<Sql>>>>,
     ir: IrProgram,
     instance_id: String,
     in_flight: Option<ClaimableEffect>,
@@ -159,7 +134,10 @@ pub struct DurableInstance<Sql: DoSql> {
     turn: Option<TurnContainerConfig>,
 }
 
-impl<Sql: DoSql> DurableInstance<Sql> {
+// `'static` so the default `DoFileStore` over the shared `Rc<Sql>` can be boxed
+// as `Box<dyn FileStore>` (both real handles — `JsDoSql`, `RusqliteDoSql` — own
+// their storage and are `'static`).
+impl<Sql: DoSql + 'static> DurableInstance<Sql> {
     /// Compile `program_source`, then get-or-create THE instance in the DO
     /// store (a Durable Object holds exactly one workflow instance). The first
     /// call creates + starts it; any later call — an alarm wake-up, a poke, an
@@ -177,7 +155,14 @@ impl<Sql: DoSql> DurableInstance<Sql> {
         let ir = whipplescript_parser::compile_program(program_source)
             .ir
             .ok_or_else(|| "program did not compile".to_owned())?;
-        let mut kernel = RuntimeKernel::new(DoSqliteStore { sql });
+        // P1: share ONE DoSql handle between the runtime store and the file
+        // plane (both hit the same DO SQLite). `Rc` shares without requiring the
+        // handle to be `Clone` (the test `RusqliteDoSql` wraps a non-`Clone`
+        // `Connection`).
+        let sql = Rc::new(sql);
+        let mut kernel = RuntimeKernel::new(DoSqliteStore {
+            sql: Rc::clone(&sql),
+        });
         let version = kernel
             .create_program_version_for_program(
                 ProgramVersionInput {
@@ -297,7 +282,13 @@ impl<Sql: DoSql> DurableInstance<Sql> {
             ir,
             instance_id,
             in_flight: None,
-            files: ports.files.unwrap_or_else(|| Box::new(NoFileStore)),
+            // P1: files work by default on the DO — the file plane is intrinsic
+            // to having DO SQLite, so a live instance always gets a real
+            // `DoFileStore` over the shared handle (an explicit port override,
+            // e.g. a `TieredFileStore`, still wins).
+            files: ports
+                .files
+                .unwrap_or_else(|| Box::new(DoFileStore::new(DoSqlStorage::new(Rc::clone(&sql))))),
             coerce: ports.coerce,
             agent_model: ports.agent_model,
             agent_tools: ports

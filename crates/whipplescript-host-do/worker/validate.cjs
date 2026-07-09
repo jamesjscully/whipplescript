@@ -31,7 +31,7 @@ function freshInstanceEnv(seedSql) {
       return JSON.stringify(positional);
     },
   };
-  return bridge;
+  return { bridge, db };
 }
 
 // 1) An effect-free workflow drives to a terminal in one step.
@@ -43,7 +43,7 @@ function testEffectFree() {
     '  record StartupSeen {', '    source "external.started"', '    state "observed"', "  }", "",
     "  complete result {", '    source "external.started"', '    state "observed"', "  }", "}",
   ].join("\n");
-  const bridge = freshInstanceEnv([]);
+  const { bridge } = freshInstanceEnv([]);
   const inst = WasmDurableInstance.create(bridge, source, "{}", "local/MinimalNoop", undefined, undefined, undefined);
   const outcome = JSON.parse(inst.step(undefined, Date.now()));
   assert.strictEqual(outcome.kind, "terminal", `effect-free: ${JSON.stringify(outcome)}`);
@@ -67,7 +67,7 @@ function testCoerceSuspendResume() {
     "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_coerce_builtin', 'schema.coerce', 'builtin-coerce', 'schema.coerce', '{}')",
     "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_coerce_builtin', NULL, 'schema.coerce', 'builtin-coerce', '{}')",
   ];
-  const bridge = freshInstanceEnv(seed);
+  const { bridge } = freshInstanceEnv(seed);
   const coerceConfig = JSON.stringify({
     provider: "anthropic", base_url: "https://api.anthropic.com",
     api_key: "test-key", model: "claude-test", max_tokens: 1024,
@@ -111,7 +111,7 @@ function testAgentSuspendResume() {
     "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
     "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
   ];
-  const bridge = freshInstanceEnv(seed);
+  const { bridge } = freshInstanceEnv(seed);
   const agentConfig = JSON.stringify({
     provider: "anthropic", base_url: "https://api.anthropic.com",
     api_key: "test-key", model: "claude-test", max_tokens: 4096,
@@ -155,7 +155,7 @@ function testExecSuspendResume() {
     "INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('script.judge', 'Run an operator-pinned script.', '{}')",
     "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_script_judge', NULL, 'script.judge', 'builtin-script', '{}')",
   ];
-  const bridge = freshInstanceEnv(seed);
+  const { bridge } = freshInstanceEnv(seed);
   const body = "echo ok\n";
   const sha = crypto.createHash("sha256").update(body).digest("hex");
   const execConfig = JSON.stringify({ base_url: "http://executor:8080", environment_epoch: "test-epoch" });
@@ -207,7 +207,7 @@ function testTurnContainerAgent() {
     "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
     "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
   ];
-  const bridge = freshInstanceEnv(seed);
+  const { bridge } = freshInstanceEnv(seed);
   const turnConfig = JSON.stringify({ base_url: "http://turn", provider: { provider: "fixture" } });
   const inst = WasmDurableInstance.create(
     bridge, source, "{}", "local/AgentDemo",
@@ -236,9 +236,41 @@ function testTurnContainerAgent() {
   console.log("PASS  agent workflow -> whip-turn/1 container round -> terminal (two steps)");
 }
 
+// 6) A FILE-WRITE workflow (P1 — the DO file plane): the file.write effect
+//    resolves IN-ISOLATE against DO SQLite (no fetch) — one step to terminal —
+//    and the bytes land in the `files` table, with RC-1 content-addressed
+//    history captured in `content_blobs`.
+function testFileWrite() {
+  const source = [
+    "workflow FileWrite", "", "output result Done", "",
+    "class Done {", "  status string", "}", "",
+    'file store out_files {', '  root "/ws"', "}", "",
+    "rule pick", "  when started", "=> {",
+    '  write text to out_files at "note.md" {', '    body "hello DO"', "    mode create", "  } as written", "",
+    "  after written succeeds as result {", '    complete result { status "wrote" }', "  }", "}",
+  ].join("\n");
+  const { bridge, db } = freshInstanceEnv([]);
+  // No files port is configured — P1 wires a real DoFileStore over DO SQLite by
+  // default, so file.* effects work with no extra deploy config.
+  const inst = WasmDurableInstance.create(bridge, source, "{}", "local/FileWrite", undefined, undefined, undefined);
+
+  const outcome = JSON.parse(inst.step(undefined, Date.now()));
+  assert.strictEqual(outcome.kind, "terminal", `file-write: ${JSON.stringify(outcome)}`);
+  assert.strictEqual(inst.status(), "completed");
+
+  // The bytes are in the file plane, keyed by the full resolved path.
+  const row = db.prepare("SELECT content FROM files WHERE key = ?").get("/ws/note.md");
+  assert.strictEqual(row && row.content, "hello DO", "note.md bytes landed in the files table");
+  // RC-1: the same bytes are captured content-addressed in the history blobs.
+  const blobs = db.prepare("SELECT COUNT(*) AS n FROM content_blobs").get();
+  assert.ok(Number(blobs.n) >= 1, "RC-1 history blob captured on the DO");
+  console.log("PASS  file-write workflow -> terminal (in-isolate) + bytes in DO SQLite");
+}
+
 testEffectFree();
 testCoerceSuspendResume();
 testAgentSuspendResume();
 testExecSuspendResume();
 testTurnContainerAgent();
+testFileWrite();
 console.log("\nALL PASS: the wasm DO runtime drives real workflows over real SQLite through the wasm-bindgen boundary.");
