@@ -137,6 +137,81 @@ impl OpenedInstance {
     }
 }
 
+/// Fork the live agent thread at an explicit source event coordinate into a
+/// new durable instance. Resource bodies and workspace state are not carried by
+/// this command; the embedding host forks those through their owning stores.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ForkInstanceCommand {
+    pub protocol: String,
+    pub request_id: String,
+    pub source: EventPosition,
+    pub target_request_id: String,
+    pub package_version_ref: String,
+    pub policy: PolicyEpochRef,
+}
+
+impl ForkInstanceCommand {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.protocol != HOST_PROTOCOL {
+            return Err(ProtocolError::WrongVersion(self.protocol.clone()));
+        }
+        nonempty("fork-instance request id", &self.request_id)?;
+        nonempty("source instance ref", &self.source.instance_ref)?;
+        if self.source.sequence == 0 {
+            return Err(ProtocolError::Invalid(
+                "source instance event position must be nonzero",
+            ));
+        }
+        nonempty("target open-instance request id", &self.target_request_id)?;
+        nonempty("package version ref", &self.package_version_ref)?;
+        self.policy.validate()
+    }
+
+    pub fn target_open_command(&self) -> OpenInstanceCommand {
+        OpenInstanceCommand {
+            protocol: self.protocol.clone(),
+            request_id: self.target_request_id.clone(),
+            package_version_ref: self.package_version_ref.clone(),
+            policy: self.policy.clone(),
+        }
+    }
+}
+
+/// WhippleScript's durable answer to [`ForkInstanceCommand`]. The target has a
+/// distinct instance identity and records the exact source coordinate from
+/// which its initial thread was seeded.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ForkedInstance {
+    pub protocol: String,
+    pub request_id: String,
+    pub source: EventPosition,
+    pub target: OpenedInstance,
+    pub forked_at: EventPosition,
+}
+
+impl ForkedInstance {
+    pub fn validate_for(&self, command: &ForkInstanceCommand) -> Result<(), ProtocolError> {
+        command.validate()?;
+        self.target.validate_for(&command.target_open_command())?;
+        if self.protocol != HOST_PROTOCOL {
+            return Err(ProtocolError::WrongVersion(self.protocol.clone()));
+        }
+        if self.request_id != command.request_id
+            || self.source != command.source
+            || self.forked_at.instance_ref != self.target.instance_ref
+            || self.source.instance_ref == self.target.instance_ref
+        {
+            return Err(ProtocolError::Mismatch("forked instance"));
+        }
+        if self.forked_at.sequence == 0 {
+            return Err(ProtocolError::Invalid(
+                "instance-fork event position must be nonzero",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The command GaugeDesk admits before WhippleScript begins a turn.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StartTurnCommand {
@@ -353,6 +428,50 @@ mod tests {
         let mut mixed = opened;
         mixed.policy.epoch += 1;
         assert!(mixed.validate_for(&command).is_err());
+    }
+
+    #[test]
+    fn forked_instance_binds_distinct_target_to_exact_source_position() {
+        let command = ForkInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "fork-chat-1".to_owned(),
+            source: EventPosition {
+                instance_ref: "whip:instance:source".to_owned(),
+                sequence: 17,
+            },
+            target_request_id: "open-chat-2".to_owned(),
+            package_version_ref: "whip:package-version:1".to_owned(),
+            policy: policy(),
+        };
+        let target = OpenedInstance {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: command.target_request_id.clone(),
+            instance_ref: "whip:instance:target".to_owned(),
+            package_version_ref: command.package_version_ref.clone(),
+            policy: command.policy.clone(),
+            opened_at: EventPosition {
+                instance_ref: "whip:instance:target".to_owned(),
+                sequence: 1,
+            },
+        };
+        let forked = ForkedInstance {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: command.request_id.clone(),
+            source: command.source.clone(),
+            target,
+            forked_at: EventPosition {
+                instance_ref: "whip:instance:target".to_owned(),
+                sequence: 3,
+            },
+        };
+        forked.validate_for(&command).expect("bound fork");
+
+        let mut mixed = forked;
+        mixed.source.sequence += 1;
+        assert_eq!(
+            mixed.validate_for(&command),
+            Err(ProtocolError::Mismatch("forked instance"))
+        );
     }
 
     #[test]
