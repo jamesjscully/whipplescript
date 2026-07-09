@@ -12,6 +12,64 @@ Registered in `spec/TRACKERS.md` (status: active).
 
 ---
 
+## DO feature-parity sweep (open intent, 2026-07-09)
+
+Jack directed: bring the DO backend to full feature parity with native, **including
+the agent-turn tool executor**. The store primitives are already at parity
+(`capture_checkpoint`/`plan_restore`/`commit_restore` on both `SqliteStore` and
+`DoSqliteStore`); the gaps are the file plane, restore surface, and tools. Two
+threads:
+
+**Thread A — file plane + restore** (restore is downstream of the file plane):
+- [ ] **P1 DO file plane wired end-to-end.** No production `DoStorage` exists (only
+      test `MemStorage`), and `create` never passes a `files` port, so every
+      instance falls back to `NoFileStore` and `file.*` effects error on the
+      deployed DO. Add a `files` table (both schema homes), an `Rc<DoSql>` sharing
+      seam (test `RusqliteDoSql` is not `Clone`, so share the handle, not clone the
+      connection), a production `DoSqlStorage: DoStorage` over that table, construct
+      `DoFileStore`, and pass it through the `files` port in `create` + `index.ts`.
+      `validate.cjs` file-effect case.
+- [ ] **P2 delete on the `FileStore` seam.** Promote the native-inherent
+      `NativeFileStore::remove` to a `FileStore::delete` trait method across every
+      impl (`NativeFileStore`, `DoFileStore`, `TieredFileStore` — both tiers,
+      `NoFileStore`), plus `DoStorage::delete_file` (`MemStorage` + `DoSqlStorage`).
+      CLI restore calls the trait method.
+- [ ] **P3 DO restore entry point.** The DO worker has no operator-command surface
+      (only step/alarm). Add `restore(cut_id)` on `WasmDurableInstance`/
+      `DurableInstance` + a command route in the TS worker, running plan → apply
+      writes/deletes through the wired `FileStore` → `commit_restore` (mirrors the
+      CLI `restore` orchestration incl. auto-checkpoint). `validate.cjs` restore
+      case.
+
+**Thread B — agent-turn tool executor** (`NoToolExecutor` errors on any tool call;
+DO turns advertise `tools: Vec::new()`):
+- [ ] **P4 in-isolate DO tool executor.** Most tools resolve synchronously against
+      DO SQLite (`DoFileStore` + `ContentStore`) under the *current* synchronous
+      `ToolExecutor` trait — no reshape. A `DoToolExecutor` for the store-resolvable
+      tools (read/write/edit/recall; ls/find/grep semantics over the flat key-space
+      TBD), advertised on the DO turn. Depends on P1.
+- [ ] **P5 brokered-tool seam reshape (MODEL-FIRST).** `ToolExecutor::execute` is
+      synchronous and called inline mid-turn, so a tool needing a sidecar (bash)
+      cannot suspend on `fetch` — the "nested step machine" deferred at
+      `harness_loop.rs:485-487`. Reshape the seam into a nested
+      `ToolCallMachine: StepMachine<Output=ToolOutcome>` that yields
+      `NeedsIo(Http)` for brokered tools and settles immediately for in-isolate
+      ones (native parity for free); extend `BrokeredTurnSnapshot` for mid-tool
+      eviction. New per-tool `whip-tool/1` Maude lifecycle (the DR-0035
+      delegated-wire model is turn-scoped, wrong granularity). **Significant
+      shared-harness change — bring a design discussion before building.**
+- [ ] **P6 `bash` brokered over `whip-tool/1`.** Kernel-side `tool_http.rs`
+      (build/parse/settle) mirroring `exec_http.rs`; DO brokers `bash` to a sidecar
+      over the reshaped seam, reusing the `whip-executor/1` NeedsHttp suspend/resume
+      shape. `validate.cjs` tool-call case.
+
+Out of scope (intentional asymmetries): `exec.command` is native-only by design
+(DR-0033 Decision 7, re-expressed as the Class-A executor HTTP effect); the
+coordination-state snapshot for the checkpoint cut is deferred on *both* hosts
+(the `[~]` items below).
+
+---
+
 ## Goal
 
 The whip evaluation core (parser + kernel + rule/flow engine + effect ledger) is
