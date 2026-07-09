@@ -60,6 +60,11 @@ impl PolicyEpochRef {
 pub struct ResourceRef {
     pub handle: String,
     pub kind: String,
+    /// Opaque resolver-local object name beneath the governed capability. IFC
+    /// admission applies to `handle`; this chooses an object without minting a
+    /// new policy principal or carrying its body in the command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
 }
 
 /// A credential-free provider binding. Secret material is resolved ephemerally
@@ -163,6 +168,9 @@ impl StartTurnCommand {
         for resource in self.resources.iter().chain(self.input.images.iter()) {
             nonempty("resource handle", &resource.handle)?;
             nonempty("resource kind", &resource.kind)?;
+            if let Some(selector) = &resource.selector {
+                nonempty("resource selector", selector)?;
+            }
         }
         Ok(())
     }
@@ -301,6 +309,7 @@ mod tests {
             resources: vec![ResourceRef {
                 handle: "gaugedesk:resource:project".to_owned(),
                 kind: "file_store".to_owned(),
+                selector: None,
             }],
             provider_binding: ProviderBindingRef {
                 binding_id: "gaugedesk:provider:primary".to_owned(),

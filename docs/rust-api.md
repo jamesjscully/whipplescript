@@ -18,6 +18,11 @@ host chat. `StartTurnCommand`, `LabeledRuntimeEvent`, and `TurnReceipt` carry
 the same verified `PolicyEpochRef`; commands contain resource/provider refs,
 not resource bodies or credentials.
 
+`ResourceRef::handle` names the capability checked by governance/IFC;
+`ResourceRef::selector` optionally names one resolver-local object beneath that
+capability (for example an ephemeral turn image). Selectors never mint policy
+principals and never contain the resource body.
+
 `host_runtime::GovernedHostRuntime` is the native persistent facade:
 
 | Item | Meaning |
