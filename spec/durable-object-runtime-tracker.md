@@ -23,6 +23,12 @@ asymmetries are intentional (below): `exec.command` (native-only by design, →
 Class-A executor HTTP effect on the DO), bash (bashkit initiative), and the
 coordination-state checkpoint snapshot (deferred on both hosts).
 
+**Residuals re-scoped to v0.4 (Jack 2026-07-09):** with the parity sweep done and
+v0.3 cutting, the deferred `[~]` items below (P7 object-store real backing,
+materialization endpoints, image-digest = env-hash, IFC egress default-deny,
+per-alarm CPU budget, coordination-state snapshot) are **v0.4-scoped** — none is a
+v0.3 blocker. The v0.3 DO deliverable (LIVE runtime + native parity) is complete.
+
 Two threads (both done):
 
 **Thread A — file plane + restore** — DONE 2026-07-09 (P1 3d523ad, P2 31f895b,
