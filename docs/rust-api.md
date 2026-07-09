@@ -42,9 +42,10 @@ The facade fails closed unless the signed envelope governs every resource,
 provider binding, and placement handle. `ResolvedPackage::compile` retains the
 pinned program IR, and instance/turn admission runs WhippleScript's IFC checker
 over that IR under the verified envelope before any secret is resolved. The
-facade binds instances to package content hashes and policy identity, rejects
-cross-binding reuse, and persists only references/evidence—not resolved
-provider secrets.
+facade binds instances to a package fingerprint covering workflow source,
+selected root/agent, system prompt, exact tool schemas, and step limit plus the
+policy identity. It rejects cross-binding or changed-content reuse and persists
+only references/evidence—not resolved provider secrets.
 
 Embedding authorities create the exact bytes to sign with
 `gov::external_signing_bytes`, attach the result with

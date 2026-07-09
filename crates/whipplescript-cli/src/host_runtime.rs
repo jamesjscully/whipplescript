@@ -75,7 +75,27 @@ impl ResolvedPackage {
                 .collect::<Vec<_>>()
                 .join("; ")
         })?;
-        let source_hash = sha256_hex(source.as_bytes());
+        let agent = agent.into();
+        let system_prompt = system_prompt.into();
+        let tool_identity = tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                })
+            })
+            .collect::<Vec<_>>();
+        let package_identity = json!({
+            "source": source,
+            "root": root,
+            "agent": &agent,
+            "system_prompt": &system_prompt,
+            "tools": tool_identity,
+            "max_steps": max_steps,
+        });
+        let source_hash = sha256_hex(package_identity.to_string().as_bytes());
         let ir_hash = sha256_hex(
             format!("{}:{}:{}", source_hash, program.workflow, HOST_PROTOCOL).as_bytes(),
         );
@@ -83,8 +103,8 @@ impl ResolvedPackage {
             version_ref: version_ref.into(),
             source_hash,
             ir_hash,
-            agent: agent.into(),
-            system_prompt: system_prompt.into(),
+            agent,
+            system_prompt,
             tools,
             max_steps,
             program,
@@ -718,14 +738,14 @@ impl GovernedHostRuntime {
     ) -> Result<OpenedInstance, HostRuntimeError> {
         command.validate()?;
         self.require_policy(&command.policy)?;
-        if let Some(opened) = self.replayed_open_instance(command)? {
-            return Ok(opened);
-        }
         let package = packages
             .resolve_package(&command.package_version_ref)
             .map_err(HostRuntimeError::Resolver)?;
         validate_package(&package, &command.package_version_ref)?;
         self.check_package_ifc(&package)?;
+        if let Some(opened) = self.replayed_open_instance(command, &package)? {
+            return Ok(opened);
+        }
 
         let version = self
             .kernel
@@ -787,6 +807,7 @@ impl GovernedHostRuntime {
     fn replayed_open_instance(
         &self,
         command: &OpenInstanceCommand,
+        package: &ResolvedPackage,
     ) -> Result<Option<OpenedInstance>, HostRuntimeError> {
         for instance in self
             .kernel
@@ -823,6 +844,18 @@ impl GovernedHostRuntime {
                     },
                 };
                 opened.validate_for(command)?;
+                let version = self
+                    .kernel
+                    .store()
+                    .get_program_version(&instance.version_id)
+                    .map_err(HostRuntimeError::Store)?
+                    .ok_or_else(|| HostRuntimeError::UnknownInstance(instance.instance_id))?;
+                if version.source_hash != package.source_hash || version.ir_hash != package.ir_hash
+                {
+                    return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                        "replayed package content",
+                    )));
+                }
                 return Ok(Some(opened));
             }
         }
@@ -2101,5 +2134,51 @@ workflow UnsafeHostChat {
             .iter()
             .any(|tool| tool.name == "write"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn package_fingerprint_covers_behavior_outside_workflow_source() {
+        let source = r#"
+workflow Fingerprint {
+  agent assistant {
+    provider owned
+    profile "repo-writer"
+    capacity 1
+  }
+  rule converse when started => { tell assistant "hello" }
+}
+"#;
+        let compile = |prompt: &str, writable: bool| {
+            ResolvedPackage::compile(
+                "package:fingerprint",
+                source,
+                Some("Fingerprint"),
+                "assistant",
+                prompt,
+                native_workspace_tool_specs(writable),
+                4,
+            )
+            .expect("package compiles")
+        };
+        let original = compile("first prompt", false);
+        assert_ne!(
+            original.source_hash,
+            compile("second prompt", false).source_hash
+        );
+        assert_ne!(
+            original.source_hash,
+            compile("first prompt", true).source_hash
+        );
+        let more_steps = ResolvedPackage::compile(
+            "package:fingerprint",
+            source,
+            Some("Fingerprint"),
+            "assistant",
+            "first prompt",
+            native_workspace_tool_specs(false),
+            5,
+        )
+        .expect("package compiles");
+        assert_ne!(original.source_hash, more_steps.source_hash);
     }
 }
