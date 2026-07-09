@@ -13,7 +13,7 @@
 //! is layered on later (Phase 7) behind the same seam.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The byte-I/O operations a file effect performs, abstracted over the physical
 /// backing. Object-safe so a durable-object backend can be used as `&dyn`.
@@ -37,6 +37,19 @@ pub trait FileStore {
     /// drop mediated files created after a cut so the file plane equals exactly
     /// the cut manifest. Removing an absent path is a no-op (idempotent).
     fn remove(&self, path: &Path) -> io::Result<()>;
+
+    /// Optional host-level path check after the language-level lexical policy.
+    /// Native filesystems need this to reject symlink escapes; virtual stores
+    /// can use the default because no host symlinks are traversed.
+    fn path_policy_error(
+        &self,
+        _root: &Path,
+        _relative_path: &Path,
+        _store_name: &str,
+        _operation: &str,
+    ) -> Option<String> {
+        None
+    }
 }
 
 /// Native backing: files live on the local filesystem (the workspace root is
@@ -44,6 +57,41 @@ pub trait FileStore {
 pub struct NativeFileStore;
 
 impl FileStore for NativeFileStore {
+    fn path_policy_error(
+        &self,
+        root: &Path,
+        relative_path: &Path,
+        store_name: &str,
+        _operation: &str,
+    ) -> Option<String> {
+        let root_path = if root.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            root
+        };
+        let canonical_root = match root_path.canonicalize() {
+            Ok(path) => path,
+            Err(_) => return None,
+        };
+        let full = root_path.join(relative_path);
+        let anchor = if full.exists() {
+            Some(full)
+        } else {
+            full.parent()
+                .map(Path::to_path_buf)
+                .and_then(nearest_existing_ancestor)
+        };
+        let anchor = anchor?;
+        match anchor.canonicalize() {
+            Ok(canonical_anchor) if canonical_anchor.starts_with(&canonical_root) => None,
+            Ok(_) => Some(format!(
+                "path `{}` escapes the `{store_name}` store root",
+                relative_path.display()
+            )),
+            Err(_) => None,
+        }
+    }
+
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
         std::fs::read_to_string(path)
     }
@@ -79,6 +127,17 @@ impl FileStore for NativeFileStore {
     }
 }
 
+fn nearest_existing_ancestor(mut path: PathBuf) -> Option<PathBuf> {
+    loop {
+        if path.exists() {
+            return Some(path);
+        }
+        if !path.pop() {
+            return None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +167,33 @@ mod tests {
         assert_eq!(files.read_to_string(&path).expect("read"), "hello");
         files.append(&path, b" world").expect("append");
         assert_eq!(files.read_to_string(&path).expect("read"), "hello world");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_file_store_refuses_symlink_escape() {
+        let dir = std::env::temp_dir().join(format!(
+            "whipplescript-filestore-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+        ));
+        let root = dir.join("root");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("secret.txt"), b"secret").expect("secret");
+        std::os::unix::fs::symlink(&outside, root.join("link")).expect("symlink");
+
+        let files = NativeFileStore;
+        let reason = files
+            .path_policy_error(&root, Path::new("link/secret.txt"), "workspace", "read")
+            .expect("symlink escapes root");
+        assert!(reason.contains("escapes"), "{reason}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
