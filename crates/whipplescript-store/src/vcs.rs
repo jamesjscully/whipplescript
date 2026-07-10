@@ -334,9 +334,148 @@ impl WorkspaceVcs {
         }
     }
 
+    /// Bind an instance to the branch it is born on (write-once; see
+    /// `Branches::bind_instance`).
+    pub fn bind_instance(
+        &mut self,
+        instance_id: &str,
+        branch_id: &str,
+        at: &str,
+    ) -> StoreResult<crate::branches::BindOutcome> {
+        self.branches.ensure_mainline(at)?;
+        self.branches.bind_instance(instance_id, branch_id, at)
+    }
+
+    pub fn instance_branch(&self, instance_id: &str) -> StoreResult<Option<String>> {
+        self.branches.instance_branch(instance_id)
+    }
+
     /// Mainline's id, for callers that don't hardcode it.
     pub fn mainline() -> &'static str {
         MAINLINE_BRANCH_ID
+    }
+}
+
+/// A branch-bound instance's file surface: the `FileStore` the effect
+/// handlers dispatch onto when the instance was born on a branch. Every
+/// mutation write-throughs a cut on the branch (COW — nothing outside the
+/// branch changes); reads resolve the branch's current head. Cut ids
+/// derive from the effect id (`<effect>-f<n>`), so one effect's file
+/// operations are attributable cuts. Interior mutability because the
+/// `FileStore` seam takes `&self`.
+#[cfg(feature = "native")]
+pub struct BranchFileStore {
+    vcs: std::cell::RefCell<WorkspaceVcs>,
+    branch_id: String,
+    cut_seed: String,
+    at: String,
+    counter: std::cell::Cell<u64>,
+}
+
+#[cfg(feature = "native")]
+impl BranchFileStore {
+    pub fn new(vcs: WorkspaceVcs, branch_id: &str, cut_seed: &str, at: &str) -> Self {
+        Self {
+            vcs: std::cell::RefCell::new(vcs),
+            branch_id: branch_id.to_owned(),
+            cut_seed: cut_seed.to_owned(),
+            at: at.to_owned(),
+            counter: std::cell::Cell::new(0),
+        }
+    }
+
+    fn next_cut_id(&self) -> String {
+        let index = self.counter.get();
+        self.counter.set(index + 1);
+        format!("{}-f{index}", self.cut_seed)
+    }
+
+    fn io_error(error: StoreError) -> std::io::Error {
+        std::io::Error::other(format!("branch file store: {error:?}"))
+    }
+
+    fn apply(&self, path: &Path, body: Option<&str>) -> std::io::Result<()> {
+        let cut_id = self.next_cut_id();
+        let path_key = path.to_string_lossy();
+        match self
+            .vcs
+            .borrow_mut()
+            .write(&self.branch_id, &path_key, body, &cut_id, &self.at)
+            .map_err(Self::io_error)?
+        {
+            VcsWriteOutcome::Written { .. } => Ok(()),
+            VcsWriteOutcome::BranchMissing => Err(std::io::Error::other(format!(
+                "instance is bound to unknown branch `{}`",
+                self.branch_id
+            ))),
+            VcsWriteOutcome::BranchNotActive => Err(std::io::Error::other(format!(
+                "instance is bound to closed branch `{}`",
+                self.branch_id
+            ))),
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+impl FileStore for BranchFileStore {
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        let path_key = path.to_string_lossy();
+        match self
+            .vcs
+            .borrow()
+            .read(&self.branch_id, &path_key)
+            .map_err(Self::io_error)?
+        {
+            Some(body) => Ok(body),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no file at {path_key} on branch `{}`", self.branch_id),
+            )),
+        }
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        let path_key = path.to_string_lossy();
+        self.vcs
+            .borrow()
+            .read(&self.branch_id, &path_key)
+            .map(|body| body.is_some())
+            .unwrap_or(false)
+    }
+
+    fn create_dir_all(&self, _path: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let body = std::str::from_utf8(bytes).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("non-UTF-8 write to {}: {error}", path.display()),
+            )
+        })?;
+        self.apply(path, Some(body))
+    }
+
+    fn append(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let existing = match self.read_to_string(path) {
+            Ok(body) => body,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+        let suffix = std::str::from_utf8(bytes).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("non-UTF-8 append to {}: {error}", path.display()),
+            )
+        })?;
+        let mut body = existing;
+        body.push_str(suffix);
+        self.apply(path, Some(&body))
+    }
+
+    fn remove(&self, path: &Path) -> std::io::Result<()> {
+        self.apply(path, None)
     }
 }
 

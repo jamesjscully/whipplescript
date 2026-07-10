@@ -82,17 +82,34 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
         // Branch-distinct effect keys (versioned-workspace note §9.1, modeled
         // in branch-effect-key.maude): the branch/cut ref joins
         // program_version + revision_epoch in every derived idempotency key.
-        // The current ref is the restore lineage — each `context.restored`
-        // marker starts a new timeline head, and a re-executed suffix must
-        // never dedupe against the orphaned segment's effects. Generation 0
-        // keeps the pre-branch key bytes, so never-restored instances (and
-        // every existing store) derive unchanged keys.
+        // The ref has two axes read from the instance log itself (so the
+        // derivation is host-agnostic): the branch the instance was born on
+        // (the `branch.bound` event, absent = mainline) and the restore
+        // lineage — each `context.restored` marker starts a new timeline
+        // head, and a re-executed suffix must never dedupe against the
+        // orphaned segment's effects. Unbound generation 0 keeps the
+        // pre-branch key bytes, so every existing store derives unchanged
+        // keys.
         let restore_generation = events
             .iter()
             .filter(|event| event.event_type == "context.restored")
             .count();
-        let active_revision_epoch_key =
-            revision_branch_key(active_revision_epoch, restore_generation);
+        let bound_branch = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == "branch.bound")
+            .and_then(|event| {
+                serde_json::from_str::<Value>(&event.payload_json)
+                    .ok()?
+                    .get("branch_id")?
+                    .as_str()
+                    .map(str::to_owned)
+            });
+        let active_revision_epoch_key = revision_branch_key(
+            active_revision_epoch,
+            bound_branch.as_deref(),
+            restore_generation,
+        );
         let facts = kernel.store().list_facts(instance_id)?;
         let all_facts = kernel.store().list_facts_including_consumed(instance_id)?;
         let effects = kernel.store().list_effects(instance_id)?;
@@ -502,18 +519,25 @@ pub fn apply_rule_cancels<S: RuntimeStore>(
 /// the revision epoch, joined by the branch/cut ref once the instance's
 /// timeline has forked (versioned-workspace note §9.1 — two branches firing
 /// the same version-node are distinct executions; branch-effect-key.maude
-/// holds the bite). The current ref axis is the restore lineage
-/// (`main.r<generation>`); a workspace-branch id will join it when
-/// instances are born on branches. Generation 0 returns the bare epoch so
-/// every pre-branching key derivation stays byte-identical.
-pub fn revision_branch_key(revision_epoch: i64, restore_generation: usize) -> String {
-    if restore_generation == 0 {
-        revision_epoch.to_string()
-    } else {
-        format!(
-            "{revision_epoch}@{}.r{restore_generation}",
+/// holds the bite). The ref composes two axes: the branch the instance was
+/// born on (`branch.bound`, `None` = mainline) and the restore lineage
+/// (`.r<generation>` per `context.restored` marker). Unbound generation 0
+/// returns the bare epoch so every pre-branching key derivation stays
+/// byte-identical.
+pub fn revision_branch_key(
+    revision_epoch: i64,
+    bound_branch: Option<&str>,
+    restore_generation: usize,
+) -> String {
+    match (bound_branch, restore_generation) {
+        (None, 0) => revision_epoch.to_string(),
+        (None, generation) => format!(
+            "{revision_epoch}@{}.r{generation}",
             whipplescript_store::branches::MAINLINE_BRANCH_ID
-        )
+        ),
+        (Some(branch), generation) => {
+            format!("{revision_epoch}@{branch}.r{generation}")
+        }
     }
 }
 
@@ -522,12 +546,12 @@ mod branch_key_tests {
     use super::revision_branch_key;
     use crate::idempotency_key;
 
-    /// Generation 0 is the bare epoch: never-restored instances (every
-    /// existing store) derive byte-identical keys.
+    /// Unbound generation 0 is the bare epoch: never-restored mainline
+    /// instances (every existing store) derive byte-identical keys.
     #[test]
     fn generation_zero_preserves_existing_key_bytes() {
-        assert_eq!(revision_branch_key(0, 0), "0");
-        assert_eq!(revision_branch_key(3, 0), "3");
+        assert_eq!(revision_branch_key(0, None, 0), "0");
+        assert_eq!(revision_branch_key(3, None, 0), "3");
     }
 
     /// Each restore generation is a distinct timeline head: the same
@@ -539,14 +563,39 @@ mod branch_key_tests {
         let key_for = |epoch_key: &str| {
             idempotency_key(&["ins_1", "ver_1", epoch_key, "rule_a", "node_1", "started"])
         };
-        let gen0 = key_for(&revision_branch_key(3, 0));
-        let gen1 = key_for(&revision_branch_key(3, 1));
-        let gen2 = key_for(&revision_branch_key(3, 2));
+        let gen0 = key_for(&revision_branch_key(3, None, 0));
+        let gen1 = key_for(&revision_branch_key(3, None, 1));
+        let gen2 = key_for(&revision_branch_key(3, None, 2));
         assert_ne!(gen0, gen1);
         assert_ne!(gen1, gen2);
         assert_ne!(gen0, gen2);
         // Within one generation the key is stable — idempotency retained.
-        assert_eq!(gen1, key_for(&revision_branch_key(3, 1)));
+        assert_eq!(gen1, key_for(&revision_branch_key(3, None, 1)));
+    }
+
+    /// Instances born on different branches never share a key for the
+    /// same version-node (the branch-effect-key.maude working-branch
+    /// flavor), and a bound branch is distinct from unbound mainline.
+    #[test]
+    fn bound_branches_never_collide() {
+        let key_for = |epoch_key: &str| {
+            idempotency_key(&["ins_1", "ver_1", epoch_key, "rule_a", "node_1", "started"])
+        };
+        let mainline = key_for(&revision_branch_key(3, None, 0));
+        let draft_a = key_for(&revision_branch_key(3, Some("draft_a"), 0));
+        let draft_b = key_for(&revision_branch_key(3, Some("draft_b"), 0));
+        assert_ne!(mainline, draft_a);
+        assert_ne!(draft_a, draft_b);
+        // Stable within a branch; restore generations fork within it too.
+        assert_eq!(
+            draft_a,
+            key_for(&revision_branch_key(3, Some("draft_a"), 0))
+        );
+        assert_ne!(
+            key_for(&revision_branch_key(3, Some("draft_a"), 1)),
+            draft_a
+        );
+        assert_eq!(revision_branch_key(3, Some("draft_a"), 0), "3@draft_a.r0");
     }
 
     /// The epoch and the branch ref are one composed component, so a bumped
@@ -554,8 +603,14 @@ mod branch_key_tests {
     /// also distinct.
     #[test]
     fn epoch_and_generation_axes_stay_distinct() {
-        assert_ne!(revision_branch_key(4, 1), revision_branch_key(3, 1));
-        assert_ne!(revision_branch_key(3, 2), revision_branch_key(3, 1));
-        assert_eq!(revision_branch_key(3, 1), "3@main.r1");
+        assert_ne!(
+            revision_branch_key(4, None, 1),
+            revision_branch_key(3, None, 1)
+        );
+        assert_ne!(
+            revision_branch_key(3, None, 2),
+            revision_branch_key(3, None, 1)
+        );
+        assert_eq!(revision_branch_key(3, None, 1), "3@main.r1");
     }
 }

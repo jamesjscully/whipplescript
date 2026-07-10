@@ -18915,10 +18915,22 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
             "lease.acquire" | "lease.release" | "lease.renew" | "ledger.append"
             | "counter.consume" => run_coordination_effect_generic(kernel, id, effect, "now")?,
             "signal.emit" => run_notify_effect_generic(kernel, id, effect, &IfcDeliveryGovernance)?,
-            "file.read" => run_file_effect_generic(kernel, &NativeFileStore, id, effect)?,
-            "file.write" => run_file_write_effect_generic(kernel, &NativeFileStore, id, effect)?,
-            "file.import" => run_file_import_effect_generic(kernel, &NativeFileStore, id, effect)?,
-            "file.export" => run_file_export_effect_generic(kernel, &NativeFileStore, id, effect)?,
+            "file.read" => {
+                let files = file_store_for_instance(id, &effect.effect_id);
+                run_file_effect_generic(kernel, &*files, id, effect)?
+            }
+            "file.write" => {
+                let files = file_store_for_instance(id, &effect.effect_id);
+                run_file_write_effect_generic(kernel, &*files, id, effect)?
+            }
+            "file.import" => {
+                let files = file_store_for_instance(id, &effect.effect_id);
+                run_file_import_effect_generic(kernel, &*files, id, effect)?
+            }
+            "file.export" => {
+                let files = file_store_for_instance(id, &effect.effect_id);
+                run_file_export_effect_generic(kernel, &*files, id, effect)?
+            }
             other => {
                 return Err(StoreError::Conflict(format!(
                     "effect kind `{other}` is not yet driven by the instance step machine \
@@ -22487,7 +22499,8 @@ fn run_file_effect(
     effect: &ClaimableEffect,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_file_effect_generic(&mut kernel, &NativeFileStore, instance_id, effect)
+    let files = file_store_for_instance(instance_id, &effect.effect_id);
+    run_file_effect_generic(&mut kernel, &*files, instance_id, effect)
 }
 
 /// Executes one `file.write` effect (std.files): resolve `<root>/<path>`, enforce
@@ -22501,7 +22514,8 @@ fn run_file_write_effect(
     effect: &ClaimableEffect,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_file_write_effect_generic(&mut kernel, &NativeFileStore, instance_id, effect)
+    let files = file_store_for_instance(instance_id, &effect.effect_id);
+    run_file_write_effect_generic(&mut kernel, &*files, instance_id, effect)
 }
 
 /// Executes one `file.import` effect (std.files): resolve `<root>/<path>`, decode
@@ -22516,7 +22530,8 @@ fn run_file_import_effect(
     effect: &ClaimableEffect,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_file_import_effect_generic(&mut kernel, &NativeFileStore, instance_id, effect)
+    let files = file_store_for_instance(instance_id, &effect.effect_id);
+    run_file_import_effect_generic(&mut kernel, &*files, instance_id, effect)
 }
 
 /// CSV-escape one field (inverse of `split_csv_record`): quote when the value
@@ -22591,7 +22606,8 @@ fn run_file_export_effect(
     effect: &ClaimableEffect,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_file_export_effect_generic(&mut kernel, &NativeFileStore, instance_id, effect)
+    let files = file_store_for_instance(instance_id, &effect.effect_id);
+    run_file_export_effect_generic(&mut kernel, &*files, instance_id, effect)
 }
 
 /// Host-agnostic core (DR-0033 chunk 3): export facts to a file through the
@@ -24496,6 +24512,18 @@ fn dev(options: &CliOptions) -> ExitCode {
         Ok(started) => started,
         Err(code) => return code,
     };
+    // Born on a branch: bind BEFORE any step runs, so every file.* effect
+    // dispatches onto the branch working set and every derived effect key
+    // carries the branch ref. A refused binding aborts the run before any
+    // side effect.
+    if let Some(branch_id) = dev_options.branch.as_deref() {
+        if let Err(message) =
+            bind_instance_to_branch(&options.store_path, &started.instance_id, branch_id)
+        {
+            eprintln!("--branch {branch_id}: {message}");
+            return ExitCode::FAILURE;
+        }
+    }
     // Load workspace skills (context-assembly Phase 2) into the store so the owned
     // harness can offer them in its `<available_skills>` catalogue. Idempotent
     // (UPSERT by name); a missing skills directory loads nothing.
@@ -25385,6 +25413,7 @@ fn acceptance_dev_options(fixture: &Value, fixture_dir: &Path) -> Result<DevOpti
     Ok(DevOptions {
         program_path: workflow.to_string_lossy().into_owned(),
         root,
+        branch: None,
         provider,
         exec_profile: ExecProfile::Dev,
         script_manifest_path: None,
@@ -27383,6 +27412,7 @@ impl DevStream {
 struct DevOptions {
     program_path: String,
     root: Option<String>,
+    branch: Option<String>,
     provider: String,
     exec_profile: ExecProfile,
     script_manifest_path: Option<PathBuf>,
@@ -27399,6 +27429,7 @@ impl DevOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut program_path = None;
         let mut root = None;
+        let mut branch = None;
         let mut provider = "fixture".to_owned();
         let mut exec_profile = ExecProfile::from_env();
         let mut script_manifest_path = script_manifest_path_from_env();
@@ -27506,6 +27537,13 @@ impl DevOptions {
                         return Err("only `--until idle` is supported".to_owned());
                     }
                 }
+                "--branch" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected a branch id after `--branch`".to_owned());
+                    };
+                    branch = Some(value.clone());
+                }
                 other if other.starts_with('-') => {
                     return Err(format!("unknown dev option `{other}`"))
                 }
@@ -27528,6 +27566,7 @@ impl DevOptions {
         Ok(Self {
             program_path,
             root,
+            branch,
             provider,
             exec_profile,
             script_manifest_path,
@@ -31183,7 +31222,8 @@ const BRANCH_USAGE: &str =
   whip branch ls <branch>\n\
   whip branch remove <branch> <path>\n\
   whip branch merge <branch>\n\
-  whip branch discard <branch>";
+  whip branch discard <branch>\n\
+  whip branch bind <branch> <instance>";
 
 /// The versioned-workspace branch stores, workspace-scoped like the
 /// coordination store (env-overridable for tests).
@@ -31215,6 +31255,84 @@ fn now_stamp() -> String {
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
     format!("unix:{secs}")
+}
+
+/// The file surface an instance's `file.*` effects dispatch onto: the
+/// branch working set when the instance was born on a branch (its writes
+/// then mint COW cuts on that branch and touch no real directory), the
+/// native filesystem otherwise. The branch store is consulted only when
+/// it already exists, so non-VCS workspaces never create one. `cut_seed`
+/// (the effect id) keys the write-through cuts for attribution.
+fn file_store_for_instance(
+    instance_id: &str,
+    cut_seed: &str,
+) -> Box<dyn whipplescript_store::files::FileStore> {
+    use whipplescript_store::vcs::{BranchFileStore, WorkspaceVcs};
+    if !branch_store_path().exists() {
+        return Box::new(NativeFileStore);
+    }
+    let Ok(vcs) = WorkspaceVcs::open(branch_store_path(), vcs_content_store_path()) else {
+        return Box::new(NativeFileStore);
+    };
+    match vcs.instance_branch(instance_id) {
+        Ok(Some(branch_id)) => Box::new(BranchFileStore::new(
+            vcs,
+            &branch_id,
+            cut_seed,
+            &now_stamp(),
+        )),
+        _ => Box::new(NativeFileStore),
+    }
+}
+
+/// Record an instance's branch binding: write-once in the branch store,
+/// plus a `branch.bound` event on the instance log so the host-agnostic
+/// kernel derives branch-distinct effect keys from state it already
+/// reads.
+fn bind_instance_to_branch(
+    store_path: &Path,
+    instance_id: &str,
+    branch_id: &str,
+) -> Result<(), String> {
+    use whipplescript_store::branches::BindOutcome;
+    let mut vcs =
+        whipplescript_store::vcs::WorkspaceVcs::open(branch_store_path(), vcs_content_store_path())
+            .map_err(|error| format!("could not open the branch stores: {error:?}"))?;
+    match vcs
+        .bind_instance(instance_id, branch_id, &now_stamp())
+        .map_err(|error| format!("bind failed: {error:?}"))?
+    {
+        BindOutcome::Bound => {}
+        BindOutcome::AlreadyBound { branch_id: other } => {
+            return Err(format!(
+                "instance `{instance_id}` is already bound to branch `{other}`"
+            ));
+        }
+        BindOutcome::BranchMissing => {
+            return Err(format!("no such branch `{branch_id}`"));
+        }
+        BindOutcome::BranchNotActive { status } => {
+            return Err(format!(
+                "branch `{branch_id}` is {} — instances cannot be born on a closed line",
+                status.as_str()
+            ));
+        }
+    }
+    let store = SqliteStore::open(store_path)
+        .map_err(|error| format!("could not open the runtime store: {error:?}"))?;
+    let payload = json!({ "branch_id": branch_id }).to_string();
+    store
+        .append_event(whipplescript_store::NewEvent {
+            instance_id,
+            event_type: "branch.bound",
+            payload_json: &payload,
+            source: "cli",
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: Some(&idempotency_key(&[instance_id, branch_id, "branch-bind"])),
+        })
+        .map_err(|error| format!("could not record the binding event: {error:?}"))?;
+    Ok(())
 }
 
 fn branch_row_json(row: &whipplescript_store::branches::BranchRow) -> Value {
@@ -31469,6 +31587,23 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 }
                 Err(error) => {
                     eprintln!("branch merge failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "bind" => {
+            let (Some(branch_id), Some(instance_id)) = (rest.first(), rest.get(1)) else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            drop(vcs);
+            match bind_instance_to_branch(&options.store_path, instance_id, branch_id) {
+                Ok(()) => emit_json(json!({
+                    "bound": instance_id,
+                    "branch_id": branch_id,
+                })),
+                Err(message) => {
+                    eprintln!("branch bind failed: {message}");
                     ExitCode::FAILURE
                 }
             }

@@ -115,6 +115,17 @@ pub enum AdvanceOutcome {
     NotFound,
 }
 
+/// Outcome of binding an instance to a branch. An instance is BORN on a
+/// branch: the binding is write-once (re-binding to the same branch is
+/// the idempotent retry; to a different one is refused).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BindOutcome {
+    Bound,
+    AlreadyBound { branch_id: String },
+    BranchMissing,
+    BranchNotActive { status: BranchStatus },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatusOutcome {
     Done(Box<BranchRow>),
@@ -167,6 +178,16 @@ pub trait Branches {
         merge_cut_id: &str,
         at: &str,
     ) -> StoreResult<StatusOutcome>;
+    /// Bind an instance to the branch it is born on (write-once; the
+    /// dispatch seam selects the instance's file surface by this).
+    fn bind_instance(
+        &mut self,
+        instance_id: &str,
+        branch_id: &str,
+        at: &str,
+    ) -> StoreResult<BindOutcome>;
+    /// The branch an instance was born on; `None` = mainline (unbound).
+    fn instance_branch(&self, instance_id: &str) -> StoreResult<Option<String>>;
 }
 
 #[cfg(feature = "native")]
@@ -260,6 +281,13 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
             WHERE name IS NOT NULL AND status = 'active';
         CREATE INDEX IF NOT EXISTS branches_parent_idx
             ON branches(parent_branch_id);
+        CREATE TABLE IF NOT EXISTS branch_instances (
+            instance_id TEXT PRIMARY KEY,
+            branch_id TEXT NOT NULL,
+            bound_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS branch_instances_branch_idx
+            ON branch_instances(branch_id);
         "#,
     )?;
     Ok(())
@@ -491,6 +519,57 @@ impl Branches for BranchStore {
         let row = Self::row_by_id(&tx, branch_id)?.expect("rebased row");
         tx.commit()?;
         Ok(AdvanceOutcome::Advanced(Box::new(row)))
+    }
+
+    fn bind_instance(
+        &mut self,
+        instance_id: &str,
+        branch_id: &str,
+        at: &str,
+    ) -> StoreResult<BindOutcome> {
+        let tx = self.connection.transaction()?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT branch_id FROM branch_instances WHERE instance_id = ?1",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_branch) = existing {
+            tx.commit()?;
+            return Ok(if existing_branch == branch_id {
+                BindOutcome::Bound
+            } else {
+                BindOutcome::AlreadyBound {
+                    branch_id: existing_branch,
+                }
+            });
+        }
+        let Some(row) = Self::row_by_id(&tx, branch_id)? else {
+            return Ok(BindOutcome::BranchMissing);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(BindOutcome::BranchNotActive { status: row.status });
+        }
+        tx.execute(
+            "INSERT INTO branch_instances (instance_id, branch_id, bound_at) \
+             VALUES (?1, ?2, ?3)",
+            params![instance_id, branch_id, at],
+        )?;
+        tx.commit()?;
+        Ok(BindOutcome::Bound)
+    }
+
+    fn instance_branch(&self, instance_id: &str) -> StoreResult<Option<String>> {
+        let branch: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT branch_id FROM branch_instances WHERE instance_id = ?1",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(branch)
     }
 
     fn discard_branch(&mut self, branch_id: &str, at: &str) -> StoreResult<StatusOutcome> {
@@ -745,6 +824,56 @@ mod tests {
                 .create_branch(create("draft_c", "draft_a"))
                 .expect("op"),
             CreateBranchOutcome::ParentNotActive {
+                status: BranchStatus::Discarded
+            }
+        );
+    }
+
+    /// Instance binding is write-once: an instance is BORN on a branch;
+    /// same-branch re-bind is the idempotent retry, cross-branch re-bind
+    /// refuses, dead lines refuse new births.
+    #[test]
+    fn instance_binding_is_write_once() {
+        let mut store = store();
+        store.ensure_mainline("t0").expect("op");
+        assert!(matches!(
+            store
+                .create_branch(create("draft_a", MAINLINE_BRANCH_ID))
+                .expect("op"),
+            CreateBranchOutcome::Created(_)
+        ));
+        assert_eq!(store.instance_branch("ins_1").expect("op"), None);
+        assert_eq!(
+            store.bind_instance("ins_1", "draft_a", "t1").expect("op"),
+            BindOutcome::Bound
+        );
+        assert_eq!(
+            store.instance_branch("ins_1").expect("op"),
+            Some("draft_a".to_owned())
+        );
+        assert_eq!(
+            store.bind_instance("ins_1", "draft_a", "t2").expect("op"),
+            BindOutcome::Bound
+        );
+        assert_eq!(
+            store
+                .bind_instance("ins_1", MAINLINE_BRANCH_ID, "t3")
+                .expect("op"),
+            BindOutcome::AlreadyBound {
+                branch_id: "draft_a".to_owned()
+            }
+        );
+        assert_eq!(
+            store.bind_instance("ins_2", "missing", "t4").expect("op"),
+            BindOutcome::BranchMissing
+        );
+        assert!(matches!(
+            store.discard_branch("draft_a", "t5").expect("op"),
+            StatusOutcome::Done(_)
+        ));
+        assert_eq!(
+            store.bind_instance("ins_3", "draft_a", "t6").expect("op"),
+            BindOutcome::BranchNotActive {
                 status: BranchStatus::Discarded
             }
         );

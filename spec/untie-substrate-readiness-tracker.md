@@ -114,9 +114,19 @@ Per-heading `· vN` tags below restate this at each phase.
       manifest → ContentStore) reads + a COW overlay for writes/deletes
       (tombstoned outcomes); `manifest()` folds the next cut and feeds
       `merge_manifests` directly (integration-tested); identical bodies
-      dedupe. Integrated into `vcs.rs`/`whip branch` (P1h) — the surface
-      is live end-to-end. Remaining for the box: effect-handler dispatch
-      selecting a branch's working set per instance + the stat cache.)*
+      dedupe. Integrated into `vcs.rs`/`whip branch` (P1h), and per-instance
+      effect dispatch is WIRED (P1i, 2026-07-10): `whip dev --branch <id>`
+      binds the instance at birth (write-once `branch_instances` table +
+      `branch.bound` instance event); the native worker's four `file.*`
+      wrappers and the instance-driver arms select `BranchFileStore` (the
+      working set with write-through cuts keyed `<effect-id>-f<n>`) when
+      bound, `NativeFileStore` otherwise (branch store consulted only if it
+      exists — non-VCS workspaces unaffected); `revision_branch_key` reads
+      the binding from the instance log, so bound instances derive
+      branch-distinct effect keys host-agnostically. End-to-end test:
+      branch-bound `file.write` lands on the branch (real root untouched),
+      merge propagates to main, unbound runs write natively. Remaining for
+      the box: the stat cache + DO-host parity for branch dispatch.)*
 - [ ] Two-plane consistent cut: substance manifest + workspace-plane
       **high-water positions** (the plane-store enumeration is the pump
       audit walked twice — do both in one pass).

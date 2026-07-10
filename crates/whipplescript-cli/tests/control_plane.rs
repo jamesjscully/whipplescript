@@ -19657,3 +19657,159 @@ fn branch_write_merge_conflict_roundtrip() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+/// Per-instance effect dispatch onto branch working sets: `whip dev
+/// --branch` binds the instance at birth, so its `file.write` effect
+/// resolves through the branch's COW working set — the real directory
+/// stays untouched, the content lands as a cut on the branch (keyed by
+/// the resolved full path), mainline sees nothing until the branch merges,
+/// and the write settles normally so the workflow completes.
+#[test]
+fn dev_branch_dispatches_file_effects_onto_the_branch_working_set() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let dir = unique_temp_dir("branch-dispatch");
+    let branches = dir.join("branches.sqlite");
+    let content = dir.join("vcs-content.sqlite");
+    let envs: &[(&str, &str)] = &[
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE",
+            branches.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            content.to_str().expect("utf-8"),
+        ),
+    ];
+    let root = dir.join("file-root");
+    fs::create_dir_all(&root).expect("root dir");
+    let note = root.join("note.md");
+
+    let src = temp_workflow_path("branch-dispatch");
+    fs::write(
+        &src,
+        format!(
+            r#"
+workflow BranchDispatch
+
+output result Result
+
+class Result {{
+  status string
+}}
+
+file store out_files {{
+  root "{}"
+}}
+
+rule pick
+  when started
+=> {{
+  write text to out_files at "note.md" {{
+    body "branch body"
+    mode create
+  }} as written
+  after written succeeds as result {{
+    complete result {{
+      status "wrote"
+    }}
+  }}
+}}
+"#,
+            root.display()
+        ),
+    )
+    .expect("write source");
+
+    // The branch must exist before an instance can be born on it.
+    run_json_with_env(bin, &["--json", "branch", "create", "draft_a"], envs);
+
+    let dev = run_json_with_env(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            src.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+            "--branch",
+            "draft_a",
+        ],
+        envs,
+    );
+    assert!(
+        dev.pointer("/workers/0/terminal_events/0").is_some(),
+        "the branch-dispatched write settles and the workflow reaches a terminal: {dev}"
+    );
+
+    // The real directory never saw the write.
+    assert!(
+        !note.exists(),
+        "a branch-bound instance's file effect must not touch the real root"
+    );
+
+    // The branch holds the content, keyed by the resolved full path.
+    let full_path = note.to_string_lossy().into_owned();
+    let on_branch = run_json_with_env(
+        bin,
+        &["--json", "branch", "read", "draft_a", &full_path],
+        envs,
+    );
+    assert_eq!(
+        on_branch.get("body").and_then(Value::as_str),
+        Some("branch body")
+    );
+
+    // Mainline sees nothing until the branch merges — then everything.
+    let on_main = Command::new(bin)
+        .args(["--json", "branch", "read", "main", &full_path])
+        .envs(
+            envs.iter()
+                .copied()
+                .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        )
+        .output()
+        .expect("read runs");
+    assert!(!on_main.status.success(), "mainline is isolated pre-merge");
+    run_json_with_env(bin, &["--json", "branch", "merge", "draft_a"], envs);
+    let merged = run_json_with_env(bin, &["--json", "branch", "read", "main", &full_path], envs);
+    assert_eq!(
+        merged.get("body").and_then(Value::as_str),
+        Some("branch body")
+    );
+
+    // An unbound instance on the same workspace still writes natively.
+    let dev_native = run_json_with_env(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            src.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+        envs,
+    );
+    assert!(
+        dev_native.pointer("/workers/0/terminal_events/0").is_some(),
+        "the unbound run reaches a terminal natively: {dev_native}"
+    );
+    assert_eq!(
+        fs::read_to_string(&note).ok(),
+        Some("branch body".to_owned()),
+        "an unbound instance writes through to the real root"
+    );
+
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_dir_all(dir);
+}
