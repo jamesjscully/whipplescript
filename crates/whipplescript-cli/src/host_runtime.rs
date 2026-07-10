@@ -222,7 +222,7 @@ impl AuthoredAgentPackage {
             .capabilities
             .iter()
             .any(|capability| capability == "human.ask");
-        ResolvedPackage::compile(
+        ResolvedPackage::compile_with_capabilities(
             self.version_ref.clone(),
             &self.source,
             Some(&self.workflow),
@@ -237,6 +237,7 @@ impl AuthoredAgentPackage {
                 human,
             ),
             self.max_steps,
+            self.capabilities.clone(),
         )
     }
 }
@@ -289,6 +290,7 @@ pub struct ResolvedPackage {
     agent: String,
     system_prompt: String,
     tools: Vec<ToolSpec>,
+    capabilities: Vec<String>,
     max_steps: usize,
     program: IrProgram,
 }
@@ -307,6 +309,32 @@ impl ResolvedPackage {
         system_prompt: impl Into<String>,
         tools: Vec<ToolSpec>,
         max_steps: usize,
+    ) -> Result<Self, String> {
+        Self::compile_with_capabilities(
+            version_ref,
+            source,
+            root,
+            agent,
+            system_prompt,
+            tools,
+            max_steps,
+            Vec::new(),
+        )
+    }
+
+    /// Compile a package while retaining its signed capability registry for
+    /// policy-epoch admission. This is the authored-package path; the legacy
+    /// `compile` constructor remains for compatibility fixtures with no registry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_with_capabilities(
+        version_ref: impl Into<String>,
+        source: &str,
+        root: Option<&str>,
+        agent: impl Into<String>,
+        system_prompt: impl Into<String>,
+        tools: Vec<ToolSpec>,
+        max_steps: usize,
+        mut capabilities: Vec<String>,
     ) -> Result<Self, String> {
         let compiled = whipplescript_parser::compile_program_with_root(source, root);
         let program = compiled.ir.ok_or_else(|| {
@@ -329,6 +357,8 @@ impl ResolvedPackage {
                 })
             })
             .collect::<Vec<_>>();
+        capabilities.sort();
+        capabilities.dedup();
         let package_identity = json!({
             "source": source,
             "root": root,
@@ -336,6 +366,7 @@ impl ResolvedPackage {
             "system_prompt": &system_prompt,
             "tools": tool_identity,
             "max_steps": max_steps,
+            "capabilities": &capabilities,
         });
         let source_hash = sha256_hex(package_identity.to_string().as_bytes());
         let ir_hash = sha256_hex(
@@ -348,6 +379,7 @@ impl ResolvedPackage {
             agent,
             system_prompt,
             tools,
+            capabilities,
             max_steps,
             program,
         })
@@ -364,6 +396,16 @@ pub enum ModelProvider {
     OpenAi,
     Anthropic,
     Codex,
+}
+
+impl ModelProvider {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Codex => "openai-codex",
+        }
+    }
 }
 
 /// Ephemeral provider material. Its `Debug` implementation is deliberately
@@ -441,6 +483,10 @@ impl ResolvedProviderBinding {
             ));
         }
         Ok(())
+    }
+
+    fn policy_identity(&self) -> (&str, &str, &str) {
+        (self.provider.as_str(), &self.model, &self.base_url)
     }
 }
 
@@ -2264,6 +2310,20 @@ impl GovernedHostRuntime {
             .resolve_provider(&command.provider_binding, &command.placement_ceiling_ref)
             .map_err(HostRuntimeError::Resolver)?;
         binding.validate()?;
+        let (provider, model, base_url) = binding.policy_identity();
+        if !self.envelope.permits_provider_binding(
+            &command.provider_binding.binding_id,
+            &command.provider_binding.credential.credential_id,
+            provider,
+            model,
+            base_url,
+            &command.placement_ceiling_ref,
+        ) {
+            return Err(HostRuntimeError::PolicyRejected(
+                "resolved provider, credential reference, or placement was not admitted by the policy epoch"
+                    .to_owned(),
+            ));
+        }
         Ok(binding)
     }
 
@@ -2287,6 +2347,12 @@ impl GovernedHostRuntime {
             .resolve_package(&command.package_version_ref)
             .map_err(HostRuntimeError::Resolver)?;
         validate_package(&package, &command.package_version_ref)?;
+        if !self.envelope.permits_capabilities(&package.capabilities) {
+            return Err(HostRuntimeError::PolicyRejected(format!(
+                "package requests capabilities outside the policy epoch: {}",
+                package.capabilities.join(", ")
+            )));
+        }
         self.check_package_ifc(&package)?;
         let command_json = serde_json::to_string(command).map_err(HostRuntimeError::Json)?;
         let effects = self
@@ -3440,12 +3506,15 @@ fn base64_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::gov::SignedEnvelope;
-    use crate::host_protocol::TurnInput;
+    use crate::host_policy::{
+        HostGovernancePolicy, PlacementPolicy, ProviderBindingPolicy, ResourcePolicy,
+    };
+    use crate::host_protocol::{CredentialRef, TurnInput};
 
     struct Packages;
 
@@ -3690,15 +3759,54 @@ workflow HumanHostChat {
     }
 
     fn signed_policy() -> String {
-        SignedEnvelope::sign_for_test(
-            "grant file_store project -> file:/workspace readable by Operator\n\
-             grant provider model -> provider:openai readable by Operator\n\
-             grant provider owned -> provider:owned readable by Operator\n\
-             grant human human -> human:operator readable by Operator from Operator\n\
-             grant placement local -> placement:local readable by Operator\n",
-            "gaugedesk-admin",
-        )
-        .to_json()
+        let labeled = |principal| ResourcePolicy {
+            reader: BTreeSet::from(["Operator".to_owned()]),
+            writer: BTreeSet::from(["Operator".to_owned()]),
+            principal,
+            internal: false,
+        };
+        let policy = HostGovernancePolicy {
+            resources: BTreeMap::from([
+                ("file:/workspace".to_owned(), labeled(false)),
+                ("provider:openai".to_owned(), labeled(true)),
+                ("provider:owned".to_owned(), labeled(true)),
+                ("human:operator".to_owned(), labeled(true)),
+                ("placement:local".to_owned(), labeled(true)),
+            ]),
+            bindings: BTreeMap::from([
+                ("project".to_owned(), "file:/workspace".to_owned()),
+                ("model".to_owned(), "provider:openai".to_owned()),
+                ("owned".to_owned(), "provider:owned".to_owned()),
+                ("human".to_owned(), "human:operator".to_owned()),
+                ("local".to_owned(), "placement:local".to_owned()),
+            ]),
+            capabilities: BTreeSet::from([
+                "workspace.read".to_owned(),
+                "workspace.write".to_owned(),
+                "command.run".to_owned(),
+                "human.ask".to_owned(),
+            ]),
+            provider_bindings: BTreeMap::from([(
+                "model".to_owned(),
+                ProviderBindingPolicy {
+                    provider: "openai".to_owned(),
+                    model: "gpt-test".to_owned(),
+                    base_url: "https://provider.invalid".to_owned(),
+                    credential_ref: "credential:model".to_owned(),
+                },
+            )]),
+            placements: BTreeMap::from([(
+                "local".to_owned(),
+                PlacementPolicy {
+                    kind: "local".to_owned(),
+                    provider_bindings: BTreeSet::from(["model".to_owned()]),
+                    command_network: false,
+                },
+            )]),
+            ..HostGovernancePolicy::default()
+        };
+        SignedEnvelope::sign_for_test(&policy.to_json().expect("policy"), "gaugedesk-admin")
+            .to_json()
     }
 
     fn temp_store() -> std::path::PathBuf {
@@ -3740,6 +3848,9 @@ workflow HumanHostChat {
             }],
             provider_binding: ProviderBindingRef {
                 binding_id: "model".to_owned(),
+                credential: CredentialRef {
+                    credential_id: "credential:model".to_owned(),
+                },
             },
             placement_ceiling_ref: "local".to_owned(),
         }
@@ -3764,6 +3875,9 @@ workflow HumanHostChat {
             }],
             provider_binding: ProviderBindingRef {
                 binding_id: "model".to_owned(),
+                credential: CredentialRef {
+                    credential_id: "credential:model".to_owned(),
+                },
             },
             placement_ceiling_ref: "local".to_owned(),
         }
