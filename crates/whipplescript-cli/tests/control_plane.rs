@@ -19504,3 +19504,156 @@ workflow Solo {
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(workflow_path);
 }
+
+/// The versioned workspace end to end through the CLI (`whip branch`):
+/// create a branch off mainline, write on the branch's virtual working
+/// set (copy-on-write — mainline never sees it), merge back (certified
+/// adoption advances mainline and closes the branch as history), and a
+/// divergent same-path pair escalates as structured conflicts with
+/// NOTHING moved — resolution is an ordinary edit, then the merge
+/// adopts. Discard closes a head without deleting its content.
+#[test]
+fn branch_write_merge_conflict_roundtrip() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("branch-vcs");
+    let branches = dir.join("branches.sqlite");
+    let content = dir.join("vcs-content.sqlite");
+    let envs: &[(&str, &str)] = &[
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE",
+            branches.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            content.to_str().expect("utf-8"),
+        ),
+    ];
+    let branch = |args: &[&str]| {
+        let mut full = vec!["--json", "branch"];
+        full.extend_from_slice(args);
+        run_json_with_env(bin, &full, envs)
+    };
+
+    // Seed mainline, branch, diverge.
+    branch(&["write", "main", "notes/a.md", "--body", "base A"]);
+    let created = branch(&["create", "draft_a", "--name", "triage"]);
+    assert_eq!(
+        created
+            .pointer("/created/branch_point_cut_id")
+            .and_then(Value::as_str),
+        branch(&["show", "main"])
+            .get("head_cut_id")
+            .and_then(Value::as_str),
+        "the branch point pins mainline's head at creation"
+    );
+    branch(&["write", "draft_a", "notes/a.md", "--body", "draft A"]);
+
+    // Copy-on-write isolation, both ways.
+    assert_eq!(
+        branch(&["read", "main", "notes/a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("base A")
+    );
+    assert_eq!(
+        branch(&["read", "draft_a", "notes/a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("draft A")
+    );
+
+    // Certified merge: mainline adopts the branch content; the branch is
+    // immutable history.
+    let merged = branch(&["merge", "draft_a"]);
+    assert_eq!(merged.get("into").and_then(Value::as_str), Some("main"));
+    assert_eq!(
+        branch(&["read", "main", "notes/a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("draft A")
+    );
+    assert_eq!(
+        branch(&["show", "draft_a"])
+            .get("status")
+            .and_then(Value::as_str),
+        Some("adopted")
+    );
+
+    // A second branch conflicting with a later mainline edit escalates:
+    // non-zero exit, structured conflicts, nothing moved.
+    branch(&["create", "draft_b"]);
+    branch(&["write", "draft_b", "notes/a.md", "--body", "B version"]);
+    branch(&["write", "main", "notes/a.md", "--body", "main version"]);
+    let conflicted = Command::new(bin)
+        .args(["--json", "branch", "merge", "draft_b"])
+        .envs(
+            envs.iter()
+                .copied()
+                .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        )
+        .output()
+        .expect("merge runs");
+    assert!(
+        !conflicted.status.success(),
+        "a conflicted merge is a non-zero, nothing-moved outcome"
+    );
+    let payload: Value = serde_json::from_slice(&conflicted.stdout).expect("conflict JSON");
+    assert_eq!(
+        payload.pointer("/conflicts/0/path").and_then(Value::as_str),
+        Some("notes/a.md")
+    );
+    assert_eq!(
+        payload
+            .pointer("/conflicts/0/theirs_branch")
+            .and_then(Value::as_str),
+        Some("main")
+    );
+    assert_eq!(
+        branch(&["read", "main", "notes/a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("main version"),
+        "nothing moved on the conflicted merge"
+    );
+    assert_eq!(
+        branch(&["show", "draft_b"])
+            .get("status")
+            .and_then(Value::as_str),
+        Some("active"),
+        "the conflicted branch stays live for resolution"
+    );
+
+    // Resolution is an ordinary authored edit adopted through mainline
+    // (manual override -- plain editing is complete over states); the
+    // branch then agrees and merges clean.
+    branch(&["write", "main", "notes/a.md", "--body", "resolved"]);
+    branch(&["write", "draft_b", "notes/a.md", "--body", "resolved"]);
+    let merged_b = branch(&["merge", "draft_b"]);
+    assert_eq!(merged_b.get("into").and_then(Value::as_str), Some("main"));
+
+    // Discard closes a head; the content stays addressable history.
+    branch(&["create", "draft_c"]);
+    branch(&["write", "draft_c", "scratch.md", "--body", "scratch"]);
+    branch(&["discard", "draft_c"]);
+    assert_eq!(
+        branch(&["show", "draft_c"])
+            .get("status")
+            .and_then(Value::as_str),
+        Some("discarded")
+    );
+    assert_eq!(
+        branch(&["read", "draft_c", "scratch.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("scratch"),
+        "discard closes the head without deleting history"
+    );
+
+    // The listing shows one live mainline; --all shows the history too.
+    let active = branch(&["list"]);
+    assert_eq!(active.as_array().map(Vec::len), Some(1));
+    let all = branch(&["list", "--all"]);
+    assert_eq!(all.as_array().map(Vec::len), Some(4));
+
+    let _ = fs::remove_dir_all(dir);
+}

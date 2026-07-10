@@ -144,6 +144,22 @@ pub trait Branches {
         manifest_hash: &str,
         at: &str,
     ) -> StoreResult<AdvanceOutcome>;
+    /// Rebase-down bookkeeping: move the branch POINT to the (new) parent
+    /// head and the branch HEAD to the rebased manifest in one atomic
+    /// step, optimistically guarded like `advance_head`. The caller (the
+    /// reconciliation planner's executor) supplies the already-merged
+    /// manifest; this store never merges.
+    #[allow(clippy::too_many_arguments)]
+    fn rebase_branch(
+        &mut self,
+        branch_id: &str,
+        expected_head_cut_id: Option<&str>,
+        point_cut_id: &str,
+        point_manifest_hash: &str,
+        head_cut_id: &str,
+        head_manifest_hash: &str,
+        at: &str,
+    ) -> StoreResult<AdvanceOutcome>;
     fn discard_branch(&mut self, branch_id: &str, at: &str) -> StoreResult<StatusOutcome>;
     fn adopt_branch(
         &mut self,
@@ -433,6 +449,46 @@ impl Branches for BranchStore {
             params![branch_id, cut_id, manifest_hash, at],
         )?;
         let row = Self::row_by_id(&tx, branch_id)?.expect("advanced row");
+        tx.commit()?;
+        Ok(AdvanceOutcome::Advanced(Box::new(row)))
+    }
+
+    fn rebase_branch(
+        &mut self,
+        branch_id: &str,
+        expected_head_cut_id: Option<&str>,
+        point_cut_id: &str,
+        point_manifest_hash: &str,
+        head_cut_id: &str,
+        head_manifest_hash: &str,
+        at: &str,
+    ) -> StoreResult<AdvanceOutcome> {
+        let tx = self.connection.transaction()?;
+        let Some(row) = Self::row_by_id(&tx, branch_id)? else {
+            return Ok(AdvanceOutcome::NotFound);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(AdvanceOutcome::NotActive { status: row.status });
+        }
+        if row.head_cut_id.as_deref() != expected_head_cut_id {
+            return Ok(AdvanceOutcome::Stale {
+                current_head_cut_id: row.head_cut_id,
+            });
+        }
+        tx.execute(
+            "UPDATE branches SET branch_point_cut_id = ?2, \
+             branch_point_manifest_hash = ?3, head_cut_id = ?4, \
+             head_manifest_hash = ?5, updated_at = ?6 WHERE branch_id = ?1",
+            params![
+                branch_id,
+                point_cut_id,
+                point_manifest_hash,
+                head_cut_id,
+                head_manifest_hash,
+                at
+            ],
+        )?;
+        let row = Self::row_by_id(&tx, branch_id)?.expect("rebased row");
         tx.commit()?;
         Ok(AdvanceOutcome::Advanced(Box::new(row)))
     }

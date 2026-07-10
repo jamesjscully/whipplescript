@@ -215,6 +215,7 @@ fn main() -> ExitCode {
         Some("cancel") => cancel(&options),
         Some("checkpoint") => checkpoint(&options),
         Some("restore") => restore(&options),
+        Some("branch") => branch_command(&options),
         Some("retry") => retry(&options),
         Some("recover") => recover(&options),
         Some("auth") => auth_command(&options),
@@ -658,6 +659,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "cancel" => "usage: whip cancel <instance>",
         "checkpoint" => "usage: whip [--json] checkpoint <instance> [--cut-id <id>]",
         "restore" => "usage: whip [--json] restore <instance> <cut-id>",
+        "branch" => BRANCH_USAGE,
         "retry" => "usage: whip retry <instance> <effect>",
         "recover" => "usage: whip recover <instance>",
         "doctor" => "usage: whip doctor [--providers] [--provider-config <path>] [--record-provider-evidence <instance>]",
@@ -31171,6 +31173,332 @@ fn restore(options: &CliOptions) -> ExitCode {
 }
 
 /// A timestamped default cut id for `whip checkpoint` when `--cut-id` is omitted.
+const BRANCH_USAGE: &str =
+    "usage: whip [--json] branch <create|list|show|write|read|ls|remove|merge|discard> ...\n\
+  whip branch create <branch> [--name <label>] [--from <parent>]\n\
+  whip branch list [--all]\n\
+  whip branch show <branch>\n\
+  whip branch write <branch> <path> --body <text>\n\
+  whip branch read <branch> <path>\n\
+  whip branch ls <branch>\n\
+  whip branch remove <branch> <path>\n\
+  whip branch merge <branch>\n\
+  whip branch discard <branch>";
+
+/// The versioned-workspace branch stores, workspace-scoped like the
+/// coordination store (env-overridable for tests).
+fn branch_store_path() -> PathBuf {
+    env::var("WHIPPLESCRIPT_BRANCH_STORE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".whipplescript/branches.sqlite"))
+}
+
+fn vcs_content_store_path() -> PathBuf {
+    env::var("WHIPPLESCRIPT_VCS_CONTENT_STORE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".whipplescript/vcs-content.sqlite"))
+}
+
+fn open_vcs() -> Result<whipplescript_store::vcs::WorkspaceVcs, ExitCode> {
+    whipplescript_store::vcs::WorkspaceVcs::open(branch_store_path(), vcs_content_store_path())
+        .map_err(|error| {
+            eprintln!("could not open the branch stores: {error:?}");
+            ExitCode::FAILURE
+        })
+}
+
+fn now_stamp() -> String {
+    // Seconds-resolution wall stamp, matching the store idiom of
+    // caller-provided clocks.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    format!("unix:{secs}")
+}
+
+fn branch_row_json(row: &whipplescript_store::branches::BranchRow) -> Value {
+    json!({
+        "branch_id": row.branch_id,
+        "name": row.name,
+        "parent_branch_id": row.parent_branch_id,
+        "branch_point_cut_id": row.branch_point_cut_id,
+        "head_cut_id": row.head_cut_id,
+        "head_manifest_hash": row.head_manifest_hash,
+        "status": row.status.as_str(),
+        "adopted_merge_cut_id": row.adopted_merge_cut_id,
+    })
+}
+
+fn conflict_json(conflict: &whipplescript_store::merge::PathConflict) -> Value {
+    json!({
+        "path": conflict.path,
+        "base": conflict.base,
+        "ours": conflict.ours,
+        "theirs": conflict.theirs,
+        "ours_branch": conflict.ours_side.label,
+        "ours_cut": conflict.ours_side.cut_id,
+        "theirs_branch": conflict.theirs_side.label,
+        "theirs_cut": conflict.theirs_side.cut_id,
+    })
+}
+
+/// `whip branch …` — the versioned-workspace surface: branch, write on a
+/// branch's virtual working set, merge back (certified or honest
+/// structured conflicts), discard. Every operation is a proposal over
+/// immutable content; no destructive verb exists.
+fn branch_command(options: &CliOptions) -> ExitCode {
+    use whipplescript_store::branches::BranchStatus;
+    use whipplescript_store::vcs::{VcsMergeOutcome, VcsWriteOutcome, WorkspaceVcs};
+
+    let mut args = options.args.iter().map(String::as_str);
+    let Some(verb) = args.next() else {
+        eprintln!("{BRANCH_USAGE}");
+        return ExitCode::from(2);
+    };
+    let rest: Vec<&str> = args.collect();
+    let at = now_stamp();
+    let mut vcs = match open_vcs() {
+        Ok(vcs) => vcs,
+        Err(code) => return code,
+    };
+    match verb {
+        "create" => {
+            let mut name: Option<&str> = None;
+            let mut parent: &str = WorkspaceVcs::mainline();
+            let mut branch_id: Option<&str> = None;
+            let mut iter = rest.iter();
+            while let Some(arg) = iter.next() {
+                match *arg {
+                    "--name" => name = iter.next().copied(),
+                    "--from" => parent = iter.next().copied().unwrap_or(parent),
+                    other if branch_id.is_none() => branch_id = Some(other),
+                    other => {
+                        eprintln!("unexpected argument `{other}`\n{BRANCH_USAGE}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let Some(branch_id) = branch_id else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.create_branch(branch_id, name, parent, &at) {
+                Ok(whipplescript_store::branches::CreateBranchOutcome::Created(row)) => {
+                    emit_json(json!({"created": branch_row_json(&row)}))
+                }
+                Ok(whipplescript_store::branches::CreateBranchOutcome::Existing(row)) => {
+                    emit_json(json!({"existing": branch_row_json(&row)}))
+                }
+                Ok(other) => {
+                    eprintln!("branch not created: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch create failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "list" => {
+            let all = rest.contains(&"--all");
+            let status = if all {
+                None
+            } else {
+                Some(BranchStatus::Active)
+            };
+            if let Err(error) = vcs.init(&at) {
+                eprintln!("branch list failed: {error:?}");
+                return ExitCode::FAILURE;
+            }
+            match vcs.list_branches(status) {
+                Ok(rows) => emit_json(Value::Array(
+                    rows.iter().map(branch_row_json).collect::<Vec<_>>(),
+                )),
+                Err(error) => {
+                    eprintln!("branch list failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "show" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.get_branch(branch_id) {
+                Ok(Some(row)) => emit_json(branch_row_json(&row)),
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch show failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "write" | "remove" => {
+            let Some(branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let Some(path) = rest.get(1).copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let body = if verb == "write" {
+                let Some(index) = rest.iter().position(|arg| *arg == "--body") else {
+                    eprintln!("`branch write` requires --body <text>\n{BRANCH_USAGE}");
+                    return ExitCode::from(2);
+                };
+                let Some(body) = rest.get(index + 1).copied() else {
+                    eprintln!("expected text after `--body`");
+                    return ExitCode::from(2);
+                };
+                Some(body)
+            } else {
+                None
+            };
+            if let Err(error) = vcs.init(&at) {
+                eprintln!("branch {verb} failed: {error:?}");
+                return ExitCode::FAILURE;
+            }
+            let cut_id = generated_cut_id();
+            match vcs.write(branch_id, path, body, &cut_id, &at) {
+                Ok(VcsWriteOutcome::Written {
+                    cut_id,
+                    manifest_hash,
+                }) => emit_json(json!({
+                    "branch_id": branch_id,
+                    "path": path,
+                    "cut_id": cut_id,
+                    "manifest_hash": manifest_hash,
+                    "removed": body.is_none(),
+                })),
+                Ok(other) => {
+                    eprintln!("branch {verb} refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch {verb} failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "read" => {
+            let (Some(branch_id), Some(path)) = (rest.first(), rest.get(1)) else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.read(branch_id, path) {
+                Ok(Some(body)) => {
+                    if options.json {
+                        emit_json(json!({"branch_id": branch_id, "path": path, "body": body}))
+                    } else {
+                        println!("{body}");
+                        ExitCode::SUCCESS
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("no file at `{path}` on branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch read failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "ls" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.manifest(branch_id) {
+                Ok(Some(manifest)) => emit_json(json!({
+                    "branch_id": branch_id,
+                    "files": manifest,
+                })),
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch ls failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "merge" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let merge_cut_id = generated_cut_id();
+            match vcs.merge(branch_id, &merge_cut_id, &at) {
+                Ok(VcsMergeOutcome::Adopted {
+                    merge_cut_id,
+                    into_branch_id,
+                }) => emit_json(json!({
+                    "adopted": branch_id,
+                    "into": into_branch_id,
+                    "merge_cut_id": merge_cut_id,
+                })),
+                Ok(VcsMergeOutcome::Conflicted { conflicts }) => {
+                    let payload = json!({
+                        "conflicted": branch_id,
+                        "conflicts": conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+                    });
+                    // Conflicts are an honest, non-zero outcome: nothing
+                    // moved; resolve on the branch and merge again.
+                    if options.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&payload)
+                                .unwrap_or_else(|_| payload.to_string())
+                        );
+                    } else {
+                        eprintln!("merge conflicted: {payload}");
+                    }
+                    ExitCode::FAILURE
+                }
+                Ok(other) => {
+                    eprintln!("merge refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch merge failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "discard" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.discard_branch(branch_id, &at) {
+                Ok(whipplescript_store::branches::StatusOutcome::Done(row)) => {
+                    emit_json(json!({"discarded": branch_row_json(&row)}))
+                }
+                Ok(other) => {
+                    eprintln!("discard refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch discard failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        other => {
+            eprintln!("unknown branch verb `{other}`\n{BRANCH_USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn generated_cut_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
