@@ -698,6 +698,26 @@ fn import_objects(connection: &Transaction<'_>, envelope: &ExportEnvelope) -> Re
         .iter()
         .map(|cut| (cut.id.as_str(), cut))
         .collect();
+    for cut in &envelope.cuts {
+        let manifest_json = serde_json::to_string(&cut.manifest)?;
+        let expected = hash_bytes(
+            format!(
+                "{}\0{}\0{}\0{}\0{}",
+                cut.parent.as_deref().unwrap_or(EMPTY_PARENT),
+                cut.merge_parent.as_deref().unwrap_or(EMPTY_PARENT),
+                cut.change_id,
+                cut.message,
+                manifest_json
+            )
+            .as_bytes(),
+        );
+        if expected != cut.id {
+            return Err(WorkspaceError::Invalid(format!(
+                "workspace export cut `{}` failed its identity hash",
+                cut.id
+            )));
+        }
+    }
     while !remaining.is_empty() {
         let before = remaining.len();
         let ready: Vec<&str> = remaining
@@ -1123,6 +1143,18 @@ mod tests {
         let imported_root = temp("imported");
         let imported = WorkspaceStore::import(&imported_root, &export).expect("import");
         assert_eq!(imported.line("main").expect("main").head, seeded);
+        let mut tampered: ExportEnvelope = serde_json::from_slice(&export).expect("decode");
+        tampered
+            .cuts
+            .last_mut()
+            .expect("cut")
+            .message
+            .push_str(" tampered");
+        assert!(WorkspaceStore::import(
+            temp("tampered"),
+            &serde_json::to_vec(&tampered).expect("encode")
+        )
+        .is_err());
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(imported_root);
     }
