@@ -1166,11 +1166,49 @@ mod tests {
             .expect("line");
         let path = store.materialization_path("doomed");
         fs::write(path.join("secret.txt"), "only here").expect("secret");
-        store.cut("doomed", &path, "secret").expect("cut");
+        let secret_cut = store
+            .cut("doomed", &path, "secret")
+            .expect("cut")
+            .expect("changed");
+        let exported_before_erasure = store.export().expect("pre-erasure export");
+        let secret_hash = hash_bytes(b"only here");
         store.remove_line("doomed").expect("remove");
         assert_eq!(store.purge_unreachable().expect("purge"), 1);
+        let connection = store.connect().expect("inspect");
+        assert_eq!(
+            load_manifest(&connection, &secret_cut.0)
+                .expect("history")
+                .get("secret.txt"),
+            Some(&secret_hash)
+        );
+        let body: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT body FROM workspace_blobs WHERE id = ?1",
+                [&secret_hash],
+                |row| row.get(0),
+            )
+            .expect("retained hash row");
+        assert_eq!(
+            body, None,
+            "HISTORY_PRESERVED keeps the hash but erases payload"
+        );
         let export = store.export().expect("export");
         assert!(!String::from_utf8_lossy(&export).contains("only here"));
+        assert!(!export
+            .windows(secret_hash.len())
+            .any(|window| window == secret_hash.as_bytes()));
+
+        // EXPORTED_COPY_NOT_RECALLED: erasure affects future exports, not a copy
+        // that already crossed the boundary.
+        let imported_root = temp("exported-copy");
+        let imported = WorkspaceStore::import(&imported_root, &exported_before_erasure)
+            .expect("old copy remains valid");
+        assert_eq!(
+            fs::read_to_string(imported.materialization_path("doomed").join("secret.txt"))
+                .expect("exported payload"),
+            "only here"
+        );
         let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(imported_root);
     }
 }
