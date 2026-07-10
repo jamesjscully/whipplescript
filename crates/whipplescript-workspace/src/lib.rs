@@ -941,7 +941,7 @@ fn render_diff(
             blob_or_empty(connection, after.get(&path))?
         };
         output.push_str(&format!(
-            "diff --whipple a/{path} b/{path}\n--- {}\n+++ {}\n",
+            "diff --git a/{path} b/{path}\n--- {}\n+++ {}\n",
             if before.contains_key(&path) {
                 format!("a/{path}")
             } else {
