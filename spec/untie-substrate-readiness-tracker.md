@@ -100,7 +100,12 @@ Per-heading `· vN` tags below restate this at each phase.
 
 - [ ] Branch manifests: cuts with **divergent children** (parent pointers,
       not a linear chain); O(1) branch creation over the content-addressed
-      store.
+      store. *(Progress 2026-07-10: workspace-plane `BranchStore` landed —
+      `crates/whipplescript-store/src/branches.rs`, `Branches` trait for DO
+      parity; O(1) creation = two pointers off the parent head, branch
+      point pinned at creation, divergent children, optimistic head
+      advance, fail-closed terminal statuses, idempotent create. Remaining
+      for the box: wire to real checkpoint cuts + the virtual working set.)*
 - [ ] Virtual working set: sandbox-mediated per-branch file surface,
       copy-on-write.
 - [ ] Two-plane consistent cut: substance manifest + workspace-plane
