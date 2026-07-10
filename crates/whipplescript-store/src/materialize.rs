@@ -65,6 +65,15 @@ fn scratch_relative(key: &str) -> String {
     key.trim_start_matches('/').to_owned()
 }
 
+/// Bounds for a partial materialization (Class-B sidecar disks are
+/// finite): exceeding the byte budget refuses CLEARLY, before any write,
+/// naming the need and the bound — never a mysterious mid-write failure.
+#[cfg(feature = "native")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MaterializeLimits {
+    pub max_bytes: Option<u64>,
+}
+
 /// Project `manifest` into `root` (created if needed). Coherence checked
 /// up front: a manifest entry whose blob is absent refuses before any
 /// write. `now_unix_nanos` seeds the cache stamp — the materialization
@@ -77,14 +86,56 @@ pub fn materialize_manifest(
     root: &Path,
     now_unix_nanos: i128,
 ) -> StoreResult<MaterializedScratch> {
+    materialize_manifest_subset(
+        manifest,
+        None,
+        content,
+        root,
+        now_unix_nanos,
+        &MaterializeLimits::default(),
+    )
+}
+
+/// Partial materialization (vw note §10.1 item 3): project only the
+/// `include` subset — the slicer-computed input closure the effect
+/// actually touches — under a byte budget. Import-back over a subset
+/// scratch is naturally partial too: un-materialized manifest paths are
+/// absent from the seeded cache, so the scan neither reports them
+/// removed nor lets the diff touch them. Fetch-on-demand for surprise
+/// reads is the DO Class-B pull-missing protocol's seam, not this
+/// function; on native, a subset miss surfaces as an ordinary
+/// file-not-found to the tool.
+#[cfg(feature = "native")]
+pub fn materialize_manifest_subset(
+    manifest: &BTreeMap<String, String>,
+    include: Option<&std::collections::BTreeSet<String>>,
+    content: &dyn ContentBlobs,
+    root: &Path,
+    now_unix_nanos: i128,
+    limits: &MaterializeLimits,
+) -> StoreResult<MaterializedScratch> {
     let mut bodies = Vec::with_capacity(manifest.len());
+    let mut total_bytes = 0u64;
     for (key, hash) in manifest {
+        if let Some(include) = include {
+            if !include.contains(key) {
+                continue;
+            }
+        }
         let Some(body) = content.get(hash)? else {
             return Err(StoreError::Conflict(format!(
                 "manifest names content {hash} for {key} but the blob is absent"
             )));
         };
+        total_bytes += body.len() as u64;
         bodies.push((key.clone(), hash.clone(), body));
+    }
+    if let Some(max_bytes) = limits.max_bytes {
+        if total_bytes > max_bytes {
+            return Err(StoreError::Conflict(format!(
+                "materialization needs {total_bytes} bytes but the budget is                  {max_bytes}; narrow the input closure or raise the bound                  (nothing was written)"
+            )));
+        }
     }
     std::fs::create_dir_all(root)
         .map_err(|error| StoreError::Conflict(format!("scratch {}: {error}", root.display())))?;
@@ -277,6 +328,69 @@ mod tests {
         assert_eq!(second.trusted, 2);
         assert_eq!(second.rehashed, 0);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Partial materialization: only the input closure lands on disk; a
+    /// tool run over the subset imports back WITHOUT the un-materialized
+    /// manifest entries being reported removed or touched; the byte
+    /// budget refuses clearly before any write.
+    #[test]
+    fn subset_materialization_respects_closure_and_budget() {
+        let content = content("subset");
+        let root = scratch_root("subset-dir");
+        let mut manifest = BTreeMap::new();
+        manifest.insert("/ws/in.md".to_owned(), content.put("input").expect("put"));
+        manifest.insert(
+            "/ws/huge.md".to_owned(),
+            content.put(&"X".repeat(4096)).expect("put"),
+        );
+        let mut closure = std::collections::BTreeSet::new();
+        closure.insert("/ws/in.md".to_owned());
+
+        // The budget wall: the FULL manifest exceeds 1KiB and refuses with
+        // nothing written; the closure fits.
+        let refused = materialize_manifest_subset(
+            &manifest,
+            None,
+            &content,
+            &root,
+            now_nanos(),
+            &MaterializeLimits {
+                max_bytes: Some(1024),
+            },
+        );
+        assert!(refused.is_err(), "over-budget refuses");
+        assert!(!root.join("ws").exists(), "nothing written on refusal");
+        let scratch = materialize_manifest_subset(
+            &manifest,
+            Some(&closure),
+            &content,
+            &root,
+            now_nanos(),
+            &MaterializeLimits {
+                max_bytes: Some(1024),
+            },
+        )
+        .expect("subset materializes under budget");
+        assert!(root.join("ws/in.md").exists());
+        assert!(
+            !root.join("ws/huge.md").exists(),
+            "outside the closure, not on disk"
+        );
+
+        // The tool touches the materialized file; import-back reports
+        // exactly that — the un-materialized entry is neither removed nor
+        // changed.
+        std::fs::write(root.join("ws/in.md"), "input v2").expect("modify");
+        let import =
+            import_scratch(&root, &scratch, &content, now_nanos() + 2_000_000_000).expect("import");
+        assert_eq!(import.changed.len(), 1);
+        assert!(import.changed.contains_key("/ws/in.md"));
+        assert!(
+            import.removed.is_empty(),
+            "un-materialized manifest paths are not phantom removals"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

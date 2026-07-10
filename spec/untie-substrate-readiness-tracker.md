@@ -262,11 +262,21 @@ Per-heading `· vN` tags below restate this at each phase.
       is detected, never dropped (stat-cache.maude at runtime). Deletions
       reported, nested walk, JSON round-trip. Consumer =
       materialize-on-exec import-back when that slice lands.)*
-- [ ] **Partial materialization**: manifest-subset materialization from
+- [x] **Partial materialization**: manifest-subset materialization from
       slicer-computed input closures; fetch-on-demand; clear failure at
       disk bounds (required for Class-B sidecars; optional-lazy on
       desktop where reflinks apply — fallback matrix: reflink APFS/btrfs/
       XFS, copy on ext4/NTFS, hardlink only for read-only inputs).
+      *(2026-07-10: `materialize_manifest_subset` — include-set filter
+      (the slicer's input-closure seam; full materialize delegates to
+      it) + `MaterializeLimits` byte budget refusing CLEARLY before any
+      write; import-back over a subset scratch is naturally partial
+      (un-materialized paths are neither phantom removals nor touchable
+      by the diff — tested). Honest residuals: fetch-on-demand for
+      surprise reads is the DO Class-B pull-missing protocol's seam (a
+      native subset miss is an ordinary file-not-found), and the
+      reflink/copy fallback matrix is a later desktop optimization —
+      subset+copy is the correct baseline everywhere.)*
 
 - [ ] **Stable change identity (dual identity, jj import)**: an
       edit/intent id assigned at creation, stable across rewrites,
