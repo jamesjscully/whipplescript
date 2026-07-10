@@ -227,6 +227,10 @@ pub struct StartTurnCommand {
     pub instance_ref: String,
     pub package_version_ref: String,
     pub policy: PolicyEpochRef,
+    /// Product-authenticated principal served by this turn. WhippleScript does
+    /// not authenticate it; it resolves the identity through the signed policy's
+    /// party map and enforces that principal's IFC ceiling.
+    pub actor_ref: String,
     pub input: TurnInput,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<ResourceRef>,
@@ -243,6 +247,7 @@ impl StartTurnCommand {
         nonempty("run ref", &self.run_ref)?;
         nonempty("instance ref", &self.instance_ref)?;
         nonempty("package version ref", &self.package_version_ref)?;
+        nonempty("authenticated actor ref", &self.actor_ref)?;
         nonempty("provider binding ref", &self.provider_binding.binding_id)?;
         nonempty(
             "provider credential ref",
@@ -485,6 +490,7 @@ mod tests {
             instance_ref: "whip:instance:1".to_owned(),
             package_version_ref: "whip:package-version:1".to_owned(),
             policy: policy(),
+            actor_ref: "operator".to_owned(),
             input: TurnInput {
                 text: "inspect the project".to_owned(),
                 images: Vec::new(),
