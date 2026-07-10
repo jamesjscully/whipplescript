@@ -135,7 +135,15 @@ Per-heading `· vN` tags below restate this at each phase.
 - [ ] Reconciliation daemon v1: silent rebase-down of slice-disjoint
       mainline deltas; quiescence points (terminals, marks, task
       completion); staleness bound; merge-up serialized by the adoption
-      lease.
+      lease. *(Progress 2026-07-10: the pure decision core landed —
+      `crates/whipplescript-store/src/reconcile.rs`: `plan_rebase_down`
+      (silent disjoint fold in any phase; intersecting deltas defer
+      mid-run and arrive as the structured ask at quiescence) +
+      `plan_merge_up` (lease → quiescence → staleness-at-merge-time
+      guards, in the TLA-modeled order). Remaining for the box: the
+      daemon loop wiring plans to BranchStore/WorkstreamStore heads, the
+      coordination adoption lease, and quiescence-point detection from
+      instance terminals/marks.)*
 - [ ] Workstream tier: named shared lines + membership (single-valued,
       fail-closed to mainline); certificate-gated auto-admit in-stream;
       boundary-gated promotion; archive re-homes members. *(Progress

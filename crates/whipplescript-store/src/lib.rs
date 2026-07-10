@@ -9,6 +9,7 @@ pub mod items;
 pub mod merge;
 #[cfg(feature = "native")]
 pub mod native_stores;
+pub mod reconcile;
 pub mod skill_frontmatter;
 pub mod working_set;
 pub mod workstreams;
