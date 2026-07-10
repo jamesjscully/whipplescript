@@ -19,6 +19,32 @@ use std::path::Path;
 #[cfg(feature = "native")]
 use rusqlite::{params, Connection, OptionalExtension};
 
+/// What the store knows about a content id: alive with payload, erased
+/// under the honesty downgrade (identity + size retained, payload gone),
+/// or never seen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum BlobStatus {
+    Live { byte_len: u64 },
+    Erased { byte_len: u64 },
+    Unknown,
+}
+
+/// Outcome of a per-blob erasure request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EraseOutcome {
+    /// Payload dropped; hash and size retained.
+    Erased {
+        byte_len: u64,
+    },
+    /// The idempotent retry.
+    AlreadyErased,
+    Unknown,
+    /// This host's blob seam has no erasure (fail-honest, never
+    /// fail-silent: the caller learns nothing was dropped).
+    Unsupported,
+}
+
 /// The content-addressed put/get seam, object-safe so the versioned
 /// workspace (working sets, manifests) runs over any host's blob table:
 /// natively `ContentStore`, on the durable object a thin impl over the
@@ -29,6 +55,22 @@ pub trait ContentBlobs {
     fn put(&self, body: &str) -> crate::StoreResult<String>;
     /// Read the full stored bytes for a content id, or `None` if unknown.
     fn get(&self, id: &str) -> crate::StoreResult<Option<String>>;
+    /// What the store knows about an id. The default derives Live/Unknown
+    /// from `get`; stores with erasure override to report tombstones.
+    fn status(&self, id: &str) -> crate::StoreResult<BlobStatus> {
+        Ok(match self.get(id)? {
+            Some(body) => BlobStatus::Live {
+                byte_len: body.len() as u64,
+            },
+            None => BlobStatus::Unknown,
+        })
+    }
+    /// Per-blob erasure (the honesty downgrade): drop the payload, retain
+    /// hash + size. Hosts without an erasure path report `Unsupported`
+    /// rather than pretending.
+    fn erase(&self, _id: &str, _at: &str) -> crate::StoreResult<EraseOutcome> {
+        Ok(EraseOutcome::Unsupported)
+    }
 }
 
 use crate::StoreResult;
@@ -92,6 +134,99 @@ impl ContentBlobs for ContentStore {
             )
             .optional()?)
     }
+
+    fn status(&self, id: &str) -> StoreResult<BlobStatus> {
+        let live: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT byte_len FROM content_blobs WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(byte_len) = live {
+            return Ok(BlobStatus::Live {
+                byte_len: byte_len as u64,
+            });
+        }
+        let erased: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT byte_len FROM content_erasures WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(byte_len) = erased {
+            return Ok(BlobStatus::Erased {
+                byte_len: byte_len as u64,
+            });
+        }
+        if let Some(info) = self.chunk_root_info(id)? {
+            return Ok(if info.erased {
+                BlobStatus::Erased {
+                    byte_len: info.byte_len,
+                }
+            } else {
+                BlobStatus::Live {
+                    byte_len: info.byte_len,
+                }
+            });
+        }
+        Ok(BlobStatus::Unknown)
+    }
+
+    /// Per-blob erasure over the substrate itself (un-tie's content-
+    /// erasure invariants become dischargeable here): the payload row is
+    /// dropped, a tombstone retains hash + size, and every manifest/cut
+    /// that references the hash stays coherent — reads degrade to an
+    /// honest absence (`HISTORY_PRESERVED`). Chunk roots delegate to the
+    /// chunk tier's fail-closed shared-chunk erasure. Content-level:
+    /// dedup means one erasure drops the payload for EVERY referencing
+    /// manifest — that is what content erasure means.
+    fn erase(&self, id: &str, at: &str) -> StoreResult<EraseOutcome> {
+        if let Some(info) = self.chunk_root_info(id)? {
+            if info.erased {
+                return Ok(EraseOutcome::AlreadyErased);
+            }
+            self.erase_chunks(id, at)?;
+            return Ok(EraseOutcome::Erased {
+                byte_len: info.byte_len,
+            });
+        }
+        let live: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT byte_len FROM content_blobs WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(byte_len) = live else {
+            let tombstoned: Option<i64> = self
+                .connection
+                .query_row(
+                    "SELECT byte_len FROM content_erasures WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            return Ok(match tombstoned {
+                Some(_) => EraseOutcome::AlreadyErased,
+                None => EraseOutcome::Unknown,
+            });
+        };
+        self.connection.execute(
+            "INSERT OR IGNORE INTO content_erasures (id, byte_len, erased_at) \
+             VALUES (?1, ?2, ?3)",
+            params![id, byte_len, at],
+        )?;
+        self.connection
+            .execute("DELETE FROM content_blobs WHERE id = ?1", params![id])?;
+        Ok(EraseOutcome::Erased {
+            byte_len: byte_len as u64,
+        })
+    }
 }
 
 #[cfg(feature = "native")]
@@ -103,6 +238,11 @@ fn ensure_content_schema(connection: &Connection) -> StoreResult<()> {
             body       TEXT NOT NULL,
             byte_len   INTEGER NOT NULL,
             created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS content_erasures (
+            id        TEXT PRIMARY KEY,
+            byte_len  INTEGER NOT NULL,
+            erased_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS content_chunk_roots (
             root_id    TEXT PRIMARY KEY,

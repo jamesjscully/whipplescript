@@ -402,20 +402,44 @@ replace git for working branches + workstreams.)*
       an explicit branch/recorded cut. CLI `whip branch diff` (JSON =
       structured entries; human = unified text). Reconstructs-the-target
       property test on the edit script.
-- [ ] Workspace export/import bundle: manifest + reachable blobs;
+- [x] Workspace export/import bundle: manifest + reachable blobs;
       idempotent re-materialization on the receiving side (the handoff
       `STATE_BEFORE_HOME` carrier); **erasure-respecting** (tombstoned
       blobs never travel).
+      **DONE 2026-07-10:** `bundle.rs` (`whipplescript.bundle.v1`, one
+      JSON document: branch lineage snapshot + head manifest + reachable
+      blobs + recorded cuts so CHANGE IDENTITY travels — a bundle-
+      imported change reunifies at a later merge). Erased blobs travel
+      as tombstones (hash + size, NO body). `export_bundle` /
+      `import_bundle` on `WorkspaceVcs`: import is idempotent
+      (`AlreadyPresent`) and never clobbers divergent local content
+      (`DivergentBranch`, honest refusal). CLI `whip branch
+      export [--out] / import`.
 - [ ] **Chunk-granular transfer**: pull-missing extends from blobs to
       chunks (bundles, hybrid desktop↔cloud, sidecar warm-up become
       rsync-class incremental); object-tier **chunk packing** (pack
       objects indexed by the manifest — internal optimization, never
       user-visible); presigned direct transfer for big artifacts on the
       cloud path.
-- [ ] Per-blob erasure: tombstone/crypto-erase with retained hashes + the
+- [x] Per-blob erasure: tombstone/crypto-erase with retained hashes + the
       honesty downgrade (keep scores/identity, lose payload/replay);
       discharge un-tie's content-erasure invariants (`HISTORY_PRESERVED`,
       `EXPORTED_COPY_NOT_RECALLED`) over the substrate itself.
+      **DONE 2026-07-10:** `ContentBlobs` seam gains `status`
+      (Live/Erased/Unknown with retained byte_len) and `erase` (default
+      = honest `Unsupported`; native override drops the payload row,
+      keeps a `content_erasures` tombstone; chunk roots delegate to the
+      P1n fail-closed shared-chunk erasure). `WorkspaceVcs::erase_path`
+      + op-log entry; CLI `whip branch erase <branch> <path>`. Both
+      invariants discharged by test
+      (`erasure_preserves_history_and_respects_exports`): manifests/
+      cuts/ops/lineage all read after erasure and reads+diff degrade
+      honestly (`HISTORY_PRESERVED`); a pre-erasure bundle keeps its
+      payload and re-materializes elsewhere (erasure is local, honestly
+      so) while a post-erasure export carries only the tombstone
+      (`EXPORTED_COPY_NOT_RECALLED`). Note: content-addressed
+      re-ingestion of identical bytes re-creates the payload under the
+      same hash — an erase after re-ingestion must be re-issued.
 - [ ] **Selection algebra + selective verbs** (vw note §7.3): a
       **revset-shaped composable expression language** (∪/∩/− plus
       structural operators: `dependents-of`, `slice-of`, `by-effect`,

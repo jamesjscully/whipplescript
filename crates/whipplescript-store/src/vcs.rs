@@ -1070,6 +1070,171 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         )?))
     }
 
+    /// Export the branch as a self-contained handoff bundle
+    /// (bundle.rs): lineage snapshot + head manifest + reachable blobs +
+    /// recorded cuts. Erasure-respecting by construction — tombstoned
+    /// payloads never travel. `None` = no such branch.
+    pub fn export_bundle(
+        &self,
+        branch_id: &str,
+    ) -> StoreResult<Option<crate::bundle::WorkspaceBundle>> {
+        let Some(branch) = self.branches.get_branch(branch_id)? else {
+            return Ok(None);
+        };
+        let manifest = self.load_manifest(branch.head_manifest_hash.as_deref())?;
+        let blobs = crate::bundle::collect_blobs(&manifest, &self.content)?;
+        let head_change_id = self.change_of(branch.head_cut_id.as_deref())?;
+        let cuts = self.branches.list_cuts(branch_id, i64::MAX as usize)?;
+        Ok(Some(crate::bundle::WorkspaceBundle {
+            format: crate::bundle::BUNDLE_FORMAT.to_owned(),
+            branch,
+            head_change_id,
+            manifest,
+            blobs,
+            cuts,
+        }))
+    }
+
+    /// Import a bundle: store its payloads (content-addressed, so
+    /// re-import is free), re-create the branch, and advance it to the
+    /// bundle's state as ONE cut carrying the TRANSPORTED change id.
+    /// Idempotent — a branch already at the bundle's state is
+    /// `AlreadyPresent`; a branch with different local content is
+    /// refused, never clobbered.
+    pub fn import_bundle(
+        &mut self,
+        bundle: &crate::bundle::WorkspaceBundle,
+        at: &str,
+    ) -> StoreResult<crate::bundle::BundleImportOutcome> {
+        use crate::bundle::BundleImportOutcome;
+        if bundle.format != crate::bundle::BUNDLE_FORMAT {
+            return Err(StoreError::Conflict(format!(
+                "unknown bundle format `{}`",
+                bundle.format
+            )));
+        }
+        for blob in &bundle.blobs {
+            if let Some(body) = &blob.body {
+                self.content.put(body)?;
+            }
+        }
+        let manifest_hash = self.store_manifest(&bundle.manifest)?;
+        let branch_id = bundle.branch.branch_id.clone();
+        self.branches.ensure_mainline(at)?;
+        if let Some(existing) = self.branches.get_branch(&branch_id)? {
+            return Ok(
+                if existing.head_manifest_hash.as_deref() == Some(manifest_hash.as_str()) {
+                    BundleImportOutcome::AlreadyPresent { branch_id }
+                } else {
+                    BundleImportOutcome::DivergentBranch {
+                        branch_id,
+                        local_head_manifest_hash: existing.head_manifest_hash,
+                    }
+                },
+            );
+        }
+        let created = self.branches.create_branch(CreateBranch {
+            branch_id: &branch_id,
+            name: bundle.branch.name.as_deref(),
+            parent_branch_id: MAINLINE_BRANCH_ID,
+            at_cut: None,
+            created_at: at,
+            idempotency_key: None,
+        })?;
+        let CreateBranchOutcome::Created(created_row) = created else {
+            return Err(StoreError::Conflict(format!(
+                "bundle import could not create branch `{branch_id}`: {created:?}"
+            )));
+        };
+        // Identity travels: the branch's recorded cuts land first, so the
+        // imported head cut resolves to its ORIGINAL change id and a
+        // later merge reunifies instead of duplicating.
+        for cut in &bundle.cuts {
+            self.branches.record_cut(CutRecord {
+                cut_id: &cut.cut_id,
+                change_id: &cut.change_id,
+                branch_id: &cut.branch_id,
+                manifest_hash: &cut.manifest_hash,
+                parent_cut_id: cut.parent_cut_id.as_deref(),
+                origin: cut.origin.as_deref(),
+                recorded_at: &cut.recorded_at,
+            })?;
+        }
+        let cut_id = bundle
+            .branch
+            .head_cut_id
+            .clone()
+            .unwrap_or_else(|| format!("bundle-{manifest_hash}"));
+        let transported_change = bundle
+            .head_change_id
+            .clone()
+            .unwrap_or_else(|| cut_id.clone());
+        match self.branches.advance_head(
+            &branch_id,
+            created_row.head_cut_id.as_deref(),
+            &cut_id,
+            &manifest_hash,
+            at,
+        )? {
+            AdvanceOutcome::Advanced(advanced) => {
+                self.branches.record_cut(CutRecord {
+                    cut_id: &cut_id,
+                    change_id: &transported_change,
+                    branch_id: &branch_id,
+                    manifest_hash: &manifest_hash,
+                    parent_cut_id: None,
+                    origin: Some("bundle-import"),
+                    recorded_at: at,
+                })?;
+                self.log_op(
+                    &format!("op-import-bundle-{branch_id}-{manifest_hash}"),
+                    "import-bundle",
+                    vec![Self::op_delta(Some(&created_row), &advanced)],
+                    Some("bundle-import"),
+                    at,
+                )?;
+                Ok(BundleImportOutcome::Imported {
+                    branch_id,
+                    cut_id,
+                    manifest_hash,
+                })
+            }
+            other => Err(StoreError::Conflict(format!(
+                "bundle import could not land on `{branch_id}`: {other:?}"
+            ))),
+        }
+    }
+
+    /// Erase one path's payload on a branch (the honesty downgrade over
+    /// the substrate): the blob's bytes drop store-wide, its hash and
+    /// size remain, every manifest stays coherent. `None` = no such
+    /// branch or path. NOT a write — the manifest is untouched; only the
+    /// content plane loses the payload.
+    pub fn erase_path(
+        &mut self,
+        branch_id: &str,
+        path: &str,
+        at: &str,
+    ) -> StoreResult<Option<(String, crate::content::EraseOutcome)>> {
+        let Some(manifest) = self.manifest(branch_id)? else {
+            return Ok(None);
+        };
+        let Some(hash) = manifest.get(path) else {
+            return Ok(None);
+        };
+        let outcome = self.content.erase(hash, at)?;
+        if matches!(outcome, crate::content::EraseOutcome::Erased { .. }) {
+            self.log_op(
+                &format!("op-erase-{hash}"),
+                "erase",
+                Vec::new(),
+                Some(&format!("erase:{path}@{hash}")),
+                at,
+            )?;
+        }
+        Ok(Some((hash.clone(), outcome)))
+    }
+
     /// Status + hash plumbing for one branch. `None` = no such branch.
     pub fn status_report(&self, branch_id: &str) -> StoreResult<Option<BranchStatusReport>> {
         let Some(branch) = self.branches.get_branch(branch_id)? else {

@@ -31334,6 +31334,9 @@ const BRANCH_USAGE: &str =
   whip branch restore <branch> <cut>\n\
   whip branch discard <branch>\n\
   whip branch ops [--limit <n>]\n\
+  whip branch export <branch> [--out <file>]\n\
+  whip branch import <file>\n\
+  whip branch erase <branch> <path>\n\
   whip branch bind <branch> <instance>\n\
   whip branch reconcile\n\
   whip branch reconcile-list";
@@ -32514,6 +32517,138 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 },
                 Err(error) => {
                     eprintln!("branch ops failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "export" => {
+            let Some(branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let out = rest
+                .iter()
+                .position(|arg| *arg == "--out")
+                .and_then(|index| rest.get(index + 1))
+                .copied();
+            match vcs.export_bundle(branch_id) {
+                Ok(Some(bundle)) => {
+                    let encoded = match serde_json::to_string_pretty(&bundle) {
+                        Ok(encoded) => encoded,
+                        Err(error) => {
+                            eprintln!("branch export failed: {error}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    match out {
+                        Some(path) => {
+                            if let Err(error) = std::fs::write(path, &encoded) {
+                                eprintln!("branch export failed writing `{path}`: {error}");
+                                return ExitCode::FAILURE;
+                            }
+                            emit_json(json!({
+                                "exported": branch_id,
+                                "out": path,
+                                "blobs": bundle.blobs.len(),
+                                "files": bundle.manifest.len(),
+                            }))
+                        }
+                        None => {
+                            println!("{encoded}");
+                            ExitCode::SUCCESS
+                        }
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch export failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "import" => {
+            let Some(path) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let body = match std::fs::read_to_string(path) {
+                Ok(body) => body,
+                Err(error) => {
+                    eprintln!("branch import failed reading `{path}`: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let bundle: whipplescript_store::bundle::WorkspaceBundle =
+                match serde_json::from_str(&body) {
+                    Ok(bundle) => bundle,
+                    Err(error) => {
+                        eprintln!("branch import failed decoding `{path}`: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            use whipplescript_store::bundle::BundleImportOutcome;
+            match vcs.import_bundle(&bundle, &at) {
+                Ok(BundleImportOutcome::Imported {
+                    branch_id,
+                    cut_id,
+                    manifest_hash,
+                }) => emit_json(json!({
+                    "imported": branch_id,
+                    "cut_id": cut_id,
+                    "manifest_hash": manifest_hash,
+                })),
+                Ok(BundleImportOutcome::AlreadyPresent { branch_id }) => emit_json(json!({
+                    "imported": branch_id,
+                    "already_present": true,
+                })),
+                Ok(BundleImportOutcome::DivergentBranch {
+                    branch_id,
+                    local_head_manifest_hash,
+                }) => {
+                    eprintln!(
+                        "import refused: branch `{branch_id}` has divergent local content \
+                         (head manifest {local_head_manifest_hash:?}); import never clobbers"
+                    );
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch import failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "erase" => {
+            let (Some(branch_id), Some(path)) = (rest.first(), rest.get(1)) else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            use whipplescript_store::content::EraseOutcome;
+            match vcs.erase_path(branch_id, path, &at) {
+                Ok(Some((hash, EraseOutcome::Erased { byte_len }))) => emit_json(json!({
+                    "erased": path,
+                    "branch_id": branch_id,
+                    "hash": hash,
+                    "byte_len": byte_len,
+                })),
+                Ok(Some((hash, EraseOutcome::AlreadyErased))) => emit_json(json!({
+                    "erased": path,
+                    "branch_id": branch_id,
+                    "hash": hash,
+                    "already_erased": true,
+                })),
+                Ok(Some((hash, other))) => {
+                    eprintln!("erase refused for {hash}: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Ok(None) => {
+                    eprintln!("no file at `{path}` on branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch erase failed: {error:?}");
                     ExitCode::FAILURE
                 }
             }
