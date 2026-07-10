@@ -9,6 +9,7 @@ pub mod merge;
 #[cfg(feature = "native")]
 pub mod native_stores;
 pub mod skill_frontmatter;
+pub mod workstreams;
 
 use std::result;
 #[cfg(feature = "native")]
