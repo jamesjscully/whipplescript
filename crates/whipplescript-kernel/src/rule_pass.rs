@@ -77,9 +77,22 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
         }
         let active_version_id = status.instance.version_id;
         let active_revision_epoch = status.instance.revision_epoch;
-        let active_revision_epoch_key = active_revision_epoch.to_string();
         project_tracker_issues(kernel, instance_id, ir)?;
         let events = kernel.store().list_events(instance_id)?;
+        // Branch-distinct effect keys (versioned-workspace note §9.1, modeled
+        // in branch-effect-key.maude): the branch/cut ref joins
+        // program_version + revision_epoch in every derived idempotency key.
+        // The current ref is the restore lineage — each `context.restored`
+        // marker starts a new timeline head, and a re-executed suffix must
+        // never dedupe against the orphaned segment's effects. Generation 0
+        // keeps the pre-branch key bytes, so never-restored instances (and
+        // every existing store) derive unchanged keys.
+        let restore_generation = events
+            .iter()
+            .filter(|event| event.event_type == "context.restored")
+            .count();
+        let active_revision_epoch_key =
+            revision_branch_key(active_revision_epoch, restore_generation);
         let facts = kernel.store().list_facts(instance_id)?;
         let all_facts = kernel.store().list_facts_including_consumed(instance_id)?;
         let effects = kernel.store().list_effects(instance_id)?;
@@ -483,4 +496,66 @@ pub fn apply_rule_cancels<S: RuntimeStore>(
         }
     }
     Ok(())
+}
+
+/// The revision-axis key component every derived idempotency key carries:
+/// the revision epoch, joined by the branch/cut ref once the instance's
+/// timeline has forked (versioned-workspace note §9.1 — two branches firing
+/// the same version-node are distinct executions; branch-effect-key.maude
+/// holds the bite). The current ref axis is the restore lineage
+/// (`main.r<generation>`); a workspace-branch id will join it when
+/// instances are born on branches. Generation 0 returns the bare epoch so
+/// every pre-branching key derivation stays byte-identical.
+pub fn revision_branch_key(revision_epoch: i64, restore_generation: usize) -> String {
+    if restore_generation == 0 {
+        revision_epoch.to_string()
+    } else {
+        format!(
+            "{revision_epoch}@{}.r{restore_generation}",
+            whipplescript_store::branches::MAINLINE_BRANCH_ID
+        )
+    }
+}
+
+#[cfg(test)]
+mod branch_key_tests {
+    use super::revision_branch_key;
+    use crate::idempotency_key;
+
+    /// Generation 0 is the bare epoch: never-restored instances (every
+    /// existing store) derive byte-identical keys.
+    #[test]
+    fn generation_zero_preserves_existing_key_bytes() {
+        assert_eq!(revision_branch_key(0, 0), "0");
+        assert_eq!(revision_branch_key(3, 0), "3");
+    }
+
+    /// Each restore generation is a distinct timeline head: the same
+    /// version-node derives a DISTINCT effect key on every side of a
+    /// restore, so a re-executed suffix never dedupes against the orphaned
+    /// segment (the branch-effect-key.maude corruption, rejected).
+    #[test]
+    fn generations_never_collide_on_the_same_version_node() {
+        let key_for = |epoch_key: &str| {
+            idempotency_key(&["ins_1", "ver_1", epoch_key, "rule_a", "node_1", "started"])
+        };
+        let gen0 = key_for(&revision_branch_key(3, 0));
+        let gen1 = key_for(&revision_branch_key(3, 1));
+        let gen2 = key_for(&revision_branch_key(3, 2));
+        assert_ne!(gen0, gen1);
+        assert_ne!(gen1, gen2);
+        assert_ne!(gen0, gen2);
+        // Within one generation the key is stable — idempotency retained.
+        assert_eq!(gen1, key_for(&revision_branch_key(3, 1)));
+    }
+
+    /// The epoch and the branch ref are one composed component, so a bumped
+    /// epoch inside a generation and a bumped generation at one epoch are
+    /// also distinct.
+    #[test]
+    fn epoch_and_generation_axes_stay_distinct() {
+        assert_ne!(revision_branch_key(4, 1), revision_branch_key(3, 1));
+        assert_ne!(revision_branch_key(3, 2), revision_branch_key(3, 1));
+        assert_eq!(revision_branch_key(3, 1), "3@main.r1");
+    }
 }

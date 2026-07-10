@@ -125,8 +125,24 @@ Per-heading `· vN` tags below restate this at each phase.
 - [ ] Workstream tier: named shared lines + membership (single-valued,
       fail-closed to mainline); certificate-gated auto-admit in-stream;
       boundary-gated promotion; archive re-homes members.
-- [ ] Branch-distinct effect keys as a general rule (branch/cut id joins
+- [x] Branch-distinct effect keys as a general rule (branch/cut id joins
       program_version + revision_epoch in the idempotency key).
+      *(2026-07-10: `rule_pass::revision_branch_key` — the composed
+      revision-axis component every derived key carries (commit keys,
+      effect ids, autofail/diagnostic keys, and everything downstream that
+      derives from effect ids). The current branch/cut ref is the restore
+      lineage (`main.r<generation>`, one head per `context.restored`
+      marker); a workspace-branch id joins the same seam when instances
+      are born on branches. Generation 0 = bare epoch, so every existing
+      store derives byte-identical keys.)*
+- [ ] **Effects-plane restore fold (discovered 2026-07-10):**
+      `list_effects` does not fold the `context.restored` marker, so a
+      re-executed suffix sees the orphaned segment's effect rows and
+      silently adopts their outcomes instead of re-offering the rules.
+      Key-distinctness (above) removes the dedup half of the hazard; the
+      visibility half needs the replay-frontier decision (which orphaned
+      effects are legal replay vs which must re-execute) — owns with the
+      virtual-working-set/regeneration slice.
 - [ ] **Content-defined chunking** for large blobs (vw note §10.1):
       FastCDC-style chunk trees, file identity = stable Merkle root
       (nothing upstream re-keys); whole-blob below threshold; erasure at

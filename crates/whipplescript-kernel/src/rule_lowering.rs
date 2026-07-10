@@ -994,7 +994,10 @@ pub fn unwrap_optional_type(ty: &IrType) -> Option<&IrType> {
 pub fn lower_rule(
     instance_id: &str,
     program_version: &str,
-    revision_epoch: &str,
+    // The composed revision-axis key component (epoch, joined by the
+    // branch/cut ref once the timeline forked) — see
+    // rule_pass::revision_branch_key. A key part only, never parsed.
+    revision_epoch_key: &str,
     ir: &IrProgram,
     rule: &IrRule,
     context: &RuleContext,
@@ -1125,7 +1128,7 @@ pub fn lower_rule(
         let effect_id = idempotency_key(&[
             instance_id,
             program_version,
-            revision_epoch,
+            revision_epoch_key,
             &rule.name,
             node_id,
             context.identity.as_deref().unwrap_or("started"),
@@ -1334,7 +1337,7 @@ pub fn lower_rule(
             let effect_id = idempotency_key(&[
                 instance_id,
                 program_version,
-                revision_epoch,
+                revision_epoch_key,
                 &rule.name,
                 &after.binding,
                 &after.predicate,
