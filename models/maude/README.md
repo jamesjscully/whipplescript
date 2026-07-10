@@ -172,6 +172,27 @@ pattern-body-surface.maude       pattern-body allow-list: a pattern body may hol
                                  rules/effects/records/local schemas etc. but not
                                  workflow contracts, nested pattern/apply, or a rule
                                  reaching a workflow terminal; allowed never rejected
+merge-slice.maude                versioned-workspace certified merge: disjoint-slice
+                                 composition over manifests vs the text-proxy engine;
+                                 cross-file write/read and consume/read anti-dependence
+                                 conflicts refuse the certificate and escalate honestly
+merge-confluence.maude           certified-merge confluence: pairwise-disjoint edits
+                                 fold order-independently; overlap-graph components
+                                 escalate jointly, never first-come partial folds
+workstream.maude                 workstream tier invariants: membership-gates-autosync
+                                 with certificate-gated auto-admit, single-valued
+                                 membership, archive-rehomes-members to mainline
+branch-effect-key.maude          branch-distinct effect idempotency keys: the naive
+                                 branch-blind key dedupes counterfactual vs real
+                                 effects (both directions demonstrated); the branch
+                                 id in the key rejects it, idempotency retained
+selective-undo.maude             selective-undo stranding: a naive by-path filter
+                                 accepts an undo that strands a retained reader; the
+                                 dependency-closure check refuses it and accepts a
+                                 selection containing its own reader
+stat-cache.maude                 import-back stat-cache soundness: a naive size+mtime
+                                 fingerprint drops a racy-granule content change; the
+                                 sound importer re-hashes inside the racy window only
 ```
 
 The shell script runs every Maude test file and checks the expected number of
