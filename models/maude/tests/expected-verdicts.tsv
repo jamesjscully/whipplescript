@@ -55,6 +55,7 @@ merge-confluence.maude	SNSNNN
 merge-slice.maude	SSNSNSNSNS
 milestone-signal.maude	SSNNN
 native-provider-lifecycle.maude	SSSNN
+op-undo.maude	SNSSSN
 owned-harness-compaction.maude	SN
 owned-harness-envelope.maude	SSNNN
 owned-harness-loop.maude	SSSNNNNN
@@ -66,6 +67,7 @@ pattern-body-surface.maude	SSSSSSNN
 pattern-recursion.maude	SSSNN
 policy-capacity-retry.maude	NSNSSS
 provenance-completeness.maude	SSN
+resolution-memory.maude	SNSSN
 restorable-context.maude	SSSNNNN
 restore-replay.maude	SNSN
 script-capability-seeding.maude	SNN
