@@ -1,7 +1,16 @@
 # DR-0036 — Per-turn workspace cut and dynamic guarantee report
 
-Status: proposed (2026-07-10; drafted as the cross-repo dependency named by
-GaugeWright ADR 0082 stage 3 — awaiting ratification here). Cross-refs:
+Status: accepted + built (2026-07-10; drafted as the cross-repo dependency
+named by GaugeWright ADR 0082 stage 3, built the same day — witness model
+`models/maude/turn-witness.maude`; resolver-witnessed cut segments aggregated
+into `host.turn.workspace_cut` evidence + a populated `workspace_cut_ref`;
+envelope `guarantee` declarations evaluated into the report's `dynamic`
+section as held / **violated** / not-evaluated — "violated" added to the §2
+vocabulary because an evaluated-and-failed guarantee is neither held nor
+not-evaluated, and the advancement consumer needs to see it; test
+`receipt_workspace_cut_and_dynamic_guarantees_from_witnessed_turn`).
+Residual: `no_tainted_reads:<label-class>` reports not-evaluated until
+label-class read tainting is witnessed. Cross-refs:
 DR-0024 (owned brokered harness — the evidence producer), DR-0027/0028
 (authority envelope / governance semantics the dynamic guarantees cite),
 DR-0034 (managed vs. delegated — both classes must satisfy or honestly decline

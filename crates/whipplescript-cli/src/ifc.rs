@@ -81,6 +81,12 @@ pub struct Envelope {
     /// the role is the agent's authority ceiling (D3). An identity with no party
     /// entry is the public bottom (fail-closed). Empty = no per-user scoping declared.
     party_of: BTreeMap<String, String>,
+    /// Dynamic per-turn guarantees governance requires each turn to evaluate
+    /// (DR-0036 §2): `(name, paths)` where `writes_within:<scope>` carries the
+    /// scope's path globs and flag guarantees (`no_reads_beyond_grant`,
+    /// `no_tainted_reads:<class>`) carry none. The report cites each as held,
+    /// violated, or not-evaluated — never silently omitted.
+    guarantees: Vec<(String, Vec<String>)>,
 }
 
 impl Envelope {
@@ -126,6 +132,28 @@ impl Envelope {
         let mut internal_workflows = BTreeSet::new();
         let mut address_of = BTreeMap::new();
         let mut party_of = BTreeMap::new();
+        let mut guarantees: Vec<(String, Vec<String>)> = Vec::new();
+        // Dynamic guarantee declarations (DR-0036 §2), round-tripped through the
+        // signed artifact.
+        if let Some(items) = value.get("guarantees").and_then(|g| g.as_array()) {
+            for item in items {
+                let Some(name) = item.get("name").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let paths = item
+                    .get("paths")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|paths| {
+                        paths
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                guarantees.push((name.to_owned(), paths));
+            }
+        }
         // a signed/canonical envelope carries the handle -> address bindings; a
         // hand-written JSON without them treats each resource key as its own address.
         if let Some(map) = value.get("bindings").and_then(|b| b.as_object()) {
@@ -235,6 +263,7 @@ impl Envelope {
             internal_workflows,
             address_of,
             party_of,
+            guarantees,
         })
     }
 
@@ -255,6 +284,7 @@ impl Envelope {
         let mut internal_workflows = BTreeSet::new();
         let mut address_of: BTreeMap<String, String> = BTreeMap::new();
         let mut party_of: BTreeMap<String, String> = BTreeMap::new();
+        let mut guarantees: Vec<(String, Vec<String>)> = Vec::new();
         for (index, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -284,6 +314,18 @@ impl Envelope {
                 } else {
                     endorse.push(pair);
                 }
+                continue;
+            }
+            // `guarantee <name> [<glob>...]` declares a dynamic per-turn guarantee
+            // (DR-0036 §2); `writes_within:<scope>` carries the scope's path globs.
+            if tokens.first().copied() == Some("guarantee") {
+                let Some(name) = tokens.get(1) else {
+                    return Err(format!("line {}: guarantee needs a name", index + 1));
+                };
+                guarantees.push((
+                    (*name).to_owned(),
+                    tokens[2..].iter().map(|tok| (*tok).to_owned()).collect(),
+                ));
                 continue;
             }
             match tokens.first().copied() {
@@ -383,6 +425,7 @@ impl Envelope {
             internal_workflows,
             address_of,
             party_of,
+            guarantees,
         })
     }
 
@@ -436,15 +479,33 @@ impl Envelope {
             .iter()
             .map(|(identity, role)| (identity.clone(), serde_json::Value::String(role.clone())))
             .collect();
-        serde_json::json!({
+        let mut canonical = serde_json::json!({
             "resources": resources,
             "bindings": bindings,
             "parties": parties,
             "delegations": delegations,
             "declassifications": declassifications,
             "endorsements": endorsements,
-        })
-        .to_string()
+        });
+        // Dynamic guarantee declarations (DR-0036 §2), sorted for a stable hash.
+        // Emitted only when declared, so envelopes predating the feature keep
+        // their signed hashes.
+        if !self.guarantees.is_empty() {
+            let mut declared = self.guarantees.clone();
+            declared.sort();
+            canonical["guarantees"] = serde_json::Value::Array(
+                declared
+                    .iter()
+                    .map(|(name, paths)| serde_json::json!({ "name": name, "paths": paths }))
+                    .collect(),
+            );
+        }
+        canonical.to_string()
+    }
+
+    /// The dynamic per-turn guarantees governance declared (DR-0036 §2).
+    pub fn declared_guarantees(&self) -> &[(String, Vec<String>)] {
+        &self.guarantees
     }
 
     /// The reader-authority SET of a resource; the empty set (`public`, the bottom)
@@ -1022,6 +1083,12 @@ impl VerifiedEnvelope {
     /// handle->address bindings.
     pub fn governs(&self, resource: &str) -> bool {
         self.envelope.governs(resource)
+    }
+
+    /// The dynamic per-turn guarantees this policy requires each turn to
+    /// evaluate (DR-0036 §2).
+    pub fn declared_guarantees(&self) -> &[(String, Vec<String>)] {
+        self.envelope.declared_guarantees()
     }
 
     /// Wrap a raw envelope as verified — TESTS ONLY (unit tests exercise the checker

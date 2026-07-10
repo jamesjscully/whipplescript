@@ -604,7 +604,7 @@ replace git for working branches + workstreams.)*
 
 ## Phase 4 — policy plane + auth · **v0.4**
 
-- [~] Policy-epoch consumption: **host trust boundary published 2026-07-09.**
+- [x] Policy-epoch consumption: **host trust boundary published 2026-07-09.**
       The `whipplescript` package now has a library target exposing the exact
       governance/IFC implementation used by the CLI. Embedding hosts call
       `VerifiedEnvelope::verify_signed_text`, which requires and verifies the
@@ -617,7 +617,30 @@ replace git for working branches + workstreams.)*
       refs rather than bodies or secrets. Remaining: drive the owned turn through
       this protocol, enforce the complete capability/provider/egress/clearance
       envelope, and mint the referenced evidence/guarantee artifacts from real
-      log positions.
+      log positions. **REMAINDER DONE 2026-07-10 (DR-0036 accepted + built):**
+      the protocol turn drives the one owned brokered machine
+      (`run_brokered_agent_turn`) under full admission — capability (tool
+      surface pinned to the package + every resource/provider/placement
+      handle governed), provider/egress/clearance (package IFC under the
+      verified envelope refuses an uncleared model principal at admission;
+      internal-signal and party ceilings as before) — and the receipt's
+      artifacts are now real: the resolver witnesses every mediated
+      write/edit per segment (durable
+      `host.turn.workspace_cut.segment` evidence, so human-suspended turns
+      aggregate honestly), `workspace_cut_ref` references the aggregated
+      `host.turn.workspace_cut` evidence (explicitly-empty cut for no-write
+      turns; DECLINED — absent — when a native command mutated outside the
+      mediated surface, per `turn-witness.maude`), and the guarantee report
+      gains the envelope-declared `dynamic` section
+      (`guarantee writes_within:<scope> <globs>` /
+      `no_reads_beyond_grant` / `no_tainted_reads:<class>` in the policy
+      DSL + canonical JSON, hash-stable for prior envelopes) evaluated per
+      turn under the cited epoch as held/violated/not-evaluated. Test:
+      `receipt_workspace_cut_and_dynamic_guarantees_from_witnessed_turn`.
+      Residuals: `no_tainted_reads` reports not-evaluated until label-class
+      read tainting is witnessed; protocol turns run package-declared
+      context with `NoopCompactor` (host owns context per GaugeWright ADR
+      0080 — compaction for embedded long threads is a quality follow-up).
 - [ ] Auth simplification: provider profiles carry host-resolved
       credentials; whip's own auth shrinks to the thin standalone resolver
       (current env/keychain design becomes the fallback path).

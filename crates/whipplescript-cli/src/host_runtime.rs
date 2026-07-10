@@ -478,6 +478,39 @@ pub struct ResolvedImage {
 /// Every call receives only the resource references admitted for this turn.
 /// WhippleScript checks the tool name against the pinned package before invoking
 /// the resolver, so neither model nor host can widen the tool surface in flight.
+/// One witnessed workspace mutation (DR-0036 §1): the resolver performed the
+/// operation itself, so this is the runtime's own claim of the delta — a
+/// content reference, never an inline body.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WitnessedWrite {
+    pub path: String,
+    /// `"add"` (path did not exist before) or `"modify"`.
+    pub kind: String,
+    pub content_hash: String,
+    pub bytes: u64,
+}
+
+/// The per-turn workspace witness a resolver hands back when the turn segment
+/// ends (DR-0036 §1; turn-witness.maude). The receipt claims a workspace cut
+/// only from a complete witness — a harness that cannot witness every
+/// mutation declines honestly, and consumers treat absence as "unwitnessed",
+/// never as "no changes".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TurnWitness {
+    /// The resolver mediates no workspace: nothing to witness or decline.
+    Unavailable,
+    /// Every mutation went through the resolver, so the delta is complete —
+    /// possibly empty (the explicitly-empty cut, distinguishable from
+    /// declining).
+    Witnessed {
+        writes: Vec<WitnessedWrite>,
+        reads: Vec<String>,
+    },
+    /// An unmediated mutation channel ran (a native command): the delta
+    /// cannot be claimed. Decline, never fabricate.
+    Unwitnessed { reason: String },
+}
+
 pub trait ResourceResolver {
     fn resolve_image(&self, image: &ResourceRef) -> Result<ResolvedImage, String>;
 
@@ -486,6 +519,13 @@ pub trait ResourceResolver {
         admitted_resources: &[ResourceRef],
         call: &ToolCall,
     ) -> Result<String, String>;
+
+    /// Take (and reset) the workspace witness accumulated since the last
+    /// take — called once per turn segment. The default declines nothing and
+    /// claims nothing: a resolver without a workspace has no witness.
+    fn take_turn_witness(&self) -> TurnWitness {
+        TurnWitness::Unavailable
+    }
 
     /// Resolve a package-declared human question after WhippleScript has
     /// admitted the turn's `human` resource. Implementations may further refuse
@@ -576,6 +616,41 @@ pub struct NativeWorkspaceResolver {
     read_only: Vec<PathBuf>,
     max_output_bytes: usize,
     command: Option<(NativeCommandPolicy, Arc<dyn CommandExecutor>)>,
+    /// The per-turn workspace witness (DR-0036 §1): every mutation this
+    /// resolver performs is recorded; a native command taints the segment
+    /// because it mutates outside the mediated surface.
+    witness: std::sync::Mutex<WitnessState>,
+}
+
+#[derive(Default)]
+struct WitnessState {
+    writes: Vec<WitnessedWrite>,
+    reads: Vec<String>,
+    taint: Option<String>,
+}
+
+impl NativeWorkspaceResolver {
+    fn witness_write(&self, path: &str, existed: bool, content: &str) {
+        let mut state = self.witness.lock().expect("witness lock");
+        state.writes.push(WitnessedWrite {
+            path: path.to_owned(),
+            kind: if existed { "modify" } else { "add" }.to_owned(),
+            content_hash: sha256_hex(content.as_bytes()),
+            bytes: content.len() as u64,
+        });
+    }
+
+    fn witness_read(&self, path: &str) {
+        let mut state = self.witness.lock().expect("witness lock");
+        state.reads.push(path.to_owned());
+    }
+
+    fn witness_taint(&self, reason: &str) {
+        let mut state = self.witness.lock().expect("witness lock");
+        if state.taint.is_none() {
+            state.taint = Some(reason.to_owned());
+        }
+    }
 }
 
 impl NativeWorkspaceResolver {
@@ -592,6 +667,7 @@ impl NativeWorkspaceResolver {
             read_only: Vec::new(),
             max_output_bytes: 50_000,
             command: None,
+            witness: std::sync::Mutex::new(WitnessState::default()),
         })
     }
 
@@ -653,6 +729,7 @@ impl NativeWorkspaceResolver {
 
     fn read(&self, arguments: &Value) -> Result<String, String> {
         let path = string_argument(arguments, "path")?;
+        self.witness_read(path);
         let resolved = self.resolve(path, false)?;
         let text = fs::read_to_string(&resolved)
             .map_err(|error| format!("cannot read workspace path `{path}`: {error}"))?;
@@ -685,8 +762,10 @@ impl NativeWorkspaceResolver {
                 .map_err(|error| format!("cannot create parent for `{path}`: {error}"))?;
             reject_symlinks_between(&self.root, parent, path)?;
         }
+        let existed = resolved.exists();
         fs::write(&resolved, content)
             .map_err(|error| format!("cannot write workspace path `{path}`: {error}"))?;
+        self.witness_write(path, existed, content);
         Ok(format!("wrote {} bytes to {path}", content.len()))
     }
 
@@ -710,13 +789,15 @@ impl NativeWorkspaceResolver {
             }
             text = text.replacen(old, new, 1);
         }
-        fs::write(&resolved, text)
+        fs::write(&resolved, &text)
             .map_err(|error| format!("cannot edit workspace path `{path}`: {error}"))?;
+        self.witness_write(path, true, &text);
         Ok(format!("applied {} edit(s) to {path}", edits.len()))
     }
 
     fn list(&self, arguments: &Value) -> Result<String, String> {
         let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+        self.witness_read(path);
         let resolved = self.resolve(path, false)?;
         let mut names = fs::read_dir(&resolved)
             .map_err(|error| format!("cannot list workspace path `{path}`: {error}"))?
@@ -735,6 +816,7 @@ impl NativeWorkspaceResolver {
 
     fn find(&self, arguments: &Value) -> Result<String, String> {
         let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+        self.witness_read(path);
         let pattern = string_argument(arguments, "pattern")?;
         let resolved = self.resolve(path, false)?;
         let mut matches = Vec::new();
@@ -750,6 +832,7 @@ impl NativeWorkspaceResolver {
 
     fn grep(&self, arguments: &Value) -> Result<String, String> {
         let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+        self.witness_read(path);
         let pattern = string_argument(arguments, "pattern")?;
         let matcher = regex::Regex::new(pattern).ok();
         let resolved = self.resolve(path, false)?;
@@ -802,6 +885,10 @@ impl NativeWorkspaceResolver {
                 policy.max_timeout.as_secs()
             ));
         }
+        // The command mutates the workspace outside the mediated tool surface:
+        // the turn's workspace cut can no longer be claimed as complete
+        // (turn-witness.maude's taint) — the receipt will decline honestly.
+        self.witness_taint("a native command ran outside the mediated tool surface");
         let output = executor.execute(&AdmittedCommand {
             command: command.to_owned(),
             workspace_root: self.root.clone(),
@@ -870,6 +957,17 @@ impl ResourceResolver for NativeWorkspaceResolver {
                 self.bash(&call.arguments)
             }
             _ => Err("tool has no native workspace implementation".to_owned()),
+        }
+    }
+
+    fn take_turn_witness(&self) -> TurnWitness {
+        let state = std::mem::take(&mut *self.witness.lock().expect("witness lock"));
+        match state.taint {
+            Some(reason) => TurnWitness::Unwitnessed { reason },
+            None => TurnWitness::Witnessed {
+                writes: state.writes,
+                reads: state.reads,
+            },
         }
     }
 
@@ -2287,10 +2385,181 @@ impl GovernedHostRuntime {
                 &input,
             )
             .map_err(HostRuntimeError::Store)?;
+        // DR-0036 §1: persist this segment's workspace witness before the turn
+        // suspends or finishes — a human-suspended turn resumes with a fresh
+        // resolver, so the receipt aggregates the durable segments instead of
+        // trusting any single resolver instance.
+        self.record_witness_segment(command, resources)?;
         if let Some(suspended) = self.pending_execution(command)? {
             return Ok(suspended);
         }
         self.finish_execution(command)
+    }
+
+    /// Record the turn segment's workspace witness as durable evidence
+    /// (DR-0036 §1). `Unavailable` records nothing — a resolver with no
+    /// workspace has nothing to claim or decline; the receipt will honestly
+    /// omit `workspace_cut_ref`.
+    fn record_witness_segment<R: ResourceResolver + ?Sized>(
+        &self,
+        command: &StartTurnCommand,
+        resources: &R,
+    ) -> Result<(), HostRuntimeError> {
+        let witness = resources.take_turn_witness();
+        let metadata = match &witness {
+            TurnWitness::Unavailable => return Ok(()),
+            TurnWitness::Witnessed { writes, reads } => json!({
+                "witness": "witnessed",
+                "writes": writes,
+                "reads": reads,
+            }),
+            TurnWitness::Unwitnessed { reason } => json!({
+                "witness": "unwitnessed",
+                "reason": reason,
+            }),
+        };
+        let run_id = idempotency_key(&[&command.instance_ref, &command.command_id, "brokered-run"]);
+        self.kernel
+            .store()
+            .record_evidence(EvidenceRecord {
+                instance_id: &command.instance_ref,
+                kind: "host.turn.workspace_cut.segment",
+                subject_type: "run",
+                subject_id: &run_id,
+                causation_id: Some(&command.command_id),
+                correlation_id: Some(&command.command_id),
+                summary: None,
+                metadata_json: &metadata.to_string(),
+            })
+            .map_err(HostRuntimeError::Store)?;
+        Ok(())
+    }
+
+    /// Fold the turn's witness segments into one claim (DR-0036 §1;
+    /// turn-witness.maude): any unwitnessed segment declines the whole turn
+    /// (never fabricate); otherwise writes merge by path (a later segment's
+    /// write to the same path supersedes) and reads union. No segments at
+    /// all = no workspace surface = nothing to reference.
+    fn aggregate_witness(
+        &self,
+        command: &StartTurnCommand,
+        run_id: &str,
+    ) -> Result<TurnWitness, HostRuntimeError> {
+        let segments = self
+            .kernel
+            .store()
+            .list_evidence_for_subject("run", run_id)
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .filter(|item| {
+                item.kind == "host.turn.workspace_cut.segment"
+                    && item.correlation_id.as_deref() == Some(&command.command_id)
+            })
+            .collect::<Vec<_>>();
+        if segments.is_empty() {
+            return Ok(TurnWitness::Unavailable);
+        }
+        let mut writes: std::collections::BTreeMap<String, WitnessedWrite> =
+            std::collections::BTreeMap::new();
+        let mut reads: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for segment in segments {
+            let value: Value =
+                serde_json::from_str(&segment.metadata_json).map_err(HostRuntimeError::Json)?;
+            match value.get("witness").and_then(Value::as_str) {
+                Some("witnessed") => {
+                    let segment_writes: Vec<WitnessedWrite> =
+                        serde_json::from_value(value.get("writes").cloned().unwrap_or_default())
+                            .map_err(HostRuntimeError::Json)?;
+                    for write in segment_writes {
+                        writes.insert(write.path.clone(), write);
+                    }
+                    if let Some(segment_reads) = value.get("reads").and_then(Value::as_array) {
+                        reads.extend(
+                            segment_reads
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned),
+                        );
+                    }
+                }
+                _ => {
+                    return Ok(TurnWitness::Unwitnessed {
+                        reason: value
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("a turn segment was unwitnessed")
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(TurnWitness::Witnessed {
+            writes: writes.into_values().collect(),
+            reads: reads.into_iter().collect(),
+        })
+    }
+
+    /// Evaluate the envelope's declared dynamic guarantees for this turn
+    /// (DR-0036 §2) under the cited policy epoch. Every declared guarantee
+    /// appears in the report — held, violated, or not-evaluated, never
+    /// silently omitted; consumers match names, never re-evaluate semantics.
+    fn evaluate_dynamic_guarantees(&self, witness: &TurnWitness) -> Vec<Value> {
+        self.envelope
+            .declared_guarantees()
+            .iter()
+            .map(|(name, paths)| {
+                if let Some(scope) = name.strip_prefix("writes_within:") {
+                    return match witness {
+                        TurnWitness::Witnessed { writes, .. } => {
+                            let outside: Vec<&str> = writes
+                                .iter()
+                                .filter(|write| {
+                                    !paths.iter().any(|glob| wildcard_matches(glob, &write.path))
+                                })
+                                .map(|write| write.path.as_str())
+                                .collect();
+                            if outside.is_empty() {
+                                json!({ "name": name, "outcome": "held", "detail": format!("{} write(s) within scope `{scope}`", writes.len()) })
+                            } else {
+                                json!({ "name": name, "outcome": "violated", "detail": format!("write(s) outside scope `{scope}`: {}", outside.join(", ")) })
+                            }
+                        }
+                        TurnWitness::Unwitnessed { reason } => json!({
+                            "name": name, "outcome": "not_evaluated", "detail": reason,
+                        }),
+                        TurnWitness::Unavailable => json!({
+                            "name": name, "outcome": "not_evaluated",
+                            "detail": "the turn had no witnessed workspace surface",
+                        }),
+                    };
+                }
+                if name == "no_reads_beyond_grant" {
+                    return match witness {
+                        TurnWitness::Witnessed { reads, .. } => json!({
+                            "name": name, "outcome": "held",
+                            "detail": format!("{} read(s), all resolver-mediated within the turn's admitted capabilities", reads.len()),
+                        }),
+                        TurnWitness::Unwitnessed { reason } => json!({
+                            "name": name, "outcome": "not_evaluated", "detail": reason,
+                        }),
+                        TurnWitness::Unavailable => json!({
+                            "name": name, "outcome": "not_evaluated",
+                            "detail": "the turn had no witnessed workspace surface",
+                        }),
+                    };
+                }
+                if name.starts_with("no_tainted_reads:") {
+                    return json!({
+                        "name": name, "outcome": "not_evaluated",
+                        "detail": "label-class read tainting is not witnessed yet",
+                    });
+                }
+                json!({
+                    "name": name, "outcome": "not_evaluated",
+                    "detail": "unknown guarantee name",
+                })
+            })
+            .collect()
     }
 
     fn validate_instance<P: PackageResolver + ?Sized>(
@@ -2367,6 +2636,29 @@ impl GovernedHostRuntime {
         let status = turn_status(&run.status)?;
         let usage_ref =
             self.ensure_evidence(command, &run_id, "host.turn.usage", &run.metadata_json)?;
+        // DR-0036 §1: the receipt's workspace cut is the aggregated witness —
+        // a complete claim (possibly explicitly empty), or honestly absent
+        // when any segment was unwitnessed or no workspace surface existed.
+        let witness = self.aggregate_witness(command, &run_id)?;
+        let workspace_cut_ref = match &witness {
+            TurnWitness::Witnessed { writes, reads } => Some(
+                self.ensure_evidence(
+                    command,
+                    &run_id,
+                    "host.turn.workspace_cut",
+                    &json!({
+                        "complete": true,
+                        "writes": writes,
+                        "reads": reads,
+                    })
+                    .to_string(),
+                )?,
+            ),
+            TurnWitness::Unwitnessed { .. } | TurnWitness::Unavailable => None,
+        };
+        // DR-0036 §2: the static admission set plus the dynamic per-turn
+        // section, evaluated under the cited policy epoch.
+        let dynamic = self.evaluate_dynamic_guarantees(&witness);
         let guarantee = json!({
             "protocol": HOST_PROTOCOL,
             "policy": command.policy,
@@ -2382,7 +2674,8 @@ impl GovernedHostRuntime {
                 "resource_provider_placement_handles_governed",
                 "tool_surface_pinned_to_package",
                 "resource_and_secret_bodies_resolved_after_admission"
-            ]
+            ],
+            "dynamic": dynamic,
         })
         .to_string();
         let guarantee_report_ref =
@@ -2397,6 +2690,7 @@ impl GovernedHostRuntime {
             "output_handle": output_handle,
             "usage_ref": usage_ref,
             "guarantee_report_ref": guarantee_report_ref,
+            "workspace_cut_ref": workspace_cut_ref,
         })
         .to_string();
         let marker = self
@@ -2430,7 +2724,7 @@ impl GovernedHostRuntime {
             output_handle,
             usage_ref,
             guarantee_report_ref,
-            workspace_cut_ref: None,
+            workspace_cut_ref,
         };
         receipt.validate_for(command)?;
         let output = self.project_turn_output(command, receipt.output_handle.clone())?;
@@ -2685,7 +2979,10 @@ impl GovernedHostRuntime {
                 .map(str::to_owned),
             usage_ref: required_string(&value, "usage_ref")?,
             guarantee_report_ref: required_string(&value, "guarantee_report_ref")?,
-            workspace_cut_ref: None,
+            workspace_cut_ref: value
+                .get("workspace_cut_ref")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         };
         receipt.validate_for(command)?;
         let mut projected = Vec::new();
@@ -4063,6 +4360,375 @@ workflow HumanHostChat {
             .any(|tool| tool.name == "bash"));
         drop(calls);
         let _ = fs::remove_dir_all(root);
+    }
+
+    struct CutPackages;
+
+    impl PackageResolver for CutPackages {
+        fn resolve_package(&self, version_ref: &str) -> Result<ResolvedPackage, String> {
+            ResolvedPackage::compile(
+                version_ref,
+                r#"
+file store project {
+  root "."
+  allow read ["**"]
+  allow write ["**"]
+}
+
+workflow HostChat {
+  agent assistant {
+    provider owned
+    profile "repo-writer"
+    capacity 1
+  }
+
+  rule converse
+    when started
+  => {
+    tell assistant
+      with access to project {
+        read ["**"]
+        write ["**"]
+      }
+      "host turn"
+  }
+}
+"#,
+                Some("HostChat"),
+                "assistant",
+                "Help through the governed workspace tools.",
+                vec![
+                    ToolSpec {
+                        name: "read".to_owned(),
+                        description: "Read a workspace path.".to_owned(),
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": { "path": { "type": "string" } },
+                            "required": ["path"],
+                            "additionalProperties": false
+                        }),
+                    },
+                    ToolSpec {
+                        name: "write".to_owned(),
+                        description: "Write a workspace path.".to_owned(),
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "content": { "type": "string" }
+                            },
+                            "required": ["path", "content"],
+                            "additionalProperties": false
+                        }),
+                    },
+                    ToolSpec {
+                        name: "bash".to_owned(),
+                        description: "Run an admitted native command.".to_owned(),
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "command": { "type": "string" },
+                                "timeout": { "type": "integer" }
+                            },
+                            "required": ["command"],
+                            "additionalProperties": false
+                        }),
+                    },
+                ],
+                6,
+            )
+        }
+    }
+
+    /// DR-0036: the terminal receipt references the turn's witnessed workspace
+    /// cut and the guarantee report carries the envelope-declared dynamic
+    /// section — held, violated, or not-evaluated, never silently omitted —
+    /// and a turn whose workspace moved through an unmediated channel
+    /// declines the cut instead of fabricating one.
+    #[test]
+    fn receipt_workspace_cut_and_dynamic_guarantees_from_witnessed_turn() {
+        struct StubExecutor;
+        impl CommandExecutor for StubExecutor {
+            fn execute(&self, _: &AdmittedCommand) -> Result<CommandExecutionOutput, String> {
+                Ok(CommandExecutionOutput {
+                    stdout: "clean\n".to_owned(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                })
+            }
+        }
+
+        let path = temp_store();
+        let workspace = std::env::temp_dir().join(format!(
+            "whip-host-cut-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&workspace).expect("workspace");
+        let policy_text = SignedEnvelope::sign_for_test(
+            "grant file_store project -> file:/workspace readable by Operator\n\
+             grant provider model -> provider:openai readable by Operator\n\
+             grant provider owned -> provider:owned readable by Operator\n\
+             grant command command -> command:local readable by Operator\n\
+             grant placement local -> placement:local readable by Operator\n\
+             guarantee writes_within:src src/*\n\
+             guarantee no_reads_beyond_grant\n\
+             guarantee no_tainted_reads:confidential\n",
+            "gaugedesk-admin",
+        )
+        .to_json();
+        let mut runtime = GovernedHostRuntime::open(&path, 21, &policy_text).expect("runtime");
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-cut-chat".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime
+            .open_instance(&open, &CutPackages)
+            .expect("instance");
+        let resources = NativeWorkspaceResolver::new(&workspace)
+            .expect("resolver")
+            .command_execution(
+                NativeCommandPolicy::allow_prefixes(["git".to_owned()], Duration::from_secs(60)),
+                Arc::new(StubExecutor),
+            );
+        let secrets = Secrets {
+            calls: Cell::new(0),
+        };
+        let dynamic_outcome = |guarantee: &Value, name: &str| -> (String, String) {
+            let entry = guarantee
+                .get("dynamic")
+                .and_then(Value::as_array)
+                .and_then(|entries| {
+                    entries
+                        .iter()
+                        .find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
+                })
+                .unwrap_or_else(|| panic!("dynamic guarantee `{name}` missing: {guarantee}"));
+            (
+                entry
+                    .get("outcome")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                entry
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        };
+        let evidence_metadata = |runtime: &GovernedHostRuntime,
+                                 command: &StartTurnCommand,
+                                 evidence_id: &str|
+         -> Value {
+            let run_id =
+                idempotency_key(&[&command.instance_ref, &command.command_id, "brokered-run"]);
+            let item = runtime
+                .kernel
+                .store()
+                .list_evidence_for_subject("run", &run_id)
+                .expect("evidence")
+                .into_iter()
+                .find(|item| item.evidence_id == evidence_id)
+                .expect("referenced evidence exists");
+            serde_json::from_str(&item.metadata_json).expect("evidence metadata")
+        };
+        let guarantee_metadata =
+            |runtime: &GovernedHostRuntime, command: &StartTurnCommand| -> Value {
+                let run_id =
+                    idempotency_key(&[&command.instance_ref, &command.command_id, "brokered-run"]);
+                let item = runtime
+                    .kernel
+                    .store()
+                    .list_evidence_for_subject("run", &run_id)
+                    .expect("evidence")
+                    .into_iter()
+                    .find(|item| item.kind == "host.turn.guarantee")
+                    .expect("guarantee evidence");
+                serde_json::from_str(&item.metadata_json).expect("guarantee metadata")
+            };
+
+        // Turn 1: one mediated write inside the declared scope. The receipt
+        // references the complete witnessed cut; writes_within holds.
+        let command1 = turn(&instance.instance_ref, &open.policy, 1);
+        let turn1 = runtime
+            .run_turn_with_driver(
+                &command1,
+                &CutPackages,
+                &secrets,
+                &resources,
+                &ScriptedDriver::new(vec![
+                    json!({
+                        "output": [{
+                            "type": "function_call",
+                            "call_id": "write-1",
+                            "name": "write",
+                            "arguments": "{\"path\":\"src/out.md\",\"content\":\"cut body\"}"
+                        }],
+                        "usage": { "input_tokens": 10, "output_tokens": 2 }
+                    }),
+                    json!({
+                        "output_text": "wrote the file",
+                        "usage": { "input_tokens": 12, "output_tokens": 3 }
+                    }),
+                ]),
+            )
+            .expect("turn 1");
+        let receipt1 = turn1.receipt.expect("terminal receipt");
+        let cut_ref = receipt1
+            .workspace_cut_ref
+            .clone()
+            .expect("witnessed turn references its workspace cut");
+        let cut = evidence_metadata(&runtime, &command1, &cut_ref);
+        assert_eq!(cut.get("complete"), Some(&Value::Bool(true)));
+        let writes = cut.get("writes").and_then(Value::as_array).expect("writes");
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            writes[0].get("path").and_then(Value::as_str),
+            Some("src/out.md")
+        );
+        assert_eq!(writes[0].get("kind").and_then(Value::as_str), Some("add"));
+        assert!(writes[0]
+            .get("content_hash")
+            .and_then(Value::as_str)
+            .is_some_and(|hash| !hash.is_empty()));
+        let guarantee1 = guarantee_metadata(&runtime, &command1);
+        assert_eq!(
+            dynamic_outcome(&guarantee1, "writes_within:src").0,
+            "held",
+            "in-scope write holds: {guarantee1}"
+        );
+        assert_eq!(
+            dynamic_outcome(&guarantee1, "no_reads_beyond_grant").0,
+            "held"
+        );
+        assert_eq!(
+            dynamic_outcome(&guarantee1, "no_tainted_reads:confidential").0,
+            "not_evaluated"
+        );
+        // Replay returns the same receipt, cut reference included.
+        let replay = runtime
+            .run_turn_with_driver(
+                &command1,
+                &CutPackages,
+                &secrets,
+                &resources,
+                &ScriptedDriver::new(Vec::new()),
+            )
+            .expect("replay");
+        assert_eq!(replay.receipt.expect("stored receipt"), receipt1);
+
+        // Turn 2: a write outside the declared scope is reported violated —
+        // certified fact for the host's advancement gate, not a refusal.
+        let command2 = turn(&instance.instance_ref, &open.policy, 2);
+        let turn2 = runtime
+            .run_turn_with_driver(
+                &command2,
+                &CutPackages,
+                &secrets,
+                &resources,
+                &ScriptedDriver::new(vec![
+                    json!({
+                        "output": [{
+                            "type": "function_call",
+                            "call_id": "write-2",
+                            "name": "write",
+                            "arguments": "{\"path\":\"elsewhere/oops.md\",\"content\":\"stray\"}"
+                        }],
+                        "usage": { "input_tokens": 10, "output_tokens": 2 }
+                    }),
+                    json!({
+                        "output_text": "done",
+                        "usage": { "input_tokens": 12, "output_tokens": 3 }
+                    }),
+                ]),
+            )
+            .expect("turn 2");
+        assert!(turn2.receipt.expect("terminal").workspace_cut_ref.is_some());
+        let guarantee2 = guarantee_metadata(&runtime, &command2);
+        let (outcome2, detail2) = dynamic_outcome(&guarantee2, "writes_within:src");
+        assert_eq!(outcome2, "violated");
+        assert!(detail2.contains("elsewhere/oops.md"), "{detail2}");
+
+        // Turn 3: no writes at all claims the explicitly-empty cut —
+        // distinguishable from an unwitnessed decline.
+        let command3 = turn(&instance.instance_ref, &open.policy, 3);
+        let turn3 = runtime
+            .run_turn_with_driver(
+                &command3,
+                &CutPackages,
+                &secrets,
+                &resources,
+                &ScriptedDriver::new(vec![json!({
+                    "output_text": "nothing to do",
+                    "usage": { "input_tokens": 8, "output_tokens": 2 }
+                })]),
+            )
+            .expect("turn 3");
+        let cut3_ref = turn3
+            .receipt
+            .expect("terminal")
+            .workspace_cut_ref
+            .expect("explicitly-empty cut is still referenced");
+        let cut3 = evidence_metadata(&runtime, &command3, &cut3_ref);
+        assert_eq!(
+            cut3.get("writes").and_then(Value::as_array).map(Vec::len),
+            Some(0)
+        );
+
+        // Turn 4: a native command mutates outside the mediated surface, so
+        // the receipt declines the cut (turn-witness.maude) and scope
+        // guarantees report not-evaluated instead of fabricating.
+        let mut command4 = turn(&instance.instance_ref, &open.policy, 4);
+        command4.resources.push(ResourceRef {
+            handle: "command".to_owned(),
+            kind: "command".to_owned(),
+            selector: None,
+        });
+        let turn4 = runtime
+            .run_turn_with_driver(
+                &command4,
+                &CutPackages,
+                &secrets,
+                &resources,
+                &ScriptedDriver::new(vec![
+                    json!({
+                        "output": [{
+                            "type": "function_call",
+                            "call_id": "bash-1",
+                            "name": "bash",
+                            "arguments": "{\"command\":\"git status\",\"timeout\":30}"
+                        }],
+                        "usage": { "input_tokens": 10, "output_tokens": 2 }
+                    }),
+                    json!({
+                        "output_text": "ran the command",
+                        "usage": { "input_tokens": 12, "output_tokens": 3 }
+                    }),
+                ]),
+            )
+            .expect("turn 4");
+        assert_eq!(
+            turn4.receipt.expect("terminal").workspace_cut_ref,
+            None,
+            "an unmediated mutation channel declines the cut"
+        );
+        let guarantee4 = guarantee_metadata(&runtime, &command4);
+        assert_eq!(
+            dynamic_outcome(&guarantee4, "writes_within:src").0,
+            "not_evaluated"
+        );
+
+        drop(runtime);
+        let _ = fs::remove_dir_all(&workspace);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
     }
 
     #[test]
