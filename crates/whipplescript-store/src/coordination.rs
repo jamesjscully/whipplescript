@@ -341,6 +341,24 @@ impl CoordinationStore {
     /// The current reset-period identifier, read from the store's clock at
     /// the worker boundary (the one place the clock is legal). The lazy
     /// counter reset compares it inside the consume transaction.
+    pub fn ledger_positions_impl(&self) -> StoreResult<Vec<(String, String, i64)>> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT owner, ledger, next_seq FROM ledger_seq ORDER BY owner, ledger")?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row?);
+        }
+        Ok(rows)
+    }
+
     pub fn current_period(&self, reset: &str) -> StoreResult<String> {
         let format = match reset {
             "hourly" => "%Y-%m-%dT%H",
@@ -515,6 +533,13 @@ pub trait Coordination {
 
     fn current_period(&self, reset: &str) -> StoreResult<String>;
 
+    /// The workspace-plane HIGH-WATER positions of the monotone ledger
+    /// stores: (owner, ledger, last minted seq). One half of the two-plane
+    /// consistent cut (vw note §9.3) — monotone stores snapshot by
+    /// position, not by copy. Leases and counters are current-state (not
+    /// monotone) and deliberately have no position.
+    fn ledger_positions(&self) -> StoreResult<Vec<(String, String, i64)>>;
+
     fn list_leases_for_owner(
         &self,
         owner: Option<&str>,
@@ -616,6 +641,10 @@ impl Coordination for CoordinationStore {
     // Each method forwards to the inherent method of the same name; inherent
     // methods win `self.method()` resolution, so this is delegation, not
     // recursion (the `unconditional_recursion` lint guards the invariant).
+    fn ledger_positions(&self) -> StoreResult<Vec<(String, String, i64)>> {
+        self.ledger_positions_impl()
+    }
+
     fn try_acquire_for_owner(
         &mut self,
         owner: &str,
@@ -967,6 +996,34 @@ mod tests {
     fn store() -> CoordinationStore {
         let path = store_path("test");
         CoordinationStore::open(path).expect("open store")
+    }
+
+    /// The two-plane cut's coordination half: ledger positions are the
+    /// monotone high-water marks, one per (owner, ledger), advancing with
+    /// each append.
+    #[test]
+    fn ledger_positions_are_high_water_marks() {
+        let mut store = store();
+        assert!(store.ledger_positions_impl().expect("op").is_empty());
+        store
+            .append_for_owner("shared", "audit", "p1", "{}", "w1", 3600)
+            .expect("append");
+        store
+            .append_for_owner("shared", "audit", "p1", "{}", "w1", 3600)
+            .expect("append");
+        store
+            .append_for_owner("shared", "mail", "p1", "{}", "w1", 3600)
+            .expect("append");
+        let positions = store.ledger_positions_impl().expect("op");
+        let audit = positions
+            .iter()
+            .find(|(_, ledger, _)| ledger == "audit")
+            .expect("audit ledger");
+        let mail = positions
+            .iter()
+            .find(|(_, ledger, _)| ledger == "mail")
+            .expect("mail ledger");
+        assert!(audit.2 > mail.2, "two appends outrank one: {positions:?}");
     }
 
     /// Mutual exclusion: at most `slots` holders per key, ever; contended

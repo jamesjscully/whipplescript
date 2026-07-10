@@ -7028,6 +7028,17 @@ fn do_mark_lease_released(
 }
 
 impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
+    fn event_position(&self) -> StoreResult<i64> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT COALESCE(MAX(event_seq), 0) FROM tracker_events",
+                &[],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_i64(&row[0])).unwrap_or(0))
+    }
+
     fn file_item(
         &mut self,
         queue: &str,
@@ -7372,6 +7383,20 @@ fn do_norm_owner(owner: &str) -> &str {
 }
 
 impl<Sql: DoSql> Coordination for DoSqliteStore<Sql> {
+    fn ledger_positions(&self) -> StoreResult<Vec<(String, String, i64)>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT owner, ledger, next_seq FROM coord_ledger_seq ORDER BY owner, ledger",
+                &[],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| (as_text(&row[0]), as_text(&row[1]), as_i64(&row[2])))
+            .collect())
+    }
+
     fn try_acquire_for_owner(
         &mut self,
         owner: &str,

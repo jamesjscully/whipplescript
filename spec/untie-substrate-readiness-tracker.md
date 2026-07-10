@@ -140,9 +140,20 @@ Per-heading `· vN` tags below restate this at each phase.
       merge propagates to main, unbound runs write natively. **DO parity +
       stat cache DONE 2026-07-10** (see below); materialize/import-back
       consumer wiring landed the same day (item below) — box complete.)*
-- [ ] Two-plane consistent cut: substance manifest + workspace-plane
+- [x] Two-plane consistent cut: substance manifest + workspace-plane
       **high-water positions** (the plane-store enumeration is the pump
-      audit walked twice — do both in one pass).
+      audit walked twice — do both in one pass). *(2026-07-10: the plane
+      stores gained position surfaces — `Coordination::ledger_positions`
+      (per-(owner,ledger) high-water; leases/counters are current-state
+      and deliberately positionless) and `WorkItems::event_position`
+      (tracker event-log max seq) — native + DO impls; `whip checkpoint`
+      and the DO checkpoint op record a `plane.positions` event in the
+      SAME quiescent pass as the substance cut, keyed by cut id, and the
+      checkpoint report surfaces it. The enumeration doubles as the pump
+      audit's store list (telemetry exporter et al. remain the §9.2
+      audit obligation). Consumer: regeneration reads the plane AT the
+      recorded positions — that machinery rides the experimentation
+      build.)*
 - [x] Materialize-on-exec + import-back: real scratch dir from a branch
       manifest; diffs imported **atomic, recorded, complete**, keyed by
       effect id, idempotent. *(2026-07-10:

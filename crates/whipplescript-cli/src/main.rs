@@ -31148,6 +31148,50 @@ fn checkpoint(options: &CliOptions) -> ExitCode {
     };
     let mut kernel = RuntimeKernel::new(store);
     let key = idempotency_key(&[instance_id, &cut_id, "checkpoint"]);
+    // Two-plane consistent cut (vw note §9.3): the workspace plane's
+    // monotone stores snapshot by HIGH-WATER POSITION, recorded in the
+    // same quiescent pass as the substance cut. The plane enumeration
+    // (coordination ledgers, tracker event log) is the pump audit's twin
+    // walk; leases/counters are current-state and have no position.
+    let plane_positions = {
+        use whipplescript_store::coordination::Coordination;
+        use whipplescript_store::items::WorkItems;
+        let ledgers =
+            whipplescript_store::coordination::CoordinationStore::open(coordination_store_path())
+                .ok()
+                .and_then(|coordination| coordination.ledger_positions().ok())
+                .unwrap_or_default();
+        let tracker_seq = whipplescript_store::items::WorkItemStore::open(items_store_path())
+            .ok()
+            .and_then(|items| items.event_position().ok())
+            .unwrap_or(0);
+        json!({
+            "coordination_ledgers": ledgers
+                .iter()
+                .map(|(owner, ledger, seq)| json!({
+                    "owner": owner, "ledger": ledger, "seq": seq,
+                }))
+                .collect::<Vec<_>>(),
+            "tracker_event_seq": tracker_seq,
+        })
+    };
+    let positions_payload = json!({
+        "cut_id": cut_id,
+        "positions": plane_positions,
+    })
+    .to_string();
+    if let Err(error) = kernel.store().append_event(whipplescript_store::NewEvent {
+        instance_id,
+        event_type: "plane.positions",
+        payload_json: &positions_payload,
+        source: "cli",
+        causation_id: None,
+        correlation_id: None,
+        idempotency_key: Some(&idempotency_key(&[instance_id, &cut_id, "plane-positions"])),
+    }) {
+        eprintln!("could not record plane positions: {}", store_error(error));
+        return ExitCode::FAILURE;
+    }
     match kernel.store_mut().capture_checkpoint(CheckpointCapture {
         instance_id,
         cut_id: &cut_id,
@@ -31157,6 +31201,7 @@ fn checkpoint(options: &CliOptions) -> ExitCode {
         Ok(checkpoint) if options.json => emit_json(json!({
             "instance_id": instance_id,
             "cut_id": checkpoint.cut_id,
+            "plane_positions": plane_positions,
             "sequence": checkpoint.sequence,
             "manifest_hash": checkpoint.manifest_hash,
             "file_count": checkpoint.file_count,

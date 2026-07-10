@@ -455,6 +455,41 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         let instance_id = self.instance_id.clone();
         let key = idempotency_key(&[&instance_id, cut_id, "checkpoint"]);
         let kernel = self.kernel.as_mut().ok_or("instance kernel consumed")?;
+        // Two-plane consistent cut, DO parity: the workspace plane's
+        // monotone high-water positions land in the same pass as the
+        // substance cut (all three surfaces share the one DO SQLite).
+        {
+            use whipplescript_store::coordination::Coordination;
+            use whipplescript_store::items::WorkItems;
+            let ledgers = kernel.store().ledger_positions().unwrap_or_default();
+            let tracker_seq = kernel.store().event_position().unwrap_or(0);
+            let ledger_entries = ledgers
+                .iter()
+                .map(|(owner, ledger, seq)| {
+                    format!("{{\"owner\":\"{owner}\",\"ledger\":\"{ledger}\",\"seq\":{seq}}}")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let payload = format!(
+                "{{\"cut_id\":\"{cut_id}\",\"positions\":{{\"coordination_ledgers\":[{ledger_entries}],\"tracker_event_seq\":{tracker_seq}}}}}"
+            );
+            kernel
+                .store()
+                .append_event(whipplescript_store::NewEvent {
+                    instance_id: &instance_id,
+                    event_type: "plane.positions",
+                    payload_json: &payload,
+                    source: "do",
+                    causation_id: None,
+                    correlation_id: None,
+                    idempotency_key: Some(&idempotency_key(&[
+                        &instance_id,
+                        cut_id,
+                        "plane-positions",
+                    ])),
+                })
+                .map_err(|error| format!("plane positions: {error:?}"))?;
+        }
         let captured = kernel
             .store_mut()
             .capture_checkpoint(CheckpointCapture {

@@ -769,6 +769,10 @@ pub fn apply_overlay(mut item: WorkItem, holder: Option<String>) -> WorkItem {
 /// `WorkItemStore` implements it by forwarding to its inherent methods, so
 /// existing callers are unaffected.
 pub trait WorkItems {
+    /// The workspace-plane HIGH-WATER position of the tracker's monotone
+    /// event log (max event_seq; 0 = empty). One half of the two-plane
+    /// consistent cut (vw note §9.3).
+    fn event_position(&self) -> StoreResult<i64>;
     fn file_item(
         &mut self,
         queue: &str,
@@ -810,6 +814,15 @@ pub trait WorkItems {
 impl WorkItems for WorkItemStore {
     // Forwards to the inherent methods of the same name; inherent methods win
     // `self.method()` resolution, so this delegates rather than recurses.
+    fn event_position(&self) -> StoreResult<i64> {
+        let position: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(event_seq), 0) FROM tracker_events",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(position)
+    }
+
     fn file_item(
         &mut self,
         queue: &str,

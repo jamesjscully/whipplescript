@@ -1333,6 +1333,15 @@ rule pick
         Some(1),
         "the cut manifest holds note.md: {checkpoint}"
     );
+    // The two-plane cut: the same pass records the workspace plane's
+    // monotone high-water positions alongside the substance manifest.
+    assert!(
+        checkpoint
+            .pointer("/plane_positions/tracker_event_seq")
+            .and_then(Value::as_i64)
+            .is_some(),
+        "the cut carries workspace-plane positions: {checkpoint}"
+    );
 
     // 3) Tamper the file on disk (drift away from the cut).
     fs::write(&note, "TAMPERED").expect("tamper note");

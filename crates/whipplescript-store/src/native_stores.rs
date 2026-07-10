@@ -585,6 +585,10 @@ impl RuntimeStore for NativeStores {
 }
 
 impl Coordination for NativeStores {
+    fn ledger_positions(&self) -> StoreResult<Vec<(String, String, i64)>> {
+        self.coord.ledger_positions_impl()
+    }
+
     fn try_acquire_for_owner(
         &mut self,
         owner: &str,
@@ -687,6 +691,10 @@ impl Coordination for NativeStores {
 }
 
 impl WorkItems for NativeStores {
+    fn event_position(&self) -> StoreResult<i64> {
+        WorkItems::event_position(&self.items)
+    }
+
     fn file_item(
         &mut self,
         queue: &str,
