@@ -69,6 +69,14 @@ impl<S: DoSql> DoBranches<S> {
             )",
             "CREATE INDEX IF NOT EXISTS branch_instances_branch_idx
                 ON branch_instances(branch_id)",
+            "CREATE TABLE IF NOT EXISTS cuts (
+                cut_id TEXT PRIMARY KEY,
+                change_id TEXT NOT NULL,
+                branch_id TEXT NOT NULL,
+                manifest_hash TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS cuts_change_idx ON cuts(change_id)",
         ] {
             self.sql.execute(statement, &[]).map_err(sql_err)?;
         }
@@ -437,6 +445,42 @@ impl<S: DoSql> Branches for DoBranches<S> {
             )
             .map_err(sql_err)?;
         Ok(rows.iter().map(|row| as_text(&row[0])).collect())
+    }
+
+    fn record_cut(
+        &mut self,
+        cut_id: &str,
+        change_id: &str,
+        branch_id: &str,
+        manifest_hash: &str,
+        at: &str,
+    ) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO cuts \
+                 (cut_id, change_id, branch_id, manifest_hash, recorded_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    text(cut_id),
+                    text(change_id),
+                    text(branch_id),
+                    text(manifest_hash),
+                    text(at),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn cut_change_id(&self, cut_id: &str) -> StoreResult<Option<String>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT change_id FROM cuts WHERE cut_id = ?1",
+                &[text(cut_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])))
     }
 }
 

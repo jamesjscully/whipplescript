@@ -191,6 +191,20 @@ pub trait Branches {
     /// Every instance born on the branch (quiescence detection: the
     /// daemon treats a branch as mid-run while any bound instance runs).
     fn list_bound_instances(&self, branch_id: &str) -> StoreResult<Vec<String>>;
+    /// Record a cut's CHANGE identity (dual identity, jj import): the
+    /// intent id assigned at creation, inherited across rewrites
+    /// (rebases) and carried by transport (sync/merge). Idempotent per
+    /// cut id.
+    fn record_cut(
+        &mut self,
+        cut_id: &str,
+        change_id: &str,
+        branch_id: &str,
+        manifest_hash: &str,
+        at: &str,
+    ) -> StoreResult<()>;
+    /// The change id a cut carries; `None` for pre-identity cuts.
+    fn cut_change_id(&self, cut_id: &str) -> StoreResult<Option<String>>;
 }
 
 #[cfg(feature = "native")]
@@ -291,6 +305,14 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
         );
         CREATE INDEX IF NOT EXISTS branch_instances_branch_idx
             ON branch_instances(branch_id);
+        CREATE TABLE IF NOT EXISTS cuts (
+            cut_id TEXT PRIMARY KEY,
+            change_id TEXT NOT NULL,
+            branch_id TEXT NOT NULL,
+            manifest_hash TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS cuts_change_idx ON cuts(change_id);
         "#,
     )?;
     Ok(())
@@ -561,6 +583,35 @@ impl Branches for BranchStore {
         )?;
         tx.commit()?;
         Ok(BindOutcome::Bound)
+    }
+
+    fn record_cut(
+        &mut self,
+        cut_id: &str,
+        change_id: &str,
+        branch_id: &str,
+        manifest_hash: &str,
+        at: &str,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO cuts \
+             (cut_id, change_id, branch_id, manifest_hash, recorded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![cut_id, change_id, branch_id, manifest_hash, at],
+        )?;
+        Ok(())
+    }
+
+    fn cut_change_id(&self, cut_id: &str) -> StoreResult<Option<String>> {
+        let change: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT change_id FROM cuts WHERE cut_id = ?1",
+                params![cut_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(change)
     }
 
     fn instance_branch(&self, instance_id: &str) -> StoreResult<Option<String>> {

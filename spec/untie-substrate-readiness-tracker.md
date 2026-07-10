@@ -278,11 +278,24 @@ Per-heading `· vN` tags below restate this at each phase.
       reflink/copy fallback matrix is a later desktop optimization —
       subset+copy is the correct baseline everywhere.)*
 
-- [ ] **Stable change identity (dual identity, jj import)**: an
+- [x] **Stable change identity (dual identity, jj import)**: an
       edit/intent id assigned at creation, stable across rewrites,
       carried alongside content hashes by selections and transport;
       merges reunify on either; intent-identical/content-divergent =
-      detected divergent change (both versions surfaced).
+      detected divergent change (both versions surfaced). *(2026-07-10:
+      the `cuts` table (native + DO parity via the `Branches` trait —
+      `record_cut`/`cut_change_id`) maps every cut to its CHANGE id: a
+      write mints change = cut (a new intent), a rebase rewrites the cut
+      but inherits the change, and sync/merge transport records the
+      admitted cut under the member head's change — the eventual full
+      merge recognizes it as the same change (content-identical
+      reunification was already native to content addressing).
+      Intent-identical/content-divergent at a sync boundary returns
+      `SyncOutcome::DivergentChange` with both manifest hashes — both
+      versions surfaced, nothing merged silently. Tested end to end at
+      the store level. Residuals: an explicit `amend` verb (today every
+      write is a new intent) and the divergence-presentation UX ride the
+      Phase 2 selection algebra.)*
 
 *(Out of scope here: counterfactual postures / subject-instrument grants /
 divert plumbing — the experimentation subsystem's build, not needed to

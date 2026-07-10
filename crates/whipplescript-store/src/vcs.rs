@@ -124,6 +124,14 @@ pub enum SyncOutcome {
     Conflicts {
         conflicts: Vec<PathConflict>,
     },
+    /// Dual identity's detection (jj import): both heads carry the SAME
+    /// change id with DIFFERENT content — the same edit, evolved apart.
+    /// Both versions surface; nothing merges silently.
+    DivergentChange {
+        change_id: String,
+        ours_manifest_hash: Option<String>,
+        theirs_manifest_hash: Option<String>,
+    },
     BranchMissing,
     BranchNotActive,
     LineMissing,
@@ -243,6 +251,26 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         self.content.get(id)
     }
 
+    /// Cut references normalize the empty-string sentinel (a rebase onto
+    /// a target with NO head records "") back to `None`, so staleness
+    /// comparisons never mistake "no head yet" for divergence.
+    fn cut_ref(cut_id: &Option<String>) -> Option<&str> {
+        cut_id.as_deref().filter(|cut| !cut.is_empty())
+    }
+
+    /// The change id a cut carries (falling back to the cut id itself for
+    /// pre-identity cuts, so every cut HAS an intent identity).
+    fn change_of(&self, cut_id: Option<&str>) -> StoreResult<Option<String>> {
+        let Some(cut_id) = cut_id else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.branches
+                .cut_change_id(cut_id)?
+                .unwrap_or_else(|| cut_id.to_owned()),
+        ))
+    }
+
     /// Write (or remove) one path on a branch through its virtual working
     /// set, minting the next cut. Copy-on-write: no other branch and no
     /// prior cut changes.
@@ -278,10 +306,16 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             &manifest_hash,
             at,
         )? {
-            AdvanceOutcome::Advanced(_) => Ok(VcsWriteOutcome::Written {
-                cut_id: cut_id.to_owned(),
-                manifest_hash,
-            }),
+            AdvanceOutcome::Advanced(_) => {
+                // A write is a NEW intent: the change id is born equal to
+                // the cut id and survives every later rewrite of the cut.
+                self.branches
+                    .record_cut(cut_id, cut_id, branch_id, &manifest_hash, at)?;
+                Ok(VcsWriteOutcome::Written {
+                    cut_id: cut_id.to_owned(),
+                    manifest_hash,
+                })
+            }
             AdvanceOutcome::Stale { .. } => Err(StoreError::Conflict(
                 "branch head moved during the write; retry".to_owned(),
             )),
@@ -380,7 +414,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let Some(parent) = self.branches.get_branch(&parent_id)? else {
             return Ok(ReconcileOutcome::NoParent);
         };
-        if branch.branch_point_cut_id == parent.head_cut_id {
+        if Self::cut_ref(&branch.branch_point_cut_id) == Self::cut_ref(&parent.head_cut_id) {
             return Ok(ReconcileOutcome::UpToDate);
         }
         let branch_side = MergeSide {
@@ -441,6 +475,11 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             .head_manifest_hash
             .clone()
             .unwrap_or_else(|| self.store_manifest(&BTreeMap::new()).unwrap_or_default());
+        // Dual identity: the rebase REWRITES the cut but the work is the
+        // same intent — the new head cut inherits the prior head's change.
+        let inherited_change = self
+            .change_of(branch.head_cut_id.as_deref())?
+            .unwrap_or_else(|| rebase_cut_id.to_owned());
         match self.branches.rebase_branch(
             branch_id,
             branch.head_cut_id.as_deref(),
@@ -450,9 +489,18 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             &rebased_hash,
             at,
         )? {
-            AdvanceOutcome::Advanced(_) => Ok(ReconcileOutcome::Rebased {
-                rebase_cut_id: rebase_cut_id.to_owned(),
-            }),
+            AdvanceOutcome::Advanced(_) => {
+                self.branches.record_cut(
+                    rebase_cut_id,
+                    &inherited_change,
+                    branch_id,
+                    &rebased_hash,
+                    at,
+                )?;
+                Ok(ReconcileOutcome::Rebased {
+                    rebase_cut_id: rebase_cut_id.to_owned(),
+                })
+            }
             AdvanceOutcome::Stale { .. } => Err(StoreError::Conflict(
                 "branch head moved during the rebase; retry".to_owned(),
             )),
@@ -509,13 +557,16 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let head = self.load_manifest(branch.head_manifest_hash.as_deref())?;
         match plan_merge_up(
             &head,
-            branch.branch_point_cut_id.as_deref(),
-            parent.head_cut_id.as_deref(),
+            Self::cut_ref(&branch.branch_point_cut_id),
+            Self::cut_ref(&parent.head_cut_id),
             true,
             true,
         ) {
             MergeUpPlan::Certified { merged_manifest } => {
                 let merged_hash = self.store_manifest(&merged_manifest)?;
+                let transported_change = self
+                    .change_of(branch.head_cut_id.as_deref())?
+                    .unwrap_or_else(|| merge_cut_id.to_owned());
                 match self.branches.advance_head(
                     &parent_id,
                     parent.head_cut_id.as_deref(),
@@ -523,7 +574,15 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     &merged_hash,
                     at,
                 )? {
-                    AdvanceOutcome::Advanced(_) => {}
+                    AdvanceOutcome::Advanced(_) => {
+                        self.branches.record_cut(
+                            merge_cut_id,
+                            &transported_change,
+                            &parent_id,
+                            &merged_hash,
+                            at,
+                        )?;
+                    }
                     AdvanceOutcome::Stale { .. } => {
                         return Err(StoreError::Conflict(
                             "parent head moved during the merge; retry".to_owned(),
@@ -593,10 +652,14 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             &manifest_hash,
             at,
         )? {
-            AdvanceOutcome::Advanced(_) => Ok(VcsWriteOutcome::Written {
-                cut_id: cut_id.to_owned(),
-                manifest_hash,
-            }),
+            AdvanceOutcome::Advanced(_) => {
+                self.branches
+                    .record_cut(cut_id, cut_id, branch_id, &manifest_hash, at)?;
+                Ok(VcsWriteOutcome::Written {
+                    cut_id: cut_id.to_owned(),
+                    manifest_hash,
+                })
+            }
             AdvanceOutcome::Stale {
                 current_head_cut_id,
             } => {
@@ -633,12 +696,28 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         if branch_id == line_id {
             return Ok(SyncOutcome::UpToDate);
         }
-        match self.branches.get_branch(line_id)? {
+        let line_row = match self.branches.get_branch(line_id)? {
             None => return Ok(SyncOutcome::LineMissing),
             Some(line) if line.status != BranchStatus::Active => {
                 return Ok(SyncOutcome::LineNotActive)
             }
-            Some(_) => {}
+            Some(line) => line,
+        };
+        // Dual identity's detection: the SAME change on both heads with
+        // DIFFERENT content is the transported-then-edited case — surface
+        // both versions, never merge silently.
+        if let Some(branch_row) = self.branches.get_branch(branch_id)? {
+            let ours_change = self.change_of(branch_row.head_cut_id.as_deref())?;
+            let theirs_change = self.change_of(line_row.head_cut_id.as_deref())?;
+            if let (Some(ours), Some(theirs)) = (&ours_change, &theirs_change) {
+                if ours == theirs && branch_row.head_manifest_hash != line_row.head_manifest_hash {
+                    return Ok(SyncOutcome::DivergentChange {
+                        change_id: ours.clone(),
+                        ours_manifest_hash: branch_row.head_manifest_hash,
+                        theirs_manifest_hash: line_row.head_manifest_hash,
+                    });
+                }
+            }
         }
         match self.reconcile_branch_against(
             branch_id,
@@ -667,7 +746,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         if branch.head_manifest_hash == branch.branch_point_manifest_hash {
             return Ok(SyncOutcome::UpToDate);
         }
-        if branch.branch_point_cut_id != line.head_cut_id {
+        if Self::cut_ref(&branch.branch_point_cut_id) != Self::cut_ref(&line.head_cut_id) {
             return Err(StoreError::Conflict(
                 "line advanced mid-sync; retry".to_owned(),
             ));
@@ -676,6 +755,12 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             .head_manifest_hash
             .clone()
             .unwrap_or_else(|| self.store_manifest(&BTreeMap::new()).unwrap_or_default());
+        // Transport preserves identity: the admitted cut carries the
+        // member head's change id, so the eventual full merge recognizes
+        // it as THE SAME change (no ancestry-less duplicates).
+        let transported_change = self
+            .change_of(branch.head_cut_id.as_deref())?
+            .unwrap_or_else(|| sync_cut_id.to_owned());
         match self.branches.advance_head(
             line_id,
             line.head_cut_id.as_deref(),
@@ -683,7 +768,15 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             &head_manifest,
             at,
         )? {
-            AdvanceOutcome::Advanced(_) => {}
+            AdvanceOutcome::Advanced(_) => {
+                self.branches.record_cut(
+                    sync_cut_id,
+                    &transported_change,
+                    line_id,
+                    &head_manifest,
+                    at,
+                )?;
+            }
             AdvanceOutcome::Stale { .. } => {
                 return Err(StoreError::Conflict(
                     "line advanced mid-sync; retry".to_owned(),
@@ -1232,6 +1325,76 @@ mod tests {
             BranchStatus::Active,
             "the stream line survives promotion"
         );
+    }
+
+    /// Dual identity end to end: a write mints a change id equal to its
+    /// cut; a rebase REWRITES the cut but inherits the change (stable
+    /// across rewrites); transport (sync) carries it to the line; and
+    /// the same change with divergent content is DETECTED, never merged
+    /// silently.
+    #[test]
+    fn change_identity_survives_rewrites_and_divergence_is_detected() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.create_branch("line_ws", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("line");
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("member");
+        vcs.write("draft_a", "a.md", Some("A work"), "cut_a1", "t2")
+            .expect("write");
+        // Birth: change id == cut id.
+        assert_eq!(
+            vcs.branches.cut_change_id("cut_a1").expect("op"),
+            Some("cut_a1".to_owned())
+        );
+        // Mainline advances disjointly; the rebase rewrites draft_a's cut
+        // but the CHANGE survives the rewrite.
+        vcs.write(MAINLINE_BRANCH_ID, "b.md", Some("B"), "cut_m1", "t3")
+            .expect("write");
+        assert!(matches!(
+            vcs.reconcile_branch("draft_a", true, "cut_a1_rebased", "t4")
+                .expect("reconcile"),
+            ReconcileOutcome::Rebased { .. }
+        ));
+        assert_eq!(
+            vcs.branches.cut_change_id("cut_a1_rebased").expect("op"),
+            Some("cut_a1".to_owned()),
+            "the rewrite inherits the intent identity"
+        );
+        // Transport: the sync-admitted cut on the line carries the change.
+        assert!(matches!(
+            vcs.sync_to_line("draft_a", "line_ws", "sync_a1", "t5")
+                .expect("sync"),
+            SyncOutcome::Synced { .. }
+        ));
+        assert_eq!(
+            vcs.branches.cut_change_id("sync_a1").expect("op"),
+            Some("cut_a1".to_owned()),
+            "transport preserves identity — no ancestry-less duplicate"
+        );
+        // Divergence: force the transported-then-edited shape — the same
+        // change id on both heads with different content — and the sync
+        // DETECTS it instead of merging.
+        let forged = vcs.content.put("forged divergent manifest").expect("put");
+        vcs.branches
+            .advance_head("draft_a", Some("sync_a1"), "cut_a2", &forged, "t6")
+            .expect("advance");
+        vcs.branches
+            .record_cut("cut_a2", "cut_a1", "draft_a", &forged, "t6")
+            .expect("record");
+        let outcome = vcs
+            .sync_to_line("draft_a", "line_ws", "sync_a2", "t7")
+            .expect("sync");
+        let SyncOutcome::DivergentChange {
+            change_id,
+            ours_manifest_hash,
+            theirs_manifest_hash,
+        } = outcome
+        else {
+            panic!("expected divergence detection, got {outcome:?}");
+        };
+        assert_eq!(change_id, "cut_a1");
+        assert_ne!(ours_manifest_hash, theirs_manifest_hash);
     }
 
     #[test]
