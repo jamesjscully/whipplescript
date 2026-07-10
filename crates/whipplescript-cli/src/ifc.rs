@@ -2269,6 +2269,22 @@ pub fn check_principal_ceiling(
     diagnostics
 }
 
+/// Resolve a product-authenticated identity through the verified party map and
+/// enforce its principal ceiling. Envelopes with no party map retain gradual
+/// behavior; an unknown identity in a governed map resolves to the public
+/// bottom and therefore fails closed on protected reads.
+pub fn check_principal_ceiling_for_identity(
+    ir: &IrProgram,
+    verified: &VerifiedEnvelope,
+    principal: &str,
+) -> Vec<Diagnostic> {
+    if !verified.envelope().has_parties() {
+        return Vec::new();
+    }
+    let role = verified.envelope().role_for_principal(principal);
+    check_principal_ceiling(ir, verified, role)
+}
+
 /// The information-flow SURFACE of a workflow (DR-0029 X1): every resource, egress
 /// sink, and principal it can touch, as sorted ids. The producer of a `@tool`
 /// package declares this and attests `ifc_surface(ir) ⊆ declared`; the consumer

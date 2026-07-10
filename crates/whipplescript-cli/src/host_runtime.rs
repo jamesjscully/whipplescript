@@ -2340,6 +2340,10 @@ impl GovernedHostRuntime {
             self.require_governed(&resource.handle)?;
         }
         self.validate_instance(command, packages)?;
+        let package = packages
+            .resolve_package(&command.package_version_ref)
+            .map_err(HostRuntimeError::Resolver)?;
+        self.check_principal_ceiling(&package, &command.actor_ref)?;
         Ok(())
     }
 
@@ -2818,6 +2822,7 @@ impl GovernedHostRuntime {
         let guarantee = json!({
             "protocol": HOST_PROTOCOL,
             "policy": command.policy,
+            "actor_ref": command.actor_ref,
             "package_version_ref": command.package_version_ref,
             "resources": command.resources,
             "images": command.input.images,
@@ -3274,6 +3279,28 @@ impl GovernedHostRuntime {
 
     fn check_package_ifc(&self, package: &ResolvedPackage) -> Result<(), HostRuntimeError> {
         let diagnostics = crate::ifc::check_with_envelope(&package.program, &self.envelope);
+        if diagnostics.is_empty() {
+            Ok(())
+        } else {
+            Err(HostRuntimeError::Ifc(
+                diagnostics
+                    .into_iter()
+                    .map(|diagnostic| diagnostic.message)
+                    .collect(),
+            ))
+        }
+    }
+
+    fn check_principal_ceiling(
+        &self,
+        package: &ResolvedPackage,
+        actor_ref: &str,
+    ) -> Result<(), HostRuntimeError> {
+        let diagnostics = crate::ifc::check_principal_ceiling_for_identity(
+            &package.program,
+            &self.envelope,
+            actor_ref,
+        );
         if diagnostics.is_empty() {
             Ok(())
         } else {
@@ -3869,6 +3896,7 @@ workflow HumanHostChat {
                     command_network: false,
                 },
             )]),
+            parties: BTreeMap::from([("operator".to_owned(), "Operator".to_owned())]),
             ..HostGovernancePolicy::default()
         };
         SignedEnvelope::sign_for_test(&policy.to_json().expect("policy"), "gaugedesk-admin")
@@ -3903,6 +3931,7 @@ workflow HumanHostChat {
             instance_ref: instance_ref.to_owned(),
             package_version_ref: package_version_ref.to_owned(),
             policy: policy.clone(),
+            actor_ref: "operator".to_owned(),
             input: TurnInput {
                 text: format!("turn {number}"),
                 images: Vec::new(),
@@ -3930,6 +3959,7 @@ workflow HumanHostChat {
             instance_ref: instance_ref.to_owned(),
             package_version_ref: "package:human".to_owned(),
             policy: policy.clone(),
+            actor_ref: "operator".to_owned(),
             input: TurnInput {
                 text: "Ask me for the missing color.".to_owned(),
                 images: Vec::new(),
@@ -3969,6 +3999,19 @@ workflow HumanHostChat {
         let resources = Resources {
             calls: Cell::new(0),
         };
+        let mut unknown_actor = turn(&instance.instance_ref, &open.policy, 0);
+        unknown_actor.actor_ref = "unknown".to_owned();
+        let denied = runtime
+            .run_turn_with_driver(
+                &unknown_actor,
+                &Packages,
+                &secrets,
+                &resources,
+                &ScriptedDriver::new(Vec::new()),
+            )
+            .expect_err("unknown actor must not exceed the public ceiling");
+        assert!(denied.to_string().contains("identity-ceiling violation"));
+        assert_eq!(secrets.calls.get(), 0, "denied actor resolves no secret");
         let first_driver = ScriptedDriver::new(vec![
             json!({
                 "output": [{
