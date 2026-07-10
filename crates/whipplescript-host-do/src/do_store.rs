@@ -4675,7 +4675,8 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .query(
                 "SELECT candidate.effect_id, candidate.kind, candidate.target, candidate.profile, \
                  candidate.input_json, candidate.required_capabilities, \
-                 COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]') \
+                 COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'), \
+                 candidate.created_by_event_id \
                  FROM effects AS candidate \
                  LEFT JOIN instances ON instances.instance_id = candidate.instance_id \
                  LEFT JOIN program_versions AS active_versions \
@@ -4706,8 +4707,16 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
+        // RC-4b on the effects plane: orphaned-segment PENDING effects are
+        // never handed to the worker after a restore (parity with native).
+        let live = do_live_event_ids(&self.sql, instance_id)?;
         let mut claimable = Vec::new();
         for row in &rows {
+            if let (Some(live), Some(event_id)) = (&live, as_opt_text(&row[7])) {
+                if !live.contains(&event_id) {
+                    continue;
+                }
+            }
             let effect = ClaimableEffect {
                 effect_id: as_text(&row[0]),
                 kind: as_text(&row[1]),
@@ -6097,7 +6106,8 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                  COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'), \
                  EXISTS (SELECT 1 FROM effect_cancellation_requests AS request \
                  WHERE request.instance_id = effects.instance_id \
-                 AND request.effect_id = effects.effect_id AND request.status = 'requested') \
+                 AND request.effect_id = effects.effect_id AND request.status = 'requested'), \
+                 effects.created_by_event_id \
                  FROM effects \
                  LEFT JOIN instances ON instances.instance_id = effects.instance_id \
                  LEFT JOIN program_versions AS active_versions \
@@ -6108,7 +6118,16 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| effect_view_from_row(r)).collect())
+        // RC-4b on the effects plane (parity with native list_effects).
+        let live = do_live_event_ids(&self.sql, instance_id)?;
+        Ok(rows
+            .iter()
+            .filter(|row| match (&live, &row.get(14).map(as_opt_text)) {
+                (Some(live), Some(Some(event_id))) => live.contains(event_id),
+                _ => true,
+            })
+            .map(|r| effect_view_from_row(r))
+            .collect())
     }
 
     fn list_runs(&self, instance_id: &str) -> StoreResult<Vec<RunView>> {
@@ -7025,6 +7044,43 @@ fn do_mark_lease_released(
     )
     .map_err(sql_err)?;
     Ok(())
+}
+
+/// The restore-marker fold over the EFFECTS plane (DO parity of the
+/// native `live_event_ids_on`): `None` when no `context.restored` marker
+/// exists (the fast path filters nothing).
+fn do_live_event_ids<S: DoSql>(
+    sql: &S,
+    instance_id: &str,
+) -> StoreResult<Option<std::collections::BTreeSet<String>>> {
+    let rows = sql
+        .query(
+            "SELECT event_id, sequence, event_type, payload_json FROM events \
+             WHERE instance_id = ?1 ORDER BY sequence",
+            &[text(instance_id)],
+        )
+        .map_err(sql_err)?;
+    let mut saw_marker = false;
+    let mut live: Vec<(String, i64)> = Vec::new();
+    for row in &rows {
+        let event_type = as_text(&row[2]);
+        if event_type == "context.restored" {
+            saw_marker = true;
+            if let Some(target) = serde_json::from_str::<serde_json::Value>(&as_text(&row[3]))
+                .ok()
+                .and_then(|payload| payload.get("restored_to_sequence")?.as_i64())
+            {
+                live.retain(|(_, seq)| *seq <= target);
+            }
+        }
+        live.push((as_text(&row[0]), as_i64(&row[1])));
+    }
+    if !saw_marker {
+        return Ok(None);
+    }
+    Ok(Some(
+        live.into_iter().map(|(event_id, _)| event_id).collect(),
+    ))
 }
 
 impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {

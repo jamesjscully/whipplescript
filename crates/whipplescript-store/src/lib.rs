@@ -2610,7 +2610,8 @@ impl SqliteStore {
                 candidate.profile,
                 candidate.input_json,
                 candidate.required_capabilities,
-                COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]')
+                COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'),
+                candidate.created_by_event_id
             FROM effects AS candidate
             LEFT JOIN instances ON instances.instance_id = candidate.instance_id
             LEFT JOIN program_versions AS active_versions
@@ -2651,18 +2652,32 @@ impl SqliteStore {
         )?;
         let effects = statement
             .query_map([instance_id], |row| {
-                Ok(ClaimableEffect {
-                    effect_id: row.get(0)?,
-                    kind: row.get(1)?,
-                    target: row.get(2)?,
-                    profile: row.get(3)?,
-                    input_json: row.get(4)?,
-                    required_capabilities_json: row.get(5)?,
-                    declared_profiles_json: row.get(6)?,
-                })
+                Ok((
+                    ClaimableEffect {
+                        effect_id: row.get(0)?,
+                        kind: row.get(1)?,
+                        target: row.get(2)?,
+                        profile: row.get(3)?,
+                        input_json: row.get(4)?,
+                        required_capabilities_json: row.get(5)?,
+                        declared_profiles_json: row.get(6)?,
+                    },
+                    row.get::<_, Option<String>>(7)?,
+                ))
             })?
             .collect::<result::Result<Vec<_>, _>>()
             .map_err(StoreError::from)?;
+        // RC-4b on the effects plane: orphaned-segment PENDING effects are
+        // never handed to a worker after a restore.
+        let live = live_event_ids_on(&self.connection, instance_id)?;
+        let effects: Vec<ClaimableEffect> = effects
+            .into_iter()
+            .filter(|(_, created_by)| match (&live, created_by) {
+                (Some(live), Some(event_id)) => live.contains(event_id),
+                _ => true,
+            })
+            .map(|(effect, _)| effect)
+            .collect();
         let mut claimable = Vec::new();
         for effect in effects {
             if policy_block_on(&self.connection, instance_id, &effect.effect_id)?.is_some() {
@@ -4448,7 +4463,8 @@ impl SqliteStore {
                     WHERE request.instance_id = effects.instance_id
                       AND request.effect_id = effects.effect_id
                       AND request.status = 'requested'
-                ) AS cancel_requested
+                ) AS cancel_requested,
+                effects.created_by_event_id
             FROM effects
             LEFT JOIN instances ON instances.instance_id = effects.instance_id
             LEFT JOIN program_versions AS active_versions
@@ -4461,24 +4477,39 @@ impl SqliteStore {
         )?;
         let rows = statement
             .query_map([instance_id], |row| {
-                Ok(EffectView {
-                    effect_id: row.get(0)?,
-                    kind: row.get(1)?,
-                    target: row.get(2)?,
-                    input_json: row.get(3)?,
-                    status: row.get(4)?,
-                    created_by_rule: row.get(5)?,
-                    program_version_id: row.get(6)?,
-                    revision_epoch: row.get(7)?,
-                    profile: row.get(8)?,
-                    required_capabilities_json: row.get(9)?,
-                    policy_block_reason: row.get(10)?,
-                    policy_block_category: row.get(11)?,
-                    declared_profiles_json: row.get(12)?,
-                    cancel_requested: row.get(13)?,
-                })
+                Ok((
+                    EffectView {
+                        effect_id: row.get(0)?,
+                        kind: row.get(1)?,
+                        target: row.get(2)?,
+                        input_json: row.get(3)?,
+                        status: row.get(4)?,
+                        created_by_rule: row.get(5)?,
+                        program_version_id: row.get(6)?,
+                        revision_epoch: row.get(7)?,
+                        profile: row.get(8)?,
+                        required_capabilities_json: row.get(9)?,
+                        policy_block_reason: row.get(10)?,
+                        policy_block_category: row.get(11)?,
+                        declared_profiles_json: row.get(12)?,
+                        cancel_requested: row.get(13)?,
+                    },
+                    row.get::<_, Option<String>>(14)?,
+                ))
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
+        // RC-4b on the effects plane: after a restore, the orphaned
+        // segment's effects are invisible — the restored timeline
+        // re-offers the rules instead of adopting orphaned outcomes.
+        let live = live_event_ids_on(&self.connection, instance_id)?;
+        let rows = rows
+            .into_iter()
+            .filter(|(_, created_by)| match (&live, created_by) {
+                (Some(live), Some(event_id)) => live.contains(event_id),
+                _ => true,
+            })
+            .map(|(view, _)| view)
+            .collect();
         Ok(rows)
     }
 
@@ -6730,6 +6761,52 @@ type ReplayRow = (
 /// rewinds the replay to (`restored_to_sequence`). `None` for a malformed
 /// marker, in which case the fold applies no rewind (retains all live events)
 /// rather than corrupting the projection.
+#[cfg(feature = "native")]
+/// The restore-marker fold over the EFFECTS plane: the set of event ids
+/// that survive every `context.restored` marker (RC-4b applied to the
+/// third plane — an effect is live iff its creating event is). `None`
+/// when no marker exists, so the un-restored fast path filters nothing.
+/// Closes the discovered gap where a re-executed suffix silently adopted
+/// the orphaned segment's effect rows instead of re-offering the rules
+/// (the visibility half; branch-distinct keys are the dedup half).
+#[cfg(feature = "native")]
+fn live_event_ids_on(
+    connection: &Connection,
+    instance_id: &str,
+) -> StoreResult<Option<std::collections::BTreeSet<String>>> {
+    let mut statement = connection.prepare(
+        "SELECT event_id, sequence, event_type, payload_json FROM events \
+         WHERE instance_id = ?1 ORDER BY sequence",
+    )?;
+    let rows = statement
+        .query_map([instance_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<result::Result<Vec<_>, _>>()?;
+    let mut saw_marker = false;
+    let mut live: Vec<(String, i64)> = Vec::new();
+    for (event_id, sequence, event_type, payload_json) in rows {
+        if event_type == "context.restored" {
+            saw_marker = true;
+            if let Some(target) = restore_marker_target(&payload_json) {
+                live.retain(|(_, seq)| *seq <= target);
+            }
+        }
+        live.push((event_id, sequence));
+    }
+    if !saw_marker {
+        return Ok(None);
+    }
+    Ok(Some(
+        live.into_iter().map(|(event_id, _)| event_id).collect(),
+    ))
+}
+
 #[cfg(feature = "native")]
 fn restore_marker_target(payload_json: &str) -> Option<i64> {
     serde_json::from_str::<Value>(payload_json)
@@ -10792,6 +10869,101 @@ mod tests {
         assert_eq!(row_count(&store, "programs"), 1);
         assert_eq!(row_count(&store, "program_versions"), 2);
         assert_eq!(row_count(&store, "instances"), 1);
+    }
+
+    /// RC-4b on the EFFECTS plane: after a `context.restored` marker, the
+    /// orphaned segment's effect rows vanish from both read paths — the
+    /// restored timeline re-offers the rules instead of silently adopting
+    /// orphaned outcomes, and the worker is never handed an orphaned
+    /// pending effect. Work committed before the cut, and NEW work after
+    /// the marker, stay live.
+    #[test]
+    fn restore_fold_hides_orphaned_effects_from_reads_and_claims() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        // Live segment: seq 1 commits eff-keep.
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "keep",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("eff-keep", "tracker.claim", "keep-key")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-keep"),
+            })
+            .expect("commit keep");
+        // Orphaned-to-be segment: seq 2 commits eff-orphan.
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "orphan",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("eff-orphan", "tracker.claim", "orphan-key")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-orphan"),
+            })
+            .expect("commit orphan");
+        assert_eq!(store.list_effects("instance-a").expect("list").len(), 2);
+
+        // Restore to seq 1: the marker orphans the second commit.
+        store
+            .append_event(NewEvent {
+                instance_id: "instance-a",
+                event_type: "context.restored",
+                payload_json: r#"{"cut_id":"cut-1","restored_to_sequence":1}"#,
+                source: "test",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some("restore-1"),
+            })
+            .expect("marker");
+        let visible = store.list_effects("instance-a").expect("list");
+        assert_eq!(
+            visible
+                .iter()
+                .map(|effect| effect.effect_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eff-keep"],
+            "the orphaned segment's effect is invisible after the fold"
+        );
+        let claimable = store.claimable_effects("instance-a").expect("claimable");
+        assert_eq!(
+            claimable
+                .iter()
+                .map(|effect| effect.effect_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eff-keep"],
+            "the worker is never handed an orphaned pending effect"
+        );
+
+        // New work on the restored timeline stays live.
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "resume",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("eff-resume", "tracker.claim", "resume-key")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-resume"),
+            })
+            .expect("commit resume");
+        let visible = store.list_effects("instance-a").expect("list");
+        assert_eq!(
+            visible
+                .iter()
+                .map(|effect| effect.effect_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eff-keep", "eff-resume"],
+            "post-restore work is live alongside the pre-cut segment"
+        );
     }
 
     #[test]

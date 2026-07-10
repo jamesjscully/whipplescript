@@ -239,14 +239,25 @@ Per-heading `· vN` tags below restate this at each phase.
       marker); a workspace-branch id joins the same seam when instances
       are born on branches. Generation 0 = bare epoch, so every existing
       store derives byte-identical keys.)*
-- [ ] **Effects-plane restore fold (discovered 2026-07-10):**
+- [x] **Effects-plane restore fold (discovered 2026-07-10):**
       `list_effects` does not fold the `context.restored` marker, so a
       re-executed suffix sees the orphaned segment's effect rows and
       silently adopts their outcomes instead of re-offering the rules.
       Key-distinctness (above) removes the dedup half of the hazard; the
       visibility half needs the replay-frontier decision (which orphaned
-      effects are legal replay vs which must re-execute) — owns with the
-      virtual-working-set/regeneration slice.
+      effects are legal replay vs which must re-execute).
+      *(2026-07-10 closed: RC-4b now applies to the effects plane — an
+      effect is live iff its `created_by_event_id` survives the marker
+      fold (`live_event_ids_on`, native + DO `do_live_event_ids`),
+      filtered in BOTH read paths: `list_effects` (rules re-offer instead
+      of adopting orphaned outcomes) and `claimable_effects` (the worker
+      is never handed an orphaned pending effect). No-marker instances
+      take the fast path (no filtering). Replay-frontier semantics:
+      effects at-or-before the cut stay live (replay of the past is
+      always valid); everything on the orphaned suffix re-executes with
+      branch-distinct keys. Regression test covers hide + claim-hide +
+      post-restore liveness; full suite green (no v0.3 restore
+      behavior change for terminal-state rewinds).)*
 - [x] **Content-defined chunking** for large blobs (vw note §10.1):
       FastCDC-style chunk trees, file identity = stable Merkle root
       (nothing upstream re-keys); whole-blob below threshold; erasure at
