@@ -98,14 +98,15 @@ Per-heading `· vN` tags below restate this at each phase.
 
 ## Phase 1 — versioned-workspace floor (canonical build home) · **v0.4**
 
-- [ ] Branch manifests: cuts with **divergent children** (parent pointers,
+- [x] Branch manifests: cuts with **divergent children** (parent pointers,
       not a linear chain); O(1) branch creation over the content-addressed
-      store. *(Progress 2026-07-10: workspace-plane `BranchStore` landed —
-      `crates/whipplescript-store/src/branches.rs`, `Branches` trait for DO
-      parity; O(1) creation = two pointers off the parent head, branch
-      point pinned at creation, divergent children, optimistic head
-      advance, fail-closed terminal statuses, idempotent create. Remaining
-      for the box: wire to real checkpoint cuts + the virtual working set.)*
+      store. *(2026-07-10: `crates/whipplescript-store/src/branches.rs` —
+      `Branches` trait for DO parity; O(1) creation = two pointers off the
+      parent head, branch point pinned at creation, divergent children,
+      optimistic head advance + atomic `rebase_branch`, fail-closed
+      terminal statuses, idempotent create. Integrated + exercised
+      end-to-end through `vcs.rs`/`whip branch` (P1h); instance-cut wiring
+      rides the later working-set-dispatch slice.)*
 - [ ] Virtual working set: sandbox-mediated per-branch file surface,
       copy-on-write. *(Progress 2026-07-10: the surface landed —
       `crates/whipplescript-store/src/working_set.rs`:
@@ -113,8 +114,9 @@ Per-heading `· vN` tags below restate this at each phase.
       manifest → ContentStore) reads + a COW overlay for writes/deletes
       (tombstoned outcomes); `manifest()` folds the next cut and feeds
       `merge_manifests` directly (integration-tested); identical bodies
-      dedupe. Remaining for the box: wiring the effect-handler dispatch
-      to select a branch's working set per instance + the stat cache.)*
+      dedupe. Integrated into `vcs.rs`/`whip branch` (P1h) — the surface
+      is live end-to-end. Remaining for the box: effect-handler dispatch
+      selecting a branch's working set per instance + the stat cache.)*
 - [ ] Two-plane consistent cut: substance manifest + workspace-plane
       **high-water positions** (the plane-store enumeration is the pump
       audit walked twice — do both in one pass).
@@ -140,10 +142,13 @@ Per-heading `· vN` tags below restate this at each phase.
       (silent disjoint fold in any phase; intersecting deltas defer
       mid-run and arrive as the structured ask at quiescence) +
       `plan_merge_up` (lease → quiescence → staleness-at-merge-time
-      guards, in the TLA-modeled order). Remaining for the box: the
-      daemon loop wiring plans to BranchStore/WorkstreamStore heads, the
-      coordination adoption lease, and quiescence-point detection from
-      instance terminals/marks.)*
+      guards, in the TLA-modeled order). The plans are EXECUTED by
+      `vcs.rs::merge` (P1h): auto rebase-down (silent disjoint / honest
+      escalation) then staleness-checked merge-up, end-to-end through
+      `whip branch merge`. Remaining for the box: the background daemon
+      loop (continuous rebase-down across live branches, the coordination
+      adoption lease for multi-writer hosts, quiescence-point detection
+      from instance terminals/marks).)*
 - [ ] Workstream tier: named shared lines + membership (single-valued,
       fail-closed to mainline); certificate-gated auto-admit in-stream;
       boundary-gated promotion; archive re-homes members. *(Progress
