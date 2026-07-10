@@ -31317,18 +31317,25 @@ fn restore(options: &CliOptions) -> ExitCode {
 
 /// A timestamped default cut id for `whip checkpoint` when `--cut-id` is omitted.
 const BRANCH_USAGE: &str =
-    "usage: whip [--json] branch <create|list|show|write|read|ls|remove|merge|discard> ...\n\
+    "usage: whip [--json] branch <create|fork|list|show|status|write|read|ls|remove|cut|probe|merge|restore|discard|ops|bind|reconcile> ...\n\
   whip branch create <branch> [--name <label>] [--from <parent>]\n\
+  whip branch fork <branch> --from <parent> [--at-cut <cut>] [--name <label>]\n\
   whip branch list [--all]\n\
   whip branch show <branch>\n\
+  whip branch status <branch>\n\
   whip branch write <branch> <path> --body <text>\n\
   whip branch read <branch> <path>\n\
   whip branch ls <branch>\n\
   whip branch remove <branch> <path>\n\
+  whip branch cut <branch>\n\
+  whip branch probe <branch>\n\
   whip branch merge <branch>\n\
+  whip branch restore <branch> <cut>\n\
   whip branch discard <branch>\n\
+  whip branch ops [--limit <n>]\n\
   whip branch bind <branch> <instance>\n\
-  whip branch reconcile";
+  whip branch reconcile\n\
+  whip branch reconcile-list";
 
 const STREAM_USAGE: &str =
     "usage: whip [--json] stream <create|join|leave|archive|promote|list|show> ...\n\
@@ -32289,6 +32296,193 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 }
             }
         }
+        "fork" => {
+            let mut name: Option<&str> = None;
+            let mut from: &str = whipplescript_store::branches::MAINLINE_BRANCH_ID;
+            let mut at_cut: Option<&str> = None;
+            let mut branch_id: Option<&str> = None;
+            let mut iter = rest.iter();
+            while let Some(arg) = iter.next() {
+                match *arg {
+                    "--name" => name = iter.next().copied(),
+                    "--from" => from = iter.next().copied().unwrap_or(from),
+                    "--at-cut" => at_cut = iter.next().copied(),
+                    other if branch_id.is_none() => branch_id = Some(other),
+                    other => {
+                        eprintln!("unexpected argument `{other}`\n{BRANCH_USAGE}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let Some(branch_id) = branch_id else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.fork_with_lineage(branch_id, name, from, at_cut, &at) {
+                Ok(whipplescript_store::branches::CreateBranchOutcome::Created(row)) => {
+                    emit_json(json!({"forked": branch_row_json(&row)}))
+                }
+                Ok(whipplescript_store::branches::CreateBranchOutcome::Existing(row)) => {
+                    emit_json(json!({"existing": branch_row_json(&row)}))
+                }
+                Ok(other) => {
+                    eprintln!("fork refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch fork failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "status" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.status_report(branch_id) {
+                Ok(Some(report)) => match serde_json::to_value(&report) {
+                    Ok(payload) => emit_json(payload),
+                    Err(error) => {
+                        eprintln!("branch status failed: {error}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch status failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "cut" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let cut_id = generated_cut_id();
+            match vcs.cut_at_quiescence(branch_id, &cut_id, &at) {
+                Ok(Some(cut)) => emit_json(json!({
+                    "branch_id": branch_id,
+                    "cut_id": cut.cut_id,
+                    "manifest_hash": cut.manifest_hash,
+                    "change_id": cut.change_id,
+                })),
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch cut failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "probe" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            use whipplescript_store::vcs::MergeProbeOutcome;
+            match vcs.merge_probe(branch_id) {
+                Ok(MergeProbeOutcome::UpToDate) => emit_json(json!({
+                    "branch_id": branch_id, "probe": "up_to_date",
+                })),
+                Ok(MergeProbeOutcome::Clean {
+                    merged_manifest_hash,
+                    changed_paths,
+                }) => emit_json(json!({
+                    "branch_id": branch_id, "probe": "clean",
+                    "merged_manifest_hash": merged_manifest_hash,
+                    "changed_paths": changed_paths,
+                })),
+                Ok(MergeProbeOutcome::Conflicted { conflicts }) => {
+                    // An honest preview, not a failure: the probe reports
+                    // what the merge would escalate.
+                    emit_json(json!({
+                        "branch_id": branch_id, "probe": "conflicted",
+                        "conflicts": conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+                    }))
+                }
+                Ok(other) => {
+                    eprintln!("probe refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch probe failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "restore" => {
+            let (Some(branch_id), Some(to_cut)) = (rest.first(), rest.get(1)) else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            use whipplescript_store::vcs::RestoreOutcome;
+            let new_cut_id = generated_cut_id();
+            match vcs.restore(branch_id, to_cut, &new_cut_id, &at) {
+                Ok(RestoreOutcome::Restored {
+                    cut_id,
+                    manifest_hash,
+                }) => emit_json(json!({
+                    "restored": branch_id,
+                    "to_cut_id": to_cut,
+                    "cut_id": cut_id,
+                    "manifest_hash": manifest_hash,
+                })),
+                Ok(RestoreOutcome::AlreadyThere) => emit_json(json!({
+                    "restored": branch_id,
+                    "to_cut_id": to_cut,
+                    "already_there": true,
+                })),
+                Ok(other) => {
+                    eprintln!("restore refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch restore failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "ops" => {
+            let limit = rest
+                .iter()
+                .position(|arg| *arg == "--limit")
+                .and_then(|index| rest.get(index + 1))
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(50);
+            match vcs.list_ops(limit) {
+                Ok(ops) => match serde_json::to_value(&ops) {
+                    Ok(payload) => emit_json(payload),
+                    Err(error) => {
+                        eprintln!("branch ops failed: {error}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(error) => {
+                    eprintln!("branch ops failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "reconcile-list" => match vcs.reconcile_list() {
+            Ok(entries) => match serde_json::to_value(&entries) {
+                Ok(payload) => emit_json(payload),
+                Err(error) => {
+                    eprintln!("branch reconcile-list failed: {error}");
+                    ExitCode::FAILURE
+                }
+            },
+            Err(error) => {
+                eprintln!("branch reconcile-list failed: {error:?}");
+                ExitCode::FAILURE
+            }
+        },
         other => {
             eprintln!("unknown branch verb `{other}`\n{BRANCH_USAGE}");
             ExitCode::from(2)

@@ -18,7 +18,8 @@ use std::collections::BTreeSet;
 
 use whipplescript_store::branches::{
     AdvanceOutcome, BindOutcome, BranchRow, BranchStatus, Branches, CreateBranch,
-    CreateBranchOutcome, StatusOutcome, MAINLINE_BRANCH_ID,
+    CreateBranchOutcome, CutRecord, CutRow, OpBranchDelta, OpRow, StatusOutcome,
+    MAINLINE_BRANCH_ID,
 };
 use whipplescript_store::content::ContentBlobs;
 use whipplescript_store::{StoreError, StoreResult};
@@ -77,8 +78,35 @@ impl<S: DoSql> DoBranches<S> {
                 recorded_at TEXT NOT NULL
             )",
             "CREATE INDEX IF NOT EXISTS cuts_change_idx ON cuts(change_id)",
+            "CREATE INDEX IF NOT EXISTS cuts_branch_idx ON cuts(branch_id)",
+            "CREATE TABLE IF NOT EXISTS ops (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                op_id TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL,
+                deltas TEXT NOT NULL,
+                origin TEXT,
+                recorded_at TEXT NOT NULL
+            )",
         ] {
             self.sql.execute(statement, &[]).map_err(sql_err)?;
+        }
+        // Provenance columns arrived with Phase 2 (exactly as native):
+        // stores minted before that gain them in place.
+        for column in ["parent_cut_id", "origin"] {
+            let info = self
+                .sql
+                .query("PRAGMA table_info(cuts)", &[])
+                .map_err(sql_err)?;
+            let present = info.iter().any(|row| {
+                row.get(1)
+                    .map(|value| as_text(value) == column)
+                    .unwrap_or(false)
+            });
+            if !present {
+                self.sql
+                    .execute(&format!("ALTER TABLE cuts ADD COLUMN {column} TEXT"), &[])
+                    .map_err(sql_err)?;
+            }
         }
         Ok(())
     }
@@ -447,25 +475,21 @@ impl<S: DoSql> Branches for DoBranches<S> {
         Ok(rows.iter().map(|row| as_text(&row[0])).collect())
     }
 
-    fn record_cut(
-        &mut self,
-        cut_id: &str,
-        change_id: &str,
-        branch_id: &str,
-        manifest_hash: &str,
-        at: &str,
-    ) -> StoreResult<()> {
+    fn record_cut(&mut self, cut: CutRecord<'_>) -> StoreResult<()> {
         self.sql
             .execute(
                 "INSERT OR IGNORE INTO cuts \
-                 (cut_id, change_id, branch_id, manifest_hash, recorded_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (cut_id, change_id, branch_id, manifest_hash, parent_cut_id, \
+                  origin, recorded_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 &[
-                    text(cut_id),
-                    text(change_id),
-                    text(branch_id),
-                    text(manifest_hash),
-                    text(at),
+                    text(cut.cut_id),
+                    text(cut.change_id),
+                    text(cut.branch_id),
+                    text(cut.manifest_hash),
+                    opt_text(cut.parent_cut_id),
+                    opt_text(cut.origin),
+                    text(cut.recorded_at),
                 ],
             )
             .map_err(sql_err)?;
@@ -482,6 +506,110 @@ impl<S: DoSql> Branches for DoBranches<S> {
             .map_err(sql_err)?;
         Ok(rows.first().map(|row| as_text(&row[0])))
     }
+
+    fn get_cut(&self, cut_id: &str) -> StoreResult<Option<CutRow>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT cut_id, change_id, branch_id, manifest_hash, \
+                 parent_cut_id, origin, recorded_at FROM cuts WHERE cut_id = ?1",
+                &[text(cut_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| decode_cut_row(row)))
+    }
+
+    fn list_cuts(&self, branch_id: &str, limit: usize) -> StoreResult<Vec<CutRow>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT cut_id, change_id, branch_id, manifest_hash, \
+                 parent_cut_id, origin, recorded_at FROM cuts \
+                 WHERE branch_id = ?1 ORDER BY rowid DESC LIMIT ?2",
+                &[text(branch_id), SqlValue::Int(limit as i64)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|row| decode_cut_row(row)).collect())
+    }
+
+    fn record_op(
+        &mut self,
+        op_id: &str,
+        kind: &str,
+        deltas: &[OpBranchDelta],
+        origin: Option<&str>,
+        at: &str,
+    ) -> StoreResult<()> {
+        let deltas_json = serde_json::to_string(deltas)
+            .map_err(|error| StoreError::Conflict(format!("op deltas encode: {error}")))?;
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO ops (op_id, kind, deltas, origin, recorded_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    text(op_id),
+                    text(kind),
+                    text(&deltas_json),
+                    opt_text(origin),
+                    text(at),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn list_ops(&self, limit: usize) -> StoreResult<Vec<OpRow>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT seq, op_id, kind, deltas, origin, recorded_at FROM ops \
+                 ORDER BY seq DESC LIMIT ?1",
+                &[SqlValue::Int(limit as i64)],
+            )
+            .map_err(sql_err)?;
+        rows.iter().map(|row| decode_op_row(row)).collect()
+    }
+
+    fn get_op(&self, op_id: &str) -> StoreResult<Option<OpRow>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT seq, op_id, kind, deltas, origin, recorded_at FROM ops \
+                 WHERE op_id = ?1",
+                &[text(op_id)],
+            )
+            .map_err(sql_err)?;
+        rows.first().map(|row| decode_op_row(row)).transpose()
+    }
+}
+
+fn decode_cut_row(row: &[SqlValue]) -> CutRow {
+    CutRow {
+        cut_id: as_text(&row[0]),
+        change_id: as_text(&row[1]),
+        branch_id: as_text(&row[2]),
+        manifest_hash: as_text(&row[3]),
+        parent_cut_id: as_opt_text(&row[4]),
+        origin: as_opt_text(&row[5]),
+        recorded_at: as_text(&row[6]),
+    }
+}
+
+fn decode_op_row(row: &[SqlValue]) -> StoreResult<OpRow> {
+    let deltas_json = as_text(&row[3]);
+    let deltas = serde_json::from_str(&deltas_json)
+        .map_err(|error| StoreError::Conflict(format!("op deltas decode: {error}")))?;
+    Ok(OpRow {
+        seq: match &row[0] {
+            SqlValue::Int(seq) => *seq,
+            _ => 0,
+        },
+        op_id: as_text(&row[1]),
+        kind: as_text(&row[2]),
+        deltas,
+        origin: as_opt_text(&row[4]),
+        recorded_at: as_text(&row[5]),
+    })
 }
 
 /// Content blobs over the DO's `content_blobs` table — the same table

@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Which branch/head a merge side is, for provenance on conflicts. The
 /// label is the branch id (or another human-meaningful head ref); the
 /// cut id pins the exact state merged.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MergeSide {
     pub label: String,
     pub cut_id: Option<String>,
@@ -32,7 +32,7 @@ pub struct MergeSide {
 /// One path's honest conflict: base and both sides as content hashes
 /// (`None` = absent/deleted on that timeline), plus both sides'
 /// provenance. `base` is `None` for an add/add collision.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PathConflict {
     pub path: String,
     pub base: Option<String>,

@@ -19667,6 +19667,127 @@ fn branch_write_merge_conflict_roundtrip() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// The Phase 2 mapped-operation surface through the CLI: probe previews
+/// a merge without moving anything, status reports ahead/behind + head
+/// hash, cut names the quiescent state, restore re-points to a recorded
+/// cut as a NEW cut, fork pins lineage at a cut, reconcile-list surfaces
+/// pending flow, and the op log records every pointer movement.
+#[test]
+fn branch_probe_status_restore_and_op_log_surface() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("branch-api");
+    let branches = dir.join("branches.sqlite");
+    let content = dir.join("vcs-content.sqlite");
+    let envs: &[(&str, &str)] = &[
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE",
+            branches.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            content.to_str().expect("utf-8"),
+        ),
+    ];
+    let branch = |args: &[&str]| {
+        let mut full = vec!["--json", "branch"];
+        full.extend_from_slice(args);
+        run_json_with_env(bin, &full, envs)
+    };
+
+    branch(&["write", "main", "a.md", "--body", "base"]);
+    branch(&["create", "draft_a"]);
+    branch(&["write", "draft_a", "a.md", "--body", "draft"]);
+
+    // Probe: a clean preview naming the changed path; nothing moves.
+    let probe = branch(&["probe", "draft_a"]);
+    assert_eq!(probe.get("probe").and_then(Value::as_str), Some("clean"));
+    assert_eq!(
+        probe.pointer("/changed_paths/0").and_then(Value::as_str),
+        Some("a.md")
+    );
+    assert_eq!(
+        branch(&["read", "main", "a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("base"),
+        "the probe moved nothing"
+    );
+
+    // Status: ahead on a.md, not behind, with head hash plumbing.
+    let status = branch(&["status", "draft_a"]);
+    assert_eq!(
+        status.pointer("/ahead_paths/0").and_then(Value::as_str),
+        Some("a.md")
+    );
+    assert_eq!(status.get("behind").and_then(Value::as_bool), Some(false));
+    assert!(status
+        .pointer("/branch/head_manifest_hash")
+        .and_then(Value::as_str)
+        .is_some());
+
+    // Reconcile-list surfaces the pending divergence.
+    let pending = branch(&["reconcile-list"]);
+    assert_eq!(
+        pending.pointer("/0/branch_id").and_then(Value::as_str),
+        Some("draft_a")
+    );
+    assert_eq!(
+        pending.pointer("/0/ahead_paths").and_then(Value::as_i64),
+        Some(1)
+    );
+
+    // Cut-at-quiescence names the head cut (turn-finalize).
+    let cut = branch(&["cut", "draft_a"]);
+    let named_cut = cut
+        .get("cut_id")
+        .and_then(Value::as_str)
+        .expect("cut id")
+        .to_owned();
+
+    // Advance past the cut, then restore back to it: a NEW cut carrying
+    // the old state — no history rewind.
+    branch(&["write", "draft_a", "a.md", "--body", "later"]);
+    let restored = branch(&["restore", "draft_a", &named_cut]);
+    assert_eq!(
+        restored.get("restored").and_then(Value::as_str),
+        Some("draft_a")
+    );
+    assert_eq!(
+        branch(&["read", "draft_a", "a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("draft"),
+        "restore re-pointed the head to the named cut's state"
+    );
+
+    // Fork with lineage pinned at the named cut.
+    let forked = branch(&[
+        "fork", "fork_1", "--from", "draft_a", "--at-cut", &named_cut,
+    ]);
+    assert_eq!(
+        forked
+            .pointer("/forked/branch_point_cut_id")
+            .and_then(Value::as_str),
+        Some(named_cut.as_str())
+    );
+
+    // The op log recorded every pointer movement, newest first.
+    let ops = branch(&["ops"]);
+    let kinds: Vec<&str> = ops
+        .as_array()
+        .expect("ops array")
+        .iter()
+        .filter_map(|op| op.get("kind").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["create", "restore", "write", "write", "create", "write"],
+        "the op log is the reflog, first-class"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// Per-instance effect dispatch onto branch working sets: `whip dev
 /// --branch` binds the instance at birth, so its `file.write` effect
 /// resolves through the branch's COW working set — the real directory

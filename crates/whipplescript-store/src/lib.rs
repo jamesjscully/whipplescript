@@ -15,6 +15,7 @@ pub mod skill_frontmatter;
 pub mod stat_cache;
 pub mod vcs;
 pub mod working_set;
+pub mod workspace_api;
 pub mod workstreams;
 
 use std::result;

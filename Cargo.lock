@@ -879,6 +879,7 @@ name = "whipplescript-store"
 version = "0.3.0"
 dependencies = [
  "rusqlite",
+ "serde",
  "serde_json",
  "whipplescript-core",
 ]

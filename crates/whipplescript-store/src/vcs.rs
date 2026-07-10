@@ -27,7 +27,7 @@ use std::path::Path;
 use crate::branches::BranchStore;
 use crate::branches::{
     AdvanceOutcome, BranchRow, BranchStatus, Branches, CreateBranch, CreateBranchOutcome,
-    StatusOutcome, MAINLINE_BRANCH_ID,
+    CutRecord, CutRow, OpBranchDelta, OpBranchState, OpRow, StatusOutcome, MAINLINE_BRANCH_ID,
 };
 use crate::content::ContentBlobs;
 #[cfg(feature = "native")]
@@ -138,6 +138,76 @@ pub enum SyncOutcome {
     LineNotActive,
 }
 
+/// Merge-probe outcome (`git merge-tree`'s replacement): what `merge`
+/// WOULD do, computed without moving any pointer. Certified-refined
+/// content written during the probe is harmless — content-addressed and
+/// unreferenced until a real merge lands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MergeProbeOutcome {
+    /// Nothing to merge: the parent already has the branch's content.
+    UpToDate,
+    /// The merge would adopt cleanly, producing this manifest.
+    Clean {
+        merged_manifest_hash: String,
+        changed_paths: Vec<String>,
+    },
+    Conflicted {
+        conflicts: Vec<PathConflict>,
+    },
+    BranchMissing,
+    BranchNotActive,
+    NoParent,
+}
+
+/// Restore (un-tie's `revert` mapping): re-point the branch head to a
+/// recorded cut's state AS A NEW CUT — a proposal over the immutable
+/// record, never a rewind of history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RestoreOutcome {
+    Restored {
+        cut_id: String,
+        manifest_hash: String,
+    },
+    /// The head already carries that state.
+    AlreadyThere,
+    CutMissing,
+    BranchMissing,
+    BranchNotActive,
+}
+
+/// A named quiescence cut (un-tie's commit-per-turn-finalize mapping).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QuiescentCut {
+    pub cut_id: String,
+    pub manifest_hash: String,
+    pub change_id: String,
+}
+
+/// Status + hash plumbing for one branch, consumable by an external
+/// host: where the head is, how far the branch diverged from its point
+/// (ahead), and whether the parent moved past it (behind).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BranchStatusReport {
+    pub branch: BranchRow,
+    pub head_change_id: Option<String>,
+    /// Paths the branch changed since its branch point.
+    pub ahead_paths: Vec<String>,
+    /// The parent's head moved past the branch point: a reconcile would
+    /// fold new parent content down.
+    pub behind: bool,
+    pub bound_instances: Vec<String>,
+}
+
+/// One entry of `reconcile-list`: a branch with pending flow in either
+/// direction.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ReconcileEntry {
+    pub branch_id: String,
+    pub target_branch_id: String,
+    pub ahead_paths: usize,
+    pub behind: bool,
+}
+
 pub struct WorkspaceVcs<B: Branches, C: ContentBlobs> {
     branches: B,
     content: C,
@@ -192,15 +262,53 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         parent_branch_id: &str,
         at: &str,
     ) -> StoreResult<CreateBranchOutcome> {
+        self.fork_with_lineage(branch_id, name, parent_branch_id, None, at)
+    }
+
+    /// Fork with lineage (un-tie's `fork-with-shared-ancestry`): a new
+    /// branch off `from_branch`, at its current head or at a pinned
+    /// earlier cut. The lineage (parent pointer + branch-point cut) is
+    /// recorded on the row; the fork is an op-log entry.
+    pub fn fork_with_lineage(
+        &mut self,
+        branch_id: &str,
+        name: Option<&str>,
+        from_branch: &str,
+        at_cut_id: Option<&str>,
+        at: &str,
+    ) -> StoreResult<CreateBranchOutcome> {
         self.branches.ensure_mainline(at)?;
-        self.branches.create_branch(CreateBranch {
+        let pinned = match at_cut_id {
+            None => None,
+            Some(cut_id) => {
+                let Some(cut) = self.branches.get_cut(cut_id)? else {
+                    return Err(StoreError::Conflict(format!(
+                        "unknown cut `{cut_id}`; fork-with-lineage needs a recorded cut"
+                    )));
+                };
+                Some((cut_id.to_owned(), cut.manifest_hash))
+            }
+        };
+        let outcome = self.branches.create_branch(CreateBranch {
             branch_id,
             name,
-            parent_branch_id,
-            at_cut: None,
+            parent_branch_id: from_branch,
+            at_cut: pinned
+                .as_ref()
+                .map(|(cut, manifest)| (cut.as_str(), manifest.as_str())),
             created_at: at,
             idempotency_key: None,
-        })
+        })?;
+        if let CreateBranchOutcome::Created(row) = &outcome {
+            self.log_op(
+                &format!("op-create-{branch_id}"),
+                "create",
+                vec![Self::op_delta(None, row)],
+                Some(&format!("from:{from_branch}")),
+                at,
+            )?;
+        }
+        Ok(outcome)
     }
 
     pub fn get_branch(&self, branch_id: &str) -> StoreResult<Option<BranchRow>> {
@@ -212,7 +320,56 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     }
 
     pub fn discard_branch(&mut self, branch_id: &str, at: &str) -> StoreResult<StatusOutcome> {
-        self.branches.discard_branch(branch_id, at)
+        let before = self.branches.get_branch(branch_id)?;
+        let outcome = self.branches.discard_branch(branch_id, at)?;
+        if let StatusOutcome::Done(row) = &outcome {
+            self.log_op(
+                &format!("op-discard-{branch_id}"),
+                "discard",
+                vec![Self::op_delta(before.as_ref(), row)],
+                None,
+                at,
+            )?;
+        }
+        Ok(outcome)
+    }
+
+    /// One branch's pointer movement for the op log.
+    fn op_delta(before: Option<&BranchRow>, after: &BranchRow) -> OpBranchDelta {
+        OpBranchDelta {
+            branch_id: after.branch_id.clone(),
+            before: before.map(OpBranchState::of),
+            after: OpBranchState::of(after),
+        }
+    }
+
+    fn log_op(
+        &mut self,
+        op_id: &str,
+        kind: &str,
+        deltas: Vec<OpBranchDelta>,
+        origin: Option<&str>,
+        at: &str,
+    ) -> StoreResult<()> {
+        self.branches.record_op(op_id, kind, &deltas, origin, at)
+    }
+
+    /// The op log, newest first (the record–narrative separation: this IS
+    /// the reflog, first-class).
+    pub fn list_ops(&self, limit: usize) -> StoreResult<Vec<OpRow>> {
+        self.branches.list_ops(limit)
+    }
+
+    pub fn get_op(&self, op_id: &str) -> StoreResult<Option<OpRow>> {
+        self.branches.get_op(op_id)
+    }
+
+    pub fn get_cut(&self, cut_id: &str) -> StoreResult<Option<CutRow>> {
+        self.branches.get_cut(cut_id)
+    }
+
+    pub fn list_cuts(&self, branch_id: &str, limit: usize) -> StoreResult<Vec<CutRow>> {
+        self.branches.list_cuts(branch_id, limit)
     }
 
     fn load_manifest(&self, hash: Option<&str>) -> StoreResult<BTreeMap<String, String>> {
@@ -306,11 +463,26 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             &manifest_hash,
             at,
         )? {
-            AdvanceOutcome::Advanced(_) => {
+            AdvanceOutcome::Advanced(advanced) => {
                 // A write is a NEW intent: the change id is born equal to
                 // the cut id and survives every later rewrite of the cut.
-                self.branches
-                    .record_cut(cut_id, cut_id, branch_id, &manifest_hash, at)?;
+                let origin = format!("write:{path}");
+                self.branches.record_cut(CutRecord {
+                    cut_id,
+                    change_id: cut_id,
+                    branch_id,
+                    manifest_hash: &manifest_hash,
+                    parent_cut_id: row.head_cut_id.as_deref(),
+                    origin: Some(&origin),
+                    recorded_at: at,
+                })?;
+                self.log_op(
+                    &format!("op-{cut_id}"),
+                    "write",
+                    vec![Self::op_delta(Some(&row), &advanced)],
+                    Some(&origin),
+                    at,
+                )?;
                 Ok(VcsWriteOutcome::Written {
                     cut_id: cut_id.to_owned(),
                     manifest_hash,
@@ -489,12 +661,22 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             &rebased_hash,
             at,
         )? {
-            AdvanceOutcome::Advanced(_) => {
-                self.branches.record_cut(
-                    rebase_cut_id,
-                    &inherited_change,
+            AdvanceOutcome::Advanced(advanced) => {
+                let origin = format!("rebase:{parent_id}");
+                self.branches.record_cut(CutRecord {
+                    cut_id: rebase_cut_id,
+                    change_id: &inherited_change,
                     branch_id,
-                    &rebased_hash,
+                    manifest_hash: &rebased_hash,
+                    parent_cut_id: branch.head_cut_id.as_deref(),
+                    origin: Some(&origin),
+                    recorded_at: at,
+                })?;
+                self.log_op(
+                    &format!("op-{rebase_cut_id}"),
+                    "rebase",
+                    vec![Self::op_delta(Some(&branch), &advanced)],
+                    Some(&origin),
                     at,
                 )?;
                 Ok(ReconcileOutcome::Rebased {
@@ -567,21 +749,25 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 let transported_change = self
                     .change_of(branch.head_cut_id.as_deref())?
                     .unwrap_or_else(|| merge_cut_id.to_owned());
-                match self.branches.advance_head(
+                let origin = format!("merge:{branch_id}");
+                let parent_advanced = match self.branches.advance_head(
                     &parent_id,
                     parent.head_cut_id.as_deref(),
                     merge_cut_id,
                     &merged_hash,
                     at,
                 )? {
-                    AdvanceOutcome::Advanced(_) => {
-                        self.branches.record_cut(
-                            merge_cut_id,
-                            &transported_change,
-                            &parent_id,
-                            &merged_hash,
-                            at,
-                        )?;
+                    AdvanceOutcome::Advanced(advanced) => {
+                        self.branches.record_cut(CutRecord {
+                            cut_id: merge_cut_id,
+                            change_id: &transported_change,
+                            branch_id: &parent_id,
+                            manifest_hash: &merged_hash,
+                            parent_cut_id: parent.head_cut_id.as_deref(),
+                            origin: Some(&origin),
+                            recorded_at: at,
+                        })?;
+                        advanced
                     }
                     AdvanceOutcome::Stale { .. } => {
                         return Err(StoreError::Conflict(
@@ -591,12 +777,24 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     AdvanceOutcome::NotActive { .. } | AdvanceOutcome::NotFound => {
                         return Ok(VcsMergeOutcome::NoParent)
                     }
-                }
+                };
                 match self.branches.adopt_branch(branch_id, merge_cut_id, at)? {
-                    StatusOutcome::Done(_) => Ok(VcsMergeOutcome::Adopted {
-                        merge_cut_id: merge_cut_id.to_owned(),
-                        into_branch_id: parent_id,
-                    }),
+                    StatusOutcome::Done(adopted) => {
+                        self.log_op(
+                            &format!("op-{merge_cut_id}"),
+                            "merge",
+                            vec![
+                                Self::op_delta(Some(&parent), &parent_advanced),
+                                Self::op_delta(Some(&branch), &adopted),
+                            ],
+                            Some(&origin),
+                            at,
+                        )?;
+                        Ok(VcsMergeOutcome::Adopted {
+                            merge_cut_id: merge_cut_id.to_owned(),
+                            into_branch_id: parent_id,
+                        })
+                    }
                     StatusOutcome::InvalidTransition { .. } => Ok(VcsMergeOutcome::BranchNotActive),
                     StatusOutcome::NotFound => Ok(VcsMergeOutcome::BranchMissing),
                 }
@@ -608,6 +806,288 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 unreachable!("CLI merge holds the mediator role and runs quiescent")
             }
         }
+    }
+
+    /// Every path whose entry differs between two manifests (present in
+    /// one, absent or different in the other).
+    fn diff_paths(a: &BTreeMap<String, String>, b: &BTreeMap<String, String>) -> Vec<String> {
+        let mut paths: Vec<String> = a
+            .iter()
+            .filter(|(path, hash)| b.get(*path) != Some(hash))
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in b.keys() {
+            if !a.contains_key(path) {
+                paths.push(path.clone());
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// Merge-probe: compute EXACTLY what `merge` would do — rebase-down
+    /// plan, certified source refinement, merge-up composition — while
+    /// moving NOTHING. The un-tie `merge-tree` mapping; agents preview
+    /// before they act (vw note §7.3: dry-run is the default
+    /// interaction).
+    pub fn merge_probe(&self, branch_id: &str) -> StoreResult<MergeProbeOutcome> {
+        let Some(branch) = self.branches.get_branch(branch_id)? else {
+            return Ok(MergeProbeOutcome::BranchMissing);
+        };
+        if branch.status != BranchStatus::Active {
+            return Ok(MergeProbeOutcome::BranchNotActive);
+        }
+        let Some(parent_id) = branch.parent_branch_id.clone() else {
+            return Ok(MergeProbeOutcome::NoParent);
+        };
+        let Some(parent) = self.branches.get_branch(&parent_id)? else {
+            return Ok(MergeProbeOutcome::NoParent);
+        };
+        let point = self.load_manifest(branch.branch_point_manifest_hash.as_deref())?;
+        let head = self.load_manifest(branch.head_manifest_hash.as_deref())?;
+        let target = self.load_manifest(parent.head_manifest_hash.as_deref())?;
+        let candidate =
+            if Self::cut_ref(&branch.branch_point_cut_id) == Self::cut_ref(&parent.head_cut_id) {
+                head
+            } else {
+                let branch_side = MergeSide {
+                    label: branch_id.to_owned(),
+                    cut_id: branch.head_cut_id.clone(),
+                };
+                let parent_side = MergeSide {
+                    label: parent_id.clone(),
+                    cut_id: parent.head_cut_id.clone(),
+                };
+                match plan_rebase_down(&point, &head, &target, &branch_side, &parent_side, true) {
+                    RebaseDownPlan::UpToDate => head,
+                    RebaseDownPlan::Silent { new_head_manifest } => new_head_manifest,
+                    RebaseDownPlan::DeferredMidRun => unreachable!("probe plans quiescent"),
+                    RebaseDownPlan::AskAtQuiescence { .. } => {
+                        let crate::merge::MergeOutcome::Conflicted {
+                            merged_remainder,
+                            conflicts: raw,
+                        } = crate::merge::merge_manifests(
+                            &point,
+                            &head,
+                            &target,
+                            &branch_side,
+                            &parent_side,
+                        )
+                        else {
+                            unreachable!("plan reported conflicts");
+                        };
+                        let (resolved, remaining) = self.refine_source_conflicts(raw)?;
+                        if !remaining.is_empty() {
+                            return Ok(MergeProbeOutcome::Conflicted {
+                                conflicts: remaining,
+                            });
+                        }
+                        let mut manifest = merged_remainder;
+                        manifest.extend(resolved);
+                        manifest
+                    }
+                }
+            };
+        let changed_paths = Self::diff_paths(&target, &candidate);
+        if changed_paths.is_empty() {
+            return Ok(MergeProbeOutcome::UpToDate);
+        }
+        let merged_manifest_hash = self.store_manifest(&candidate)?;
+        Ok(MergeProbeOutcome::Clean {
+            merged_manifest_hash,
+            changed_paths,
+        })
+    }
+
+    /// Restore (un-tie's `revert` mapping): re-point the branch head to a
+    /// recorded cut's state AS A NEW CUT. The record is untouched — undo
+    /// of the restore is another restore (or `undo-op`).
+    pub fn restore(
+        &mut self,
+        branch_id: &str,
+        to_cut_id: &str,
+        new_cut_id: &str,
+        at: &str,
+    ) -> StoreResult<RestoreOutcome> {
+        let Some(row) = self.branches.get_branch(branch_id)? else {
+            return Ok(RestoreOutcome::BranchMissing);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(RestoreOutcome::BranchNotActive);
+        }
+        let Some(cut) = self.branches.get_cut(to_cut_id)? else {
+            return Ok(RestoreOutcome::CutMissing);
+        };
+        if row.head_manifest_hash.as_deref() == Some(cut.manifest_hash.as_str()) {
+            return Ok(RestoreOutcome::AlreadyThere);
+        }
+        match self.branches.advance_head(
+            branch_id,
+            row.head_cut_id.as_deref(),
+            new_cut_id,
+            &cut.manifest_hash,
+            at,
+        )? {
+            AdvanceOutcome::Advanced(advanced) => {
+                // A restore is a NEW intent (a counterfactual state the
+                // branch proposes), not the old change re-materialized.
+                let origin = format!("restore:{to_cut_id}");
+                self.branches.record_cut(CutRecord {
+                    cut_id: new_cut_id,
+                    change_id: new_cut_id,
+                    branch_id,
+                    manifest_hash: &cut.manifest_hash,
+                    parent_cut_id: row.head_cut_id.as_deref(),
+                    origin: Some(&origin),
+                    recorded_at: at,
+                })?;
+                self.log_op(
+                    &format!("op-{new_cut_id}"),
+                    "restore",
+                    vec![Self::op_delta(Some(&row), &advanced)],
+                    Some(&origin),
+                    at,
+                )?;
+                Ok(RestoreOutcome::Restored {
+                    cut_id: new_cut_id.to_owned(),
+                    manifest_hash: cut.manifest_hash,
+                })
+            }
+            AdvanceOutcome::Stale { .. } => Err(StoreError::Conflict(
+                "branch head moved during the restore; retry".to_owned(),
+            )),
+            AdvanceOutcome::NotActive { .. } => Ok(RestoreOutcome::BranchNotActive),
+            AdvanceOutcome::NotFound => Ok(RestoreOutcome::BranchMissing),
+        }
+    }
+
+    /// Name the branch's current state as a durable cut (un-tie's
+    /// commit-per-turn-finalize mapping). The head cut IS the quiescent
+    /// cut when one exists — this records it (idempotently) and returns
+    /// it; a virgin head mints the named cut over the current manifest.
+    /// `None` = no such branch.
+    pub fn cut_at_quiescence(
+        &mut self,
+        branch_id: &str,
+        cut_id: &str,
+        at: &str,
+    ) -> StoreResult<Option<QuiescentCut>> {
+        let Some(row) = self.branches.get_branch(branch_id)? else {
+            return Ok(None);
+        };
+        if let Some(head_cut) = Self::cut_ref(&row.head_cut_id) {
+            let manifest_hash = row.head_manifest_hash.clone().unwrap_or_default();
+            self.branches.record_cut(CutRecord {
+                cut_id: head_cut,
+                change_id: head_cut,
+                branch_id,
+                manifest_hash: &manifest_hash,
+                parent_cut_id: None,
+                origin: Some("cut"),
+                recorded_at: at,
+            })?;
+            let change_id = self
+                .change_of(Some(head_cut))?
+                .unwrap_or_else(|| head_cut.to_owned());
+            return Ok(Some(QuiescentCut {
+                cut_id: head_cut.to_owned(),
+                manifest_hash,
+                change_id,
+            }));
+        }
+        // Virgin head (no cut yet — a fresh mainline): mint the named cut
+        // over the current (empty) manifest.
+        let manifest = self.load_manifest(row.head_manifest_hash.as_deref())?;
+        let manifest_hash = self.store_manifest(&manifest)?;
+        match self
+            .branches
+            .advance_head(branch_id, None, cut_id, &manifest_hash, at)?
+        {
+            AdvanceOutcome::Advanced(advanced) => {
+                self.branches.record_cut(CutRecord {
+                    cut_id,
+                    change_id: cut_id,
+                    branch_id,
+                    manifest_hash: &manifest_hash,
+                    parent_cut_id: None,
+                    origin: Some("cut"),
+                    recorded_at: at,
+                })?;
+                self.log_op(
+                    &format!("op-{cut_id}"),
+                    "cut",
+                    vec![Self::op_delta(Some(&row), &advanced)],
+                    Some("cut"),
+                    at,
+                )?;
+                Ok(Some(QuiescentCut {
+                    cut_id: cut_id.to_owned(),
+                    manifest_hash,
+                    change_id: cut_id.to_owned(),
+                }))
+            }
+            AdvanceOutcome::Stale { .. } => Err(StoreError::Conflict(
+                "branch head moved during the cut; retry".to_owned(),
+            )),
+            AdvanceOutcome::NotActive { .. } | AdvanceOutcome::NotFound => Ok(None),
+        }
+    }
+
+    /// Status + hash plumbing for one branch. `None` = no such branch.
+    pub fn status_report(&self, branch_id: &str) -> StoreResult<Option<BranchStatusReport>> {
+        let Some(branch) = self.branches.get_branch(branch_id)? else {
+            return Ok(None);
+        };
+        let point = self.load_manifest(branch.branch_point_manifest_hash.as_deref())?;
+        let head = self.load_manifest(branch.head_manifest_hash.as_deref())?;
+        let ahead_paths = Self::diff_paths(&point, &head);
+        let behind = match branch.parent_branch_id.as_deref() {
+            None => false,
+            Some(parent_id) => match self.branches.get_branch(parent_id)? {
+                None => false,
+                Some(parent) => {
+                    Self::cut_ref(&branch.branch_point_cut_id) != Self::cut_ref(&parent.head_cut_id)
+                }
+            },
+        };
+        let head_change_id = self.change_of(branch.head_cut_id.as_deref())?;
+        let bound_instances = self.branches.list_bound_instances(branch_id)?;
+        Ok(Some(BranchStatusReport {
+            branch,
+            head_change_id,
+            ahead_paths,
+            behind,
+            bound_instances,
+        }))
+    }
+
+    /// Every active branch with pending flow in either direction — the
+    /// daemon's work list and the host's "what needs attention" view.
+    pub fn reconcile_list(&self) -> StoreResult<Vec<ReconcileEntry>> {
+        let mut entries = Vec::new();
+        for branch in self.branches.list_branches(Some(BranchStatus::Active))? {
+            let Some(parent_id) = branch.parent_branch_id.clone() else {
+                continue;
+            };
+            let Some(parent) = self.branches.get_branch(&parent_id)? else {
+                continue;
+            };
+            let behind =
+                Self::cut_ref(&branch.branch_point_cut_id) != Self::cut_ref(&parent.head_cut_id);
+            let point = self.load_manifest(branch.branch_point_manifest_hash.as_deref())?;
+            let head = self.load_manifest(branch.head_manifest_hash.as_deref())?;
+            let ahead_paths = Self::diff_paths(&point, &head).len();
+            if behind || ahead_paths > 0 {
+                entries.push(ReconcileEntry {
+                    branch_id: branch.branch_id,
+                    target_branch_id: parent_id,
+                    ahead_paths,
+                    behind,
+                });
+            }
+        }
+        Ok(entries)
     }
 
     /// Commit an imported scratch diff (materialize.rs) as ONE cut on the
@@ -652,9 +1132,23 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             &manifest_hash,
             at,
         )? {
-            AdvanceOutcome::Advanced(_) => {
-                self.branches
-                    .record_cut(cut_id, cut_id, branch_id, &manifest_hash, at)?;
+            AdvanceOutcome::Advanced(advanced) => {
+                self.branches.record_cut(CutRecord {
+                    cut_id,
+                    change_id: cut_id,
+                    branch_id,
+                    manifest_hash: &manifest_hash,
+                    parent_cut_id: row.head_cut_id.as_deref(),
+                    origin: Some("import"),
+                    recorded_at: at,
+                })?;
+                self.log_op(
+                    &format!("op-{cut_id}"),
+                    "import",
+                    vec![Self::op_delta(Some(&row), &advanced)],
+                    Some("import"),
+                    at,
+                )?;
                 Ok(VcsWriteOutcome::Written {
                     cut_id: cut_id.to_owned(),
                     manifest_hash,
@@ -761,21 +1255,25 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let transported_change = self
             .change_of(branch.head_cut_id.as_deref())?
             .unwrap_or_else(|| sync_cut_id.to_owned());
-        match self.branches.advance_head(
+        let origin = format!("sync:{branch_id}");
+        let line_advanced = match self.branches.advance_head(
             line_id,
             line.head_cut_id.as_deref(),
             sync_cut_id,
             &head_manifest,
             at,
         )? {
-            AdvanceOutcome::Advanced(_) => {
-                self.branches.record_cut(
-                    sync_cut_id,
-                    &transported_change,
-                    line_id,
-                    &head_manifest,
-                    at,
-                )?;
+            AdvanceOutcome::Advanced(advanced) => {
+                self.branches.record_cut(CutRecord {
+                    cut_id: sync_cut_id,
+                    change_id: &transported_change,
+                    branch_id: line_id,
+                    manifest_hash: &head_manifest,
+                    parent_cut_id: line.head_cut_id.as_deref(),
+                    origin: Some(&origin),
+                    recorded_at: at,
+                })?;
+                advanced
             }
             AdvanceOutcome::Stale { .. } => {
                 return Err(StoreError::Conflict(
@@ -784,7 +1282,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             }
             AdvanceOutcome::NotActive { .. } => return Ok(SyncOutcome::LineNotActive),
             AdvanceOutcome::NotFound => return Ok(SyncOutcome::LineMissing),
-        }
+        };
         // The member re-points fully in sync (point == head == the sync
         // cut) and keeps working.
         match self.branches.rebase_branch(
@@ -796,9 +1294,21 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             &head_manifest,
             at,
         )? {
-            AdvanceOutcome::Advanced(_) => Ok(SyncOutcome::Synced {
-                sync_cut_id: sync_cut_id.to_owned(),
-            }),
+            AdvanceOutcome::Advanced(repointed) => {
+                self.log_op(
+                    &format!("op-{sync_cut_id}"),
+                    "sync",
+                    vec![
+                        Self::op_delta(Some(&line), &line_advanced),
+                        Self::op_delta(Some(&branch), &repointed),
+                    ],
+                    Some(&origin),
+                    at,
+                )?;
+                Ok(SyncOutcome::Synced {
+                    sync_cut_id: sync_cut_id.to_owned(),
+                })
+            }
             AdvanceOutcome::Stale { .. } => Err(StoreError::Conflict(
                 "branch head moved mid-sync; retry".to_owned(),
             )),
@@ -1380,7 +1890,15 @@ mod tests {
             .advance_head("draft_a", Some("sync_a1"), "cut_a2", &forged, "t6")
             .expect("advance");
         vcs.branches
-            .record_cut("cut_a2", "cut_a1", "draft_a", &forged, "t6")
+            .record_cut(CutRecord {
+                cut_id: "cut_a2",
+                change_id: "cut_a1",
+                branch_id: "draft_a",
+                manifest_hash: &forged,
+                parent_cut_id: Some("sync_a1"),
+                origin: None,
+                recorded_at: "t6",
+            })
             .expect("record");
         let outcome = vcs
             .sync_to_line("draft_a", "line_ws", "sync_a2", "t7")

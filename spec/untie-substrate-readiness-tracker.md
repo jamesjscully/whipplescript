@@ -371,9 +371,25 @@ replace git for working branches + workstreams.)*
 
 ## Phase 2 — workspace API for external hosts (the git-replacement surface) · **v0.4**
 
-- [ ] The mapped operation surface (un-tie's 13 consumed git capabilities):
+- [x] The mapped operation surface (un-tie's 13 consumed git capabilities):
       init / branch / fork-with-lineage / cut-at-quiescence / merge-probe /
       merge / restore / promote / status+hash / reconcile-list / remove.
+      **DONE 2026-07-10:** `workspace_api.rs` — one serializable protocol
+      (`WorkspaceOp` in, `WorkspaceOpOutcome` out, tagged JSON both ways;
+      refusals are data, not errors) over new `WorkspaceVcs` verbs
+      `merge_probe` (full pipeline preview, moves nothing),
+      `fork_with_lineage` (pin at a recorded cut), `cut_at_quiescence`
+      (turn-finalize: the head cut IS the cut, recorded idempotently),
+      `restore` (re-point to a recorded cut AS A NEW CUT — new intent,
+      no rewind), `status_report` (ahead paths/behind/head hash/bound
+      instances), `reconcile_list`. Plus the **op log** (`ops` table,
+      both hosts): every mutating verb records before/after pointer
+      states per touched branch — the record–narrative separation's
+      reflog, first-class, and `undo-op`'s substrate — and cuts gained
+      provenance columns (`parent_cut_id`, `origin`; in-place migration).
+      CLI: `whip branch fork/status/cut/probe/restore/ops/reconcile-list`.
+      Protocol + op-log unit tests, CLI e2e
+      (`branch_probe_status_restore_and_op_log_surface`).
 - [ ] Review-grade diff: an against-target diff surface consumable by an
       external UI (presentation quality, not just manifest delta).
 - [ ] Workspace export/import bundle: manifest + reachable blobs;

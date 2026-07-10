@@ -26,7 +26,8 @@ use crate::StoreResult;
 /// The distinguished mainline branch id.
 pub const MAINLINE_BRANCH_ID: &str = "main";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BranchStatus {
     Active,
     Discarded,
@@ -52,7 +53,7 @@ impl BranchStatus {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BranchRow {
     pub branch_id: String,
     pub name: Option<String>,
@@ -137,6 +138,85 @@ pub enum StatusOutcome {
     NotFound,
 }
 
+/// One recorded cut with its provenance — the archaeology substrate
+/// (vw note §7.3: write-attribution supersedes blame; every cut knows
+/// what produced it and which head it advanced from).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CutRow {
+    pub cut_id: String,
+    pub change_id: String,
+    pub branch_id: String,
+    pub manifest_hash: String,
+    /// The head cut this cut advanced from (`None` = first cut on the
+    /// line, or a row recorded before lineage existed).
+    pub parent_cut_id: Option<String>,
+    /// What produced the cut: `write:<path>`, `import:<scope>`,
+    /// `rebase`, `merge:<branch>`, `sync:<branch>`, `restore:<cut>`.
+    pub origin: Option<String>,
+    pub recorded_at: String,
+}
+
+/// Request to record a cut's identity + provenance. Idempotent per
+/// `cut_id` (first record wins; retries are no-ops).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CutRecord<'a> {
+    pub cut_id: &'a str,
+    pub change_id: &'a str,
+    pub branch_id: &'a str,
+    pub manifest_hash: &'a str,
+    pub parent_cut_id: Option<&'a str>,
+    pub origin: Option<&'a str>,
+    pub recorded_at: &'a str,
+}
+
+/// A branch's pointer state as one workspace operation saw it — the op
+/// log's unit of record. Everything `undo-op` needs to re-point the
+/// branch is here; nothing else is (content is immutable, so pointers
+/// ARE the operation).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OpBranchState {
+    pub head_cut_id: Option<String>,
+    pub head_manifest_hash: Option<String>,
+    pub branch_point_cut_id: Option<String>,
+    pub branch_point_manifest_hash: Option<String>,
+    pub status: String,
+}
+
+impl OpBranchState {
+    pub fn of(row: &BranchRow) -> Self {
+        Self {
+            head_cut_id: row.head_cut_id.clone(),
+            head_manifest_hash: row.head_manifest_hash.clone(),
+            branch_point_cut_id: row.branch_point_cut_id.clone(),
+            branch_point_manifest_hash: row.branch_point_manifest_hash.clone(),
+            status: row.status.as_str().to_owned(),
+        }
+    }
+}
+
+/// One branch a workspace operation moved: its pointers before and
+/// after. `before = None` means the operation created the branch.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OpBranchDelta {
+    pub branch_id: String,
+    pub before: Option<OpBranchState>,
+    pub after: OpBranchState,
+}
+
+/// One workspace operation in the op log (jj's most-loved feature
+/// imported as a first-class record): what kind of verb ran, which
+/// branch pointers it moved, and from-where-to-where. Append-only —
+/// `undo-op` appends a compensating op, never deletes.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OpRow {
+    pub seq: i64,
+    pub op_id: String,
+    pub kind: String,
+    pub deltas: Vec<OpBranchDelta>,
+    pub origin: Option<String>,
+    pub recorded_at: String,
+}
+
 /// Object-safe branch-tier seam, mirroring `Coordination`/`WorkItems`: the
 /// DO host supplies its own implementation over `DoSql`.
 pub trait Branches {
@@ -191,20 +271,30 @@ pub trait Branches {
     /// Every instance born on the branch (quiescence detection: the
     /// daemon treats a branch as mid-run while any bound instance runs).
     fn list_bound_instances(&self, branch_id: &str) -> StoreResult<Vec<String>>;
-    /// Record a cut's CHANGE identity (dual identity, jj import): the
-    /// intent id assigned at creation, inherited across rewrites
-    /// (rebases) and carried by transport (sync/merge). Idempotent per
+    /// Record a cut's CHANGE identity (dual identity, jj import) plus its
+    /// provenance: the intent id assigned at creation, inherited across
+    /// rewrites (rebases) and carried by transport (sync/merge); the
+    /// parent cut it advanced from; and what produced it. Idempotent per
     /// cut id.
-    fn record_cut(
-        &mut self,
-        cut_id: &str,
-        change_id: &str,
-        branch_id: &str,
-        manifest_hash: &str,
-        at: &str,
-    ) -> StoreResult<()>;
+    fn record_cut(&mut self, cut: CutRecord<'_>) -> StoreResult<()>;
     /// The change id a cut carries; `None` for pre-identity cuts.
     fn cut_change_id(&self, cut_id: &str) -> StoreResult<Option<String>>;
+    /// The full recorded cut; `None` for unrecorded ids.
+    fn get_cut(&self, cut_id: &str) -> StoreResult<Option<CutRow>>;
+    /// The branch's recorded cuts, newest first, up to `limit`.
+    fn list_cuts(&self, branch_id: &str, limit: usize) -> StoreResult<Vec<CutRow>>;
+    /// Append one operation to the op log. Idempotent per op id.
+    fn record_op(
+        &mut self,
+        op_id: &str,
+        kind: &str,
+        deltas: &[OpBranchDelta],
+        origin: Option<&str>,
+        at: &str,
+    ) -> StoreResult<()>;
+    /// The op log, newest first, up to `limit`.
+    fn list_ops(&self, limit: usize) -> StoreResult<Vec<OpRow>>;
+    fn get_op(&self, op_id: &str) -> StoreResult<Option<OpRow>>;
 }
 
 #[cfg(feature = "native")]
@@ -273,6 +363,33 @@ fn map_branch_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BranchRow> {
 }
 
 #[cfg(feature = "native")]
+fn map_cut_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CutRow> {
+    Ok(CutRow {
+        cut_id: row.get(0)?,
+        change_id: row.get(1)?,
+        branch_id: row.get(2)?,
+        manifest_hash: row.get(3)?,
+        parent_cut_id: row.get(4)?,
+        origin: row.get(5)?,
+        recorded_at: row.get(6)?,
+    })
+}
+
+#[cfg(feature = "native")]
+fn map_op_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<OpRow>> {
+    let deltas_json: String = row.get(3)?;
+    let deltas = serde_json::from_str(&deltas_json).map_err(crate::StoreError::from);
+    Ok(deltas.map(|deltas| OpRow {
+        seq: row.get(0).unwrap_or_default(),
+        op_id: row.get(1).unwrap_or_default(),
+        kind: row.get(2).unwrap_or_default(),
+        deltas,
+        origin: row.get(4).unwrap_or_default(),
+        recorded_at: row.get(5).unwrap_or_default(),
+    }))
+}
+
+#[cfg(feature = "native")]
 fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
@@ -313,8 +430,35 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
             recorded_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS cuts_change_idx ON cuts(change_id);
+        CREATE INDEX IF NOT EXISTS cuts_branch_idx ON cuts(branch_id);
+        CREATE TABLE IF NOT EXISTS ops (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            op_id TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL,
+            deltas TEXT NOT NULL,
+            origin TEXT,
+            recorded_at TEXT NOT NULL
+        );
         "#,
     )?;
+    // Provenance columns arrived with Phase 2; stores minted before that
+    // gain them in place (pre-migration rows read as NULL — honest
+    // "recorded before lineage existed").
+    for column in ["parent_cut_id", "origin"] {
+        ensure_column(connection, "cuts", column)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+fn ensure_column(connection: &Connection, table: &str, column: &str) -> StoreResult<()> {
+    let mut stmt = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+    if !existing.iter().any(|name| name == column) {
+        connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])?;
+    }
     Ok(())
 }
 
@@ -585,19 +729,21 @@ impl Branches for BranchStore {
         Ok(BindOutcome::Bound)
     }
 
-    fn record_cut(
-        &mut self,
-        cut_id: &str,
-        change_id: &str,
-        branch_id: &str,
-        manifest_hash: &str,
-        at: &str,
-    ) -> StoreResult<()> {
+    fn record_cut(&mut self, cut: CutRecord<'_>) -> StoreResult<()> {
         self.connection.execute(
             "INSERT OR IGNORE INTO cuts \
-             (cut_id, change_id, branch_id, manifest_hash, recorded_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![cut_id, change_id, branch_id, manifest_hash, at],
+             (cut_id, change_id, branch_id, manifest_hash, parent_cut_id, \
+              origin, recorded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                cut.cut_id,
+                cut.change_id,
+                cut.branch_id,
+                cut.manifest_hash,
+                cut.parent_cut_id,
+                cut.origin,
+                cut.recorded_at
+            ],
         )?;
         Ok(())
     }
@@ -612,6 +758,76 @@ impl Branches for BranchStore {
             )
             .optional()?;
         Ok(change)
+    }
+
+    fn get_cut(&self, cut_id: &str) -> StoreResult<Option<CutRow>> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT cut_id, change_id, branch_id, manifest_hash, \
+                 parent_cut_id, origin, recorded_at FROM cuts WHERE cut_id = ?1",
+                params![cut_id],
+                map_cut_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    fn list_cuts(&self, branch_id: &str, limit: usize) -> StoreResult<Vec<CutRow>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT cut_id, change_id, branch_id, manifest_hash, \
+             parent_cut_id, origin, recorded_at FROM cuts \
+             WHERE branch_id = ?1 ORDER BY rowid DESC LIMIT ?2",
+        )?;
+        let mapped = stmt.query_map(params![branch_id, limit as i64], map_cut_row)?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row?);
+        }
+        Ok(rows)
+    }
+
+    fn record_op(
+        &mut self,
+        op_id: &str,
+        kind: &str,
+        deltas: &[OpBranchDelta],
+        origin: Option<&str>,
+        at: &str,
+    ) -> StoreResult<()> {
+        let deltas_json = serde_json::to_string(deltas).map_err(crate::StoreError::from)?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO ops (op_id, kind, deltas, origin, recorded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![op_id, kind, deltas_json, origin, at],
+        )?;
+        Ok(())
+    }
+
+    fn list_ops(&self, limit: usize) -> StoreResult<Vec<OpRow>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT seq, op_id, kind, deltas, origin, recorded_at FROM ops \
+             ORDER BY seq DESC LIMIT ?1",
+        )?;
+        let mapped = stmt.query_map(params![limit as i64], map_op_row)?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row??);
+        }
+        Ok(rows)
+    }
+
+    fn get_op(&self, op_id: &str) -> StoreResult<Option<OpRow>> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT seq, op_id, kind, deltas, origin, recorded_at FROM ops \
+                 WHERE op_id = ?1",
+                params![op_id],
+                map_op_row,
+            )
+            .optional()?;
+        row.transpose()
     }
 
     fn instance_branch(&self, instance_id: &str) -> StoreResult<Option<String>> {
