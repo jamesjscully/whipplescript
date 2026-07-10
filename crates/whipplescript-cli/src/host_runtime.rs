@@ -73,6 +73,26 @@ struct AuthoredAgentPackageManifest {
 }
 
 impl AuthoredAgentPackage {
+    /// Parse an authored package from already-resolved document bytes. This is
+    /// the embedding seam for immutable built-in packages and content-addressed
+    /// stores; [`Self::load`] is the filesystem convenience wrapper.
+    pub fn from_documents(
+        manifest_text: impl Into<String>,
+        source: impl Into<String>,
+        system_prompt: impl Into<String>,
+    ) -> Result<Self, String> {
+        let manifest_text = manifest_text.into();
+        let manifest: AuthoredAgentPackageManifest = serde_json::from_str(&manifest_text)
+            .map_err(|error| format!("invalid agent package manifest: {error}"))?;
+        if manifest.schema != AGENT_PACKAGE_SCHEMA {
+            return Err(format!(
+                "unsupported agent package schema `{}`",
+                manifest.schema
+            ));
+        }
+        Self::from_parts(manifest_text, manifest, source.into(), system_prompt.into())
+    }
+
     /// Load and validate the canonical three-file package rooted at `root`.
     /// Referenced files must be direct, non-symlink children of the package
     /// directory. Their exact bytes, plus the manifest, determine the immutable
@@ -88,15 +108,9 @@ impl AuthoredAgentPackage {
         let manifest_text = read_package_child(&root, AGENT_PACKAGE_MANIFEST)?;
         let manifest: AuthoredAgentPackageManifest = serde_json::from_str(&manifest_text)
             .map_err(|error| format!("invalid agent package manifest: {error}"))?;
-        if manifest.schema != AGENT_PACKAGE_SCHEMA {
-            return Err(format!(
-                "unsupported agent package schema `{}`",
-                manifest.schema
-            ));
-        }
         let source = read_package_child(&root, &manifest.source)?;
         let system_prompt = read_package_child(&root, &manifest.system_prompt)?;
-        Self::from_parts(manifest_text, manifest, source, system_prompt)
+        Self::from_documents(manifest_text, source, system_prompt)
     }
 
     fn from_parts(
