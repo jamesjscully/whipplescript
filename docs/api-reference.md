@@ -1070,6 +1070,15 @@ a credential resolves from and a redacted preview (JSON adds
 `openai` or `anthropic`. There is no `login` subcommand — whip runs no OAuth
 flow.
 
+An embedding host may own auth entirely by handing whip resolved credentials
+inside provider profiles: `WHIPPLESCRIPT_PROVIDER_PROFILES` names a host-written
+JSON file mapping profile name (the agent's declared `profile`, with `default`
+as the catch-all) to `{ provider, model, api_key | api_key_env, base_url?,
+max_tokens?, timeout_secs? }`. When an entry matches, owned turns use it and
+whip performs no credential acquisition; the resolver order above becomes the
+standalone fallback. A configured-but-broken entry fails the turn honestly
+rather than silently falling back. `status` names the active profiles file.
+
 ## Introspection and governance
 
 ### `agents`

@@ -21708,6 +21708,12 @@ fn auth_status(options: &CliOptions) -> ExitCode {
             };
         rows.push((provider.to_owned(), source, redacted));
     }
+    // Phase 4 auth relocation: when the policy channel hands whip resolved
+    // credentials inside provider profiles, the host owns auth and the rows
+    // above are only the standalone FALLBACK.
+    let host_profiles = std::env::var("WHIPPLESCRIPT_PROVIDER_PROFILES")
+        .ok()
+        .filter(|path| !path.is_empty());
     if options.json {
         let providers: Vec<Value> = rows
             .iter()
@@ -21723,9 +21729,15 @@ fn auth_status(options: &CliOptions) -> ExitCode {
         let _ = emit_json(json!({
             "schema": "whipplescript.auth_status.v0",
             "config_path": auth::auth_config_path().map(|path| path.display().to_string()),
+            "host_resolved_profiles": host_profiles,
             "providers": providers,
         }));
     } else {
+        if let Some(path) = &host_profiles {
+            println!(
+                "host-resolved provider profiles: {path} (whip's own credentials below are the fallback path)"
+            );
+        }
         for (provider, source, redacted) in &rows {
             match redacted {
                 Some(redacted) => println!("{provider}: {redacted} (from {source})"),

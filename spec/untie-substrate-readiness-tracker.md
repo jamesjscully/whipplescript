@@ -641,9 +641,22 @@ replace git for working branches + workstreams.)*
       read tainting is witnessed; protocol turns run package-declared
       context with `NoopCompactor` (host owns context per GaugeWright ADR
       0080 — compaction for embedded long threads is a quality follow-up).
-- [ ] Auth simplification: provider profiles carry host-resolved
+- [x] Auth simplification: provider profiles carry host-resolved
       credentials; whip's own auth shrinks to the thin standalone resolver
       (current env/keychain design becomes the fallback path).
+      *(2026-07-10: `WHIPPLESCRIPT_PROVIDER_PROFILES` = the policy channel —
+      a host-written JSON file mapping the agent's declared `profile` (then
+      `default`) to `{provider, model, api_key | api_key_env, base_url?,
+      max_tokens?, timeout_secs?}`. Owned turns consult it FIRST
+      (`host_resolved_profile_config`); when an entry matches the host owns
+      auth and whip acquires nothing; a configured-but-broken entry fails
+      the turn honestly instead of silently falling back. Whip's own
+      resolver (env → `whip auth` store → codex OAuth — already thin, no
+      login flow) is the standalone fallback, and `whip auth status` names
+      the active channel. The embedded/protocol path already had
+      host-resolved credentials by construction (`SecretResolver` →
+      `ResolvedProviderBinding`, resolved after admission). Test:
+      `host_resolved_profiles_select_validate_and_fail_honestly`.)*
 
 ## Phase 5 — store seam (two stores, three disciplines) · **v0.4**
 

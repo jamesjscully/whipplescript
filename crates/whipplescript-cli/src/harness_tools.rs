@@ -3028,6 +3028,97 @@ struct HarnessModelConfig {
     timeout: Duration,
 }
 
+/// Auth relocation (untie research note §2, tracker Phase 4): the policy
+/// channel may hand whip RESOLVED credentials inside provider profiles.
+/// `WHIPPLESCRIPT_PROVIDER_PROFILES` names a host-written JSON file mapping
+/// profile name → `{ provider, model, api_key | api_key_env, base_url?,
+/// max_tokens?, timeout_secs? }`; the agent's declared profile is looked up
+/// first, then `"default"`. When an entry matches, the HOST owns auth — whip
+/// performs no credential acquisition of its own. Whip's standalone resolver
+/// (env / `whip auth` store / codex OAuth) is the FALLBACK, consulted only
+/// when this channel yields nothing. A configured-but-broken channel fails
+/// the turn honestly instead of silently falling back.
+fn host_resolved_profile_config(
+    profile: Option<&str>,
+) -> Result<Option<HarnessModelConfig>, String> {
+    let Some(path) = std::env::var_os("WHIPPLESCRIPT_PROVIDER_PROFILES") else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        format!("WHIPPLESCRIPT_PROVIDER_PROFILES is set but unreadable: {error}")
+    })?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("provider profiles file is not valid JSON: {error}"))?;
+    profile_config_from_value(&value, profile)
+}
+
+/// The pure half of [`host_resolved_profile_config`]: select and validate the
+/// profile entry from the host-written document.
+fn profile_config_from_value(
+    value: &Value,
+    profile: Option<&str>,
+) -> Result<Option<HarnessModelConfig>, String> {
+    let (name, entry) = match profile
+        .and_then(|name| value.get(name).map(|entry| (name, entry)))
+        .or_else(|| value.get("default").map(|entry| ("default", entry)))
+    {
+        Some(found) => found,
+        None => return Ok(None),
+    };
+    let provider = match entry.get("provider").and_then(Value::as_str) {
+        Some("openai") => CoerceProvider::OpenAi,
+        Some("anthropic") => CoerceProvider::Anthropic,
+        Some(other) => {
+            return Err(format!(
+                "provider profile `{name}` names unknown provider `{other}` (expected `openai` or `anthropic`)"
+            ));
+        }
+        None => {
+            return Err(format!("provider profile `{name}` needs a `provider`"));
+        }
+    };
+    let api_key = entry
+        .get("api_key")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            entry
+                .get("api_key_env")
+                .and_then(Value::as_str)
+                .and_then(|env_name| std::env::var(env_name).ok())
+                .filter(|key| !key.is_empty())
+        });
+    let Some(api_key) = api_key else {
+        return Err(format!(
+            "provider profile `{name}` carries no resolvable credential (`api_key` or `api_key_env`)"
+        ));
+    };
+    let Some(model) = entry.get("model").and_then(Value::as_str) else {
+        return Err(format!("provider profile `{name}` needs a `model`"));
+    };
+    Ok(Some(HarnessModelConfig {
+        provider,
+        api_key,
+        model: model.to_owned(),
+        base_url: entry
+            .get("base_url")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| provider.default_base_url().to_string()),
+        max_tokens: entry
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(4096),
+        timeout: Duration::from_secs(
+            entry
+                .get("timeout_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(120),
+        ),
+    }))
+}
+
 /// Resolve the live model client config. `Ok(None)` means run the credential-free
 /// fixture client (dev/CI default); `Err` means the provider was requested but
 /// could not be configured (fail the turn rather than silently use the fixture).
@@ -3111,8 +3202,13 @@ pub fn run_owned_agent_turn(
     let is_work_unit_root = work_unit_root.is_none();
     let work_unit = work_unit_root.unwrap_or(instance_id);
     // Resolve the model client before taking the workspace lease, so a config
-    // error never leaks a held lease.
-    let model_config = resolve_harness_model_config().map_err(StoreError::Conflict)?;
+    // error never leaks a held lease. Host-resolved provider profiles (the
+    // policy channel, Phase 4 auth relocation) take precedence; whip's own
+    // env/stored/oauth resolver is the standalone fallback.
+    let model_config = match host_resolved_profile_config(profile).map_err(StoreError::Conflict)? {
+        Some(config) => Some(config),
+        None => resolve_harness_model_config().map_err(StoreError::Conflict)?,
+    };
     // Discover `@tool` sub-workflows (DR-0025) up front: a non-convergent tool
     // fails the turn at setup, before the lease, so it never leaks a lease. Two
     // sources: the agent's in-program `tools [...]` grant (the curation surface)
@@ -3374,6 +3470,77 @@ mod tests {
     use super::*;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Phase 4 auth relocation: host-resolved provider profiles select by the
+    /// agent's declared profile (then `default`), carry resolved credentials,
+    /// and fail honestly when configured but incomplete — whip's own resolver
+    /// is only the fallback when the channel yields nothing.
+    #[test]
+    fn host_resolved_profiles_select_validate_and_fail_honestly() {
+        let document = serde_json::json!({
+            "repo-writer": {
+                "provider": "anthropic",
+                "model": "claude-sonnet-5",
+                "api_key": "host-resolved-key",
+                "max_tokens": 2048,
+            },
+            "default": {
+                "provider": "openai",
+                "model": "gpt-fallback",
+                "api_key": "default-key",
+            },
+        });
+        // The declared profile wins over `default`.
+        let config = profile_config_from_value(&document, Some("repo-writer"))
+            .expect("valid entry")
+            .expect("profile entry");
+        assert!(matches!(config.provider, CoerceProvider::Anthropic));
+        assert_eq!(config.api_key, "host-resolved-key");
+        assert_eq!(config.model, "claude-sonnet-5");
+        assert_eq!(config.max_tokens, 2048);
+        assert_eq!(
+            config.base_url,
+            CoerceProvider::Anthropic.default_base_url()
+        );
+        // An undeclared profile falls to `default`.
+        let fallback = profile_config_from_value(&document, Some("unlisted"))
+            .expect("valid entry")
+            .expect("default entry");
+        assert_eq!(fallback.api_key, "default-key");
+        // No matching entry at all -> the channel yields nothing (the caller
+        // falls back to whip's standalone resolver).
+        let empty = serde_json::json!({ "other": { "provider": "openai" } });
+        assert!(profile_config_from_value(&empty, Some("repo-writer"))
+            .expect("no entry is not an error")
+            .is_none());
+        // Configured-but-broken entries fail honestly instead of silently
+        // falling back: missing credential, missing model, unknown provider.
+        for broken in [
+            serde_json::json!({ "default": { "provider": "anthropic", "model": "m" } }),
+            serde_json::json!({ "default": { "provider": "anthropic", "api_key": "k" } }),
+            serde_json::json!({ "default": { "provider": "martian", "model": "m", "api_key": "k" } }),
+        ] {
+            assert!(
+                profile_config_from_value(&broken, None).is_err(),
+                "{broken}"
+            );
+        }
+        // `api_key_env` resolves through the named environment variable.
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("WHIP_TEST_PROFILE_KEY_4B", "env-carried-key");
+        let via_env = serde_json::json!({
+            "default": {
+                "provider": "openai",
+                "model": "gpt",
+                "api_key_env": "WHIP_TEST_PROFILE_KEY_4B",
+            }
+        });
+        let resolved = profile_config_from_value(&via_env, None)
+            .expect("valid")
+            .expect("entry");
+        assert_eq!(resolved.api_key, "env-carried-key");
+        std::env::remove_var("WHIP_TEST_PROFILE_KEY_4B");
+    }
 
     fn temp_root() -> PathBuf {
         let nanos = std::time::SystemTime::now()
