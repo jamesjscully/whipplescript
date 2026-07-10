@@ -1012,13 +1012,31 @@ reverts to exact prior bytes. Native file I/O only.
 ### `checkpoint`
 
 ```sh
-whip [--json] checkpoint <instance> [--cut-id <id>]
+whip [--json] checkpoint <instance> [--cut-id <id>] [--external-positions <json|@file>]
 ```
 
 Captures a checkpoint of the instance's three planes at the current event
 position. `--cut-id` names the cut; when omitted a timestamped id is generated.
 Human output reports the cut id, event sequence, and captured file count; JSON
-output adds the manifest hash.
+output adds the manifest hash. `--external-positions` records the position
+**pair** for cross-store backup/handoff: an external authority's own scope
+positions (inline JSON, or `@path` to a file) travel inside the same fenced
+`plane.positions` event as the workspace cut id, so both stores restore to one
+coherent coordinate. Read the pair back via `whip handles`.
+
+### `handles`
+
+```sh
+whip [--json] handles <instance>
+```
+
+The referenceable-handles surface (`whipplescript.handles.v0`): the stable
+pointers an external policy authority admits decisions against —
+one-owner-per-fact, so the authority's log records decisions plus these
+pointers while the facts stay whip-owned. Reports the instance's latest
+event-log position, its effect ids with status, the workspace binding's line
+with head and recent cut ids, and the latest position-pair cut. See
+`spec/store-seam-contract-draft.md` for the seam contract these handles serve.
 
 ### `restore`
 

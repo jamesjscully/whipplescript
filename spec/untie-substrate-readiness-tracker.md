@@ -660,16 +660,37 @@ replace git for working branches + workstreams.)*
 
 ## Phase 5 — store seam (two stores, three disciplines) · **v0.4**
 
-- [ ] Referenceable handles for external admission logs: stable event-log
+- [x] Referenceable handles for external admission logs: stable event-log
       positions, workspace cut ids, effect ids exposed so a policy
       authority can admit *decisions + pointers* (one-owner-per-fact).
-- [ ] Position-pair cut: write-fence + capture of (external scope
+      *(2026-07-10: `whip handles <instance>` →
+      `whipplescript.handles.v0` — latest event position, effect ids with
+      status, the workspace binding's line + head/recent cut ids (with
+      origin provenance), and the latest position-pair cut; the
+      host-protocol receipts already carry the evidence-ref handles
+      (`usage_ref`/`guarantee_report_ref`/`workspace_cut_ref`). E2e:
+      `handles_expose_pointers_and_checkpoint_records_position_pair`.)*
+- [x] Position-pair cut: write-fence + capture of (external scope
       positions, workspace cut id) for cross-store backup/handoff.
-- [ ] Seam-contract draft, co-authored with the un-tie side: jurisdiction
+      *(2026-07-10: `whip checkpoint <instance> --external-positions
+      <json|@file>` — the authority's own scope positions ride INSIDE the
+      same fenced `plane.positions` event as the workspace cut id (one
+      coherent coordinate, P1q's two-plane pass extended), readable back
+      via `whip handles` → `position_pair`. Same e2e.)*
+- [x] Seam-contract draft, co-authored with the un-tie side: jurisdiction
       table (which whip side-effects map to admitted commands vs. declared
       whip-internal), idempotent crossing semantics, and a formal model of
       the crossing (their Quint / our stack as fits the
-      formal-tool-division).
+      formal-tool-division). *(2026-07-10: whip's half DRAFTED —
+      `spec/store-seam-contract-draft.md`: handles table, jurisdiction
+      table (embedded vs standalone per side-effect), idempotent crossing
+      semantics; formal model `models/maude/seam-crossing.maude`
+      (exactly-once folding over at-least-once delivery; bites: naive
+      double-fold + unadmitted bypass; gate-registered SSNNSS). OPEN for
+      the un-tie side (named in the draft): their Quint twin, the
+      admitted-erasure command shape, handoff-export format details, and
+      ratification (each repo records its own half). Aligned with
+      GaugeDesk ADR 0080.)*
 
 ---
 

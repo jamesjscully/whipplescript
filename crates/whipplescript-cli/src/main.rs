@@ -216,6 +216,7 @@ fn main() -> ExitCode {
         Some("checkpoint") => checkpoint(&options),
         Some("restore") => restore(&options),
         Some("fork") => fork_instance_command(&options),
+        Some("handles") => handles_command(&options),
         Some("branch") => branch_command(&options),
         Some("stream") => stream_command(&options),
         Some("retry") => retry(&options),
@@ -659,9 +660,10 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "pause" => "usage: whip pause <instance>",
         "resume" => "usage: whip resume <instance>",
         "cancel" => "usage: whip cancel <instance>",
-        "checkpoint" => "usage: whip [--json] checkpoint <instance> [--cut-id <id>]",
+        "checkpoint" => "usage: whip [--json] checkpoint <instance> [--cut-id <id>] [--external-positions <json|@file>]",
         "restore" => "usage: whip [--json] restore <instance> <cut-id>",
         "fork" => "usage: whip [--json] fork <instance> [--agent <name>] [--branch-id <id>]",
+        "handles" => "usage: whip [--json] handles <instance>",
         "branch" => BRANCH_USAGE,
         "stream" => STREAM_USAGE,
         "retry" => "usage: whip retry <instance> <effect>",
@@ -31130,9 +31132,11 @@ fn cancel(options: &CliOptions) -> ExitCode {
 /// mid-run. `--cut-id` names the cut for a later `whip restore`; a timestamped
 /// id is generated when omitted.
 fn checkpoint(options: &CliOptions) -> ExitCode {
-    let usage = "usage: whip checkpoint <instance> [--cut-id <id>]";
+    let usage =
+        "usage: whip checkpoint <instance> [--cut-id <id>] [--external-positions <json|@file>]";
     let mut instance_id: Option<&str> = None;
     let mut cut_id: Option<String> = None;
+    let mut external_positions: Option<Value> = None;
     let mut iter = options.args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -31142,6 +31146,34 @@ fn checkpoint(options: &CliOptions) -> ExitCode {
                     return ExitCode::from(2);
                 };
                 cut_id = Some(id.clone());
+            }
+            // Position-pair cut (untie tracker Phase 5): the external
+            // authority's own scope positions, recorded in the SAME fenced
+            // pass as the workspace cut so a cross-store backup/handoff
+            // restores both stores to one coherent coordinate.
+            "--external-positions" => {
+                let Some(raw) = iter.next() else {
+                    eprintln!("expected JSON (or @file) after `--external-positions`");
+                    return ExitCode::from(2);
+                };
+                let text = if let Some(path) = raw.strip_prefix('@') {
+                    match fs::read_to_string(path) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            eprintln!("cannot read external positions file `{path}`: {error}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    raw.clone()
+                };
+                match serde_json::from_str::<Value>(&text) {
+                    Ok(value) => external_positions = Some(value),
+                    Err(error) => {
+                        eprintln!("external positions must be valid JSON: {error}");
+                        return ExitCode::from(2);
+                    }
+                }
             }
             other if instance_id.is_none() => instance_id = Some(other),
             other => {
@@ -31192,6 +31224,10 @@ fn checkpoint(options: &CliOptions) -> ExitCode {
     let positions_payload = json!({
         "cut_id": cut_id,
         "positions": plane_positions,
+        // The position pair: the external store's positions travel INSIDE
+        // the same event as the workspace cut id — one coherent coordinate,
+        // or absent when no external scope was supplied.
+        "external": external_positions,
     })
     .to_string();
     if let Err(error) = kernel.store().append_event(whipplescript_store::NewEvent {
@@ -31326,6 +31362,120 @@ fn restore(options: &CliOptions) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => report_store_error("failed to commit restore", error),
+    }
+}
+
+/// `whip handles <instance>` — the referenceable-handles surface (untie
+/// tracker Phase 5): the stable pointers an external policy authority admits
+/// decisions against, one-owner-per-fact — the authority's log records
+/// *decisions plus these pointers*; the facts they name stay whip-owned.
+/// Event-log position, effect ids with status, the workspace binding's line
+/// and recorded cut ids, and the latest position-pair cut.
+fn handles_command(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip [--json] handles <instance>";
+    let [instance_id] = options.args.as_slice() else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    if !matches!(store.get_instance(instance_id), Ok(Some(_))) {
+        eprintln!("no such instance `{instance_id}`");
+        return ExitCode::from(2);
+    }
+    let events = match store.list_events(instance_id) {
+        Ok(events) => events,
+        Err(error) => return report_store_error("failed to list events", error),
+    };
+    let event_position = events.last().map(|event| event.sequence).unwrap_or(0);
+    // The latest position-pair cut: workspace cut id + monotone plane
+    // positions (+ the external authority's own positions when the pair was
+    // captured through `whip checkpoint --external-positions`).
+    let position_pair = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "plane.positions")
+        .and_then(|event| serde_json::from_str::<Value>(&event.payload_json).ok());
+    let effects = match store.list_effects(instance_id) {
+        Ok(effects) => effects
+            .iter()
+            .map(|effect| {
+                json!({
+                    "effect_id": effect.effect_id,
+                    "kind": effect.kind,
+                    "status": effect.status,
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => return report_store_error("failed to list effects", error),
+    };
+    let mut workspace = Value::Null;
+    if branch_store_path().exists() {
+        let vcs = match whipplescript_store::vcs::WorkspaceVcs::open(
+            branch_store_path(),
+            vcs_content_store_path(),
+        ) {
+            Ok(vcs) => vcs,
+            Err(error) => return report_store_error("branch stores unavailable", error),
+        };
+        if let Ok(Some(branch_id)) = vcs.instance_branch(instance_id) {
+            let row = match vcs.get_branch(&branch_id) {
+                Ok(row) => row,
+                Err(error) => return report_store_error("failed to load the branch", error),
+            };
+            let cuts = match vcs.list_cuts(&branch_id, 10) {
+                Ok(cuts) => cuts
+                    .iter()
+                    .map(|cut| {
+                        json!({
+                            "cut_id": cut.cut_id,
+                            "origin": cut.origin,
+                            "recorded_at": cut.recorded_at,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                Err(error) => return report_store_error("failed to list cuts", error),
+            };
+            workspace = json!({
+                "branch_id": branch_id,
+                "head_cut_id": row.as_ref().and_then(|row| row.head_cut_id.clone()),
+                "head_manifest_hash": row.as_ref().and_then(|row| row.head_manifest_hash.clone()),
+                "recent_cuts": cuts,
+            });
+        }
+    }
+    if options.json {
+        emit_json(json!({
+            "schema": "whipplescript.handles.v0",
+            "instance_ref": instance_id,
+            "event_position": { "instance_ref": instance_id, "sequence": event_position },
+            "effects": effects,
+            "workspace": workspace,
+            "position_pair": position_pair,
+        }))
+    } else {
+        println!("instance `{instance_id}` at event position {event_position}");
+        println!("{} effect id(s)", effects.len());
+        match &workspace {
+            Value::Null => println!("no workspace binding"),
+            workspace => println!(
+                "workspace line `{}` head cut {}",
+                workspace
+                    .get("branch_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
+                workspace
+                    .get("head_cut_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(none)"),
+            ),
+        }
+        if position_pair.is_some() {
+            println!("latest position-pair cut recorded (see --json for the pair)");
+        }
+        ExitCode::SUCCESS
     }
 }
 

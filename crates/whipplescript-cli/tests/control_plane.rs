@@ -20155,6 +20155,168 @@ rule pick
     let _ = fs::remove_dir_all(dir);
 }
 
+/// Store-seam Phase 5: `whip handles` exposes the stable pointers an
+/// external policy authority admits decisions against (event position,
+/// effect ids, workspace cut ids), and `whip checkpoint
+/// --external-positions` records the position PAIR — the authority's own
+/// scope positions and the workspace cut id inside one fenced event — so a
+/// cross-store backup restores both stores to one coherent coordinate.
+#[test]
+fn handles_expose_pointers_and_checkpoint_records_position_pair() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("seam-handles");
+    let store_path = dir.join("store.sqlite");
+    let store = store_path.to_str().expect("utf-8 store path");
+    let branches = dir.join("branches.sqlite");
+    let content = dir.join("vcs-content.sqlite");
+    let root = dir.join("file-root");
+    fs::create_dir_all(&root).expect("root");
+    let envs: &[(&str, &str)] = &[
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE",
+            branches.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            content.to_str().expect("utf-8"),
+        ),
+    ];
+    let src = dir.join("seam.whip");
+    fs::write(
+        &src,
+        format!(
+            r#"
+workflow SeamHandles
+
+output result Result
+
+class Result {{
+  status string
+}}
+
+file store out_files {{
+  root "{}"
+}}
+
+rule pick
+  when started
+=> {{
+  write text to out_files at "note.md" {{
+    body "seam body"
+    mode create
+  }} as written
+  after written succeeds as result {{
+    complete result {{
+      status "wrote"
+    }}
+  }}
+}}
+"#,
+            root.display()
+        ),
+    )
+    .expect("write source");
+
+    run_json_with_env(bin, &["--json", "branch", "create", "seam_line"], envs);
+    let dev = run_json_with_env(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            src.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+            "--branch",
+            "seam_line",
+        ],
+        envs,
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // The position-pair cut: external scope positions ride the same fenced
+    // event as the workspace cut id.
+    let checkpoint = run_json_with_env(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "checkpoint",
+            &instance_id,
+            "--cut-id",
+            "pair_cut_1",
+            "--external-positions",
+            r#"{"gauge_ledger_seq": 42, "scope": "org/acme"}"#,
+        ],
+        envs,
+    );
+    assert_eq!(
+        checkpoint.get("cut_id").and_then(Value::as_str),
+        Some("pair_cut_1")
+    );
+
+    let handles = run_json_with_env(
+        bin,
+        &["--store", store, "--json", "handles", &instance_id],
+        envs,
+    );
+    assert_eq!(
+        handles.get("schema").and_then(Value::as_str),
+        Some("whipplescript.handles.v0")
+    );
+    assert!(
+        handles
+            .pointer("/event_position/sequence")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            > 0
+    );
+    assert!(
+        !handles
+            .get("effects")
+            .and_then(Value::as_array)
+            .expect("effect ids")
+            .is_empty(),
+        "effect ids are referenceable: {handles}"
+    );
+    assert_eq!(
+        handles
+            .pointer("/workspace/branch_id")
+            .and_then(Value::as_str),
+        Some("seam_line")
+    );
+    assert!(
+        handles
+            .pointer("/workspace/head_cut_id")
+            .and_then(Value::as_str)
+            .is_some(),
+        "the branch head cut id is a referenceable handle: {handles}"
+    );
+    assert_eq!(
+        handles
+            .pointer("/position_pair/cut_id")
+            .and_then(Value::as_str),
+        Some("pair_cut_1")
+    );
+    assert_eq!(
+        handles
+            .pointer("/position_pair/external/gauge_ledger_seq")
+            .and_then(Value::as_i64),
+        Some(42),
+        "the external scope positions ride the same fenced event: {handles}"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// Phase 3 fork item (chat fork over branches; chat-fork.maude): `whip fork`
 /// births a new instance whose agent thread seeds from the source's
 /// completed turns and whose file surface is a FRESH branch forked at the

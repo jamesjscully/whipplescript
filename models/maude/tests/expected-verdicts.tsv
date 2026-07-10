@@ -72,6 +72,7 @@ resolution-memory.maude	SNSSN
 restorable-context.maude	SSSNNNN
 restore-replay.maude	SNSN
 script-capability-seeding.maude	SNN
+seam-crossing.maude	SSNNSS
 selective-undo.maude	SNSSN
 skills-never-grant.maude	SSNN
 stat-cache.maude	SNSNSSNS
