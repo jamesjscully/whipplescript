@@ -174,6 +174,15 @@ others are active workshop material.
   re-query before `uncertain` resolution, version exchange, kernel-owned
   shape-only redaction. *Accepted (obligations-over-dialects ratified); build
   items B1–B6 un-gated.*
+- [0036-per-turn-workspace-cut-and-dynamic-guarantees.md](0036-per-turn-workspace-cut-and-dynamic-guarantees.md):
+  the receipt's `workspace_cut_ref` gets populated (the runtime's labeled,
+  reference-only claim of the turn's workspace delta; honest decline for
+  unmediated delegated harnesses) and the guarantee report gains a **dynamic
+  section** — named per-turn guarantees (`writes_within:<scope>`,
+  `no_reads_beyond_grant`, `no_tainted_reads:<class>`) evaluated under the
+  cited policy epoch, so hosts match guarantee names instead of re-deriving
+  semantics. Drafted as the cross-repo dependency of GaugeWright ADR 0082
+  (advancement policy). *Proposed.*
 
 ## Historical Decision Trackers
 
