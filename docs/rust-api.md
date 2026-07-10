@@ -38,6 +38,7 @@ principals and never contain the resource body.
 | `answer_human_ask(...)` / `answer_human_ask_with_driver(...)` | Admit an authenticated respondent ref, append the correlated tool result, issue an attributable answer receipt, and resume the same suspended turn under its unchanged epoch. |
 | `cancellation_handle(instance, command)` | Mint an out-of-band `HostCancellationHandle`; its independent store connection records a durable cooperative-cancel request while the runtime thread is blocked. |
 | `TurnExecution::output` / `LabeledTurnOutput` | WhippleScript-folded assistant/tool projection carrying the turn's IFC join label; hosts never inspect the runtime store or recreate transcript folding. |
+| `TurnExecution::evidence_pointers()` / `RuntimeEvidencePointer` | Body-free references to WhippleScript-owned labeled events, human asks/answers, and terminal receipts for admission into an external product decision log. |
 | `PackageResolver` | Resolve immutable WhippleScript package bytes/IR and its package-declared tool schemas. |
 | `SecretResolver` | Resolve provider credentials ephemerally, after policy admission. |
 | `ResolvedProviderBinding::new_codex(...)` | Host-resolved short-lived Codex material; WhippleScript owns the Codex request/SSE wire but never credential acquisition, refresh, lookup, or persistence. |

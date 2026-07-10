@@ -604,7 +604,8 @@ replace git for working branches + workstreams.)*
 
 ## Phase 4 — policy plane + auth · **v0.4**
 
-- [x] Policy-epoch consumption: **host trust boundary published 2026-07-09.**
+- [x] Policy-epoch consumption: **host trust boundary and complete host policy
+      constraints published 2026-07-09.**
       The `whipplescript` package now has a library target exposing the exact
       governance/IFC implementation used by the CLI. Embedding hosts call
       `VerifiedEnvelope::verify_signed_text`, which requires and verifies the
@@ -614,7 +615,11 @@ replace git for working branches + workstreams.)*
       protocol now carries that identity on `StartTurnCommand`, every
       `LabeledRuntimeEvent`, and `TurnReceipt`; receipt validation rejects
       command/run/instance/policy mixups, and commands contain resource/provider
-      refs rather than bodies or secrets. Remaining: drive the owned turn through
+      refs rather than bodies or secrets. `HostGovernancePolicy` publishes typed
+      capabilities, exact provider/model/base-url/credential refs, and placement
+      constraints; the owned runtime enforces them before secret resolution.
+      GaugeDesk compiles/signs live epochs and owns credential custody.
+      Remaining: drive the owned turn through
       this protocol, enforce the complete capability/provider/egress/clearance
       envelope, and mint the referenced evidence/guarantee artifacts from real
       log positions. **REMAINDER DONE 2026-07-10 (DR-0036 accepted + built):**
@@ -663,6 +668,8 @@ replace git for working branches + workstreams.)*
 - [x] Referenceable handles for external admission logs: stable event-log
       positions, workspace cut ids, effect ids exposed so a policy
       authority can admit *decisions + pointers* (one-owner-per-fact).
+      `RuntimeEvidencePointer` publishes events, asks/answers, and terminal
+      receipts without their evidence bodies.
       *(2026-07-10: `whip handles <instance>` →
       `whipplescript.handles.v0` — latest event position, effect ids with
       status, the workspace binding's line + head/recent cut ids (with
@@ -690,7 +697,8 @@ replace git for working branches + workstreams.)*
       the un-tie side (named in the draft): their Quint twin, the
       admitted-erasure command shape, handoff-export format details, and
       ratification (each repo records its own half). Aligned with
-      GaugeDesk ADR 0080.)*
+      GaugeDesk ADR 0080. GaugeDesk's `append_record_with_key` admits each
+      pointer at most once and returns its stable position.)*
 
 ---
 
