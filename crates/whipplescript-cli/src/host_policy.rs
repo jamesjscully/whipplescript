@@ -122,8 +122,19 @@ impl HostGovernancePolicy {
             nonempty("party identity", identity)?;
             nonempty("party role", role)?;
         }
+        validate_pairs("delegation", &self.delegations)?;
+        validate_pairs("declassification", &self.declassifications)?;
+        validate_pairs("endorsement", &self.endorsements)?;
         Ok(())
     }
+}
+
+fn validate_pairs(what: &str, pairs: &[[String; 2]]) -> Result<(), String> {
+    for [left, right] in pairs {
+        nonempty(&format!("{what} source"), left)?;
+        nonempty(&format!("{what} target"), right)?;
+    }
+    Ok(())
 }
 
 fn require_principal_binding(
@@ -227,5 +238,17 @@ mod tests {
             .validate()
             .expect_err("unknown provider must fail")
             .contains("undeclared provider"));
+    }
+
+    #[test]
+    fn rejects_empty_trusted_crossing_and_delegation_terms() {
+        let mut policy = complete_policy();
+        policy
+            .delegations
+            .push(["Operator".to_owned(), String::new()]);
+        assert!(policy
+            .validate()
+            .expect_err("empty delegation role must fail")
+            .contains("delegation target"));
     }
 }
