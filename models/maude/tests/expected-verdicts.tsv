@@ -86,6 +86,7 @@ tracker-lease.maude	SSSSNNN
 tracker-projection.maude	SSNNN
 tracker-readiness.maude	SSSNNNN
 turn-access-grant.maude	SSNN
+turn-witness.maude	SNNSSS
 workflow-authority-attenuation.maude	SSSNNN
 workflow-composition.maude	SNSNSNSNNSSS
 workflow-revision.maude	SSSSNNNNN
