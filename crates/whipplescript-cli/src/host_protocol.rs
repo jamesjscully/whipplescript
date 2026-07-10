@@ -70,8 +70,14 @@ pub struct ResourceRef {
 /// A credential-free provider binding. Secret material is resolved ephemerally
 /// by reference after policy admission.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CredentialRef {
+    pub credential_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderBindingRef {
     pub binding_id: String,
+    pub credential: CredentialRef,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -238,6 +244,10 @@ impl StartTurnCommand {
         nonempty("instance ref", &self.instance_ref)?;
         nonempty("package version ref", &self.package_version_ref)?;
         nonempty("provider binding ref", &self.provider_binding.binding_id)?;
+        nonempty(
+            "provider credential ref",
+            &self.provider_binding.credential.credential_id,
+        )?;
         nonempty("placement ceiling ref", &self.placement_ceiling_ref)?;
         self.policy.validate()?;
         for resource in self.resources.iter().chain(self.input.images.iter()) {
@@ -474,6 +484,9 @@ mod tests {
             }],
             provider_binding: ProviderBindingRef {
                 binding_id: "gaugedesk:provider:primary".to_owned(),
+                credential: CredentialRef {
+                    credential_id: "gaugedesk:credential:primary".to_owned(),
+                },
             },
             placement_ceiling_ref: "gaugedesk:placement:local".to_owned(),
         }

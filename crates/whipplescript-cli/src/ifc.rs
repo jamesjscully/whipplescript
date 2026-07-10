@@ -22,6 +22,8 @@ use whipplescript_parser::{
     Diagnostic, IrEffectKind, IrEffectNode, IrProgram, IrRule, IrWorkflowContractKind,
 };
 
+use crate::host_policy::{PlacementPolicy, ProviderBindingPolicy};
+
 /// The bottom reader-authority: data readable by `public` is readable by anyone,
 /// and `public` itself holds no authority above itself.
 const PUBLIC: &str = "public";
@@ -81,6 +83,12 @@ pub struct Envelope {
     /// the role is the agent's authority ceiling (D3). An identity with no party
     /// entry is the public bottom (fail-closed). Empty = no per-user scoping declared.
     party_of: BTreeMap<String, String>,
+    /// Package capabilities admitted by the product authority for this epoch.
+    capabilities: BTreeSet<String>,
+    /// Exact, credential-free provider identities admitted by handle.
+    provider_bindings: BTreeMap<String, ProviderBindingPolicy>,
+    /// Placement constraints admitted by handle.
+    placements: BTreeMap<String, PlacementPolicy>,
 }
 
 impl Envelope {
@@ -126,6 +134,31 @@ impl Envelope {
         let mut internal_workflows = BTreeSet::new();
         let mut address_of = BTreeMap::new();
         let mut party_of = BTreeMap::new();
+        let capabilities = value
+            .get("capabilities")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let provider_bindings = value
+            .get("provider_bindings")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| format!("invalid provider binding policy: {error}"))?
+            .unwrap_or_default();
+        let placements = value
+            .get("placements")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| format!("invalid placement policy: {error}"))?
+            .unwrap_or_default();
         // a signed/canonical envelope carries the handle -> address bindings; a
         // hand-written JSON without them treats each resource key as its own address.
         if let Some(map) = value.get("bindings").and_then(|b| b.as_object()) {
@@ -235,6 +268,9 @@ impl Envelope {
             internal_workflows,
             address_of,
             party_of,
+            capabilities,
+            provider_bindings,
+            placements,
         })
     }
 
@@ -383,6 +419,9 @@ impl Envelope {
             internal_workflows,
             address_of,
             party_of,
+            capabilities: BTreeSet::new(),
+            provider_bindings: BTreeMap::new(),
+            placements: BTreeMap::new(),
         })
     }
 
@@ -443,6 +482,9 @@ impl Envelope {
             "delegations": delegations,
             "declassifications": declassifications,
             "endorsements": endorsements,
+            "capabilities": self.capabilities,
+            "provider_bindings": self.provider_bindings,
+            "placements": self.placements,
         })
         .to_string()
     }
@@ -572,6 +614,36 @@ impl Envelope {
     /// tool enforcement; it does not expose labels or acts-for internals.
     pub fn governs(&self, resource: &str) -> bool {
         self.governed.contains(self.resolve(resource))
+    }
+
+    fn permits_capabilities(&self, capabilities: &[String]) -> bool {
+        capabilities
+            .iter()
+            .all(|capability| self.capabilities.contains(capability))
+    }
+
+    fn permits_provider_binding(
+        &self,
+        binding_handle: &str,
+        credential_ref: &str,
+        provider: &str,
+        model: &str,
+        base_url: &str,
+        placement_handle: &str,
+    ) -> bool {
+        let Some(binding) = self.provider_bindings.get(binding_handle) else {
+            return false;
+        };
+        if binding.credential_ref != credential_ref
+            || binding.provider != provider
+            || binding.model != model
+            || binding.base_url != base_url
+        {
+            return false;
+        }
+        self.placements
+            .get(placement_handle)
+            .is_some_and(|placement| placement.provider_bindings.contains(binding_handle))
     }
 
     /// An integrity label rendered for diagnostics: `public` for the empty set, else
@@ -1022,6 +1094,34 @@ impl VerifiedEnvelope {
     /// handle->address bindings.
     pub fn governs(&self, resource: &str) -> bool {
         self.envelope.governs(resource)
+    }
+
+    /// Whether every capability in a pinned package was admitted by this epoch.
+    pub fn permits_capabilities(&self, capabilities: &[String]) -> bool {
+        self.envelope.permits_capabilities(capabilities)
+    }
+
+    /// Whether a resolver's non-secret provider result is exactly the binding
+    /// and placement tuple the product authority signed. Secret bytes are not
+    /// inspected and never enter the envelope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn permits_provider_binding(
+        &self,
+        binding_handle: &str,
+        credential_ref: &str,
+        provider: &str,
+        model: &str,
+        base_url: &str,
+        placement_handle: &str,
+    ) -> bool {
+        self.envelope.permits_provider_binding(
+            binding_handle,
+            credential_ref,
+            provider,
+            model,
+            base_url,
+            placement_handle,
+        )
     }
 
     /// Wrap a raw envelope as verified — TESTS ONLY (unit tests exercise the checker
@@ -4687,6 +4787,76 @@ rule triage
         assert_eq!(attestation.signer, "gaugedesk-admin");
         assert_eq!(attestation.envelope_hash, signed.envelope_hash);
         assert!(verified.governs("ledger"));
+    }
+
+    #[test]
+    fn signed_host_policy_preserves_runtime_constraints() {
+        use crate::host_policy::{
+            HostGovernancePolicy, PlacementPolicy, ProviderBindingPolicy, ResourcePolicy,
+        };
+
+        let policy = HostGovernancePolicy {
+            resources: BTreeMap::from([
+                (
+                    "provider:openai".to_owned(),
+                    ResourcePolicy {
+                        principal: true,
+                        ..ResourcePolicy::default()
+                    },
+                ),
+                (
+                    "placement:local".to_owned(),
+                    ResourcePolicy {
+                        principal: true,
+                        ..ResourcePolicy::default()
+                    },
+                ),
+            ]),
+            bindings: BTreeMap::from([
+                ("model".to_owned(), "provider:openai".to_owned()),
+                ("local".to_owned(), "placement:local".to_owned()),
+            ]),
+            capabilities: BTreeSet::from(["workspace.read".to_owned()]),
+            provider_bindings: BTreeMap::from([(
+                "model".to_owned(),
+                ProviderBindingPolicy {
+                    provider: "openai".to_owned(),
+                    model: "gpt-5".to_owned(),
+                    base_url: "https://api.openai.com/v1/responses".to_owned(),
+                    credential_ref: "credential:account:openai".to_owned(),
+                },
+            )]),
+            placements: BTreeMap::from([(
+                "local".to_owned(),
+                PlacementPolicy {
+                    kind: "local".to_owned(),
+                    provider_bindings: BTreeSet::from(["model".to_owned()]),
+                    command_network: false,
+                },
+            )]),
+            ..HostGovernancePolicy::default()
+        };
+        let unsigned = policy.to_json().expect("policy");
+        let signed = crate::gov::SignedEnvelope::sign_for_test(&unsigned, "gaugedesk-admin");
+        let verified = VerifiedEnvelope::verify_signed_text(&signed.to_json()).expect("verifies");
+        assert!(verified.permits_capabilities(&["workspace.read".to_owned()]));
+        assert!(!verified.permits_capabilities(&["workspace.write".to_owned()]));
+        assert!(verified.permits_provider_binding(
+            "model",
+            "credential:account:openai",
+            "openai",
+            "gpt-5",
+            "https://api.openai.com/v1/responses",
+            "local",
+        ));
+        assert!(!verified.permits_provider_binding(
+            "model",
+            "credential:account:openai",
+            "openai",
+            "gpt-5",
+            "https://evil.invalid/v1/responses",
+            "local",
+        ));
     }
 
     #[test]

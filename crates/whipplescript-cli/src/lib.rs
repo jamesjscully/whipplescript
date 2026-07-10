@@ -5,6 +5,7 @@
 //! reimplementing envelope parsing, attestation verification, or IFC semantics.
 
 pub mod gov;
+pub mod host_policy;
 pub mod host_protocol;
 pub mod host_runtime;
 pub mod ifc;
