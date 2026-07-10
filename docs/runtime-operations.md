@@ -48,6 +48,60 @@ leases, workflow invocations, inbox items, evidence, artifacts, and
 registered capabilities, profiles, packages, and providers. The event log is
 the source of truth; everything else can be rebuilt from it.
 
+## Cloud runtime (Cloudflare Durable Object) and deploy
+
+The native SQLite runtime above is one substrate. The same workflow also runs
+unchanged on the edge: the whole evaluation core executes inside a **Cloudflare
+Durable Object** wasm isolate. The isolate is sans-IO — its only async
+primitive is `fetch` — so every HTTP-bearing effect is a resumable step machine
+that survives isolate eviction and resumes where it left off.
+
+The DO host runs the *same* instance scheduler you run locally, over the Durable
+Object's synchronous SQLite: a full port of the runtime, coordination, and
+work-item stores. Timers and deadlines fire via DO **alarms** instead of worker
+passes, and provider credentials come from DO **secrets** rather than the local
+credential store.
+
+The edge runtime is at feature parity with native operation:
+
+- `file.*` effects run against a DO-owned file plane (no host filesystem).
+- `whip checkpoint` / `whip restore` work as operator commands on a deployed
+  instance, exactly as on a native store (see [Restoring to a prior
+  point](#restoring-to-a-prior-point-checkpoint-restore)).
+- An agent turn runs a real in-isolate tool set — read, write, edit, ls, find,
+  grep, recall, plus work-tracker todos — against DO storage, with no
+  filesystem and no subprocess.
+
+### Deploying with `whip deploy`
+
+`whip deploy` is a one-command edge deploy of a workflow to a Worker plus its
+Durable Object.
+
+```sh
+whip deploy [--worker-dir <path>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]
+```
+
+Use `--dry-run` to preview the build and upload without publishing,
+`--skip-build` to reuse an existing wasm artifact, and `--set-secrets` to push
+provider credentials into DO secrets as part of the deploy.
+
+### The compute plane (`whip executor`)
+
+`whip executor` runs a **Class-A** compute sidecar that the runtime calls over a
+`whip-executor/1` wire.
+
+```sh
+whip executor [--bind <addr:port>]   # Class-A exec sidecar; default 127.0.0.1:8080
+```
+
+The sidecar authenticates every request with a bearer token from
+`WHIP_EXECUTOR_TOKEN` (compared in constant time) and refuses non-loopback calls
+that do not carry it. A Class-B per-turn container path also exists.
+
+**Enabling the compute plane in production is a follow-on configuration step** —
+it is not on by default. A workflow deploys and runs without it; the compute
+plane is wired up separately when you need it.
+
 ## Instance lifecycle
 
 ```text
@@ -81,8 +135,9 @@ lacks a required credential reference — blocks the effect rather than failing 
 so fixing the binding lets the run resume without a manual re-trigger. Every
 blocked effect carries a categorized reason in `whip effects`/`status` as
 `policy_block: { category, detail }`, where `category` is one of `capability`,
-`profile`, `capacity`, `dependency` (scheduling-time) or `provider_health`,
-`credentials` (binding-time). The detail never contains secret values.
+`profile`, `capacity`, `dependency` (scheduling-time) or `provider_config`,
+`credentials`, `enforcement`, `provider_health` (binding-time). The detail never
+contains secret values.
 
 A provider failure is recorded as effect/run state, events, and evidence — it
 does **not** fail the workflow. Rules decide policy: retry, escalate, ignore,
@@ -138,6 +193,28 @@ and the run carries the `runtime.recovery_uncertain` diagnostic, marking "we
 could not confirm whether the external side effect happened." Recovery never
 silently re-runs such an effect; `retry` is an explicit operator decision.
 
+### Restoring to a prior point (checkpoint / restore)
+
+`checkpoint` and `restore` rewind an instance's *context* — not just one
+effect — back to an earlier point.
+
+```sh
+whip --store <store> checkpoint <instance>              # capture a cut of head
+whip --store <store> checkpoint <instance> --cut-id <id>
+whip --store <store> restore    <instance> <cut-id>     # rewind to that cut
+```
+
+A checkpoint captures a coherent *cut* across three planes at once: file
+state, the agent transcript, and the event-log position. `restore` rewinds
+all three back to a named cut as a single coherence-checked operation, so the
+planes never drift out of step. It does a full reconcile and auto-checkpoints
+head first, so the pre-restore state is itself recoverable.
+
+The rewind is append-only: it records a `context.restored` marker that every
+subsequent read folds, rather than deleting history — consistent with the
+event log being the source of truth. Add `--json` for machine-readable output.
+Checkpoint/restore operate on native file I/O.
+
 ## Child workflows
 
 `invoke Workflow { ... } as child` creates a durable child instance with its
@@ -186,3 +263,7 @@ whip --store <store> --json trace <instance> --check > incident-trace.json
 
 For provider issues, also preserve artifacts and the provider configuration
 names involved — never credential values.
+
+To capture a rewindable point before an intervention (rather than just a JSON
+snapshot), take a [checkpoint](#restoring-to-a-prior-point-checkpoint-restore)
+of the instance first; `restore` can then return all three planes to that cut.

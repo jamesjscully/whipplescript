@@ -3,7 +3,7 @@
 This page is the public machine-readable contract surface for the CLI. Field
 sets may grow within the same schema version; consumers should ignore unknown
 fields. Required fields listed here are safe to depend on for the current
-`main` documentation set and released `0.1.x` CLI unless a schema version
+documentation set and released `0.3.x` CLI unless a schema version
 changes.
 
 For command usage, see [CLI reference](api-reference.md).
@@ -18,12 +18,18 @@ For command usage, see [CLI reference](api-reference.md).
 | `dev --stream ndjson` | `whipplescript.dev_stream.v0` | Draft event envelope. Event names may grow. |
 | `accept --json` | `whipplescript.acceptance_report.v0` | Test-only report. Store-isolation expectations are part of the contract. |
 | `trace --json --check` | `whipplescript.local_trace.v0` | Draft trace/conformance report. |
+| `test --json` | `whipplescript.test_report.v0` | Draft public report emitted by `whip test --json`; one entry per selected scenario plus a summary. |
+| `verify-report` | `whipplescript.verified_artifacts.v0` | Verification bundle emitted by `whip verify-report` over check/compile/artifacts reports. |
+| `verify-report --emit lowered-ir` | `whipplescript.lowered_ir_report.v0` | Lowered-IR artifact emitted by `whip verify-report --emit lowered-ir`. |
+| `verify-report --emit construct-graph` | `whipplescript.construct_graph.v0` | Standalone construct-graph artifact; also nested in the check report below. |
 | Package manifest | `whipplescript.package_manifest.v0` | First-class package/library/provider manifest. |
 | Platform construct catalog | `whipplescript.platform_construct_catalog.v0` | Compiler-owned package construct/lowering vocabulary emitted by `whip package catalog`. |
 | Package check | `whipplescript.package_check.v0` | Result of `whip package check --json`. |
 | Package contract | `whipplescript.package_contract.v0` | Digest-bearing normalized package/registry artifact used by check, compile, and verified artifact reports. |
 | Package lock | `whipplescript.package_lock.v0` | Pins accepted package manifests by exact SHA-256. |
-| Artifact manifest | `whipplescript.artifact_manifest.v1` | Provider artifact metadata contract. |
+| Package set | `whipplescript.package_set.v0` | Declarative package set (`whip.packages.json`) resolved by `whip package sync`. |
+| Package sync | `whipplescript.package_sync.v0` | Result of `whip package sync [--json]`. |
+| Artifact manifest | `whipplescript.artifact_manifest.v1` | Provider artifact metadata contract (schema documented with the provider model, not under `spec/report-schemas/`). |
 | Inspection commands | command-shaped JSON | Stable enough for operators; no schema id yet. |
 | Coordination inspection | command-shaped JSON | Stable enough for operators; no schema id yet. |
 

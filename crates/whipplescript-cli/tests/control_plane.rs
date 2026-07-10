@@ -19813,3 +19813,138 @@ rule pick
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_dir_all(dir);
 }
+
+/// Materialize-on-exec + import-back: a branch-bound instance's raw exec
+/// runs inside a real scratch directory projected from the branch's
+/// manifest — the command reads a materialized branch file with ordinary
+/// POSIX I/O and writes a new one — and the diff imports back as one
+/// effect-keyed cut: the output lands on the branch, the unchanged input
+/// is not re-recorded, and the scratch directory is cleaned up.
+#[test]
+fn branch_bound_exec_materializes_and_imports_back() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let dir = unique_temp_dir("exec-materialize");
+    let branches = dir.join("branches.sqlite");
+    let content = dir.join("vcs-content.sqlite");
+    let envs: &[(&str, &str)] = &[
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE",
+            branches.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            content.to_str().expect("utf-8"),
+        ),
+        ("WHIPPLESCRIPT_EXEC_ALLOW", "cat *"),
+    ];
+
+    // Seed the branch with the exec's input file (relative key).
+    run_json_with_env(bin, &["--json", "branch", "create", "draft_a"], envs);
+    run_json_with_env(
+        bin,
+        &[
+            "--json",
+            "branch",
+            "write",
+            "draft_a",
+            "ws/in.md",
+            "--body",
+            "seed-content",
+        ],
+        envs,
+    );
+
+    let src = temp_workflow_path("exec-materialize");
+    fs::write(
+        &src,
+        r#"
+use std.script
+workflow ExecOnBranch
+
+output result Report
+
+class Report {
+  message string
+}
+
+rule go
+  when started
+=> {
+  exec "cat ws/in.md > out.txt" as run
+
+  after run succeeds {
+    complete result {
+      message "done"
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let dev = run_json_with_env(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            src.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+            "--branch",
+            "draft_a",
+        ],
+        envs,
+    );
+    assert!(
+        dev.pointer("/workers/0/terminal_events/0").is_some(),
+        "the exec settles and the workflow reaches a terminal: {dev}"
+    );
+
+    // The command read the MATERIALIZED input and its output imported back
+    // onto the branch as a new cut.
+    let out = run_json_with_env(
+        bin,
+        &["--json", "branch", "read", "draft_a", "out.txt"],
+        envs,
+    );
+    assert_eq!(
+        out.get("body").and_then(Value::as_str),
+        Some("seed-content"),
+        "the exec read the projected branch file and its output landed on the branch"
+    );
+    // The unchanged input keeps its single blob and key.
+    let input = run_json_with_env(
+        bin,
+        &["--json", "branch", "read", "draft_a", "ws/in.md"],
+        envs,
+    );
+    assert_eq!(
+        input.get("body").and_then(Value::as_str),
+        Some("seed-content")
+    );
+    // The head cut is the effect-keyed import cut.
+    let row = run_json_with_env(bin, &["--json", "branch", "show", "draft_a"], envs);
+    assert!(
+        row.get("head_cut_id")
+            .and_then(Value::as_str)
+            .is_some_and(|cut| cut.starts_with("cut-exec-")),
+        "the import is one effect-keyed cut: {row}"
+    );
+    // Mainline never saw any of it; merge carries the exec's product over.
+    run_json_with_env(bin, &["--json", "branch", "merge", "draft_a"], envs);
+    let merged = run_json_with_env(bin, &["--json", "branch", "read", "main", "out.txt"], envs);
+    assert_eq!(
+        merged.get("body").and_then(Value::as_str),
+        Some("seed-content")
+    );
+
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_dir_all(dir);
+}

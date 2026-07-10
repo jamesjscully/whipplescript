@@ -119,8 +119,8 @@ Per-heading `· vN` tags below restate this at each phase.
       `WorkspaceVcs`, plain DO file plane untouched, rebind refused.
       Deploy-shell verb routing (index.ts) for bind/branch ops is the
       remaining production-enable step.)*
-- [ ] Virtual working set: sandbox-mediated per-branch file surface,
-      copy-on-write. *(Progress 2026-07-10: the surface landed —
+- [x] Virtual working set: sandbox-mediated per-branch file surface,
+      copy-on-write. *(2026-07-10: the surface landed —
       `crates/whipplescript-store/src/working_set.rs`:
       `VirtualWorkingSet` implements the `FileStore` seam over (head
       manifest → ContentStore) reads + a COW overlay for writes/deletes
@@ -138,14 +138,31 @@ Per-heading `· vN` tags below restate this at each phase.
       branch-distinct effect keys host-agnostically. End-to-end test:
       branch-bound `file.write` lands on the branch (real root untouched),
       merge propagates to main, unbound runs write natively. **DO parity +
-      stat cache DONE 2026-07-10** (see below) — box stays open only for
-      the materialize/import-back consumer wiring of the stat cache.)*
+      stat cache DONE 2026-07-10** (see below); materialize/import-back
+      consumer wiring landed the same day (item below) — box complete.)*
 - [ ] Two-plane consistent cut: substance manifest + workspace-plane
       **high-water positions** (the plane-store enumeration is the pump
       audit walked twice — do both in one pass).
-- [ ] Materialize-on-exec + import-back: real scratch dir from a branch
+- [x] Materialize-on-exec + import-back: real scratch dir from a branch
       manifest; diffs imported **atomic, recorded, complete**, keyed by
-      effect id, idempotent.
+      effect id, idempotent. *(2026-07-10:
+      `crates/whipplescript-store/src/materialize.rs` —
+      `materialize_manifest` projects a branch manifest into a real
+      scratch (coherence-checked up front; absolute keys mapped to
+      relative entries with the mapping restored on import; seeded stat
+      cache whose materialization granule stays racy, so a tool's
+      immediate same-granule write is undroppable) + `import_scratch`
+      (scan_dir diff, every changed blob stored, original keys restored) +
+      `WorkspaceVcs::import_diff` (whole diff = ONE head advance, keyed by
+      the effect-derived cut id; the crash-retry that finds the head at
+      that cut is a no-op success). Wired: a branch-bound instance's raw
+      `exec` runs `current_dir(scratch)` and imports back
+      (`branch_import` metadata on the effect terminal; scratch cleaned).
+      E2E test: exec `cat`s a materialized branch file into a new output,
+      the output lands as an effect-keyed cut, unchanged input not
+      re-recorded, merge carries the product to mainline. DO-side exec
+      materialization rides the compute-plane sidecar (P8) protocol, not
+      this seam.)*
 - [ ] Merge engine v1: path-level three-way over manifests with
       provenance-carrying conflict detection + escalation (never fake
       auto-merge); declaration-granularity whip-source merge with slice

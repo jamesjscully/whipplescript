@@ -181,3 +181,23 @@ scripts/check-real-providers-report.sh
 
 Provider-specific variants exist (for example `WHIPPLESCRIPT_PI_DESTRUCTIVE_TESTS`).
 Reports record only whether the markers are set, never their values.
+
+## Cloud deploy, checkpoint, restore, or executor trouble
+
+The sections above cover local/native runs. For the v0.3 edge runtime — a
+workflow running unchanged inside a Cloudflare Durable Object — the full
+operator surface lives in the [Runtime & operations](runtime-operations.md)
+guide. A few common snags:
+
+- `whip deploy` targets a Worker plus Durable Object. Render the plan without
+  pushing using `--dry-run`, reuse the last build with `--skip-build`, and push
+  provider credentials as DO secrets with `--set-secrets`
+  (`whip deploy [--worker-dir <path>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]`).
+- The `whip executor` Class-A compute sidecar is not on by default; enabling the
+  compute plane in production is a follow-on configuration step. The sidecar
+  refuses non-loopback calls without a bearer token — set `WHIP_EXECUTOR_TOKEN`
+  (it binds `127.0.0.1:8080` by default; override with `--bind <addr:port>`).
+- `whip checkpoint <instance>` captures a cut and `whip restore <instance> <cut-id>`
+  rewinds file state, agent transcript, and event-log position together as one
+  coherence-checked cut; `restore` reconciles fully and auto-checkpoints head
+  first. These use native file I/O only.

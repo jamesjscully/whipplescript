@@ -25,18 +25,34 @@ whip check examples/multi-agent-bounded-concurrency.whip
 ```
 
 `check` parses, type-checks, and lowers the source, then prints the compiled
-summary — declared agents, each rule's reads and writes, and the dependency
-edges between rules:
+summary — source tags and descriptions, declared trackers and agents, and,
+for each rule, its reads, effects, and the dependency edges between them.
+The excerpt below is trimmed; the real output prints every rule in full:
 
 ```text
 == examples/multi-agent-bounded-concurrency.whip
 workflow MultiAgentBoundedConcurrency
+source_tags
+@service workflow MultiAgentBoundedConcurrency
+trackers
+  tracker backlog provider=builtin
 agents
   agent implementer harness=<fallback> provider=codex profile=repo-writer capacity=2 ...
   agent reviewer harness=<fallback> provider=claude profile=repo-reader capacity=1 ...
 rules
   rule implement_ready_work
+    reads
+      pattern:backlog has ready issue as issue
+      pattern:implementer is available
+    effects
+      active_claim kind=tracker.claim binding=active_claim key=...
+      turn kind=agent.tell binding=turn key=...
+      effect3 kind=tracker.finish binding=- key=...
+    dependencies
+      active_claim --succeeds--> turn
+      turn --succeeds--> effect3
   rule review_completed_turn
+    ...
 ```
 
 `check` also enforces two static liveness rules: every workflow must be able

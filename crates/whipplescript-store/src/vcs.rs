@@ -337,6 +337,107 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         }
     }
 
+    /// Commit an imported scratch diff (materialize.rs) as ONE cut on the
+    /// branch: atomic (a single head advance carries the whole diff),
+    /// recorded, complete (the caller stored every blob first), keyed by
+    /// the effect-derived `cut_id`, and IDEMPOTENT — a crash-retry that
+    /// finds the head already at this cut is a no-op success, so
+    /// re-driving the effect never double-applies.
+    pub fn import_diff(
+        &mut self,
+        branch_id: &str,
+        changed: &BTreeMap<String, String>,
+        removed: &[String],
+        cut_id: &str,
+        at: &str,
+    ) -> StoreResult<VcsWriteOutcome> {
+        let Some(row) = self.branches.get_branch(branch_id)? else {
+            return Ok(VcsWriteOutcome::BranchMissing);
+        };
+        if row.head_cut_id.as_deref() == Some(cut_id) {
+            // The idempotent retry: this effect's import already landed.
+            return Ok(VcsWriteOutcome::Written {
+                cut_id: cut_id.to_owned(),
+                manifest_hash: row.head_manifest_hash.unwrap_or_default(),
+            });
+        }
+        if row.status != BranchStatus::Active {
+            return Ok(VcsWriteOutcome::BranchNotActive);
+        }
+        let mut manifest = self.load_manifest(row.head_manifest_hash.as_deref())?;
+        for (path, hash) in changed {
+            manifest.insert(path.clone(), hash.clone());
+        }
+        for path in removed {
+            manifest.remove(path);
+        }
+        let manifest_hash = self.store_manifest(&manifest)?;
+        match self.branches.advance_head(
+            branch_id,
+            row.head_cut_id.as_deref(),
+            cut_id,
+            &manifest_hash,
+            at,
+        )? {
+            AdvanceOutcome::Advanced(_) => Ok(VcsWriteOutcome::Written {
+                cut_id: cut_id.to_owned(),
+                manifest_hash,
+            }),
+            AdvanceOutcome::Stale {
+                current_head_cut_id,
+            } => {
+                if current_head_cut_id.as_deref() == Some(cut_id) {
+                    // Raced with our own retry: the import landed.
+                    return Ok(VcsWriteOutcome::Written {
+                        cut_id: cut_id.to_owned(),
+                        manifest_hash,
+                    });
+                }
+                Err(StoreError::Conflict(
+                    "branch head moved during the import; retry".to_owned(),
+                ))
+            }
+            AdvanceOutcome::NotActive { .. } => Ok(VcsWriteOutcome::BranchNotActive),
+            AdvanceOutcome::NotFound => Ok(VcsWriteOutcome::BranchMissing),
+        }
+    }
+
+    /// Materialize-on-exec: project the branch's head manifest into a
+    /// real scratch directory (materialize.rs). `None` = no such branch.
+    #[cfg(feature = "native")]
+    pub fn materialize_branch(
+        &self,
+        branch_id: &str,
+        root: &Path,
+        now_unix_nanos: i128,
+    ) -> StoreResult<Option<crate::materialize::MaterializedScratch>> {
+        let Some(manifest) = self.manifest(branch_id)? else {
+            return Ok(None);
+        };
+        crate::materialize::materialize_manifest(&manifest, &self.content, root, now_unix_nanos)
+            .map(Some)
+    }
+
+    /// Import-back: scan the scratch against its seeded cache, store every
+    /// changed blob, and commit the whole diff as ONE effect-keyed,
+    /// idempotent cut on the branch.
+    #[cfg(feature = "native")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_scratch(
+        &mut self,
+        branch_id: &str,
+        root: &Path,
+        scratch: &crate::materialize::MaterializedScratch,
+        cut_id: &str,
+        at: &str,
+        now_unix_nanos: i128,
+    ) -> StoreResult<(crate::materialize::ScratchImport, VcsWriteOutcome)> {
+        let import =
+            crate::materialize::import_scratch(root, scratch, &self.content, now_unix_nanos)?;
+        let outcome = self.import_diff(branch_id, &import.changed, &import.removed, cut_id, at)?;
+        Ok((import, outcome))
+    }
+
     /// Bind an instance to the branch it is born on (write-once; see
     /// `Branches::bind_instance`).
     pub fn bind_instance(
@@ -652,6 +753,73 @@ mod tests {
             vcs.merge("draft_a", "cut_merge_3", "t10").expect("merge"),
             VcsMergeOutcome::Adopted { .. }
         ));
+    }
+
+    /// import_diff commits a whole scratch diff as ONE effect-keyed cut,
+    /// and the crash-retry (same cut id) is a no-op success — never a
+    /// double-apply, never a spurious conflict.
+    #[test]
+    fn import_diff_is_atomic_and_idempotent() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.write(MAINLINE_BRANCH_ID, "a.md", Some("A0"), "cut_m1", "t1")
+            .expect("write");
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("create");
+        let mut changed = BTreeMap::new();
+        changed.insert(
+            "out.md".to_owned(),
+            vcs.content.put("produced").expect("put"),
+        );
+        changed.insert(
+            "a.md".to_owned(),
+            vcs.content.put("A modified").expect("put"),
+        );
+        let removed = Vec::new();
+        let first = vcs
+            .import_diff("draft_a", &changed, &removed, "cut_effect_1", "t3")
+            .expect("import");
+        let VcsWriteOutcome::Written { manifest_hash, .. } = first else {
+            panic!("expected the import to land");
+        };
+        assert_eq!(
+            vcs.read("draft_a", "out.md").expect("read").as_deref(),
+            Some("produced")
+        );
+        assert_eq!(
+            vcs.read("draft_a", "a.md").expect("read").as_deref(),
+            Some("A modified"),
+            "the whole diff landed in one cut"
+        );
+        // The idempotent retry: same effect-keyed cut id, no double-apply.
+        let retry = vcs
+            .import_diff("draft_a", &changed, &removed, "cut_effect_1", "t4")
+            .expect("retry");
+        assert_eq!(
+            retry,
+            VcsWriteOutcome::Written {
+                cut_id: "cut_effect_1".to_owned(),
+                manifest_hash,
+            }
+        );
+        // Removals fold in the same atomic step.
+        let mut second_changed = BTreeMap::new();
+        second_changed.insert("b.md".to_owned(), vcs.content.put("B new").expect("put"));
+        let outcome = vcs
+            .import_diff(
+                "draft_a",
+                &second_changed,
+                &["out.md".to_owned()],
+                "cut_effect_2",
+                "t5",
+            )
+            .expect("second import");
+        assert!(matches!(outcome, VcsWriteOutcome::Written { .. }));
+        assert_eq!(vcs.read("draft_a", "out.md").expect("read"), None);
+        assert_eq!(
+            vcs.read("draft_a", "b.md").expect("read").as_deref(),
+            Some("B new")
+        );
     }
 
     #[test]

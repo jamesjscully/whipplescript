@@ -23208,6 +23208,10 @@ fn run_exec_effect(
     };
     let cache_hit = cached_result.is_some();
 
+    // Set by the branch-bound raw-exec path: the import-back summary that
+    // rides the effect's terminal metadata.
+    let mut branch_import_meta: Option<Value> = None;
+
     let outcome = if let Some(result) = cached_result {
         Ok(result)
     } else if mode == "capability" {
@@ -23223,13 +23227,49 @@ fn run_exec_effect(
             format!("exec command `{command}` is not granted; add it to WHIPPLESCRIPT_EXEC_ALLOW"),
         ))
     } else {
-        match std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .output()
-        {
-            Ok(output) => exec_output_to_outcome(output, &parse_contract),
-            Err(error) => Err((None, format!("exec command failed to start: {error}"))),
+        // Materialize-on-exec (versioned-workspace note §10): a
+        // branch-bound instance's raw exec runs inside a real scratch
+        // directory projected from the branch's manifest, and the diff
+        // imports back as ONE effect-keyed, idempotent cut. Unbound
+        // instances keep the inherited working directory.
+        match branch_exec_scratch(instance_id, &effect.effect_id) {
+            Err(message) => Err((None, message)),
+            Ok(None) => match std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .output()
+            {
+                Ok(output) => exec_output_to_outcome(output, &parse_contract),
+                Err(error) => Err((None, format!("exec command failed to start: {error}"))),
+            },
+            Ok(Some((branch_id, scratch_root, scratch))) => {
+                let spawned = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .current_dir(&scratch_root)
+                    .output();
+                match spawned {
+                    Ok(output) => match exec_output_to_outcome(output, &parse_contract) {
+                        Ok(ok) => {
+                            match import_branch_exec_scratch(
+                                &branch_id,
+                                &scratch_root,
+                                &scratch,
+                                &effect.effect_id,
+                            ) {
+                                Ok(import_meta) => {
+                                    branch_import_meta = Some(import_meta);
+                                    let _ = std::fs::remove_dir_all(&scratch_root);
+                                    Ok(ok)
+                                }
+                                Err(message) => Err((None, message)),
+                            }
+                        }
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err((None, format!("exec command failed to start: {error}"))),
+                }
+            }
         }
     };
 
@@ -23253,6 +23293,9 @@ fn run_exec_effect(
                 {
                     insert_json_field(&mut value, "sha256", Value::String(sha256));
                 }
+            }
+            if let Some(meta) = branch_import_meta.take() {
+                insert_json_field(&mut value, "branch_import", meta);
             }
             if let (Some(content_key), Some(result_json)) = (&cache_key, &cache_payload) {
                 // First writer wins: an existing entry for the key stays
@@ -31282,6 +31325,92 @@ fn file_store_for_instance(
             &now_stamp(),
         )),
         _ => Box::new(NativeFileStore),
+    }
+}
+
+/// Materialize-on-exec, setup half: when the instance is branch-bound,
+/// project the branch's head manifest into an effect-keyed scratch
+/// directory and hand back the seeded stat cache. A crash-retried effect
+/// re-materializes fresh (the whole effect re-runs; the import stays
+/// idempotent by cut id). `None` = unbound instance, run in place.
+#[allow(clippy::type_complexity)]
+fn branch_exec_scratch(
+    instance_id: &str,
+    effect_id: &str,
+) -> Result<
+    Option<(
+        String,
+        PathBuf,
+        whipplescript_store::materialize::MaterializedScratch,
+    )>,
+    String,
+> {
+    if !branch_store_path().exists() {
+        return Ok(None);
+    }
+    let vcs =
+        whipplescript_store::vcs::WorkspaceVcs::open(branch_store_path(), vcs_content_store_path())
+            .map_err(|error| format!("branch stores unavailable: {error:?}"))?;
+    let Some(branch_id) = vcs
+        .instance_branch(instance_id)
+        .map_err(|error| format!("binding lookup failed: {error:?}"))?
+    else {
+        return Ok(None);
+    };
+    let scratch_root = std::env::temp_dir().join(format!("whip-exec-scratch-{effect_id}"));
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let now_unix_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as i128)
+        .unwrap_or(0);
+    let scratch = vcs
+        .materialize_branch(&branch_id, &scratch_root, now_unix_nanos)
+        .map_err(|error| format!("materialize failed: {error:?}"))?
+        .ok_or_else(|| format!("instance is bound to unknown branch `{branch_id}`"))?;
+    Ok(Some((branch_id, scratch_root, scratch)))
+}
+
+/// Materialize-on-exec, import half: scan the scratch, store every changed
+/// blob, commit the diff as ONE cut keyed by the effect id, and return the
+/// summary that rides the effect's terminal metadata.
+fn import_branch_exec_scratch(
+    branch_id: &str,
+    scratch_root: &Path,
+    scratch: &whipplescript_store::materialize::MaterializedScratch,
+    effect_id: &str,
+) -> Result<Value, String> {
+    use whipplescript_store::vcs::VcsWriteOutcome;
+    let mut vcs =
+        whipplescript_store::vcs::WorkspaceVcs::open(branch_store_path(), vcs_content_store_path())
+            .map_err(|error| format!("branch stores unavailable: {error:?}"))?;
+    let now_unix_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as i128)
+        .unwrap_or(0);
+    let cut_id = format!("cut-exec-{effect_id}");
+    let (import, outcome) = vcs
+        .import_scratch(
+            branch_id,
+            scratch_root,
+            scratch,
+            &cut_id,
+            &now_stamp(),
+            now_unix_nanos,
+        )
+        .map_err(|error| format!("import-back failed: {error:?}"))?;
+    match outcome {
+        VcsWriteOutcome::Written { cut_id, .. } => Ok(json!({
+            "branch_id": branch_id,
+            "cut_id": cut_id,
+            "changed": import.changed.len(),
+            "removed": import.removed.len(),
+            "trusted": import.trusted,
+            "rehashed": import.rehashed,
+        })),
+        VcsWriteOutcome::BranchNotActive => Err(format!(
+            "branch `{branch_id}` closed during the exec; the diff was not adopted"
+        )),
+        VcsWriteOutcome::BranchMissing => Err(format!("branch `{branch_id}` disappeared")),
     }
 }
 

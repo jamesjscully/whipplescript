@@ -17,6 +17,13 @@ Everything external — an agent turn, a model decision, a human approval — is
 an effect, recorded durably before it runs and resolved by events after.
 That split is what makes a workflow steppable, resumable, and auditable.
 
+The same rules-and-effects kernel runs locally and, unchanged, inside a
+Cloudflare Durable Object on the edge: `whip deploy` ships a workflow to a
+Worker plus Durable Object, and `whip checkpoint` / `whip restore` rewind an
+instance's file state, agent transcript, and event-log position together as
+one coherence-checked cut. See [Runtime & operations](runtime-operations.md)
+for the cloud runtime and the operator commands.
+
 ## Workflow
 
 The durable boundary for a unit of work. Starting a workflow creates an
@@ -69,10 +76,13 @@ reactions are independent.
 A durable request for external work. `tell` (agent turn), `coerce`/`decide`
 (typed model decision), `askHuman` (review request), `call` (package
 capability), `exec` (dev raw command or hosted pinned script capability),
-`timer` (a delay), the queue verbs (`file`/`claim`/`release`/`finish`), and
-`invoke` (child workflow) all create effects. An effect records what was
-requested, which provider ran it, whether it finished, and what evidence was
-captured.
+`timer` (a delay), the tracker verbs (`file`/`claim`/`release`/`finish`), and
+`invoke` (child workflow) all create effects. So do the event verbs `emit` (an
+event) and `emit signal ... to` (a signal to another instance), `send via`
+(channel messaging), and the coordination verbs `acquire`/`release` (leases),
+`consume` (a counter budget), and `append` (a ledger entry). An effect records
+what was requested, which provider ran it, whether it finished, and what
+evidence was captured.
 
 ## Work queue
 
@@ -103,9 +113,10 @@ execution details — never the source file.
 
 The thing that executes effects. The *fixture provider* is deterministic and
 local: it completes effects with synthetic results, which makes it the right
-default for development, tutorials, and tests. Native providers (Codex,
-Claude, Pi) bridge to real agent systems; see
-[providers & packages](providers.md).
+default for development, tutorials, and tests. The *owned harness* runs the
+agent tool-use loop inside whip itself — whip is the executor. The delegating
+native providers (Codex and Claude; Pi is deferred) instead hand the whole
+turn to the provider's own harness. See [providers & packages](providers.md).
 
 ## Worker
 

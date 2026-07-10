@@ -211,11 +211,11 @@ effects, `after` semantics — still applies.
 ## Work queues
 
 When work arrives as a backlog rather than as facts you seed up front, declare
-a queue and let rules claim from it:
+a `tracker` and let rules claim from it:
 
 ```whip
-queue backlog {
-  tracker builtin
+tracker backlog {
+  provider builtin
 }
 
 rule pick_up
@@ -231,9 +231,9 @@ rule pick_up
 }
 ```
 
-The verbs are `file item into <queue> { ... }`, `claim`, `release`, and
+The verbs are `file item into <tracker> { ... }`, `claim`, `release`, and
 `finish`. A losing `claim` is a normal branchable failure, not an error, so a
-contended queue stays correct without locks in source.
+contended tracker stays correct without locks in source.
 
 Operate the backlog from the CLI with `whip issue new`, `whip issue list`,
 `whip issue show`, and the lifecycle verbs `ready`/`claim`/`renew`/`release`/
@@ -259,10 +259,12 @@ after turn times out as t {
 }
 ```
 
-Durations are `<n><unit>` with units `s`/`m`/`h`/`d`. Timers and timeouts fire
-on worker passes — there is no daemon — so `whip dev --until idle` treats
-pending timers as idle, and `whip status` lists the time effects an instance is
-waiting on.
+Durations are `<n><unit>` with units `s`/`m`/`h`/`d`. In the native/local
+worker, timers and timeouts fire on worker passes — there is no daemon — so
+`whip dev --until idle` treats pending timers as idle, and `whip status` lists
+the time effects an instance is waiting on. (The cloud Durable Object runtime
+fires timers autonomously via a DO alarm instead — see
+[Runtime & operations](runtime-operations.md).)
 
 ## Express retries as facts
 
@@ -359,7 +361,7 @@ orchestration into shell.
 | Import package/library surface | `use std.memory` |
 | Reuse a rule/effect fragment at compile time | `pattern` + `apply` |
 | Sequence fixed steps with shared bindings | `flow` |
-| Pull work from a durable backlog | `queue` + `claim` |
+| Pull work from a durable backlog | `tracker` + `claim` |
 | Run work with its own lifecycle and terminal contract | `workflow` + `invoke` |
 
 Patterns are compile-time templates — `apply` expands them into ordinary

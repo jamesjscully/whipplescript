@@ -1,14 +1,19 @@
 # WhippleScript Docs
 
 WhippleScript coordinates durable work across agents, humans, packages, queues,
-timers, scripts, and child workflows. The docs are written for two readers:
+timers, scripts, and child workflows. The same durable kernel runs locally and
+on the edge inside a Cloudflare Durable Object; see
+[Runtime & operations](runtime-operations.md) for `whip deploy` and the
+checkpoint/restore operator surface. The docs are written for two readers:
 humans using the website and coding agents reading Markdown directly.
 
-**Version scope:** the Markdown in this repository documents the current
-checkout of `main`. Release users should read the docs from the matching Git
+**Version scope:** the Markdown in this repository tracks the latest released
+line of the CLI. Release users should read the docs from the matching Git
 tag when exact CLI flags or JSON fields matter. The current published CLI
-version is `0.1.x`; the implementation-stage label printed by `whip --help`
+version is `0.3.x`; the implementation-stage label printed by `whip --help`
 is an internal progress marker, not a separate compatibility version.
+In-progress work on the next release line lands on a separate branch and is
+not reflected here unless a page says otherwise.
 
 If you are a coding agent, start with the local companion skill at
 `skills/whipplescript-author/SKILL.md`
@@ -23,6 +28,7 @@ are not required for normal authoring.
 
 | Goal | Read |
 | --- | --- |
+| Install the CLI | [Install](install.md) |
 | Install and run a checked workflow | [Quickstart](quickstart.md) |
 | Learn the runtime nouns | [Concepts](concepts.md) |
 | Build a real workflow from an empty file | [Tutorial](tutorial.md) |
@@ -31,6 +37,7 @@ are not required for normal authoring.
 | Pick a known-good example | [Examples](examples.md) |
 | Run or inspect instances | [CLI reference](api-reference.md) |
 | Consume machine-readable output | [JSON reference](json-reference.md) |
+| Work with the Rust crates | [Rust API reference](rust-api.md) |
 | Interpret errors | [Diagnostics guide](diagnostics.md) |
 | Operate running workflows | [Runtime & operations](runtime-operations.md) |
 | Configure agents, providers, and packages | [Providers & packages](providers.md) |
@@ -39,7 +46,8 @@ are not required for normal authoring.
 
 ## Agent Route
 
-Use this route when the task is "write or fix a workflow":
+Use this route when the task is "write or fix a workflow"
+(the [Agent Guide](agent-guide.md) covers the same route in more depth):
 
 1. Read `skills/whipplescript-author/SKILL.md`.
 2. Pick the closest checked example from [Examples](examples.md).

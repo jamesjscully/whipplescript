@@ -324,7 +324,7 @@ carry row source spans in JSON output.
 ### `coerce`
 
 A typed, coerce-backed model decision. Calling it in a rule creates a durable
-`coerce` effect:
+`schema.coerce` effect:
 
 ```whip
 coerce assessIncident(title string, impact string, mitigation string) -> IncidentAssessment {
@@ -557,6 +557,50 @@ specs). At runtime the worker fires all three recurrence forms — `every <durat
 honoring daylight-saving transitions (a `09:00` local schedule shifts its UTC
 instant across the DST boundary; a nonexistent spring-forward local time is skipped).
 
+Besides `clock`, two more built-in source providers ship: `file` and `http`.
+Each admits one durable signal fact per unit of input — a `file` source per
+non-empty line, an `http` source per element of a fetched JSON array — and both
+share the clock source's at-most-once, replay-safe admission (keyed by input
+index, so re-reading a growing file or re-polling an append-only feed only
+admits entries not already seen).
+
+A `file` source reads a local path; its observation record binds
+`{ line, line_index, path }`:
+
+```whip
+source file as feed {
+  path "./inbox.txt"
+  observe as obs
+  emit ingress.fed {
+    text obs.line
+    index obs.line_index
+  }
+}
+```
+
+An `http` source GETs a URL that returns a JSON array; its observation record
+binds `{ item, item_index, url }` (where `item` is the JSON element
+re-stringified):
+
+```whip
+source http as feed {
+  url "https://example.com/feed.json"
+  observe as obs
+  emit ingress.ingested {
+    text obs.item
+  }
+}
+```
+
+`http` fetches are GET-only and pass through an SSRF/egress policy: only
+`http`/`https` URLs are accepted, private and loopback addresses are blocked, and
+the destination host must appear on an allowlist configured through
+`WHIPPLESCRIPT_HTTP_SOURCE_ALLOW` (with `WHIPPLESCRIPT_HTTP_SOURCE_ALLOW_PRIVATE`
+to opt private/loopback hosts back in for local testing). A scheme-less or
+non-http(s) URL is rejected at `whip check` time. Web *search* is designed but
+deferred — it is not yet available. See `ingress-file-source.whip` and
+`ingress-http-source.whip` in the examples for complete workflows.
+
 ## Rules
 
 A rule waits for facts and events, optionally filters them with guards, and
@@ -705,7 +749,7 @@ becomes an effect, and a later rule branches on its completion.
 | `done binding` | Consume a matched fact. |
 | `done binding -> record ...` | Consume and replace in one atomic commit. |
 | `tell agent [requires [...]] [as x] [timeout <dur>] [with access to <resource> { ... }] "..."` | Enqueue an `agent.tell` effect (see [turn-access grants](#turn-access-grants)). |
-| `coerce fn(...) as x` | Enqueue a typed `coerce` effect. |
+| `coerce fn(...) as x` | Enqueue a typed `schema.coerce` effect. |
 | `decide "..." -> { ... } as x` | Enqueue an inline typed model decision (see [Inline `decide`](#inline-decide)). |
 | `askHuman [as x] [choices [...]] "..."` | Enqueue a human review request. |
 | `file item into <queue> { ... }` | File a new item into a [work queue](#work-queues). |
@@ -756,7 +800,7 @@ base** — the same shape for every effect kind:
 | `f.reason` | The human-facing failure text. |
 | `f.summary` | A short summary (often the same as `reason`). |
 | `f.effect_id` / `f.run_id` | Identifiers locating the failed effect run. |
-| `f.kind` | The failing effect kind (e.g. `"exec"`, `"coerce"`, `"workflow.invoke"`). |
+| `f.kind` | The failing effect kind (e.g. `"exec"`, `"schema.coerce"`, `"workflow.invoke"`). |
 
 Reading any other field off `f` is a check error — effect-specific failure detail
 (an `exec` exit code, a provider error code) is **not** exposed yet; it is reserved
@@ -1000,7 +1044,7 @@ after verdict succeeds as v {
 }
 ```
 
-It lowers to the same `coerce` effect as a named `coerce`, so the same
+It lowers to the same `schema.coerce` effect as a named `coerce`, so the same
 rules apply: it is durable, it can fail, and its typed output is available
 only in an `after ... succeeds` (or `after verdict succeeds`) branch. Use a
 named `coerce` when the decision is reused or deserves a documented prompt;
@@ -1123,8 +1167,8 @@ Use it when work arrives as a backlog of items to be claimed, worked, and
 finished, rather than as facts seeded up front:
 
 ```whip
-queue backlog {
-  tracker builtin
+tracker backlog {
+  provider builtin
 }
 ```
 

@@ -33,6 +33,7 @@ If a workflow already ran, inspect state before editing source:
 
 ```sh
 whip status <instance>
+whip log <instance>
 whip effects <instance>
 whip runs <instance>
 whip --json diagnostics <instance>
@@ -40,5 +41,11 @@ whip --json evidence <instance>
 whip --json trace <instance> --check
 ```
 
-Read [Runtime & operations](runtime-operations.md) for lifecycle behavior and
+To rewind an instance's context (file state, transcript, and event-log
+position) as one coherence-checked cut, use `whip checkpoint <instance>` and
+`whip restore <instance> <cut-id>`. To run a workflow on the cloud runtime, use
+`whip deploy`.
+
+Read [Runtime & operations](runtime-operations.md) for the full operator surface
+(lifecycle behavior, checkpoint/restore, and cloud deployment) and
 [Providers & packages](providers.md) for provider setup.

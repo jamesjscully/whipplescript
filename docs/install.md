@@ -65,7 +65,7 @@ whip check examples/minimal-noop.whip   # from a checkout
 ```
 
 `whip --version` prints the package version, for example
-`whipplescript 0.1.0`. `whip --help` also prints the implementation-stage
+`whipplescript 0.3.0`. `whip --help` also prints the implementation-stage
 label in parentheses; that label is for project tracking and does not replace
 the package version.
 

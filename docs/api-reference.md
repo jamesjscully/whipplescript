@@ -24,11 +24,17 @@ whip [--store path] [--json] [--input JSON] <command> [args]
 The current command set is:
 
 ```text
-package, check, compile, run, revise, step, worker, dev, accept, instances,
-status, log, facts, effects, runs, artifacts, inbox, signal, items, leases,
-ledger, counters, evidence, diagnostics, trace, otel-export, telemetry, pause,
-resume, cancel, retry, recover, doctor
+package, check, compile, verify-report, gov, agent, agents, providers, skills,
+skill, lint, lsp, fmt, test, run, revise, step, worker, dev, accept, instances,
+status, log, facts, effects, runs, artifacts, inbox, signal, message, issue,
+leases, ledger, counters, evidence, diagnostics, trace, otel-export, telemetry,
+pause, resume, cancel, checkpoint, restore, retry, recover, auth, deploy,
+executor, doctor
 ```
+
+`branch` also dispatches, but it backs the unreleased v0.4 versioned workspace and
+is documented below as experimental. The top-level `whip --help` banner lists a
+subset of these commands; the dispatch above is authoritative.
 
 Run `whip <command> --help` or `whip help <command>` to print the usage line
 for any command.
@@ -45,6 +51,8 @@ for any command.
 | `WHIPPLESCRIPT_SCRIPT_MANIFEST` | JSON manifest path for hosted script capabilities. Equivalent to `--script-manifest`. |
 | `WHIPPLESCRIPT_RUN_ID` | Run identity stamped onto items filed by an agent through `whip issue new`. |
 | `WHIPPLESCRIPT_PROVIDER_CONFIGS` | Colon-separated provider binding config paths for the worker. |
+| `WHIPPLESCRIPT_WORKER_DIR` | Default worker directory for `whip deploy` when `--worker-dir` is omitted. |
+| `WHIP_EXECUTOR_TOKEN` | Bearer token the `whip executor` sidecar requires for non-loopback calls (constant-time compared). |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP endpoint for `otel-export` (defaults to `http://localhost:4318`). |
 | `OTEL_SERVICE_NAME` | Service name attached to exported OpenTelemetry resource spans. |
 
@@ -592,25 +600,30 @@ runs argv-direct with JSON stdin.
 With `--package-lock`, the worker registers locked package manifests before
 claimable-effect policy checks.
 
-Supported fixture effect kinds:
+Supported effect kinds (the canonical dotted kind strings that appear in
+`whip effects` and JSON output):
 
 ```text
 agent.tell
-coerce
+schema.coerce
 human.ask
-capability.call
-workflow.invoke
-queue.file
-queue.claim
-queue.release
-queue.finish
-timer.wait
-exec.command
+event.emit
 signal.emit
+workflow.invoke
+exec.command
+capability.call
 lease.acquire
 lease.release
 ledger.append
 counter.consume
+tracker.file
+tracker.claim
+tracker.release
+tracker.finish
+file.read
+file.write
+file.import
+file.export
 ```
 
 JSON output includes:
@@ -770,6 +783,7 @@ and evidence links.
 | `facts <instance>` | Show current unconsumed facts. |
 | `effects <instance>` | Show effects, status, target, profile, and block reason. |
 | `runs <instance>` | Show provider run attempts. |
+| `artifacts <run-id>` | Show artifact-manifest metadata for a provider run (`whip artifacts <run-id>`). |
 | `evidence <instance>` | Show evidence records and evidence links. |
 | `diagnostics <instance>` | Show durable diagnostics. |
 | `trace <instance> [--check]` | Show trace bundle; with `--check`, reconstruct abstract trace and run conformance checks. |
@@ -936,6 +950,194 @@ and service name plus the per-instance count of runs already exported.
 it — so the next `otel-export` re-sends from the start. Neither command touches
 workflow execution.
 
+### `message`
+
+```sh
+whip message <instance> --channel <name> --text <text> \
+  [--markdown <md>] [--from <sender>] [--thread <id>] \
+  --program <workflow.whip> [--root <workflow>]
+```
+
+Injects an inbound channel message into a running instance. It compiles the
+program, checks that `<name>` names a declared `channel`, builds the generic
+`Message` envelope, and derives a `message.<channel>` fact that rules match with
+`when message from <channel> as x`. A message needs at least one of `--text` or
+`--markdown`; an undeclared channel or a missing instance is a usage error. JSON
+output includes the recorded event and derived fact ids.
+
+## Cloud deployment and runtime
+
+The same durable rule/effect kernel that runs locally also runs unchanged inside
+a Cloudflare Durable Object wasm isolate. `deploy` publishes a workflow to that
+edge runtime; `executor` is the optional Class-A compute sidecar.
+
+### `deploy`
+
+```sh
+whip deploy [--worker-dir <path>] [--name <worker>] \
+  [--dry-run] [--skip-build] [--set-secrets]
+```
+
+One-command edge deploy of a workflow to a Cloudflare Worker plus its Durable
+Object. `deploy` requires `npm` and `wrangler` on `PATH`; it stages the worker
+bundle, optionally builds it, and publishes it. `--worker-dir` selects the
+worker directory (or set `WHIPPLESCRIPT_WORKER_DIR`); `--dry-run` validates the
+bundle without publishing; `--skip-build` reuses a prior build; `--set-secrets`
+pushes locally set provider credentials as Worker secrets (a key that is not set
+locally is skipped with a note). On the edge, timers and deadlines fire through
+Durable Object alarms and provider credentials come from Durable Object secrets.
+
+### `executor`
+
+```sh
+whip executor [--bind <addr:port>]
+```
+
+Runs the Class-A exec sidecar that backs real toolchains for the compute plane,
+serving the `whip-executor/1` wire. The default bind is loopback only
+(`127.0.0.1:8080`); a container entrypoint binds `0.0.0.0:8080`. In-cluster calls
+authenticate with a constant-time-compared bearer token
+(`WHIP_EXECUTOR_TOKEN`), and the sidecar refuses non-loopback calls that lack it.
+The compute plane (this Class-A sidecar and the Class-B per-turn container path)
+is built and live-proven; enabling it in production is a follow-on configuration
+step, not on by default.
+
+## Restorable context
+
+`checkpoint` and `restore` rewind an agent's work — its files, its transcript,
+and the instance's event-log position — to a prior point as one consistent,
+coherence-checked cut. File history is captured content-addressed, so restore
+reverts to exact prior bytes. Native file I/O only.
+
+### `checkpoint`
+
+```sh
+whip [--json] checkpoint <instance> [--cut-id <id>]
+```
+
+Captures a checkpoint of the instance's three planes at the current event
+position. `--cut-id` names the cut; when omitted a timestamped id is generated.
+Human output reports the cut id, event sequence, and captured file count; JSON
+output adds the manifest hash.
+
+### `restore`
+
+```sh
+whip [--json] restore <instance> <cut-id>
+```
+
+Restores the instance to the named checkpoint. It coherence-checks the cut up
+front and refuses (mutating nothing) rather than applying a partial cut, then
+auto-checkpoints the current head so the restore is itself undoable, applies the
+file reconcile (writing manifest paths back to cut content and removing post-cut
+files), and commits a `context.restored` marker that folds the instance and
+transcript planes to the cut. The success line names the `auto-before-<cut-id>`
+checkpoint you can restore to in order to undo. Exit `1` if the cut is refused.
+
+## Credentials
+
+### `auth`
+
+```sh
+whip auth status
+whip auth set <openai|anthropic> <key>
+```
+
+Manages native coerce-provider credentials. `status` reports, per provider, where
+a credential resolves from and a redacted preview (JSON adds
+`whipplescript.auth_status.v0` with a `configured` flag). `set` stores a key for
+`openai` or `anthropic`. There is no `login` subcommand — whip runs no OAuth
+flow.
+
+## Introspection and governance
+
+### `agents`
+
+```sh
+whip [--json] agents [--root <workflow>] <workflow.whip>
+```
+
+Lists every declared agent in a program from the compiled IR, with each agent's
+provider, harness, profile, capacity, capabilities, tools, and skills.
+
+### `providers`
+
+```sh
+whip [--json] providers [--root <workflow>] <workflow.whip>
+```
+
+The operator view of every provider a program needs: aggregates the `provider` of
+each declared agent, channel, and source into a distinct list, with what
+references each.
+
+### `skills`
+
+```sh
+whip [--json] skills [--root <workflow>] <workflow.whip>
+```
+
+Lists every skill declared across a program's agents, each with the agents that
+declare it.
+
+### `skill`
+
+```sh
+whip [--json] skill list
+whip [--json] skill validate <SKILL.md|dir>
+whip [--json] skill install <SKILL.md|dir>
+```
+
+Manages the local owned-harness skill control plane: `list` enumerates installed
+skills, `validate` checks a `SKILL.md` (or a directory of them), and `install`
+adds one to the local skill store. Skills are content-addressed and never grant
+authority.
+
+### `gov`
+
+```sh
+whip gov <sign|verify|escalate|escalations|agent> [args]
+```
+
+The governance surface (DR-0026/0028). `sign`/`verify` operate on signed
+governance envelopes, `escalate <request>` files a low-integrity request to the
+`WHIPPLESCRIPT_GOV_ESCALATIONS` log for an admin to review, `escalations` lists
+them, and `gov agent` starts the privileged governance agent loop (it refuses to
+start without governance privilege).
+
+### `agent`
+
+```sh
+whip agent
+```
+
+Starts the unprivileged interactive whip-agent loop (DR-0026/0028). It reads
+commands from stdin — `check <file>` runs the information-flow check on a whip
+source, `escalate <request>` files a governance escalation, and `quit` exits. It
+has no path to signing governance; a `sign` is refused.
+
+### `verify-report`
+
+```sh
+whip verify-report [--entry-index <n>] \
+  [--emit construct-graph|lowered-ir|artifacts] \
+  <check-or-compile-or-artifacts-report.json>...
+```
+
+Re-verifies the digests inside a previously emitted `check`, `compile`, or
+artifacts report and re-derives its verified artifacts. `--entry-index` selects
+one entry from a multi-entry report; `--emit` prints a chosen embedded artifact
+(the construct graph, the lowered IR report, or the artifact set).
+
+### `branch` (experimental, unreleased)
+
+```sh
+whip [--json] branch <create|list|show|write|read|ls|remove|merge|discard|bind> ...
+```
+
+`branch` backs the in-progress v0.4 versioned workspace (whip-native VCS) and is
+**not** part of the released 0.3 surface. It is present in the dispatch but should
+be treated as experimental and subject to change.
+
 ## Language reference index
 
 For examples and semantics, see [Language Reference](language-reference.md).
@@ -956,7 +1158,10 @@ This section is a compact index of source constructs.
 | Agent | `agent name { profile "..."; capacity N; skills [...] }` | Logical provider target and policy metadata. |
 | Coerce | `coerce fn(args...) -> Type { prompt """markdown ... """ }` | Declared coerce-backed effect. |
 | Flow | `flow name when ... { step; step; ... }` | A rule whose body is a multi-step sequence; lowers to `flow.<name>.seg<N>` rules. |
-| Queue | `queue name { tracker builtin }` | Declared vendor-neutral work-item backlog. |
+| Channel | `channel name { provider slack destination "#ops" }` | Named messaging endpoint for inbound `when message from` and outbound `send via`. |
+| Source | `source clock\|file\|http as name { ... observe as obs emit <signal> { ... } }` | Ingress source (clock schedule, file, or GET-only http fetch) whose `emit` clause admits observed input as a typed signal (the `event.emit` effect kind). |
+| File store | `file store name { root "..." allow read [...] allow write [...] }` | Policy boundary over a provider-backed document root for `read text`/`write text`/`import`/`export`. |
+| Tracker | `tracker name { provider builtin }` | Declared vendor-neutral work-item backlog. |
 | Lease | `lease name { key Type slots N ttl 10m }` | Workspace-scoped bounded mutex/semaphore resource. |
 | Ledger | `ledger name { entry Type partition by field retain 90d }` | Workspace-scoped append log partitioned by a typed field. |
 | Counter | `counter name { key Type cap N reset daily }` | Workspace-scoped consumable budget with lazy reset. |
@@ -976,7 +1181,7 @@ This section is a compact index of source constructs.
 | Availability | `worker is available` inside a `when` clause/group | Match logical agent capacity/policy availability. |
 | Human answer | `when human answered <label> as x` | Match a `human.answer.received` fact created when an inbox item is answered. The binding payload exposes `choice`, `text`, `answered_by`, `prompt`, `inbox_item_id`, and `effect_id`. |
 | Agent turn | `when <agent> completed turn ... [as x]` | Match an `agent.turn.completed` fact. A declared agent name filters to that agent's turns; the generic word `worker` matches any agent. |
-| Queue readiness | `when <queue> has ready item as x` | Match an item that is ready to be claimed in a work queue. |
+| Tracker readiness | `when <tracker> has ready issue as x` | Match an item that is ready to be claimed in a work tracker. |
 | Declared signal | `when deploy.finished as x` | Match a typed external signal fact declared with `signal deploy.finished { ... }`. |
 | General fact | `when fact <dotted.name> as x [where ...]` | General readiness form; the English phrases above are sugar over it. |
 
@@ -990,14 +1195,19 @@ This section is a compact index of source constructs.
 | `done binding -> record ...` | Consume and create replacement fact atomically. |
 | `tell agent ... [timeout <dur>] as turn` | `agent.tell` effect. |
 | `prompt "..." [using provider] as result` | Provider-backed free-text prompt effect returning a string-shaped result. |
-| `coerce fn(...) as result` | `coerce` effect. |
-| `decide "..." -> { ... } as result` | Inline typed `coerce` effect. |
+| `coerce fn(...) as result` | `schema.coerce` effect (the source keyword is `coerce`; the effect kind is `schema.coerce`). |
+| `decide "..." -> { ... } as result` | Inline typed `schema.coerce` effect. |
 | `exec "<command>" as result` | Dev-profile `exec.command` effect (requires `use std.script` + a non-empty `WHIPPLESCRIPT_EXEC_ALLOW`, which seed the `script.raw` capability; exposes `exit_code`, `stdout`). |
 | `exec <capability> with <record> -> Type as result` | Hosted `exec.command` effect requiring `script.<capability>`, typed JSON stdin, SHA-256 manifest verification, and typed stdout ingestion. |
-| `file item into <queue> { ... }` | `queue.file` effect. |
-| `claim <item> [as x]` | `queue.claim` effect (already-claimed is a branchable failure). |
-| `release <item>` | `queue.release` effect. |
-| `finish <item> [{ summary ... }]` | `queue.finish` effect. |
+| `file item into <tracker> { ... }` | `tracker.file` effect. |
+| `claim <item> [as x]` | `tracker.claim` effect (already-claimed is a branchable failure). |
+| `release <item>` | `tracker.release` effect. |
+| `finish <item> [{ summary ... }]` | `tracker.finish` effect. |
+| `read text from <store> at <path> as x` | `file.read` effect over a declared `file store`. |
+| `write text to <store> at <path> { body ... [mode ...] } as x` | `file.write` effect over a declared `file store`. |
+| `import <jsonl\|json\|csv> <Schema> from <store> at <path> as x` | `file.import` effect decoding structured rows into typed facts. |
+| `export <jsonl\|json\|csv> <Schema> to <store> at <path> { [where ...] mode ... } as x` | `file.export` effect writing typed rows to a file. |
+| `redact <binding> keep [..] as <out>` | Project a record-typed binding onto a chosen subset of fields (type-level + runtime field drop with per-field IFC refinement). |
 | `timer <duration> as x` | `timer.wait` effect completed when due. |
 | `timer until <time> as x` | Absolute `timer.wait` effect completed at or after a typed instant. |
 | `cancel <binding>` | Terminal-cancel a pending effect; request cancellation of a running one. |

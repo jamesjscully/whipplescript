@@ -330,15 +330,18 @@ environment already has.
 | Effect | Created by | Executed as |
 | --- | --- | --- |
 | `agent.tell` | `tell` | an agent turn |
-| `coerce` | `coerce` / `decide` | a typed model decision |
+| `schema.coerce` | `coerce` / `decide` | a typed model decision |
 | `human.ask` | `askHuman` | an inbox item awaiting a human answer |
-| `queue.*` | `file` / `claim` / `release` / `finish` | work-queue operations |
+| `tracker.file` / `tracker.claim` / `tracker.release` / `tracker.finish` | `file` / `claim` / `release` / `finish` | durable work-tracker operations |
 | `timer.wait` | `timer` | a delay that fires when due |
 | `exec.command` | `exec` | dev raw command or hosted SHA-256-pinned script capability |
+| `event.emit` | `emit <event> { ... }` | a typed event injected into this instance's fact stream |
 | `signal.emit` | `emit signal` | typed signal injection into another instance |
 | `lease.acquire` / `lease.release` | `acquire` / `release` | workspace-scoped coordination lock/semaphore operations |
 | `ledger.append` | `append ... to <ledger>` | durable partitioned append-log write |
 | `counter.consume` | `consume ... amount ...` | bounded budget consumption |
+| `file.read` / `file.write` | `read text from <store> at <path>` / `write text to <store> at <path>` | durable read/write through a `file store` path policy |
+| `file.import` / `file.export` | `import <fmt> <Schema> from <store> ...` / `export <fmt> <Schema> to <store> ...` | structured records read from / written to a file-store path |
 | `workflow.invoke` | `invoke` | a child workflow instance |
 | namespaced capabilities | `call package.capability` | a package capability provider |
 

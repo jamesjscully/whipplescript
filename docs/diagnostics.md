@@ -226,6 +226,72 @@ after slot contended {
 }
 ```
 
+## Recursion And Namespace Checks
+
+### Recursive pattern application
+
+Diagnostic:
+
+```text
+error: recursive pattern application is not allowed (graph.unbounded_pattern_recursion): expansion cycle Loop -> Loop
+```
+
+Cause: a pattern's `apply` expands into itself, directly or through a cycle.
+Pattern expansion must elaborate into a finite program.
+
+Fix: break the cycle so expansion terminates.
+
+Invalid fixture: `examples/invalid/recursive-pattern.whip`.
+
+### Recursive workflow invocation
+
+Diagnostic:
+
+```text
+error: recursive workflow invocation is not allowed (graph.unbounded_workflow_invocation_recursion): invocation cycle Ping -> Pong -> Ping
+```
+
+Cause: workflows `invoke` each other in a cycle, which has no compile-time
+convergence proof.
+
+Fix: route the recurrence through an external event, clock, or durable
+boundary instead of a direct `invoke` cycle.
+
+Invalid fixture: `examples/invalid/recursive-workflow-invocation.whip`.
+
+### Flow-state namespace violation
+
+Diagnostic:
+
+```text
+error: rule `X` may not reference flow-state fact `FlowAwait_...`: flow progression state is owned by the flow's generated rules
+```
+
+Cause: a user rule matches or reads a flow's internal `FlowAwait_*`
+progression fact. That state is owned by the flow's generated rules.
+
+Fix: drive the workflow from your own fact classes; a flow's `FlowAwait_*`
+state is internal.
+
+Invalid fixture: `examples/invalid/flow-state-access.whip`.
+
+### Evidence-only fact matched as a fact
+
+Diagnostic:
+
+```text
+error: rule `X` matches evidence-only fact `agent.turn.streamed`: in-turn observations are evidence, not rule-matchable facts
+```
+
+Cause: a rule's `when` clause matches an in-turn observation
+(e.g. `agent.turn.streamed`), which is recorded as evidence rather than a
+rule-matchable lifecycle fact.
+
+Fix: match a lifecycle fact (`agent.turn.completed`/`failed`/`timed_out`/
+`cancelled`) and read the in-turn detail from its evidence.
+
+Invalid fixture: `examples/invalid/evidence-fact-match.whip`.
+
 ## Runtime And Provider Diagnostics
 
 Provider failures do not automatically fail the workflow. They appear as
@@ -284,12 +350,18 @@ diagnostics:
 | Fixture | Covers |
 | --- | --- |
 | `broken.whip` | Parse/source-shape errors. |
+| `headerless-library.whip` | Source with no `workflow` declaration (library fragment). |
 | `unknown-schema.whip` | Unknown declarations. |
 | `bad-record.whip` | Record payload validation. |
 | `bad-agent.whip` | Agent capacity, duplicate skills, unknown fields, missing profile. |
 | `bad-effect-graph.whip` | Unknown `after` bindings and unsupported dependency predicates. |
 | `bad-effect-payload.whip` | Effect payload type errors. |
+| `bad-terminal-payload.whip` | Terminal `complete`/`fail` payload with no declared workflow output. |
 | `bad-expression-functions.whip` | Expression function/query arity and type errors. |
 | `bad-finite-domain.whip` | Enum/literal-domain misuse. |
 | `effect-output-scope.whip` | Effect output visibility errors. |
 | `effectful-self-loop.whip` | Effectful liveness/self-loop restrictions. |
+| `evidence-fact-match.whip` | Matching an evidence-only fact as a rule-matchable fact. |
+| `flow-state-access.whip` | Referencing a flow's internal `FlowAwait_*` state. |
+| `recursive-pattern.whip` | Recursive pattern application (expansion cycle). |
+| `recursive-workflow-invocation.whip` | Recursive workflow `invoke` cycle. |

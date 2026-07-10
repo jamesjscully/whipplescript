@@ -10,8 +10,11 @@ All examples below check with no credentials. Agent turns use the built-in
 **`owned`** brokered harness by default — whip runs the tool-use loop itself, and
 a credential-free fixture model client drives `dev`/CI. Two examples instead
 exhibit the **optional** delegating providers: `multi-agent-bounded-concurrency`
-(Codex + Claude) and `incident-router` (Codex/Claude/Pi routing). The catalog
-commands are verified by `scripts/check-docs-examples.sh`.
+(Codex + Claude) and `incident-router` (routing across `codex`/`claude`/`pi`
+`AgentRef`s at check-time). Only Codex and Claude are usable delegating providers;
+the Pi RPC adapter is present in-tree but deferred, so `incident-router` only
+type-checks its Pi branch rather than running it. The catalog commands are verified
+by `scripts/check-docs-examples.sh`.
 
 ## Start Here
 
@@ -27,7 +30,7 @@ commands are verified by `scripts/check-docs-examples.sh`.
 | --- | --- | --- |
 | [`coerce-branch.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/coerce-branch.whip) | `whip check examples/coerce-branch.whip` | Named typed model decision with a success fact and human fallback on failure. |
 | [`terminal-output-union.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/terminal-output-union.whip) | `whip check examples/terminal-output-union.whip` | Exhaustive `case` over an effect terminal union: completed, failed, timed out, cancelled. |
-| [`incident-router.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/incident-router.whip) | `whip check examples/incident-router.whip` | Rich guards and dynamic routing: arrays, maps, optionals, `exists`, `in`, assertions, `AgentRef`. **Optional-provider exhibit**: routes across Codex/Claude/Pi. |
+| [`incident-router.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/incident-router.whip) | `whip check examples/incident-router.whip` | Rich guards and dynamic routing: arrays, maps, optionals, `exists`, `in`, assertions, `AgentRef`. **Optional-provider exhibit**: `AgentRef` routing across `codex`/`claude`/`pi` at check-time (Codex and Claude are the usable delegating providers; the Pi adapter is deferred). |
 | [`scheduled-escalation.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/scheduled-escalation.whip) | `whip check examples/scheduled-escalation.whip` | Time as effects: `timeout`, `timer until`, `cancel`, and terminal-union handling. |
 | [`exec-json-ingest.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/exec-json-ingest.whip) | `whip check examples/exec-json-ingest.whip` | Gated local commands with typed JSON output: `exec -> Type` and `exec -> each Type`. |
 | [`event-bridge.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/event-bridge.whip) | `whip check examples/event-bridge.whip` | External signal ingress (`whip signal`) and directed signal injection: `emit signal ... to <instance>` relays an acknowledgement into a live peer instance, which reacts via typed `when`. A missing target fails the effect with `target instance <id> not found`. |

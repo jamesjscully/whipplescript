@@ -159,4 +159,5 @@ privileges — with no ambient authority.
   Windows with shell and PowerShell installers and checksums, and crates.io-ready
   packaging.
 
+[0.3.0]: https://github.com/jamesjscully/whipplescript/releases/tag/v0.3.0
 [0.2.0]: https://github.com/jamesjscully/whipplescript/releases/tag/v0.2.0

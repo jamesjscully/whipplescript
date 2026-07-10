@@ -202,8 +202,10 @@ whip --store .whipplescript/triage.sqlite \
   dev triage.whip --provider fixture --until idle
 ```
 
-`dev` reports both assertions passing, and `status` shows the instance is
-still `running` — it is waiting for the sign-off:
+`dev` evaluates both assertions and exits `0`; a failing assertion would be
+printed and exit non-zero (pass `--json` to see the per-assertion pass/fail
+detail). `status` shows the instance is still `running` — it is waiting for
+the sign-off:
 
 ```sh
 whip --store .whipplescript/triage.sqlite status <instance_id>
@@ -239,12 +241,14 @@ whip --store .whipplescript/triage.sqlite facts <instance_id>
 ```
 
 ```text
-TriagedTicket          {"id":"T-31","plan":"...","severity":"high","status":"triaged",...}
-TriagedTicket          {"id":"T-32","plan":"...","severity":"low","status":"triaged",...}
-agent.turn.completed   {"agent":"triager","provider":"fixture","status":"completed",...}
-agent.turn.completed   {"agent":"triager","provider":"fixture","status":"completed",...}
-human.answer.received  {"answer":{"answered_by":"alice","choice":"approve",...},...}
+TriagedTicket          TriagedTicket:triaged:...  {"id":"T-31","plan":"...","severity":"high","status":"triaged",...}
+TriagedTicket          TriagedTicket:triaged:...  {"id":"T-32","plan":"...","severity":"low","status":"triaged",...}
+agent.turn.completed   key_...                    {"agent":"triager","provider":"fixture","status":"completed",...}
+agent.turn.completed   key_...                    {"agent":"triager","provider":"fixture","status":"completed",...}
+human.answer.received  key_...                    {"answer":{"answered_by":"alice","choice":"approve",...},...}
 ```
+
+Each line is the fact type, its fact key, then the JSON payload.
 
 `effects` shows the two agent turns and the human ask, all `completed`;
 `trace --check` verifies the lifecycle conforms to the runtime model.

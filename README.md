@@ -29,7 +29,14 @@ WhippleScript separates the two concerns:
   and child workflows are durable effects, executed by workers through
   providers, with results recorded as events.
 
-The result is a workflow you can step, pause, resume, revise, and audit.
+The result is a workflow you can step, pause, resume, revise, checkpoint,
+restore, and audit.
+
+The same durable kernel also runs on the edge: `whip deploy` ships a workflow
+to a Cloudflare Durable Object, and `whip checkpoint` / `whip restore` rewind a
+running instance to an earlier coherent point. See
+[Runtime & operations](docs/runtime-operations.md) for the cloud runtime and
+operator surface.
 
 ## A taste
 
@@ -168,6 +175,7 @@ crates/whipplescript-parser   .whip parser and typed IR
 crates/whipplescript-store    SQLite-backed runtime store
 crates/whipplescript-kernel   deterministic rule/effect kernel
 crates/whipplescript-cli      the whip CLI
+crates/whipplescript-host-do  Cloudflare Durable Object cloud host
 docs/                         user documentation
 spec/                         design records and implementation trackers
 models/                       formal models (Maude, TLA+)

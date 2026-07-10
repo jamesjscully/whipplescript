@@ -90,7 +90,8 @@ Primary entrypoints:
 | `parse_duration_seconds(value)` | Parse supported duration literal to seconds. |
 | `parse_time_epoch_seconds(value)` | Parse supported timestamp literal to epoch seconds. |
 
-Important AST/IR structs include:
+Important AST/IR structs include (an illustrative subset; the parser defines
+roughly thirty `*Decl` types):
 
 ```text
 Program
@@ -101,7 +102,6 @@ ApplyDecl
 IncludeDecl
 UseDecl
 HarnessDecl
-QueueDecl
 FlowDecl
 AgentDecl
 EnumDecl
@@ -112,6 +112,11 @@ CounterDecl
 ClassDecl
 TableDecl
 CoerceDecl
+TrackerDecl
+ChannelDecl
+ActionDecl
+FileStoreDecl
+SourceDecl
 AssertDecl
 RuleDecl
 WhenClause
@@ -161,6 +166,14 @@ Rule/effect methods:
 | `cancel_effect(...)` | Cancel an effect. |
 | `renew_lease(...)` / `expire_leases(...)` | Lease maintenance. |
 | `retry_effect(...)` | Retry failed/timed-out effect. |
+
+Checkpoint/restore methods (back the `whip checkpoint` / `whip restore` commands):
+
+| Method | Meaning |
+| --- | --- |
+| `capture_checkpoint(...)` | Capture a coherence-checked cut of an instance's file state, agent transcript, and event-log position. |
+| `plan_restore(instance_id, cut_id)` | Plan a restore to a captured cut, returning a `RestoreDecision`. |
+| `commit_restore(...)` | Commit the planned restore, appending the append-only `context.restored` marker that all reads fold. |
 
 Inspection methods:
 
@@ -284,3 +297,37 @@ Trace API:
 | `TraceEvent` | Abstract lifecycle event. |
 | `TraceRecord` | Sequenced abstract event. |
 | `check_trace(records)` | Validate trace conformance. |
+
+## `whipplescript-host-do`
+
+`whipplescript-host-do` is the Cloudflare Durable Object host binding for the
+sans-IO WhippleScript core. It runs the same evaluation kernel inside a wasm
+isolate, supplying the DO's own synchronous storage instead of the native
+`rusqlite` backend. The crate depends on `whipplescript-kernel` and
+`whipplescript-store` built with `default-features = false` (store traits and
+data types only, no rusqlite) and builds as both `cdylib` and `rlib`.
+
+Host seam traits (the DO shell implements these):
+
+| Item | Meaning |
+| --- | --- |
+| `DoSql` | Synchronous SQL interface the DO exposes to the ported store. |
+| `DoStorage` | Flat file-plane storage backing `DoFileStore`. |
+| `FetchClient` / `FetchHost` | The single async primitive available to HTTP-bearing effects (`fetch`). |
+| `Alarms` | DO alarm scheduling for timers/deadlines. |
+| `Secrets` | Provider-credential resolution from DO secrets. |
+| `ObjectStore` | Optional object tier backing `TieredFileStore`. |
+
+Runtime and store surface:
+
+| Item | Meaning |
+| --- | --- |
+| `DoSqlStorage` / `DoSqliteStore` | The runtime/coordination/work-item store ported onto `DoSql`. |
+| `DoFileStore` / `TieredFileStore` | DO-owned file plane implementing the `FileStore` trait. |
+| `DurableInstance` | Instance driver over DO storage: `create`, `step`, `status`, `checkpoint`, `restore`, `bind_branch`. |
+| `DoToolExecutor` / `do_tool_specs()` | In-isolate tool set (read/write/edit/ls/find/grep/recall + work-tracker todos) over the flat `files` table. |
+| `WasmDurableInstance` | The `#[wasm_bindgen]` wrapper (wasm32 only) exposing `create`/`step`/`status`/`checkpoint`/`restore` to the Worker shell. |
+
+`whip deploy` packages a workflow onto a Worker + DO using this crate. Enabling
+the Class-A/Class-B compute plane in production is a follow-on configuration
+step, not on by default.
