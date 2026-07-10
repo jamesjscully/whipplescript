@@ -236,17 +236,20 @@ Per-heading `· vN` tags below restate this at each phase.
       visibility half needs the replay-frontier decision (which orphaned
       effects are legal replay vs which must re-execute) — owns with the
       virtual-working-set/regeneration slice.
-- [ ] **Content-defined chunking** for large blobs (vw note §10.1):
+- [x] **Content-defined chunking** for large blobs (vw note §10.1):
       FastCDC-style chunk trees, file identity = stable Merkle root
       (nothing upstream re-keys); whole-blob below threshold; erasure at
-      chunk level with retained root. *(Progress 2026-07-10: the pure
-      chunking core landed — `crates/whipplescript-store/src/chunking.rs`:
-      FastCDC boundaries over a frozen splitmix64 gear table (explicitly
-      identity-bearing), normalized masks, whole-blob-below-threshold
-      keeps plain content-hash identity, root = hash over ordered chunk
-      ids; dedup properties tested (append shares all but tail, mid-file
-      edit contained). Remaining for the box: wiring into the tiered
-      blob store + chunk-level erasure with retained root.)*
+      chunk level with retained root. *(2026-07-10 complete: pure core
+      (`chunking.rs`, frozen gear table, dedup property-tested) +
+      `chunk_str` (FastCDC snapped to UTF-8 boundaries — the string
+      tier's own frozen identity) + the store tier
+      (`ContentStore::put_chunked/get_chunked` — below-threshold IS plain
+      `put`, chunks dedupe across roots via a junction table) +
+      chunk-level erasure (`erase_chunks`: drops this root's chunk
+      BODIES except those shared with a live sibling root — fail-closed
+      sharing; the root row + chunk hashes + size are the retained
+      honesty-downgrade handle). Object-tier packing/spill rides the DO
+      P7/P8 work, not this seam.)*
 - [x] **Stat cache** in the virtual working set: mtime/size/inode
       fingerprints so import-back is O(touched) not O(tree); implements
       the P0 soundness invariant. *(2026-07-10:

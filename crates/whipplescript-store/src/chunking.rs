@@ -175,6 +175,54 @@ pub fn chunk_blob(data: &[u8], config: &ChunkingConfig) -> ChunkTree {
     }
 }
 
+/// Chunk a UTF-8 string: FastCDC ranges snapped FORWARD to character
+/// boundaries so every chunk is itself valid UTF-8 (the string tier's
+/// storage rows are TEXT). Snapping is deterministic, so this is its own
+/// frozen identity, distinct from raw-byte chunking; a blob below the
+/// threshold keeps its plain content hash exactly like `chunk_blob`.
+pub fn chunk_str(body: &str, config: &ChunkingConfig) -> ChunkTree {
+    let data = body.as_bytes();
+    if data.len() <= config.whole_blob_threshold {
+        return ChunkTree {
+            root_hash: content_hash_hex(data),
+            chunks: Vec::new(),
+        };
+    }
+    let mut chunks = Vec::new();
+    let mut id_bytes: Vec<u8> = Vec::new();
+    let mut start = 0usize;
+    for (_, raw_end) in chunk_ranges(data, config) {
+        let mut end = raw_end.min(data.len());
+        while end < data.len() && !body.is_char_boundary(end) {
+            end += 1;
+        }
+        if end <= start {
+            continue;
+        }
+        let hash = content_hash_hex(&data[start..end]);
+        id_bytes.extend_from_slice(hash.as_bytes());
+        chunks.push(ChunkRef {
+            hash,
+            offset: start,
+            len: end - start,
+        });
+        start = end;
+    }
+    if start < data.len() {
+        let hash = content_hash_hex(&data[start..]);
+        id_bytes.extend_from_slice(hash.as_bytes());
+        chunks.push(ChunkRef {
+            hash,
+            offset: start,
+            len: data.len() - start,
+        });
+    }
+    ChunkTree {
+        root_hash: content_hash_hex(&id_bytes),
+        chunks,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
