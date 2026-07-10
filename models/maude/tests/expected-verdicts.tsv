@@ -10,6 +10,7 @@ cache-prefix-append-only.maude	SSSN
 case-family.maude	SSSSSNNNN
 case-selector.maude	SNN
 catalogue-determinism.maude	SSN
+chat-fork.maude	SSSNNSS
 clock-source.maude	SNSNSNSSN
 coerce-branches.maude	SNSS
 compaction-epoch-lifecycle.maude	SSSNN
