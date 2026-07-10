@@ -818,6 +818,7 @@ dependencies = [
  "whipplescript-kernel",
  "whipplescript-parser",
  "whipplescript-store",
+ "whipplescript-workspace",
 ]
 
 [[package]]
@@ -862,6 +863,16 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "whipplescript-core",
+]
+
+[[package]]
+name = "whipplescript-workspace"
+version = "0.2.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

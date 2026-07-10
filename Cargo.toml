@@ -6,6 +6,7 @@ members = [
     "crates/whipplescript-kernel",
     "crates/whipplescript-parser",
     "crates/whipplescript-store",
+    "crates/whipplescript-workspace",
 ]
 resolver = "2"
 

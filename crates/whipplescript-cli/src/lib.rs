@@ -10,3 +10,10 @@ pub mod host_protocol;
 pub mod host_runtime;
 pub mod ifc;
 pub mod principal;
+
+/// Native versioned-workspace substrate used by embedding hosts. Re-exported
+/// here so hosts depend on WhippleScript's published integration surface rather
+/// than an implementation crate.
+pub mod workspace {
+    pub use whipplescript_workspace::*;
+}
