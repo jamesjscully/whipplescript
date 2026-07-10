@@ -1375,6 +1375,20 @@ pub struct ProjectedToolCall {
     pub ok: Option<bool>,
 }
 
+/// WhippleScript's certified dependency set for one field of the host-visible
+/// turn projection.
+///
+/// Agent turns are intentionally opaque IFC boxes: every resource admitted to
+/// the turn may influence both the assistant text and the tool-call transcript.
+/// Publishing that conservative per-field signature lets an embedding product
+/// derive provenance from WhippleScript's admitted resource set instead of
+/// independently guessing which inputs influenced an output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CertifiedOutputFieldFlow {
+    pub field: String,
+    pub reads: Vec<ResourceRef>,
+}
+
 /// The content projection WhippleScript has admitted for its embedding host.
 ///
 /// The projection is derived from WhippleScript's durable transcript, carries
@@ -1387,6 +1401,7 @@ pub struct LabeledTurnOutput {
     pub label_ref: String,
     pub assistant_text: String,
     pub tool_calls: Vec<ProjectedToolCall>,
+    pub flow_signature: Vec<CertifiedOutputFieldFlow>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2913,6 +2928,7 @@ impl GovernedHostRuntime {
             label_ref: self.label_ref(),
             assistant_text,
             tool_calls,
+            flow_signature: certified_output_flow(command),
         }))
     }
 
@@ -2951,6 +2967,26 @@ impl GovernedHostRuntime {
     fn label_ref(&self) -> String {
         format!("whip:label:{}:turn-join", self.policy.envelope_hash)
     }
+}
+
+fn certified_output_flow(command: &StartTurnCommand) -> Vec<CertifiedOutputFieldFlow> {
+    let mut reads = command.resources.clone();
+    reads.extend(command.input.images.iter().cloned());
+    reads.sort_by(|left, right| {
+        (&left.handle, &left.kind, &left.selector).cmp(&(
+            &right.handle,
+            &right.kind,
+            &right.selector,
+        ))
+    });
+    reads.dedup();
+    ["assistant_text", "tool_calls"]
+        .into_iter()
+        .map(|field| CertifiedOutputFieldFlow {
+            field: field.to_owned(),
+            reads: reads.clone(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3652,6 +3688,27 @@ workflow HumanHostChat {
             Some("governed file body")
         );
         assert_eq!(first_output.tool_calls[0].ok, Some(true));
+        assert_eq!(
+            first_output.flow_signature,
+            vec![
+                CertifiedOutputFieldFlow {
+                    field: "assistant_text".to_owned(),
+                    reads: vec![ResourceRef {
+                        handle: "project".to_owned(),
+                        kind: "file_store".to_owned(),
+                        selector: None,
+                    }],
+                },
+                CertifiedOutputFieldFlow {
+                    field: "tool_calls".to_owned(),
+                    reads: vec![ResourceRef {
+                        handle: "project".to_owned(),
+                        kind: "file_store".to_owned(),
+                        selector: None,
+                    }],
+                },
+            ]
+        );
         assert_eq!(resources.calls.get(), 1);
         drop(runtime);
 
