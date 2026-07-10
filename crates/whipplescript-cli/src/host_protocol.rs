@@ -394,6 +394,18 @@ pub struct TurnReceipt {
     pub workspace_cut_ref: Option<String>,
 }
 
+/// A body-free pointer to authoritative runtime evidence owned by
+/// WhippleScript. Embedding products may admit this value into their decision
+/// log without copying the evidence body or inventing a parallel event schema.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "pointer_kind", content = "pointer", rename_all = "snake_case")]
+pub enum RuntimeEvidencePointer {
+    Event(LabeledRuntimeEvent),
+    HumanAsk(LabeledHumanAsk),
+    HumanAnswer(HumanAnswerReceipt),
+    TurnReceipt(TurnReceipt),
+}
+
 impl TurnReceipt {
     /// Validate the receipt against the command it claims to settle. This is the
     /// host-side anti-mixup check; it does not reinterpret runtime evidence.
