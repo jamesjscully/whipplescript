@@ -1078,11 +1078,24 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         &self,
         branch_id: &str,
     ) -> StoreResult<Option<crate::bundle::WorkspaceBundle>> {
+        self.export_bundle_delta(branch_id, &std::collections::BTreeSet::new())
+    }
+
+    /// `export_bundle` with pull-missing (rsync-class incremental): units
+    /// in `have` — the receiver's declared inventory, computed by
+    /// `bundle::transferable_ids` over ITS store — travel as structure
+    /// only. Blob AND chunk granular, so a hybrid desktop↔cloud sync
+    /// moves only the chunks that actually changed.
+    pub fn export_bundle_delta(
+        &self,
+        branch_id: &str,
+        have: &std::collections::BTreeSet<String>,
+    ) -> StoreResult<Option<crate::bundle::WorkspaceBundle>> {
         let Some(branch) = self.branches.get_branch(branch_id)? else {
             return Ok(None);
         };
         let manifest = self.load_manifest(branch.head_manifest_hash.as_deref())?;
-        let blobs = crate::bundle::collect_blobs(&manifest, &self.content)?;
+        let blobs = crate::bundle::collect_blobs_delta(&manifest, &self.content, have)?;
         let head_change_id = self.change_of(branch.head_cut_id.as_deref())?;
         let cuts = self.branches.list_cuts(branch_id, i64::MAX as usize)?;
         Ok(Some(crate::bundle::WorkspaceBundle {
@@ -1093,6 +1106,20 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             blobs,
             cuts,
         }))
+    }
+
+    /// The transferable-unit ids this store can serve for the branch's
+    /// manifest (pull-missing negotiation: the RECEIVER computes this
+    /// over its store and sends it as the sender's `have` set).
+    pub fn transferable_ids(&self, branch_id: &str) -> StoreResult<Option<Vec<String>>> {
+        let Some(branch) = self.branches.get_branch(branch_id)? else {
+            return Ok(None);
+        };
+        let manifest = self.load_manifest(branch.head_manifest_hash.as_deref())?;
+        Ok(Some(crate::bundle::transferable_ids(
+            &manifest,
+            &self.content,
+        )?))
     }
 
     /// Import a bundle: store its payloads (content-addressed, so
@@ -1114,8 +1141,31 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             )));
         }
         for blob in &bundle.blobs {
+            if let Some(chunk_ids) = &blob.chunk_ids {
+                // A chunk root: re-link the structure without
+                // re-chunking; an erased root lands as the tombstone it
+                // is (identity, no payload).
+                self.content
+                    .put_chunk_root(&blob.id, chunk_ids, blob.byte_len)?;
+                if blob.erased {
+                    self.content.erase(&blob.id, at)?;
+                }
+                continue;
+            }
             if let Some(body) = &blob.body {
                 self.content.put(body)?;
+            } else if blob.omitted {
+                // The sender skipped this unit because we declared we
+                // have it — verify, fail honest if the negotiation lied.
+                if !matches!(
+                    self.content.status(&blob.id)?,
+                    crate::content::BlobStatus::Live { .. }
+                ) {
+                    return Err(StoreError::Conflict(format!(
+                        "delta bundle omitted `{}` but this store does not hold it",
+                        blob.id
+                    )));
+                }
             }
         }
         let manifest_hash = self.store_manifest(&bundle.manifest)?;
@@ -1577,6 +1627,12 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// Mainline's id, for callers that don't hardcode it.
     pub fn mainline() -> &'static str {
         MAINLINE_BRANCH_ID
+    }
+
+    /// The content seam, for callers that need the concrete store's
+    /// tier entry points (chunked puts, packing).
+    pub fn content_store(&self) -> &C {
+        &self.content
     }
 }
 

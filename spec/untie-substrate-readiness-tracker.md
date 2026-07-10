@@ -415,12 +415,29 @@ replace git for working branches + workstreams.)*
       (`AlreadyPresent`) and never clobbers divergent local content
       (`DivergentBranch`, honest refusal). CLI `whip branch
       export [--out] / import`.
-- [ ] **Chunk-granular transfer**: pull-missing extends from blobs to
+- [~] **Chunk-granular transfer**: pull-missing extends from blobs to
       chunks (bundles, hybrid desktop↔cloud, sidecar warm-up become
       rsync-class incremental); object-tier **chunk packing** (pack
       objects indexed by the manifest — internal optimization, never
       user-visible); presigned direct transfer for big artifacts on the
       cloud path.
+      **Pull-missing + packing DONE 2026-07-10:** reads became
+      tier-transparent (`ContentStore::get` resolves loose rows, packed
+      chunks, and reassembles roots — chunk-rooted manifests now work
+      everywhere: working sets, diff, bundles); `ContentBlobs` gains
+      `chunk_ids`/`put_chunk_root` so bundles carry root STRUCTURE and
+      chunks as individual delta-eligible units; negotiation =
+      `whip branch digest` (sender ids) → `whip branch have` (receiver
+      filter) → `whip branch export --delta-have` (omitted units travel
+      as structure; import verifies the receiver actually holds them —
+      fail-honest). `pack_root` moves loose chunks into one indexed pack
+      blob, reads fall through, and erasure DISSOLVES affected packs
+      (survivors re-inline; shared chunks live on) so packed bytes
+      actually die. Tests: `delta_bundles_move_only_missing_chunks`,
+      `pack_root_is_read_transparent_and_erasure_safe`.
+      **REMAINING:** presigned direct transfer for big artifacts on the
+      cloud path — rides the production-container/R2 decision (Jack;
+      DO-runtime tracker), not buildable until that lands.
 - [x] Per-blob erasure: tombstone/crypto-erase with retained hashes + the
       honesty downgrade (keep scores/identity, lose payload/replay);
       discharge un-tie's content-erasure invariants (`HISTORY_PRESERVED`,

@@ -71,6 +71,25 @@ pub trait ContentBlobs {
     fn erase(&self, _id: &str, _at: &str) -> crate::StoreResult<EraseOutcome> {
         Ok(EraseOutcome::Unsupported)
     }
+    /// The ordered chunk ids under a chunk root, or `None` when the id is
+    /// not a root. Chunk-granular transfer's seam: a bundle carries the
+    /// root's structure and only the missing chunks travel.
+    fn chunk_ids(&self, _id: &str) -> crate::StoreResult<Option<Vec<String>>> {
+        Ok(None)
+    }
+    /// Record a chunk root's structure (transport support: the receiving
+    /// side re-links roots without re-chunking). Hosts without a chunk
+    /// tier refuse rather than silently dropping structure.
+    fn put_chunk_root(
+        &self,
+        _root_id: &str,
+        _chunk_ids: &[String],
+        _byte_len: u64,
+    ) -> crate::StoreResult<()> {
+        Err(crate::StoreError::Conflict(
+            "this content store has no chunk tier".to_owned(),
+        ))
+    }
 }
 
 use crate::StoreResult;
@@ -124,15 +143,41 @@ impl ContentBlobs for ContentStore {
         Ok(id)
     }
 
+    /// Reads are transparent over the whole tier: a plain blob row, a
+    /// chunk packed into a pack object, or a chunk ROOT (reassembled) all
+    /// answer to their id — callers (working sets, bundles, diff) never
+    /// see the tiering.
     fn get(&self, id: &str) -> StoreResult<Option<String>> {
-        Ok(self
+        if let Some(body) = self
             .connection
             .query_row(
                 "SELECT body FROM content_blobs WHERE id = ?1",
                 params![id],
                 |row| row.get::<_, String>(0),
             )
-            .optional()?)
+            .optional()?
+        {
+            return Ok(Some(body));
+        }
+        if let Some(body) = self.read_packed(id)? {
+            return Ok(Some(body));
+        }
+        // Chunk-root reassembly (each piece resolves through rows or
+        // packs; chunks are never themselves roots, so this is depth 1).
+        let Some(info) = self.chunk_root_info(id)? else {
+            return Ok(None);
+        };
+        if info.erased {
+            return Ok(None);
+        }
+        let mut body = String::with_capacity(info.byte_len as usize);
+        for chunk_id in &info.chunk_ids {
+            let Some(piece) = self.get(chunk_id)? else {
+                return Ok(None);
+            };
+            body.push_str(&piece);
+        }
+        Ok(Some(body))
     }
 
     fn status(&self, id: &str) -> StoreResult<BlobStatus> {
@@ -145,6 +190,19 @@ impl ContentBlobs for ContentStore {
             )
             .optional()?;
         if let Some(byte_len) = live {
+            return Ok(BlobStatus::Live {
+                byte_len: byte_len as u64,
+            });
+        }
+        let packed: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT len FROM content_pack_entries WHERE chunk_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(byte_len) = packed {
             return Ok(BlobStatus::Live {
                 byte_len: byte_len as u64,
             });
@@ -227,6 +285,30 @@ impl ContentBlobs for ContentStore {
             byte_len: byte_len as u64,
         })
     }
+
+    fn chunk_ids(&self, id: &str) -> StoreResult<Option<Vec<String>>> {
+        Ok(self.chunk_root_info(id)?.map(|info| info.chunk_ids))
+    }
+
+    fn put_chunk_root(
+        &self,
+        root_id: &str,
+        chunk_ids: &[String],
+        byte_len: u64,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO content_chunk_roots (root_id, byte_len) VALUES (?1, ?2)",
+            params![root_id, byte_len as i64],
+        )?;
+        for (seq, chunk_id) in chunk_ids.iter().enumerate() {
+            self.connection.execute(
+                "INSERT OR IGNORE INTO content_chunk_refs (root_id, seq, chunk_id) \
+                 VALUES (?1, ?2, ?3)",
+                params![root_id, seq as i64, chunk_id],
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "native")]
@@ -257,6 +339,14 @@ fn ensure_content_schema(connection: &Connection) -> StoreResult<()> {
         );
         CREATE INDEX IF NOT EXISTS content_chunk_refs_chunk_idx
             ON content_chunk_refs(chunk_id);
+        CREATE TABLE IF NOT EXISTS content_pack_entries (
+            chunk_id TEXT PRIMARY KEY,
+            pack_id  TEXT NOT NULL,
+            offset   INTEGER NOT NULL,
+            len      INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS content_pack_entries_pack_idx
+            ON content_pack_entries(pack_id);
         "#,
     )?;
     Ok(())
@@ -308,27 +398,12 @@ impl ContentStore {
         Ok(tree.root_hash)
     }
 
-    /// Read through the chunk tier: a plain blob id reads directly; a
-    /// chunk root reassembles. `Ok(None)` = unknown id OR an erased root
-    /// (consult `chunk_root_info` for the retained identity).
+    /// Read through the chunk tier. `Ok(None)` = unknown id OR an erased
+    /// root (consult `chunk_root_info` for the retained identity).
+    /// Kept as the tier's named entry point; `get` itself is transparent
+    /// over roots and packs, so this simply delegates.
     pub fn get_chunked(&self, id: &str) -> StoreResult<Option<String>> {
-        if let Some(body) = self.get(id)? {
-            return Ok(Some(body));
-        }
-        let Some(info) = self.chunk_root_info(id)? else {
-            return Ok(None);
-        };
-        if info.erased {
-            return Ok(None);
-        }
-        let mut body = String::with_capacity(info.byte_len as usize);
-        for chunk_id in &info.chunk_ids {
-            let Some(piece) = self.get(chunk_id)? else {
-                return Ok(None);
-            };
-            body.push_str(&piece);
-        }
-        Ok(Some(body))
+        self.get(id)
     }
 
     /// The retained identity of a chunk root, before or after erasure.
@@ -360,6 +435,140 @@ impl ContentStore {
         }))
     }
 
+    /// Read a chunk that lives inside a pack object. Offsets are byte
+    /// positions at chunk boundaries (UTF-8-snapped by construction).
+    fn read_packed(&self, chunk_id: &str) -> StoreResult<Option<String>> {
+        let entry: Option<(String, i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT pack_id, offset, len FROM content_pack_entries WHERE chunk_id = ?1",
+                params![chunk_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((pack_id, offset, len)) = entry else {
+            return Ok(None);
+        };
+        let pack: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT body FROM content_blobs WHERE id = ?1",
+                params![pack_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(pack) = pack else {
+            return Ok(None);
+        };
+        let (start, end) = (offset as usize, (offset + len) as usize);
+        if end > pack.len() || !pack.is_char_boundary(start) || !pack.is_char_boundary(end) {
+            return Err(crate::StoreError::Conflict(format!(
+                "pack {pack_id} entry for {chunk_id} is out of bounds"
+            )));
+        }
+        Ok(Some(pack[start..end].to_owned()))
+    }
+
+    /// Object-tier chunk packing (vw note §10.1; internal optimization,
+    /// never user-visible): move a root's loose chunk bodies into ONE
+    /// pack blob with an offset index. Reads stay transparent
+    /// (`get` falls through to the pack); identity is untouched. Returns
+    /// how many chunks were packed (0 = nothing loose to pack).
+    pub fn pack_root(&self, root_id: &str) -> StoreResult<usize> {
+        let Some(info) = self.chunk_root_info(root_id)? else {
+            return Ok(0);
+        };
+        if info.erased {
+            return Ok(0);
+        }
+        // Only chunks that still live as loose rows move; chunks already
+        // packed (or shared and packed by a sibling) are left where they
+        // are — reads resolve either way.
+        let mut loose: Vec<(String, String)> = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for chunk_id in &info.chunk_ids {
+            if !seen.insert(chunk_id.clone()) {
+                continue;
+            }
+            let body: Option<String> = self
+                .connection
+                .query_row(
+                    "SELECT body FROM content_blobs WHERE id = ?1",
+                    params![chunk_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(body) = body {
+                loose.push((chunk_id.clone(), body));
+            }
+        }
+        if loose.is_empty() {
+            return Ok(0);
+        }
+        let mut pack_body = String::new();
+        let mut entries = Vec::new();
+        for (chunk_id, body) in &loose {
+            entries.push((chunk_id.clone(), pack_body.len() as i64, body.len() as i64));
+            pack_body.push_str(body);
+        }
+        let pack_id = self.put(&pack_body)?;
+        for (chunk_id, offset, len) in &entries {
+            self.connection.execute(
+                "INSERT OR IGNORE INTO content_pack_entries (chunk_id, pack_id, offset, len) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![chunk_id, pack_id, offset, len],
+            )?;
+        }
+        for (chunk_id, _, _) in &entries {
+            self.connection.execute(
+                "DELETE FROM content_blobs WHERE id = ?1 AND id != ?2",
+                params![chunk_id, pack_id],
+            )?;
+        }
+        Ok(entries.len())
+    }
+
+    /// Re-inline every surviving chunk of the packs that hold this
+    /// root's chunks, then drop the pack blobs — erasure of packed
+    /// content must remove the BYTES, and a pack is one blob, so the
+    /// pack dissolves and survivors return to loose rows.
+    fn unpack_for_erasure(&self, root_id: &str) -> StoreResult<()> {
+        let mut stmt = self.connection.prepare(
+            "SELECT DISTINCT entries.pack_id FROM content_pack_entries AS entries \
+             JOIN content_chunk_refs AS refs ON refs.chunk_id = entries.chunk_id \
+             WHERE refs.root_id = ?1",
+        )?;
+        let packs: Vec<String> = stmt
+            .query_map(params![root_id], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for pack_id in packs {
+            let mut stmt = self.connection.prepare(
+                "SELECT chunk_id, offset, len FROM content_pack_entries WHERE pack_id = ?1",
+            )?;
+            let entries: Vec<(String, i64, i64)> = stmt
+                .query_map(params![pack_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<Result<_, _>>()?;
+            for (chunk_id, _, _) in &entries {
+                if let Some(body) = self.read_packed(chunk_id)? {
+                    self.connection.execute(
+                        "INSERT OR IGNORE INTO content_blobs (id, body, byte_len, created_at) \
+                         VALUES (?1, ?2, ?3, datetime('now'))",
+                        params![chunk_id, body, body.len() as i64],
+                    )?;
+                }
+            }
+            self.connection.execute(
+                "DELETE FROM content_pack_entries WHERE pack_id = ?1",
+                params![pack_id],
+            )?;
+            self.connection
+                .execute("DELETE FROM content_blobs WHERE id = ?1", params![pack_id])?;
+        }
+        Ok(())
+    }
+
     /// Chunk-level erasure with the retained root (vw note §10.1 item 1):
     /// drop this root's chunk BODIES — except chunks still referenced by
     /// another live root (dedup sharing survives, fail-closed) — and mark
@@ -367,6 +576,10 @@ impl ContentStore {
     /// payload and replay are honestly gone. Returns how many chunk
     /// bodies were erased.
     pub fn erase_chunks(&self, root_id: &str, at: &str) -> StoreResult<usize> {
+        // Packed chunks first: dissolve their packs back to loose rows so
+        // the erasure below actually removes bytes (a pack is one blob —
+        // deleting an index entry alone would leave the payload inside).
+        self.unpack_for_erasure(root_id)?;
         let erased = self.connection.execute(
             "DELETE FROM content_blobs WHERE id IN (
                  SELECT refs.chunk_id FROM content_chunk_refs AS refs
@@ -492,6 +705,71 @@ mod tests {
             store.get_chunked(&sibling_root).expect("get").as_deref(),
             Some(sibling.as_str()),
             "the sibling sharing chunks still reads whole"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Chunk packing is invisible: after `pack_root` the loose chunk
+    /// rows dissolve into one pack blob, every id still reads (chunks
+    /// AND the reassembled root), status stays Live — and erasure of a
+    /// packed root still removes the bytes (packs dissolve, survivors
+    /// return to loose rows, shared chunks live on).
+    #[test]
+    fn pack_root_is_read_transparent_and_erasure_safe() {
+        use crate::chunking::ChunkingConfig;
+        let dir = std::env::temp_dir().join(format!(
+            "whip-pack-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+        ));
+        let store = ContentStore::open(dir.join("content.db")).expect("open");
+        let config = ChunkingConfig {
+            whole_blob_threshold: 256,
+            min_size: 64,
+            avg_size: 256,
+            max_size: 1024,
+        };
+        let big = "abcdefghij-0123456789=".repeat(500);
+        let root = store.put_chunked(&big, &config).expect("put");
+        let sibling = format!("{big}EXTRA");
+        let sibling_root = store.put_chunked(&sibling, &config).expect("put sibling");
+        let info = store.chunk_root_info(&root).expect("info").expect("root");
+
+        let packed = store.pack_root(&root).expect("pack");
+        assert!(packed > 1, "the loose chunks moved into the pack");
+        // Reads stay transparent: individual chunks and the whole root.
+        for chunk_id in &info.chunk_ids {
+            assert!(
+                store.get(chunk_id).expect("get").is_some(),
+                "packed chunk {chunk_id} still reads"
+            );
+            assert!(matches!(
+                store.status(chunk_id).expect("status"),
+                BlobStatus::Live { .. }
+            ));
+        }
+        assert_eq!(
+            store.get(&root).expect("get").as_deref(),
+            Some(big.as_str())
+        );
+        assert_eq!(
+            store.get(&sibling_root).expect("get").as_deref(),
+            Some(sibling.as_str()),
+            "the sibling reads through the pack for shared chunks"
+        );
+
+        // Erasure of the packed root removes bytes; the sibling's shared
+        // chunks survive (fail-closed sharing, now across the pack tier).
+        store.erase_chunks(&root, "t1").expect("erase");
+        assert_eq!(store.get(&root).expect("get"), None);
+        assert_eq!(
+            store.get(&sibling_root).expect("get").as_deref(),
+            Some(sibling.as_str()),
+            "the live sibling still reads whole after the pack dissolved"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

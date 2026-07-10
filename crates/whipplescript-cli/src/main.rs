@@ -31334,8 +31334,10 @@ const BRANCH_USAGE: &str =
   whip branch restore <branch> <cut>\n\
   whip branch discard <branch>\n\
   whip branch ops [--limit <n>]\n\
-  whip branch export <branch> [--out <file>]\n\
+  whip branch export <branch> [--out <file>] [--delta-have <ids-file>]\n\
   whip branch import <file>\n\
+  whip branch digest <branch>\n\
+  whip branch have <ids-file>\n\
   whip branch erase <branch> <path>\n\
   whip branch bind <branch> <instance>\n\
   whip branch reconcile\n\
@@ -32531,7 +32533,28 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 .position(|arg| *arg == "--out")
                 .and_then(|index| rest.get(index + 1))
                 .copied();
-            match vcs.export_bundle(branch_id) {
+            // Pull-missing: --delta-have carries the receiver's declared
+            // inventory (JSON array of ids from `whip branch have`).
+            let have: std::collections::BTreeSet<String> = match rest
+                .iter()
+                .position(|arg| *arg == "--delta-have")
+                .and_then(|index| rest.get(index + 1))
+            {
+                None => Default::default(),
+                Some(path) => match std::fs::read_to_string(path)
+                    .map_err(|error| error.to_string())
+                    .and_then(|body| {
+                        serde_json::from_str::<Vec<String>>(&body)
+                            .map_err(|error| error.to_string())
+                    }) {
+                    Ok(ids) => ids.into_iter().collect(),
+                    Err(error) => {
+                        eprintln!("branch export failed reading `{path}`: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+            };
+            match vcs.export_bundle_delta(branch_id, &have) {
                 Ok(Some(bundle)) => {
                     let encoded = match serde_json::to_string_pretty(&bundle) {
                         Ok(encoded) => encoded,
@@ -32616,6 +32639,46 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 }
                 Err(error) => {
                     eprintln!("branch import failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "digest" => {
+            let Some(branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.transferable_ids(branch_id) {
+                Ok(Some(ids)) => emit_json(json!(ids)),
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch digest failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "have" => {
+            let Some(path) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let ids: Vec<String> = match std::fs::read_to_string(path)
+                .map_err(|error| error.to_string())
+                .and_then(|body| serde_json::from_str(&body).map_err(|error| error.to_string()))
+            {
+                Ok(ids) => ids,
+                Err(error) => {
+                    eprintln!("branch have failed reading `{path}`: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match whipplescript_store::bundle::held_subset(&ids, vcs.content_store()) {
+                Ok(held) => emit_json(json!(held)),
+                Err(error) => {
+                    eprintln!("branch have failed: {error:?}");
                     ExitCode::FAILURE
                 }
             }
