@@ -33,8 +33,8 @@ use whipplescript_store::{
 use crate::host_protocol::{
     AnswerHumanAskCommand, EventPosition, ForkInstanceCommand, ForkedInstance, HumanAnswerReceipt,
     LabeledHumanAsk, LabeledRuntimeEvent, OpenInstanceCommand, OpenedInstance, PolicyEpochRef,
-    ProtocolError, ProviderBindingRef, ResourceRef, StartTurnCommand, TurnReceipt, TurnStatus,
-    HOST_PROTOCOL,
+    ProtocolError, ProviderBindingRef, ResourceRef, RuntimeEvidencePointer, StartTurnCommand,
+    TurnReceipt, TurnStatus, HOST_PROTOCOL,
 };
 use crate::ifc::VerifiedEnvelope;
 
@@ -1399,10 +1399,40 @@ pub struct TurnExecution {
     pub pending_human_ask: Option<LabeledHumanAsk>,
 }
 
+impl TurnExecution {
+    /// Publish only stable references to WhippleScript-owned evidence. Payload,
+    /// label, usage, and guarantee bodies remain in the runtime store.
+    pub fn evidence_pointers(&self) -> Vec<RuntimeEvidencePointer> {
+        let mut pointers = self
+            .events
+            .iter()
+            .cloned()
+            .map(RuntimeEvidencePointer::Event)
+            .collect::<Vec<_>>();
+        if let Some(ask) = &self.pending_human_ask {
+            pointers.push(RuntimeEvidencePointer::HumanAsk(ask.clone()));
+        }
+        if let Some(receipt) = &self.receipt {
+            pointers.push(RuntimeEvidencePointer::TurnReceipt(receipt.clone()));
+        }
+        pointers
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HumanAnswerExecution {
     pub answer_receipt: HumanAnswerReceipt,
     pub turn: TurnExecution,
+}
+
+impl HumanAnswerExecution {
+    pub fn evidence_pointers(&self) -> Vec<RuntimeEvidencePointer> {
+        let mut pointers = vec![RuntimeEvidencePointer::HumanAnswer(
+            self.answer_receipt.clone(),
+        )];
+        pointers.extend(self.turn.evidence_pointers());
+        pointers
+    }
 }
 
 /// One durable human suspension recovered from WhippleScript's owned store.
