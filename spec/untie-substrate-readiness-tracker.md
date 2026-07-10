@@ -51,26 +51,50 @@ Per-heading `· vN` tags below restate this at each phase.
 
 ## Phase 0 — formal models (the workspace build's model-first gate) · **v0.4**
 
-- [ ] Shared program/edit model for merge + transfer: disjoint-slice
+- [x] Shared program/edit model for merge + transfer: disjoint-slice
       composition over manifests (coverage) + the essential bite — a
       **cross-file semantic conflict that text merge silently accepts and
       slice-overlap rejects** — + an anti-dependence merge bite
-      (write-or-consume ∩ read ⇒ no certificate).
-- [ ] Confluence claim: pairwise-disjoint edits fold order-independently;
-      only overlap-graph components escalate jointly.
-- [ ] Workstream invariants imported from un-tie's `workstream.qnt`
+      (write-or-consume ∩ read ⇒ no certificate). *(2026-07-10:
+      `models/maude/merge-slice.maude` — text-proxy vs certified engine over
+      one manifest; bites: cross-file write∩read both directions,
+      consume∩read, same-declaration; coverage: same-file disjoint certified
+      merge preserving both writes, honest escalation, read∩read allowed.)*
+- [x] Confluence claim: pairwise-disjoint edits fold order-independently;
+      only overlap-graph components escalate jointly. *(2026-07-10:
+      `models/maude/merge-confluence.maude` — nondeterministic fold over the
+      full order lattice; bites: no order reaches a different cut, a 3-edit
+      overlap chain whose ends are pairwise disjoint escalates jointly
+      (neither end ever folds), no wedged normal form.)*
+- [x] Workstream invariants imported from un-tie's `workstream.qnt`
       (*membership-gates-autosync*, *archive-rehomes-members*) restated in
-      our formal stack, coverage + bite.
-- [ ] Branch-distinct effect keys bite: a counterfactual/branch effect that
+      our formal stack, coverage + bite. *(2026-07-10:
+      `models/maude/workstream.maude` — plus the note's refinements:
+      auto-admit requires a certificate (uncertified push bite) and
+      single-valued membership (double-home bite); archive closes the line
+      immediately and re-homes every member with a rebase-down pass.)*
+- [x] Branch-distinct effect keys bite: a counterfactual/branch effect that
       dedupes against a real one absent the branch id in the key (silent
-      corruption demonstrated, then rejected).
-- [ ] Selective-undo stranding bite: a file-scoped `undo` that a naive
+      corruption demonstrated, then rejected). *(2026-07-10:
+      `models/maude/branch-effect-key.maude` — naive vs branch-keyed store
+      side by side; corruption demonstrated in BOTH directions (cf absorbed
+      into real, real absorbed into cf), rejected under bkey; within-branch
+      idempotency retained.)*
+- [x] Selective-undo stranding bite: a file-scoped `undo` that a naive
       path filter accepts and the dependency-closure check rejects (a
-      later edit read the undone writes).
-- [ ] Stat-cache soundness invariant: import-back must never miss a
+      later edit read the undone writes). *(2026-07-10:
+      `models/maude/selective-undo.maude` — naive path filter accepts the
+      stranding plan (demonstrated with the stranding test true); the
+      closure check refuses it honestly, and accepts a selection that
+      contains its own reader — closure-shaped, not read-shaped.)*
+- [x] Stat-cache soundness invariant: import-back must never miss a
       same-size-same-mtime content change (git's racy-timestamp hazard) —
       model the invariant + a bite where a naive fingerprint cache
-      silently drops a real change.
+      silently drops a real change. *(2026-07-10:
+      `models/maude/stat-cache.maude` — naive importer drops the racy-granule
+      change (demonstrated: skip reachable, import unreachable); sound
+      importer re-hashes inside the racy window (trust unreachable there),
+      keeps the O(touched) trust path outside it, no spurious imports.)*
 
 ## Phase 1 — versioned-workspace floor (canonical build home) · **v0.4**
 
@@ -132,6 +156,40 @@ replace git for working branches + workstreams.)*
       no per-blob erasure, no chunk transfer, no two-plane-cut elegance.
       Trade: earlier product value + de-risked storage swap behind a
       stable API, vs. a temporary second substrate.
+
+      *Analysis (2026-07-10, decision still Jack's — the fork is
+      whip-build-order independent, so the Phase 1 floor build proceeds
+      under either branch):*
+
+      **For git-backed first.** (a) The workspace API (Phase 2's 13
+      operations) gets exercised by a real consumer (gaugedesk) months
+      earlier, so its shape hardens before the native store freezes any
+      mistake in. jj is the existence proof that semantics-over-git-objects
+      works and that the backend swap can be deferred indefinitely without
+      the surface changing. (b) Workstreams, certified merge on
+      whip-legible content, and the no-destructive verbs are the *product*
+      value; per-blob erasure and chunk transfer are substrate value —
+      shipping the former early sequences user feedback where it changes
+      design. (c) The Phase 0 models constrain the *semantics*, which are
+      backend-agnostic — nothing modeled is lost by a git interim.
+
+      **Against.** (a) A second substrate is real carrying cost: the git
+      backend needs its own two-plane-cut approximation, its own effect-id
+      keyed import discipline, and honest degradation tags — all throwaway.
+      (b) The known degradations (no per-blob erasure, no chunk transfer,
+      no two-plane-cut elegance) are exactly the properties un-tie's
+      content-erasure invariants (`HISTORY_PRESERVED`,
+      `EXPORTED_COPY_NOT_RECALLED`) eventually need discharged — a long
+      git interim invites erasure-shaped debt. (c) whip's file surface is
+      already sandbox-mediated and event-sourced (restorable context, DO
+      file plane) — unlike jj, the native store is not greenfield; Phase 1
+      mostly composes machinery that exists, so the de-risking premium is
+      smaller than jj's situation suggests.
+
+      **Lean:** build Phase 1 native floor now (fork-independent); hold the
+      git-backed gaugedesk API for a cheap *subset* trial only if gaugedesk
+      needs workstreams before Phase 1 lands. The fork's real payload is
+      gaugedesk sequencing, which lives in that repo's court.
 
 ## Phase 2 — workspace API for external hosts (the git-replacement surface) · **v0.4**
 
