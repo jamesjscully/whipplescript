@@ -24,6 +24,8 @@ sha1 = "0.10"
 chrono = { version = "0.4.45", default-features = false, features = ["alloc", "std"] }
 chrono-tz = "0.10.4"
 ureq = { version = "2", features = ["json"] }
+url = "2"
+htmd = "0.5"
 
 [features]
 # Codex/Claude delegating providers are optional (DR-0024); the owned harness is

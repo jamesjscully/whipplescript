@@ -49,8 +49,11 @@ pub const TOOL_RECALL: &str = "recall";
 pub const TOOL_LIST_TODOS: &str = "list_todos";
 pub const TOOL_ADD_TODO: &str = "add_todo";
 pub const TOOL_UPDATE_TODO: &str = "update_todo";
+pub const TOOL_WEB_SEARCH: &str = "web_search";
+pub const TOOL_WEB_FETCH: &str = "web_fetch";
 
 const TRACKER_RESOURCE: &str = "tracker";
+const WEB_RESOURCE: &str = "web";
 
 /// Default wall-clock cap for a single `bash` command, in seconds.
 const BASH_DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -278,6 +281,52 @@ fn file_tool_specs_for_turn(
         .collect()
 }
 
+/// The web tools ride the `with access to web { search fetch }` grant only
+/// (per the accepted design notes): search is provider-resolved at call
+/// time, fetch is structurally GET-only behind the central guard.
+fn web_tool_specs_for_turn(access: &TurnToolAccess) -> Vec<ToolSpec> {
+    let mut specs = Vec::new();
+    if access.web_search {
+        specs.push(ToolSpec {
+            name: TOOL_WEB_SEARCH.into(),
+            description: "Search the web. Returns ranked results (title, url, snippet, \
+                          published) — data, not fetched pages; use web_fetch to read one."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "allowed_domains": { "type": "array", "items": { "type": "string" } },
+                    "blocked_domains": { "type": "array", "items": { "type": "string" } },
+                    "freshness": { "type": "string", "description": "pd|pw|pm|py or a provider date filter" },
+                    "count": { "type": "integer", "description": "max results, capped at 20" }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        });
+    }
+    if access.web_fetch {
+        specs.push(ToolSpec {
+            name: TOOL_WEB_FETCH.into(),
+            description: "Fetch one URL (GET only). HTML is converted to markdown; binary \
+                          content returns a metadata line. Private-network and metadata \
+                          addresses are never fetchable."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" },
+                    "max_bytes": { "type": "integer", "description": "response byte cap (policy-bounded)" }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }),
+        });
+    }
+    specs
+}
+
 fn tracker_tool_specs_for_turn(
     policy: &HarnessProfilePolicy,
     access: &TurnToolAccess,
@@ -331,6 +380,10 @@ pub struct FileToolExecutor {
     /// `None` means no turn-access policy was installed (direct/test executor);
     /// `Some(false)` is the live owned-turn default-deny command policy.
     command_run_granted: Option<bool>,
+    /// The web egress doors are default-deny even for direct executor use:
+    /// the tools reach the network, so only an explicit grant opens them.
+    web_search_granted: bool,
+    web_fetch_granted: bool,
     /// `None` preserves direct/test executor behavior; live owned turns install
     /// `Some` so tracker mutations are bound to `with access to tracker { ... }`.
     tracker_access: Option<TurnTrackerAccess>,
@@ -407,6 +460,10 @@ struct TurnToolAccess {
     file_resources: Vec<String>,
     command_run: bool,
     tracker: TurnTrackerAccess,
+    /// `with access to web { search }` — the web-search egress door.
+    web_search: bool,
+    /// `with access to web { fetch }` — the GET-only fetch egress door.
+    web_fetch: bool,
 }
 
 impl TurnToolAccess {
@@ -416,6 +473,8 @@ impl TurnToolAccess {
             file_resources: Vec::new(),
             command_run: false,
             tracker: TurnTrackerAccess::deny_all(),
+            web_search: false,
+            web_fetch: false,
         }
     }
 }
@@ -711,6 +770,8 @@ impl FileToolExecutor {
             holder: "agent".to_string(),
             max_bytes: DEFAULT_MAX_BYTES,
             command_run_granted: None,
+            web_search_granted: false,
+            web_fetch_granted: false,
             tracker_access: None,
             workflow_tools: Vec::new(),
             store_path: None,
@@ -804,6 +865,8 @@ impl FileToolExecutor {
     fn with_turn_tool_access(mut self, access: TurnToolAccess) -> Self {
         self.file_policy = Some(access.file.scopes);
         self.command_run_granted = Some(access.command_run);
+        self.web_search_granted = access.web_search;
+        self.web_fetch_granted = access.web_fetch;
         self.tracker_access = Some(access.tracker);
         self
     }
@@ -914,6 +977,8 @@ impl FileToolExecutor {
             TOOL_ADD_TODO => self.add_todo(args),
             TOOL_UPDATE_TODO => self.update_todo(args),
             TOOL_BASH => self.bash(args),
+            TOOL_WEB_SEARCH => self.web_search(args),
+            TOOL_WEB_FETCH => self.web_fetch(args),
             TOOL_READ => self.read(args),
             TOOL_WRITE => self.write(args),
             TOOL_EDIT => self.edit(args),
@@ -1244,6 +1309,85 @@ impl FileToolExecutor {
     /// Run a shell command in the workspace. Default-deny: the command must match
     /// an allow-list prefix or it is refused (the sandbox boundary). Output is
     /// combined stdout+stderr, truncated; a non-zero exit is an error result.
+    /// `web_search` (accepted design note): provider resolved at call time —
+    /// Brave when a key is configured, else the provider-mediated floor, else
+    /// an honest "configure a search provider" failure. The query is egress;
+    /// results are low-integrity ingress.
+    fn web_search(&self, args: &Value) -> Result<String, String> {
+        if !self.web_search_granted {
+            return Err(
+                "web_search is not granted for this turn (`with access to web { search }` required)"
+                    .to_owned(),
+            );
+        }
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .filter(|query| !query.trim().is_empty())
+            .ok_or_else(|| "web_search needs a non-empty `query`".to_owned())?;
+        let provider =
+            crate::web_tools::resolve_search_provider().map_err(|error| error.to_tool_message())?;
+        let domains = |key: &str| -> Vec<String> {
+            args.get(key)
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let search_query = crate::web_tools::SearchQuery {
+            query: query.to_owned(),
+            allowed_domains: domains("allowed_domains"),
+            blocked_domains: domains("blocked_domains"),
+            freshness: args
+                .get("freshness")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            count: args
+                .get("count")
+                .and_then(Value::as_u64)
+                .unwrap_or(10)
+                .clamp(1, 20) as usize,
+        };
+        let results = provider
+            .search(&search_query)
+            .map_err(|error| error.to_tool_message())?;
+        Ok(crate::web_tools::results_to_tool_json(
+            &results,
+            provider.tag(),
+        ))
+    }
+
+    /// `web_fetch` (accepted design note): structurally GET-only — the only
+    /// egress is the URL string — behind the central guard (resolve-then-check,
+    /// pinned connection, redirect re-entry, unconditional private/metadata
+    /// denial). HTML converts to markdown for context economy.
+    fn web_fetch(&self, args: &Value) -> Result<String, String> {
+        if !self.web_fetch_granted {
+            return Err(
+                "web_fetch is not granted for this turn (`with access to web { fetch }` required)"
+                    .to_owned(),
+            );
+        }
+        let url = args
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.trim().is_empty())
+            .ok_or_else(|| "web_fetch needs a non-empty `url`".to_owned())?;
+        let mut policy = crate::web_tools::FetchPolicy::default();
+        if let Some(max_bytes) = args.get("max_bytes").and_then(Value::as_u64) {
+            // The caller may narrow the byte cap, never widen past policy.
+            policy.max_bytes = (max_bytes as usize).min(policy.max_bytes).max(1);
+        }
+        crate::web_tools::web_fetch(url, &policy)
+            .map(|outcome| outcome.to_tool_json())
+            .map_err(|error| error.to_tool_message())
+    }
+
     fn bash(&self, args: &Value) -> Result<String, String> {
         let command = str_arg(args, "command")?;
         if !self.profile_policy.bash {
@@ -2869,6 +3013,8 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
     let mut file_resources = Vec::<String>::new();
     let mut command_run = false;
     let mut tracker = TurnTrackerAccess::deny_all();
+    let mut web_search = false;
+    let mut web_fetch = false;
     for (grant_index, grant) in grants.iter().enumerate() {
         let resource = grant
             .get("resource")
@@ -2899,6 +3045,8 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
                     merge_grant_globs(&mut grant_write, globs)
                 }
                 "run" if resource == "command" => command_run = true,
+                "search" if resource == WEB_RESOURCE => web_search = true,
+                "fetch" if resource == WEB_RESOURCE => web_fetch = true,
                 "file" | "add" if resource == TRACKER_RESOURCE => tracker.file = true,
                 "claim" if resource == TRACKER_RESOURCE => tracker.claim = true,
                 "finish" | "complete" | "close" if resource == TRACKER_RESOURCE => {
@@ -2952,6 +3100,8 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
         file_resources,
         command_run,
         tracker,
+        web_search,
+        web_fetch,
     })
 }
 
@@ -2968,6 +3118,11 @@ fn enforce_turn_access_governance(access: &TurnToolAccess) -> Result<(), String>
             }
             if access.tracker.mutates() {
                 resources.push(TRACKER_RESOURCE.to_owned());
+            }
+            // The web tools are egress doors (query/URL leave the workspace):
+            // a governed envelope must govern the `web` resource.
+            if access.web_search || access.web_fetch {
+                resources.push(WEB_RESOURCE.to_owned());
             }
             let missing = resources
                 .into_iter()
@@ -3247,6 +3402,8 @@ pub fn run_owned_agent_turn(
         .with_turn_tool_access(turn_tool_access.clone())
         .with_resolved_profile_policy(profile_policy.clone());
     let mut tools = file_tool_specs_for_turn(&profile_policy, &turn_tool_access);
+    // Web tools (accepted 2026-07-07 design notes): granted-only egress doors.
+    tools.extend(web_tool_specs_for_turn(&turn_tool_access));
     // Tracker tools (slice 4): offered only when a tracker queue is configured.
     if let Some(queue) = std::env::var("WHIPPLESCRIPT_HARNESS_TRACKER")
         .ok()

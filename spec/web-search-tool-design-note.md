@@ -1,8 +1,9 @@
 # The web search tool — Design Note (SearchProvider trait, Brave first)
 
-**Status: ACCEPTED DESIGN NOTE (Jack, 2026-07-07; pre-build — a
-build-time DR formalizes the trait + provider protocol; §8 residuals
-land at build).** This note is the search half
+**Status: ACCEPTED (Jack, 2026-07-07) — BUILT 2026-07-10 (v0.4, native
+owned harness: `web_tools.rs`, SearchProvider trait, Brave first-party +
+Anthropic provider-mediated floor + honest absent tier; §8 residuals
+that remain open: codex-path probe, quality calibration, DO boxes).** This note is the search half
 of the **network-tool policy discussion** that the web search item in
 `owned-harness-tool-surface.md` has been gated on since the 2026-07-01
 surface-hardening pass. That item's settled shape (IFC egress/ingress,

@@ -20155,6 +20155,121 @@ rule pick
     let _ = fs::remove_dir_all(dir);
 }
 
+/// The web tools (accepted 2026-07-07 design notes, built v0.4): `web_fetch`
+/// is exposed only under `with access to web { fetch }` and every fetch runs
+/// through the central guard — a private/metadata address is refused with a
+/// typed blocked-by-policy failure BEFORE any connection exists, so this
+/// e2e is deterministic offline. The refusal is recorded in the turn like
+/// any tool result.
+#[test]
+fn owned_turn_web_fetch_guard_refuses_private_targets() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("web-fetch-guard");
+    let store_path = dir.join("store.sqlite");
+    let store = store_path.to_str().expect("utf-8 store path");
+    let ws = dir.join("workspace");
+    fs::create_dir_all(&ws).expect("workspace");
+    let src = dir.join("web.whip");
+    fs::write(
+        &src,
+        r#"
+workflow WebFetchGuard
+
+output result Done
+
+class Done {
+  note string
+}
+
+agent helper {
+  provider owned
+  profile "repo-reader"
+  capacity 1
+}
+
+rule begin
+  when started
+  when helper is available
+=> {
+  tell helper as turn
+    with access to web {
+      fetch
+    }
+  """
+  Fetch the metadata endpoint.
+  """
+
+  after turn succeeds {
+    complete result { note "done" }
+  }
+}
+"#,
+    )
+    .expect("write workflow");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store,
+            "--json",
+            "dev",
+            src.to_str().expect("utf-8 source path"),
+            "--provider",
+            "owned",
+            "--until",
+            "idle",
+        ])
+        .env(
+            "WHIPPLESCRIPT_OWNED_FIXTURE_TOOL",
+            r#"web_fetch:{"url":"http://169.254.169.254/latest/meta-data/"}"#,
+        )
+        .env("WHIPPLESCRIPT_HARNESS_WORKSPACE", &ws)
+        .output()
+        .expect("dev runs");
+    assert!(
+        output.status.success(),
+        "dev failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let json_start = stdout.find(['{', '[']).expect("json output");
+    let dev: Value = serde_json::from_str(&stdout[json_start..]).expect("dev json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    // The guard refusal is a recorded tool result inside the turn transcript:
+    // typed blocked-by-policy, never a connection.
+    let log = run_json(bin, &["--store", store, "--json", "log", instance_id]);
+    let transcript_text = log
+        .as_array()
+        .expect("event array")
+        .iter()
+        .filter(|event| {
+            event.get("event_type").and_then(Value::as_str)
+                == Some("agent.turn.brokered.transcript")
+        })
+        .map(|event| {
+            event
+                .get("payload")
+                .map(|payload| payload.to_string())
+                .unwrap_or_default()
+        })
+        .collect::<String>();
+    assert!(
+        transcript_text.contains("blocked-by-policy"),
+        "the metadata fetch must be refused by the guard: {transcript_text}"
+    );
+    assert!(
+        transcript_text.contains("never fetchable"),
+        "the refusal names the policy: {transcript_text}"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// Store-seam Phase 5: `whip handles` exposes the stable pointers an
 /// external policy authority admits decisions against (event position,
 /// effect ids, workspace cut ids), and `whip checkpoint

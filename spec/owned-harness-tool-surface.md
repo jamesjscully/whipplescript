@@ -171,8 +171,20 @@ update_todo               tracker capability; status-specific
   ingress** (taint source, like an inbound message). A capability grantable via
   `with access to` — the first real customer of the workflow authority model (a
   subagent gets web search only if delegated it). **Designs ACCEPTED
-  (Jack, 2026-07-07) — the network-tool policy gate is closed; remaining
-  work is build.** Search:
+  (Jack, 2026-07-07) — the network-tool policy gate is closed. BUILT
+  2026-07-10 (v0.4, native owned harness):** `web_search` + `web_fetch`
+  in `crates/whipplescript-cli/src/web_tools.rs`, exposed only under
+  `with access to web { search fetch }` (the grant already lowers;
+  governed envelopes must govern the `web` resource); SearchProvider
+  trait with Brave first + the Anthropic provider-mediated floor +
+  honest absent tier; fetch = GET-only behind the central guard
+  (resolve-then-check, pinned connection, per-hop redirect re-entry,
+  unconditional private/metadata denial), htmd HTML→markdown. Tests:
+  guard/mapping/filter units + e2e
+  `owned_turn_web_fetch_guard_refuses_private_targets`. Residuals: DO
+  build boxes (NeedsHttp executor + TS-shell guard + egress allowlist
+  entries) ride the DO tracker; codex-path floor probe; robots posture;
+  boilerplate-trim pass. Search:
   [`web-search-tool-design-note.md`](web-search-tool-design-note.md)
   (SearchProvider trait; Brave first, Exa/Tavily deferred; zero-config
   floor = model-provider-native search; scraping rejected). Fetch:

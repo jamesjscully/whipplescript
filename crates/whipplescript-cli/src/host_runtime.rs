@@ -1561,8 +1561,7 @@ impl GovernedHostRuntime {
         &self,
         command: &StartTurnCommand,
     ) -> Result<Option<Value>, HostRuntimeError> {
-        let run_id =
-            idempotency_key(&[&command.instance_ref, &command.command_id, "brokered-run"]);
+        let run_id = idempotency_key(&[&command.instance_ref, &command.command_id, "brokered-run"]);
         let item = self
             .kernel
             .store()

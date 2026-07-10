@@ -1,7 +1,11 @@
 # The web fetch tool — Design Note (in-house, GET-only)
 
-**Status: ACCEPTED DESIGN NOTE (Jack, 2026-07-07; pre-build — §8
-residuals land at build).** Opened by Jack 2026-07-07 as the
+**Status: ACCEPTED (Jack, 2026-07-07) — BUILT 2026-07-10 (v0.4, native
+owned harness: `web_tools.rs`, GET-only behind the central FetchGuard
+with resolve-then-check + pinned connection + redirect re-entry, htmd
+converter; §8 residuals that remain open: grant-naming settled as
+`web { fetch search }` by the `command { run }` precedent, robots
+posture, boilerplate-trim, PDF extraction, DO boxes).** Opened by Jack 2026-07-07 as the
 fetch half of the network-tool policy discussion (search half:
 `web-search-tool-design-note.md`, accepted the same day). Direction
 settled: **built in-house** — the fetchkit dependency was dropped
