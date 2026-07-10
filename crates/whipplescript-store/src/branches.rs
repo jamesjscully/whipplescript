@@ -217,6 +217,64 @@ pub struct OpRow {
     pub recorded_at: String,
 }
 
+/// One structured conflict object (vw note §7.3: base + both sides +
+/// both sides' provenance, never `<<<<<<<` markers). A recorded open
+/// conflict TAGS the branch: the state is legal — recordable,
+/// buildable-upon — and never adoptable while any conflict is open
+/// (resolution-memory.maude). The id is content-addressed from its
+/// components, so an identical conflict recurs under the same identity.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ConflictRow {
+    pub conflict_id: String,
+    pub branch_id: String,
+    pub path: String,
+    pub base: Option<String>,
+    pub ours: Option<String>,
+    pub theirs: Option<String>,
+    /// Provenance labels for both sides (branch ids / head refs).
+    pub ours_label: String,
+    pub theirs_label: String,
+    /// `open` | `resolved` | `superseded` (a later clean three-way
+    /// dissolved it).
+    pub state: String,
+    /// The resolution's content hash, when resolved.
+    pub resolution: Option<String>,
+    pub recorded_at: String,
+    pub updated_at: String,
+}
+
+impl ConflictRow {
+    /// The content-addressed conflict identity: branch, path, and the
+    /// exact triple. Components are already content hashes, so joining
+    /// them IS the content addressing.
+    pub fn identity(
+        branch_id: &str,
+        path: &str,
+        base: Option<&str>,
+        ours: Option<&str>,
+        theirs: Option<&str>,
+    ) -> String {
+        format!(
+            "cf|{branch_id}|{path}|{}|{}|{}",
+            base.unwrap_or("-"),
+            ours.unwrap_or("-"),
+            theirs.unwrap_or("-")
+        )
+    }
+
+    /// The resolution-memory key: the content triple alone (no branch,
+    /// no path) — rerere without the fragile hidden cache, and the
+    /// daemon's propagation key across descendants.
+    pub fn triple_key(base: Option<&str>, ours: Option<&str>, theirs: Option<&str>) -> String {
+        format!(
+            "tk|{}|{}|{}",
+            base.unwrap_or("-"),
+            ours.unwrap_or("-"),
+            theirs.unwrap_or("-")
+        )
+    }
+}
+
 /// Object-safe branch-tier seam, mirroring `Coordination`/`WorkItems`: the
 /// DO host supplies its own implementation over `DoSql`.
 pub trait Branches {
@@ -283,6 +341,21 @@ pub trait Branches {
     fn get_cut(&self, cut_id: &str) -> StoreResult<Option<CutRow>>;
     /// The branch's recorded cuts, newest first, up to `limit`.
     fn list_cuts(&self, branch_id: &str, limit: usize) -> StoreResult<Vec<CutRow>>;
+    /// Pointer-level state restore — `undo-op`'s compensator, and ONLY
+    /// its: re-point head, branch point, and status to a recorded
+    /// `OpBranchState`, guarded on the current head like `advance_head`.
+    /// This appends a transition (the caller records the compensating
+    /// op); it never rewrites the log. Statuses move through here even
+    /// out of terminal states — undoing an adopt re-opens the branch —
+    /// which is exactly why this method is not part of the ordinary verb
+    /// surface.
+    fn restore_branch_state(
+        &mut self,
+        branch_id: &str,
+        expected_head_cut_id: Option<&str>,
+        state: &OpBranchState,
+        at: &str,
+    ) -> StoreResult<AdvanceOutcome>;
     /// Append one operation to the op log. Idempotent per op id.
     fn record_op(
         &mut self,
@@ -295,6 +368,31 @@ pub trait Branches {
     /// The op log, newest first, up to `limit`.
     fn list_ops(&self, limit: usize) -> StoreResult<Vec<OpRow>>;
     fn get_op(&self, op_id: &str) -> StoreResult<Option<OpRow>>;
+    /// Record an open conflict object. Idempotent per conflict id; a
+    /// previously resolved/superseded identical conflict re-opens (the
+    /// same divergence recurred).
+    fn record_conflict(&mut self, row: &ConflictRow) -> StoreResult<()>;
+    /// The branch's OPEN conflicts.
+    fn open_conflicts(&self, branch_id: &str) -> StoreResult<Vec<ConflictRow>>;
+    /// Move a conflict to `resolved` (with the resolution hash) or
+    /// `superseded`. Returns false when the id is unknown.
+    fn set_conflict_state(
+        &mut self,
+        conflict_id: &str,
+        state: &str,
+        resolution: Option<&str>,
+        at: &str,
+    ) -> StoreResult<bool>;
+    /// The stored resolution for a content triple, if any.
+    fn resolution_memory(&self, triple_key: &str) -> StoreResult<Option<String>>;
+    /// Store a resolution keyed by its content triple (first one wins;
+    /// re-recording the same key is a no-op).
+    fn record_resolution_memory(
+        &mut self,
+        triple_key: &str,
+        resolution: &str,
+        at: &str,
+    ) -> StoreResult<()>;
 }
 
 #[cfg(feature = "native")]
@@ -376,6 +474,24 @@ fn map_cut_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CutRow> {
 }
 
 #[cfg(feature = "native")]
+fn map_conflict_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConflictRow> {
+    Ok(ConflictRow {
+        conflict_id: row.get(0)?,
+        branch_id: row.get(1)?,
+        path: row.get(2)?,
+        base: row.get(3)?,
+        ours: row.get(4)?,
+        theirs: row.get(5)?,
+        ours_label: row.get(6)?,
+        theirs_label: row.get(7)?,
+        state: row.get(8)?,
+        resolution: row.get(9)?,
+        recorded_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+#[cfg(feature = "native")]
 fn map_op_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<OpRow>> {
     let deltas_json: String = row.get(3)?;
     let deltas = serde_json::from_str(&deltas_json).map_err(crate::StoreError::from);
@@ -437,6 +553,27 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
             kind TEXT NOT NULL,
             deltas TEXT NOT NULL,
             origin TEXT,
+            recorded_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS conflicts (
+            conflict_id TEXT PRIMARY KEY,
+            branch_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            base TEXT,
+            ours TEXT,
+            theirs TEXT,
+            ours_label TEXT NOT NULL,
+            theirs_label TEXT NOT NULL,
+            state TEXT NOT NULL,
+            resolution TEXT,
+            recorded_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS conflicts_branch_idx
+            ON conflicts(branch_id, state);
+        CREATE TABLE IF NOT EXISTS resolution_memory (
+            triple_key TEXT PRIMARY KEY,
+            resolution TEXT NOT NULL,
             recorded_at TEXT NOT NULL
         );
         "#,
@@ -787,6 +924,41 @@ impl Branches for BranchStore {
         Ok(rows)
     }
 
+    fn restore_branch_state(
+        &mut self,
+        branch_id: &str,
+        expected_head_cut_id: Option<&str>,
+        state: &OpBranchState,
+        at: &str,
+    ) -> StoreResult<AdvanceOutcome> {
+        let tx = self.connection.transaction()?;
+        let Some(row) = Self::row_by_id(&tx, branch_id)? else {
+            return Ok(AdvanceOutcome::NotFound);
+        };
+        if row.head_cut_id.as_deref() != expected_head_cut_id {
+            return Ok(AdvanceOutcome::Stale {
+                current_head_cut_id: row.head_cut_id,
+            });
+        }
+        tx.execute(
+            "UPDATE branches SET head_cut_id = ?2, head_manifest_hash = ?3, \
+             branch_point_cut_id = ?4, branch_point_manifest_hash = ?5, \
+             status = ?6, updated_at = ?7 WHERE branch_id = ?1",
+            params![
+                branch_id,
+                state.head_cut_id,
+                state.head_manifest_hash,
+                state.branch_point_cut_id,
+                state.branch_point_manifest_hash,
+                state.status,
+                at
+            ],
+        )?;
+        let row = Self::row_by_id(&tx, branch_id)?.expect("restored row");
+        tx.commit()?;
+        Ok(AdvanceOutcome::Advanced(Box::new(row)))
+    }
+
     fn record_op(
         &mut self,
         op_id: &str,
@@ -828,6 +1000,85 @@ impl Branches for BranchStore {
             )
             .optional()?;
         row.transpose()
+    }
+
+    fn record_conflict(&mut self, row: &ConflictRow) -> StoreResult<()> {
+        // Idempotent per id; a terminal identical conflict RE-OPENS —
+        // the same divergence recurred and is once again the ask.
+        self.connection.execute(
+            "INSERT INTO conflicts (conflict_id, branch_id, path, base, ours, \
+             theirs, ours_label, theirs_label, state, resolution, recorded_at, \
+             updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', NULL, ?9, ?9) \
+             ON CONFLICT(conflict_id) DO UPDATE SET state = 'open', \
+             resolution = NULL, updated_at = ?9 WHERE state != 'open'",
+            params![
+                row.conflict_id,
+                row.branch_id,
+                row.path,
+                row.base,
+                row.ours,
+                row.theirs,
+                row.ours_label,
+                row.theirs_label,
+                row.recorded_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn open_conflicts(&self, branch_id: &str) -> StoreResult<Vec<ConflictRow>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT conflict_id, branch_id, path, base, ours, theirs, \
+             ours_label, theirs_label, state, resolution, recorded_at, updated_at \
+             FROM conflicts WHERE branch_id = ?1 AND state = 'open' ORDER BY path",
+        )?;
+        let mapped = stmt.query_map(params![branch_id], map_conflict_row)?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row?);
+        }
+        Ok(rows)
+    }
+
+    fn set_conflict_state(
+        &mut self,
+        conflict_id: &str,
+        state: &str,
+        resolution: Option<&str>,
+        at: &str,
+    ) -> StoreResult<bool> {
+        let changed = self.connection.execute(
+            "UPDATE conflicts SET state = ?2, resolution = ?3, updated_at = ?4 \
+             WHERE conflict_id = ?1",
+            params![conflict_id, state, resolution, at],
+        )?;
+        Ok(changed > 0)
+    }
+
+    fn resolution_memory(&self, triple_key: &str) -> StoreResult<Option<String>> {
+        let resolution: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT resolution FROM resolution_memory WHERE triple_key = ?1",
+                params![triple_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(resolution)
+    }
+
+    fn record_resolution_memory(
+        &mut self,
+        triple_key: &str,
+        resolution: &str,
+        at: &str,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO resolution_memory (triple_key, resolution, recorded_at) \
+             VALUES (?1, ?2, ?3)",
+            params![triple_key, resolution, at],
+        )?;
+        Ok(())
     }
 
     fn instance_branch(&self, instance_id: &str) -> StoreResult<Option<String>> {

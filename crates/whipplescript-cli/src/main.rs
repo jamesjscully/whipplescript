@@ -31332,8 +31332,18 @@ const BRANCH_USAGE: &str =
   whip branch probe <branch>\n\
   whip branch merge <branch>\n\
   whip branch restore <branch> <cut>\n\
+  whip branch attribution <branch>\n\
+  whip branch log <branch> [--limit <n>]\n\
+  whip branch bisect <branch> --good <cut> --bad <cut> --run <command>\n\
+  whip branch select <branch> <expr>\n\
+  whip branch undo <branch> <expr> [--apply]\n\
+  whip branch transport <branch> <expr> --onto <target> [--apply]\n\
+  whip branch adopt-only <branch> <expr> [--apply]\n\
+  whip branch conflicts <branch>\n\
+  whip branch resolve <branch> <path> <--ours|--theirs|--body <text>>\n\
   whip branch discard <branch>\n\
   whip branch ops [--limit <n>]\n\
+  whip branch undo-op [<op-id>]\n\
   whip branch export <branch> [--out <file>] [--delta-have <ids-file>]\n\
   whip branch import <file>\n\
   whip branch digest <branch>\n\
@@ -32639,6 +32649,427 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 }
                 Err(error) => {
                     eprintln!("branch import failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "attribution" => {
+            let Some(branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.attribution(branch_id) {
+                Ok(Some(rows)) => match serde_json::to_value(&rows) {
+                    Ok(payload) => emit_json(payload),
+                    Err(error) => {
+                        eprintln!("branch attribution failed: {error}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch attribution failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "log" => {
+            let Some(branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let limit = rest
+                .iter()
+                .position(|arg| *arg == "--limit")
+                .and_then(|index| rest.get(index + 1))
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(50);
+            match vcs.list_cuts(branch_id, limit) {
+                Ok(cuts) => match serde_json::to_value(&cuts) {
+                    Ok(payload) => emit_json(payload),
+                    Err(error) => {
+                        eprintln!("branch log failed: {error}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(error) => {
+                    eprintln!("branch log failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "bisect" => {
+            // Checkout-free bisect: candidate cuts materialize into
+            // scratch directories and the predicate runs there — no
+            // branch pointer ever moves.
+            let Some(_branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let flag = |name: &str| {
+                rest.iter()
+                    .position(|arg| *arg == name)
+                    .and_then(|index| rest.get(index + 1))
+                    .copied()
+            };
+            let (Some(good), Some(bad), Some(run)) = (flag("--good"), flag("--bad"), flag("--run"))
+            else {
+                eprintln!("`branch bisect` requires --good, --bad, --run\n{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let chain = match vcs.cut_chain(bad, good) {
+                Ok(Some(chain)) if chain.len() >= 2 => chain,
+                Ok(_) => {
+                    eprintln!("no recorded lineage from `{bad}` back to `{good}`");
+                    return ExitCode::FAILURE;
+                }
+                Err(error) => {
+                    eprintln!("branch bisect failed: {error:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let probe = |cut_id: &str| -> Result<bool, String> {
+                let manifest = vcs
+                    .cut_manifest(cut_id)
+                    .map_err(|error| format!("{error:?}"))?
+                    .ok_or_else(|| format!("cut `{cut_id}` has no manifest"))?;
+                let scratch = std::env::temp_dir()
+                    .join(format!("whip-bisect-{}-{cut_id}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&scratch);
+                whipplescript_store::materialize::materialize_manifest(
+                    &manifest,
+                    vcs.content_store(),
+                    &scratch,
+                    0,
+                )
+                .map_err(|error| format!("{error:?}"))?;
+                let status = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(run)
+                    .current_dir(&scratch)
+                    .status()
+                    .map_err(|error| error.to_string())?;
+                let _ = std::fs::remove_dir_all(&scratch);
+                Ok(status.success())
+            };
+            // Invariant: chain[lo] is good, chain[hi] is bad; find the
+            // first bad cut.
+            let mut lo = 0usize;
+            let mut hi = chain.len() - 1;
+            let mut steps = Vec::new();
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                match probe(&chain[mid].cut_id) {
+                    Ok(true) => {
+                        steps.push(json!({"cut_id": chain[mid].cut_id, "verdict": "good"}));
+                        lo = mid;
+                    }
+                    Ok(false) => {
+                        steps.push(json!({"cut_id": chain[mid].cut_id, "verdict": "bad"}));
+                        hi = mid;
+                    }
+                    Err(error) => {
+                        eprintln!("bisect probe failed at `{}`: {error}", chain[mid].cut_id);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            emit_json(json!({
+                "first_bad_cut": chain[hi].cut_id,
+                "last_good_cut": chain[lo].cut_id,
+                "change_id": chain[hi].change_id,
+                "origin": chain[hi].origin,
+                "steps": steps,
+            }))
+        }
+        "select" | "undo" | "transport" | "adopt-only" => {
+            let (Some(branch_id), Some(expr_text)) = (rest.first().copied(), rest.get(1).copied())
+            else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let expr = match whipplescript_store::selection::parse(expr_text) {
+                Ok(expr) => expr,
+                Err(error) => {
+                    eprintln!("selection did not parse: {error}");
+                    return ExitCode::from(2);
+                }
+            };
+            let apply = rest.contains(&"--apply");
+            match verb {
+                "select" => {
+                    let units = match vcs.change_units(branch_id, 500) {
+                        Ok(units) => units,
+                        Err(error) => {
+                            eprintln!("branch select failed: {error:?}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    let picked: Vec<_> = whipplescript_store::selection::eval(&expr, &units)
+                        .into_iter()
+                        .map(|index| units[index].clone())
+                        .collect();
+                    match serde_json::to_value(&picked) {
+                        Ok(payload) => emit_json(payload),
+                        Err(error) => {
+                            eprintln!("branch select failed: {error}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                "undo" => {
+                    // Dry-run is the default interaction: show the plan
+                    // (including what it would strand); --apply executes.
+                    if !apply {
+                        return match vcs.plan_undo_selection(branch_id, &expr) {
+                            Ok(Some(plan)) => match serde_json::to_value(&plan) {
+                                Ok(payload) => emit_json(json!({
+                                    "dry_run": true,
+                                    "plan": payload,
+                                })),
+                                Err(error) => {
+                                    eprintln!("branch undo failed: {error}");
+                                    ExitCode::FAILURE
+                                }
+                            },
+                            Ok(None) => {
+                                eprintln!("no such branch `{branch_id}`");
+                                ExitCode::FAILURE
+                            }
+                            Err(error) => {
+                                eprintln!("branch undo failed: {error:?}");
+                                ExitCode::FAILURE
+                            }
+                        };
+                    }
+                    use whipplescript_store::vcs::UndoSelectionOutcome;
+                    let cut_id = generated_cut_id();
+                    match vcs.apply_undo_selection(branch_id, &expr, &cut_id, &at) {
+                        Ok(UndoSelectionOutcome::Proposed {
+                            cut_id,
+                            manifest_hash,
+                            reverted_paths,
+                        }) => emit_json(json!({
+                            "undone": branch_id,
+                            "cut_id": cut_id,
+                            "manifest_hash": manifest_hash,
+                            "reverted_paths": reverted_paths,
+                        })),
+                        Ok(UndoSelectionOutcome::WouldStrand { stranded }) => {
+                            let payload = serde_json::to_value(&stranded).unwrap_or_default();
+                            eprintln!(
+                                "undo refused: the exclusion strands retained work: {payload}"
+                            );
+                            ExitCode::FAILURE
+                        }
+                        Ok(other) => {
+                            eprintln!("undo refused: {other:?}");
+                            ExitCode::FAILURE
+                        }
+                        Err(error) => {
+                            eprintln!("branch undo failed: {error:?}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                transport_like => {
+                    use whipplescript_store::vcs::TransportOutcome;
+                    let onto = rest
+                        .iter()
+                        .position(|arg| *arg == "--onto")
+                        .and_then(|index| rest.get(index + 1))
+                        .copied();
+                    if transport_like == "transport" && onto.is_none() {
+                        eprintln!("`branch transport` requires --onto <target>\n{BRANCH_USAGE}");
+                        return ExitCode::from(2);
+                    }
+                    if !apply {
+                        // Dry-run: the universe filtered to the selection
+                        // is the preview (the apply reports conflicts
+                        // instead of moving anything anyway).
+                        let units = match vcs.change_units(branch_id, 500) {
+                            Ok(units) => units,
+                            Err(error) => {
+                                eprintln!("branch {transport_like} failed: {error:?}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        let picked: Vec<_> = whipplescript_store::selection::eval(&expr, &units)
+                            .into_iter()
+                            .map(|index| units[index].clone())
+                            .collect();
+                        return match serde_json::to_value(&picked) {
+                            Ok(payload) => emit_json(json!({
+                                "dry_run": true,
+                                "would_move": payload,
+                            })),
+                            Err(error) => {
+                                eprintln!("branch {transport_like} failed: {error}");
+                                ExitCode::FAILURE
+                            }
+                        };
+                    }
+                    let cut_id = generated_cut_id();
+                    let outcome = if transport_like == "transport" {
+                        vcs.transport_selection(
+                            branch_id,
+                            &expr,
+                            onto.expect("checked above"),
+                            &cut_id,
+                            &at,
+                        )
+                    } else {
+                        vcs.adopt_only(branch_id, &expr, &cut_id, &at)
+                    };
+                    match outcome {
+                        Ok(TransportOutcome::Transported {
+                            cut_id,
+                            change_id,
+                            moved_paths,
+                        }) => emit_json(json!({
+                            "transported": branch_id,
+                            "cut_id": cut_id,
+                            "change_id": change_id,
+                            "moved_paths": moved_paths,
+                        })),
+                        Ok(TransportOutcome::UpToDate) => emit_json(json!({
+                            "transported": branch_id,
+                            "up_to_date": true,
+                        })),
+                        Ok(TransportOutcome::Conflicted { conflicts }) => {
+                            let payload = json!({
+                                "conflicted": branch_id,
+                                "conflicts":
+                                    conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+                            });
+                            eprintln!("{transport_like} conflicted: {payload}");
+                            ExitCode::FAILURE
+                        }
+                        Ok(other) => {
+                            eprintln!("{transport_like} refused: {other:?}");
+                            ExitCode::FAILURE
+                        }
+                        Err(error) => {
+                            eprintln!("branch {transport_like} failed: {error:?}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+            }
+        }
+        "conflicts" => {
+            let Some(branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.open_conflicts(branch_id) {
+                Ok(rows) => match serde_json::to_value(&rows) {
+                    Ok(payload) => emit_json(payload),
+                    Err(error) => {
+                        eprintln!("branch conflicts failed: {error}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(error) => {
+                    eprintln!("branch conflicts failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "resolve" => {
+            let (Some(branch_id), Some(path)) = (rest.first().copied(), rest.get(1).copied())
+            else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            use whipplescript_store::vcs::{ResolutionChoice, ResolveOutcome};
+            let body_arg = rest
+                .iter()
+                .position(|arg| *arg == "--body")
+                .and_then(|index| rest.get(index + 1))
+                .copied();
+            let choice = if rest.contains(&"--ours") {
+                ResolutionChoice::TakeOurs
+            } else if rest.contains(&"--theirs") {
+                ResolutionChoice::TakeTheirs
+            } else if let Some(body) = body_arg {
+                ResolutionChoice::Body(body)
+            } else {
+                eprintln!("`branch resolve` needs --ours, --theirs, or --body\n{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let cut_id = generated_cut_id();
+            match vcs.resolve_conflict(branch_id, path, choice, &cut_id, &at) {
+                Ok(ResolveOutcome::Resolved { cut_id, resolution }) => emit_json(json!({
+                    "resolved": path,
+                    "branch_id": branch_id,
+                    "cut_id": cut_id,
+                    "resolution": resolution,
+                })),
+                Ok(ResolveOutcome::NoOpenConflict) => {
+                    eprintln!("no open conflict at `{path}` on branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Ok(other) => {
+                    eprintln!("resolve refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch resolve failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "undo-op" => {
+            // Default target: the newest op — jj's `undo` ergonomics.
+            let op_id = match rest.first().copied() {
+                Some(op_id) => op_id.to_owned(),
+                None => match vcs.list_ops(1) {
+                    Ok(ops) => match ops.first() {
+                        Some(op) => op.op_id.clone(),
+                        None => {
+                            eprintln!("the op log is empty; nothing to undo");
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("branch undo-op failed: {error:?}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+            };
+            use whipplescript_store::vcs::UndoOpOutcome;
+            let undo_op_id = format!("op-undo-{}", generated_cut_id());
+            match vcs.undo_op(&op_id, &undo_op_id, &at) {
+                Ok(UndoOpOutcome::Undone { undo_op_id }) => emit_json(json!({
+                    "undone": op_id,
+                    "undo_op_id": undo_op_id,
+                })),
+                Ok(UndoOpOutcome::HeadMoved {
+                    branch_id,
+                    current_head_cut_id,
+                    expected_head_cut_id,
+                }) => {
+                    eprintln!(
+                        "undo refused: branch `{branch_id}` moved since op `{op_id}` \
+                         (head {current_head_cut_id:?}, op left it at {expected_head_cut_id:?}); \
+                         undo the newer ops first"
+                    );
+                    ExitCode::FAILURE
+                }
+                Ok(UndoOpOutcome::OpMissing) => {
+                    eprintln!("no op `{op_id}` in the log");
+                    ExitCode::FAILURE
+                }
+                Ok(UndoOpOutcome::NothingToUndo) => {
+                    eprintln!("op `{op_id}` moved no branch pointers; nothing to undo");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch undo-op failed: {error:?}");
                     ExitCode::FAILURE
                 }
             }

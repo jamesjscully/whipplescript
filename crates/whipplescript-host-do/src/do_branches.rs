@@ -17,7 +17,7 @@
 use std::collections::BTreeSet;
 
 use whipplescript_store::branches::{
-    AdvanceOutcome, BindOutcome, BranchRow, BranchStatus, Branches, CreateBranch,
+    AdvanceOutcome, BindOutcome, BranchRow, BranchStatus, Branches, ConflictRow, CreateBranch,
     CreateBranchOutcome, CutRecord, CutRow, OpBranchDelta, OpRow, StatusOutcome,
     MAINLINE_BRANCH_ID,
 };
@@ -85,6 +85,27 @@ impl<S: DoSql> DoBranches<S> {
                 kind TEXT NOT NULL,
                 deltas TEXT NOT NULL,
                 origin TEXT,
+                recorded_at TEXT NOT NULL
+            )",
+            "CREATE TABLE IF NOT EXISTS conflicts (
+                conflict_id TEXT PRIMARY KEY,
+                branch_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                base TEXT,
+                ours TEXT,
+                theirs TEXT,
+                ours_label TEXT NOT NULL,
+                theirs_label TEXT NOT NULL,
+                state TEXT NOT NULL,
+                resolution TEXT,
+                recorded_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS conflicts_branch_idx
+                ON conflicts(branch_id, state)",
+            "CREATE TABLE IF NOT EXISTS resolution_memory (
+                triple_key TEXT PRIMARY KEY,
+                resolution TEXT NOT NULL,
                 recorded_at TEXT NOT NULL
             )",
         ] {
@@ -532,6 +553,43 @@ impl<S: DoSql> Branches for DoBranches<S> {
         Ok(rows.iter().map(|row| decode_cut_row(row)).collect())
     }
 
+    fn restore_branch_state(
+        &mut self,
+        branch_id: &str,
+        expected_head_cut_id: Option<&str>,
+        state: &whipplescript_store::branches::OpBranchState,
+        at: &str,
+    ) -> StoreResult<AdvanceOutcome> {
+        let Some(row) = self.row_by_id(branch_id)? else {
+            return Ok(AdvanceOutcome::NotFound);
+        };
+        if row.head_cut_id.as_deref() != expected_head_cut_id {
+            return Ok(AdvanceOutcome::Stale {
+                current_head_cut_id: row.head_cut_id,
+            });
+        }
+        self.sql
+            .execute(
+                "UPDATE branches SET head_cut_id = ?2, head_manifest_hash = ?3, \
+                 branch_point_cut_id = ?4, branch_point_manifest_hash = ?5, \
+                 status = ?6, updated_at = ?7 WHERE branch_id = ?1",
+                &[
+                    text(branch_id),
+                    opt_text(state.head_cut_id.as_deref()),
+                    opt_text(state.head_manifest_hash.as_deref()),
+                    opt_text(state.branch_point_cut_id.as_deref()),
+                    opt_text(state.branch_point_manifest_hash.as_deref()),
+                    text(&state.status),
+                    text(at),
+                ],
+            )
+            .map_err(sql_err)?;
+        let row = self
+            .row_by_id(branch_id)?
+            .ok_or_else(|| StoreError::Conflict("restored row missing".to_owned()))?;
+        Ok(AdvanceOutcome::Advanced(Box::new(row)))
+    }
+
     fn record_op(
         &mut self,
         op_id: &str,
@@ -581,6 +639,99 @@ impl<S: DoSql> Branches for DoBranches<S> {
             .map_err(sql_err)?;
         rows.first().map(|row| decode_op_row(row)).transpose()
     }
+
+    fn record_conflict(&mut self, row: &ConflictRow) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "INSERT INTO conflicts (conflict_id, branch_id, path, base, ours, \
+                 theirs, ours_label, theirs_label, state, resolution, recorded_at, \
+                 updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', NULL, ?9, ?9) \
+                 ON CONFLICT(conflict_id) DO UPDATE SET state = 'open', \
+                 resolution = NULL, updated_at = ?9 WHERE state != 'open'",
+                &[
+                    text(&row.conflict_id),
+                    text(&row.branch_id),
+                    text(&row.path),
+                    opt_text(row.base.as_deref()),
+                    opt_text(row.ours.as_deref()),
+                    opt_text(row.theirs.as_deref()),
+                    text(&row.ours_label),
+                    text(&row.theirs_label),
+                    text(&row.recorded_at),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn open_conflicts(&self, branch_id: &str) -> StoreResult<Vec<ConflictRow>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT conflict_id, branch_id, path, base, ours, theirs, \
+                 ours_label, theirs_label, state, resolution, recorded_at, updated_at \
+                 FROM conflicts WHERE branch_id = ?1 AND state = 'open' ORDER BY path",
+                &[text(branch_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|row| decode_conflict_row(row)).collect())
+    }
+
+    fn set_conflict_state(
+        &mut self,
+        conflict_id: &str,
+        state: &str,
+        resolution: Option<&str>,
+        at: &str,
+    ) -> StoreResult<bool> {
+        self.sql
+            .execute(
+                "UPDATE conflicts SET state = ?2, resolution = ?3, updated_at = ?4 \
+                 WHERE conflict_id = ?1",
+                &[
+                    text(conflict_id),
+                    text(state),
+                    opt_text(resolution),
+                    text(at),
+                ],
+            )
+            .map_err(sql_err)?;
+        let rows = self
+            .sql
+            .query(
+                "SELECT 1 FROM conflicts WHERE conflict_id = ?1",
+                &[text(conflict_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(!rows.is_empty())
+    }
+
+    fn resolution_memory(&self, triple_key: &str) -> StoreResult<Option<String>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT resolution FROM resolution_memory WHERE triple_key = ?1",
+                &[text(triple_key)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+
+    fn record_resolution_memory(
+        &mut self,
+        triple_key: &str,
+        resolution: &str,
+        at: &str,
+    ) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO resolution_memory (triple_key, resolution, recorded_at) \
+                 VALUES (?1, ?2, ?3)",
+                &[text(triple_key), text(resolution), text(at)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
 }
 
 fn decode_cut_row(row: &[SqlValue]) -> CutRow {
@@ -592,6 +743,23 @@ fn decode_cut_row(row: &[SqlValue]) -> CutRow {
         parent_cut_id: as_opt_text(&row[4]),
         origin: as_opt_text(&row[5]),
         recorded_at: as_text(&row[6]),
+    }
+}
+
+fn decode_conflict_row(row: &[SqlValue]) -> ConflictRow {
+    ConflictRow {
+        conflict_id: as_text(&row[0]),
+        branch_id: as_text(&row[1]),
+        path: as_text(&row[2]),
+        base: as_opt_text(&row[3]),
+        ours: as_opt_text(&row[4]),
+        theirs: as_opt_text(&row[5]),
+        ours_label: as_text(&row[6]),
+        theirs_label: as_text(&row[7]),
+        state: as_text(&row[8]),
+        resolution: as_opt_text(&row[9]),
+        recorded_at: as_text(&row[10]),
+        updated_at: as_text(&row[11]),
     }
 }
 

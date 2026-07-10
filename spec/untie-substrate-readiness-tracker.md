@@ -457,7 +457,7 @@ replace git for working branches + workstreams.)*
       (`EXPORTED_COPY_NOT_RECALLED`). Note: content-addressed
       re-ingestion of identical bytes re-creates the payload under the
       same hash — an erase after re-ingestion must be re-issued.
-- [ ] **Selection algebra + selective verbs** (vw note §7.3): a
+- [x] **Selection algebra + selective verbs** (vw note §7.3): a
       **revset-shaped composable expression language** (∪/∩/− plus
       structural operators: `dependents-of`, `slice-of`, `by-effect`,
       `in-branch`) over provenance events (path/declaration/effect/
@@ -467,20 +467,78 @@ replace git for working branches + workstreams.)*
       `transport <selection>` (dual-identity-preserving — reunifies at
       later merge; divergence detected); `adopt --only <selection>`;
       dry-run previews as default.
-- [ ] Structured conflict surface: conflict objects (base + both sides +
+      **DONE 2026-07-10:** `selection.rs` — grammar `| ~ &` (loosest→
+      tightest) + parens; atoms `path(glob)/by-effect/by-origin/
+      in-branch/change/cut/since/until/dependents-of(expr)`; universe =
+      change-units from cut lineage (cut, path, before→after,
+      provenance). `undo <selection>` refuses stranding exclusions per
+      selective-undo.maude (path-level dependence = the slicer seam's
+      conservative floor; `dependents-of` repairs); the applied undo is
+      a counterfactual proposal cut tagged `undo-selection`.
+      `transport_selection` carries the change id when the selection is
+      ONE change (cherry-pick reunifies) and refuses overlap with the
+      target's divergence, moving nothing. `adopt_only` = transport onto
+      the parent; the remainder stays live. CLI `whip branch
+      select/undo/transport/adopt-only` — dry-run default, `--apply`
+      executes. RESIDUAL (grammar is closed under new atoms): `decl()` /
+      `slice-of(gauge)` land when the slicer joins as this algebra's
+      client; agent/instance atoms need write-provenance rows the effect
+      plane doesn't yet stamp per-cut beyond effect-derived cut ids.
+- [x] Structured conflict surface: conflict objects (base + both sides +
       provenance) per declaration/path; **conflict-bearing cuts are
       legal, tagged states** (never adoptable while conflicted; work
       proceeds around and atop them); per-item resolution as a
       provenance-carrying edit re-running gates; **resolution memory**
       keyed by content-addressed conflict pairs, with resolutions
       **auto-propagating to descendants** via the reconciliation daemon.
-- [ ] Provenance archaeology surfaces: write-attribution query
+      **DONE 2026-07-10** (modeled first: resolution-memory.maude —
+      adoption-gate bite, exact-triple-match bite, work-proceeds +
+      propagation coverage): a conflicted reconcile RECORDS each residue
+      as an open conflict object (`conflicts` table, both hosts; id =
+      content-addressed from branch/path/triple; identical recurrence
+      re-opens) and supersedes rows the latest three-way no longer
+      produces — the table stays truthful, never a stale block. Writes
+      proceed atop the tagged state; `merge` refuses while any row is
+      open (belt over the three-way's own re-detection). `whip branch
+      conflicts` lists; `whip branch resolve <path> --ours|--theirs|
+      --body` is an ordinary provenance-carrying cut that closes the row
+      and stores memory keyed by the triple — PLUS the post-resolution
+      triple (base, resolution, theirs), so the branch's own next
+      reconcile folds while theirs is unchanged and a moved theirs is
+      honestly a NEW conflict. Memory consult runs FIRST in conflict
+      refinement (before the source merger) on every reconcile tick =
+      daemon auto-propagation to descendants; erased resolutions never
+      re-materialize (fail closed). Gates re-run at merge time via the
+      recompile-checked source-merge path; the recorded resolution cut
+      carries `resolve` provenance.
+- [x] Provenance archaeology surfaces: write-attribution query
       (blame-superseding), lineage/log views; checkout-free bisect over
       materialized cuts (mostly pre-answered by evidence attribution —
       surface, not machinery).
-- [ ] **Workspace-operation undo as a front-and-center verb** ("undo the
+      **DONE 2026-07-10:** `whip branch attribution` (newest recorded
+      unit per live path: cut/change/origin/time — provenance, not line
+      ranges), `whip branch log` (recorded cuts with lineage + origins;
+      `whip branch ops` is the operation view), `whip branch bisect
+      --good --bad --run <cmd>` (binary search over the recorded
+      parent-pointer cut chain; each probe MATERIALIZES the cut's
+      manifest into a scratch dir and runs the predicate there — no
+      branch pointer ever moves). Surfaces over existing machinery, as
+      specified.
+- [x] **Workspace-operation undo as a front-and-center verb** ("undo the
       adopt", "undo that reconciliation") — the op-log query surfaced as
       jj's most-loved feature, not left as a property.
+      **DONE 2026-07-10** (modeled first: op-undo.maude — moved-head
+      bite, double-apply bite, append-only + undo-of-undo coverage):
+      `whip branch undo-op [<op-id>]` (no arg = the newest op, jj's
+      ergonomics) re-points EVERY branch the op touched back to its
+      recorded before-state as a NEW compensating op — the log only
+      appends; undo-of-undo is the same verb on the compensator. Guard:
+      any touched branch not exactly where the op left it is an honest
+      refusal (undo the newer ops first), never a lost update. Undoing a
+      merge re-points the parent AND re-opens the adopted branch (the
+      `restore_branch_state` compensator is the ONLY path through
+      terminal statuses); undoing a create closes the head (discard —
+      the record survives). Both hosts.
 
 ## Phase 3 — conversational runtime readiness (the Pi-replacement surface, whip half) · **v0.3** (fork item → v0.4)
 

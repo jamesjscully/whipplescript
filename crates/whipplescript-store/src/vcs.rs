@@ -208,6 +208,107 @@ pub struct ReconcileEntry {
     pub behind: bool,
 }
 
+/// One path's write-attribution: who last wrote it, as what change,
+/// from what origin (blame-superseding — provenance, not line ranges).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PathAttribution {
+    pub path: String,
+    pub cut_id: Option<String>,
+    pub change_id: Option<String>,
+    pub origin: Option<String>,
+    pub recorded_at: Option<String>,
+}
+
+/// A previewed `undo <selection>` (dry-run is the default interaction:
+/// agents show before they do).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UndoSelectionPlan {
+    pub selected: Vec<crate::selection::ChangeUnit>,
+    /// Retained later units whose inputs the undo would remove — a
+    /// non-empty list refuses the apply (selective-undo.maude).
+    pub stranded: Vec<crate::selection::ChangeUnit>,
+    /// Path → the content it reverts to (`None` = the path disappears).
+    pub reverts: BTreeMap<String, Option<String>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UndoSelectionOutcome {
+    Proposed {
+        cut_id: String,
+        manifest_hash: String,
+        reverted_paths: Vec<String>,
+    },
+    WouldStrand {
+        stranded: Vec<crate::selection::ChangeUnit>,
+    },
+    NothingSelected,
+    BranchMissing,
+    BranchNotActive,
+}
+
+/// Outcome of `transport <selection>` / `adopt --only <selection>`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransportOutcome {
+    Transported {
+        cut_id: String,
+        change_id: String,
+        moved_paths: Vec<String>,
+    },
+    /// Every selected unit is already on the target.
+    UpToDate,
+    /// The selection overlaps the target's own divergence: honest
+    /// conflicts, nothing moves.
+    Conflicted {
+        conflicts: Vec<PathConflict>,
+    },
+    NothingSelected,
+    BranchMissing,
+    TargetMissing,
+    TargetNotActive,
+}
+
+/// How to resolve one conflict item.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolutionChoice<'a> {
+    TakeOurs,
+    TakeTheirs,
+    Body(&'a str),
+}
+
+/// Outcome of a per-item conflict resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolveOutcome {
+    Resolved {
+        cut_id: String,
+        /// The resolution's content hash (`None` = resolved by deletion).
+        resolution: Option<String>,
+    },
+    NoOpenConflict,
+    /// The chosen side's payload is gone (erased) and cannot be
+    /// re-materialized.
+    ContentUnavailable,
+    BranchMissing,
+    BranchNotActive,
+}
+
+/// Outcome of `undo-op`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UndoOpOutcome {
+    Undone {
+        undo_op_id: String,
+    },
+    /// The moved-head refusal (op-undo.maude's bite): some touched
+    /// branch is no longer where the op left it.
+    HeadMoved {
+        branch_id: String,
+        current_head_cut_id: Option<String>,
+        expected_head_cut_id: Option<String>,
+    },
+    OpMissing,
+    /// The op moved no branch pointers (e.g. an erasure record).
+    NothingToUndo,
+}
+
 pub struct WorkspaceVcs<B: Branches, C: ContentBlobs> {
     branches: B,
     content: C,
@@ -496,21 +597,47 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         }
     }
 
-    /// Source-aware conflict refinement: for each conflicted `.whip` path
-    /// with both sides present, ask the installed merger for a certified
-    /// declaration-granularity merge; certified content is stored and
-    /// folded, everything else stays an honest conflict (fail closed:
-    /// no merger, delete-vs-modify, or non-source paths never refine).
+    /// Conflict refinement, two stages. First the RESOLUTION MEMORY
+    /// (resolution-memory.maude): a conflict whose content-addressed
+    /// triple was resolved before applies the stored resolution — the
+    /// daemon's auto-propagation to descendants; rerere as ordinary
+    /// workspace-plane knowledge, exact triple match only. Then
+    /// source-aware refinement: for each conflicted `.whip` path with
+    /// both sides present, ask the installed merger for a certified
+    /// declaration-granularity merge. Remembered/certified content is
+    /// stored and folded, everything else stays an honest conflict
+    /// (fail closed: no merger, delete-vs-modify, or non-source paths
+    /// never refine).
     fn refine_source_conflicts(
         &self,
         conflicts: Vec<PathConflict>,
     ) -> StoreResult<(BTreeMap<String, String>, Vec<PathConflict>)> {
-        let Some(merger) = self.source_merger.as_deref() else {
-            return Ok((BTreeMap::new(), conflicts));
-        };
         let mut resolved = BTreeMap::new();
-        let mut remaining = Vec::new();
+        let mut unremembered = Vec::new();
         for conflict in conflicts {
+            let key = crate::branches::ConflictRow::triple_key(
+                conflict.base.as_deref(),
+                conflict.ours.as_deref(),
+                conflict.theirs.as_deref(),
+            );
+            if let Some(resolution) = self.branches.resolution_memory(&key)? {
+                // Apply only while the resolution's payload is live —
+                // an erased resolution cannot re-materialize.
+                if matches!(
+                    self.content.status(&resolution)?,
+                    crate::content::BlobStatus::Live { .. }
+                ) {
+                    resolved.insert(conflict.path.clone(), resolution);
+                    continue;
+                }
+            }
+            unremembered.push(conflict);
+        }
+        let Some(merger) = self.source_merger.as_deref() else {
+            return Ok((resolved, unremembered));
+        };
+        let mut remaining = Vec::new();
+        for conflict in unremembered {
             let refinable = conflict.path.ends_with(".whip")
                 && conflict.ours.is_some()
                 && conflict.theirs.is_some();
@@ -540,6 +667,156 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             }
         }
         Ok((resolved, remaining))
+    }
+
+    /// Record the CURRENT three-way's residue as the branch's open
+    /// conflict set: new conflicts open (or re-open), open rows the
+    /// latest three-way no longer produces are superseded — the table
+    /// stays truthful to the latest reconciliation, never a stale block.
+    fn sync_conflict_table(
+        &mut self,
+        branch_id: &str,
+        current: &[PathConflict],
+        at: &str,
+    ) -> StoreResult<()> {
+        let mut current_ids = std::collections::BTreeSet::new();
+        for conflict in current {
+            let conflict_id = crate::branches::ConflictRow::identity(
+                branch_id,
+                &conflict.path,
+                conflict.base.as_deref(),
+                conflict.ours.as_deref(),
+                conflict.theirs.as_deref(),
+            );
+            current_ids.insert(conflict_id.clone());
+            self.branches
+                .record_conflict(&crate::branches::ConflictRow {
+                    conflict_id,
+                    branch_id: branch_id.to_owned(),
+                    path: conflict.path.clone(),
+                    base: conflict.base.clone(),
+                    ours: conflict.ours.clone(),
+                    theirs: conflict.theirs.clone(),
+                    ours_label: conflict.ours_side.label.clone(),
+                    theirs_label: conflict.theirs_side.label.clone(),
+                    state: "open".to_owned(),
+                    resolution: None,
+                    recorded_at: at.to_owned(),
+                    updated_at: at.to_owned(),
+                })?;
+        }
+        for stale in self.branches.open_conflicts(branch_id)? {
+            if !current_ids.contains(&stale.conflict_id) {
+                self.branches
+                    .set_conflict_state(&stale.conflict_id, "superseded", None, at)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A clean three-way dissolves every open conflict on the branch.
+    fn supersede_open_conflicts(&mut self, branch_id: &str, at: &str) -> StoreResult<()> {
+        for stale in self.branches.open_conflicts(branch_id)? {
+            self.branches
+                .set_conflict_state(&stale.conflict_id, "superseded", None, at)?;
+        }
+        Ok(())
+    }
+
+    /// The branch's open conflict objects (the ask surface).
+    pub fn open_conflicts(
+        &self,
+        branch_id: &str,
+    ) -> StoreResult<Vec<crate::branches::ConflictRow>> {
+        self.branches.open_conflicts(branch_id)
+    }
+
+    /// Resolve one open conflict per-item (vw note §7.3): take-ours /
+    /// take-theirs / an authored body. The resolution is an ORDINARY
+    /// provenance-carrying write on the branch (a cut with origin
+    /// `resolve:<path>`), the conflict row closes, and the resolution
+    /// enters the content-addressed memory — from where the daemon
+    /// auto-propagates it to any descendant hitting the identical pair.
+    pub fn resolve_conflict(
+        &mut self,
+        branch_id: &str,
+        path: &str,
+        choice: ResolutionChoice<'_>,
+        cut_id: &str,
+        at: &str,
+    ) -> StoreResult<ResolveOutcome> {
+        let open = self.branches.open_conflicts(branch_id)?;
+        let Some(conflict) = open.into_iter().find(|row| row.path == path) else {
+            return Ok(ResolveOutcome::NoOpenConflict);
+        };
+        let body = match choice {
+            ResolutionChoice::TakeOurs => match conflict.ours.as_deref() {
+                Some(hash) => self.content.get(hash)?,
+                None => None,
+            },
+            ResolutionChoice::TakeTheirs => match conflict.theirs.as_deref() {
+                Some(hash) => self.content.get(hash)?,
+                None => None,
+            },
+            ResolutionChoice::Body(body) => Some(body.to_owned()),
+        };
+        let Some(body) = body else {
+            // Take-side of a deletion or an erased payload: nothing to
+            // materialize. Deleting IS a legal resolution when the side
+            // is an absence.
+            let deleting = matches!(
+                (&choice, &conflict.ours, &conflict.theirs),
+                (ResolutionChoice::TakeOurs, None, _) | (ResolutionChoice::TakeTheirs, _, None)
+            );
+            if !deleting {
+                return Ok(ResolveOutcome::ContentUnavailable);
+            }
+            match self.write(branch_id, path, None, cut_id, at)? {
+                VcsWriteOutcome::Written { .. } => {}
+                VcsWriteOutcome::BranchMissing => return Ok(ResolveOutcome::BranchMissing),
+                VcsWriteOutcome::BranchNotActive => return Ok(ResolveOutcome::BranchNotActive),
+            }
+            self.branches
+                .set_conflict_state(&conflict.conflict_id, "resolved", None, at)?;
+            return Ok(ResolveOutcome::Resolved {
+                cut_id: cut_id.to_owned(),
+                resolution: None,
+            });
+        };
+        match self.write(branch_id, path, Some(&body), cut_id, at)? {
+            VcsWriteOutcome::Written { .. } => {}
+            VcsWriteOutcome::BranchMissing => return Ok(ResolveOutcome::BranchMissing),
+            VcsWriteOutcome::BranchNotActive => return Ok(ResolveOutcome::BranchNotActive),
+        }
+        let resolution_hash = self.content.put(&body)?;
+        self.branches.set_conflict_state(
+            &conflict.conflict_id,
+            "resolved",
+            Some(&resolution_hash),
+            at,
+        )?;
+        let key = crate::branches::ConflictRow::triple_key(
+            conflict.base.as_deref(),
+            conflict.ours.as_deref(),
+            conflict.theirs.as_deref(),
+        );
+        self.branches
+            .record_resolution_memory(&key, &resolution_hash, at)?;
+        // The branch's own next three-way sees (base, RESOLUTION, theirs)
+        // — the resolution was authored in full knowledge of theirs, so
+        // it re-applies verbatim while theirs is unchanged; a moved
+        // theirs changes the triple and is honestly a NEW conflict.
+        let post_key = crate::branches::ConflictRow::triple_key(
+            conflict.base.as_deref(),
+            Some(&resolution_hash),
+            conflict.theirs.as_deref(),
+        );
+        self.branches
+            .record_resolution_memory(&post_key, &resolution_hash, at)?;
+        Ok(ResolveOutcome::Resolved {
+            cut_id: cut_id.to_owned(),
+            resolution: Some(resolution_hash),
+        })
     }
 
     /// One reconciliation-daemon tick for one branch: fold the parent's
@@ -587,6 +864,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             return Ok(ReconcileOutcome::NoParent);
         };
         if Self::cut_ref(&branch.branch_point_cut_id) == Self::cut_ref(&parent.head_cut_id) {
+            self.supersede_open_conflicts(branch_id, at)?;
             return Ok(ReconcileOutcome::UpToDate);
         }
         let branch_side = MergeSide {
@@ -608,7 +886,10 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             &parent_side,
             quiescent,
         ) {
-            RebaseDownPlan::UpToDate => return Ok(ReconcileOutcome::UpToDate),
+            RebaseDownPlan::UpToDate => {
+                self.supersede_open_conflicts(branch_id, at)?;
+                return Ok(ReconcileOutcome::UpToDate);
+            }
             RebaseDownPlan::Silent { new_head_manifest } => new_head_manifest,
             RebaseDownPlan::DeferredMidRun => return Ok(ReconcileOutcome::DeferredMidRun),
             RebaseDownPlan::AskAtQuiescence { conflicts } => {
@@ -632,6 +913,12 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 debug_assert_eq!(raw.len(), conflicts.len());
                 let (resolved, remaining) = self.refine_source_conflicts(raw)?;
                 if !remaining.is_empty() {
+                    // The residue is the ask AND the tag: record each as
+                    // an open conflict object on the branch (conflict-
+                    // bearing state — legal, buildable-upon, never
+                    // adoptable), superseding open rows the new
+                    // three-way no longer produces.
+                    self.sync_conflict_table(branch_id, &remaining, at)?;
                     return Ok(ReconcileOutcome::Conflicts {
                         conflicts: remaining,
                     });
@@ -641,6 +928,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 manifest
             }
         };
+        self.supersede_open_conflicts(branch_id, at)?;
         let rebased_hash = self.store_manifest(&new_head)?;
         let parent_head_cut = parent.head_cut_id.clone().unwrap_or_default();
         let parent_head_hash = parent
@@ -734,6 +1022,31 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             ReconcileOutcome::BranchMissing => return Ok(VcsMergeOutcome::BranchMissing),
             ReconcileOutcome::BranchNotActive => return Ok(VcsMergeOutcome::BranchNotActive),
             ReconcileOutcome::NoParent => return Ok(VcsMergeOutcome::NoParent),
+        }
+        // The tagged-state guard (resolution-memory.maude): a branch with
+        // open conflict objects is never adoptable, whatever the current
+        // three-way says.
+        let open = self.branches.open_conflicts(branch_id)?;
+        if !open.is_empty() {
+            return Ok(VcsMergeOutcome::Conflicted {
+                conflicts: open
+                    .into_iter()
+                    .map(|row| PathConflict {
+                        path: row.path,
+                        base: row.base,
+                        ours: row.ours,
+                        theirs: row.theirs,
+                        ours_side: MergeSide {
+                            label: row.ours_label,
+                            cut_id: None,
+                        },
+                        theirs_side: MergeSide {
+                            label: row.theirs_label,
+                            cut_id: None,
+                        },
+                    })
+                    .collect(),
+            });
         }
 
         let head = self.load_manifest(branch.head_manifest_hash.as_deref())?;
@@ -1106,6 +1419,468 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             blobs,
             cuts,
         }))
+    }
+
+    /// Undo one workspace operation (jj's most-loved feature as a
+    /// front-and-center verb; op-undo.maude): re-point every branch the
+    /// op touched back to its recorded before-state, as a NEW
+    /// compensating op — the log is append-only, undo-of-undo is the
+    /// same verb on the compensator. Guarded per the model's bite: any
+    /// touched branch whose head moved since the op is an honest
+    /// refusal, never a lost update. Undoing a creation closes the head
+    /// (discard — the record survives; no destructive verbs).
+    pub fn undo_op(
+        &mut self,
+        op_id: &str,
+        undo_op_id: &str,
+        at: &str,
+    ) -> StoreResult<UndoOpOutcome> {
+        let Some(op) = self.branches.get_op(op_id)? else {
+            return Ok(UndoOpOutcome::OpMissing);
+        };
+        if op.deltas.is_empty() {
+            return Ok(UndoOpOutcome::NothingToUndo);
+        }
+        // Guard pass: every touched branch must still be exactly where
+        // the op left it (the model's moved-head bite).
+        for delta in &op.deltas {
+            let Some(row) = self.branches.get_branch(&delta.branch_id)? else {
+                return Ok(UndoOpOutcome::HeadMoved {
+                    branch_id: delta.branch_id.clone(),
+                    current_head_cut_id: None,
+                    expected_head_cut_id: delta.after.head_cut_id.clone(),
+                });
+            };
+            if OpBranchState::of(&row) != delta.after {
+                return Ok(UndoOpOutcome::HeadMoved {
+                    branch_id: delta.branch_id.clone(),
+                    current_head_cut_id: row.head_cut_id,
+                    expected_head_cut_id: delta.after.head_cut_id.clone(),
+                });
+            }
+        }
+        // Apply pass: restore each branch to its before-state.
+        let mut undo_deltas = Vec::new();
+        for delta in &op.deltas {
+            let row = self
+                .branches
+                .get_branch(&delta.branch_id)?
+                .ok_or_else(|| StoreError::Conflict("branch vanished mid-undo".to_owned()))?;
+            let restored = match &delta.before {
+                Some(before) => {
+                    match self.branches.restore_branch_state(
+                        &delta.branch_id,
+                        row.head_cut_id.as_deref(),
+                        before,
+                        at,
+                    )? {
+                        AdvanceOutcome::Advanced(restored) => restored,
+                        other => {
+                            return Err(StoreError::Conflict(format!(
+                                "undo of `{op_id}` could not restore `{}`: {other:?}",
+                                delta.branch_id
+                            )))
+                        }
+                    }
+                }
+                None => {
+                    // The op created this branch: the compensator closes
+                    // the head. The record remains readable history.
+                    match self.branches.discard_branch(&delta.branch_id, at)? {
+                        StatusOutcome::Done(discarded) => discarded,
+                        other => {
+                            return Err(StoreError::Conflict(format!(
+                                "undo of `{op_id}` could not close created branch `{}`: {other:?}",
+                                delta.branch_id
+                            )))
+                        }
+                    }
+                }
+            };
+            undo_deltas.push(OpBranchDelta {
+                branch_id: delta.branch_id.clone(),
+                before: Some(delta.after.clone()),
+                after: OpBranchState::of(&restored),
+            });
+        }
+        self.log_op(
+            undo_op_id,
+            "undo",
+            undo_deltas,
+            Some(&format!("undo:{op_id}")),
+            at,
+        )?;
+        Ok(UndoOpOutcome::Undone {
+            undo_op_id: undo_op_id.to_owned(),
+        })
+    }
+
+    /// The branch's recorded change-units, oldest first (the selection
+    /// algebra's universe): each cut's manifest diffed against its
+    /// lineage parent. Cuts without a readable manifest pair are
+    /// skipped rather than fabricated.
+    pub fn change_units(
+        &self,
+        branch_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::selection::ChangeUnit>> {
+        let mut cuts = self.branches.list_cuts(branch_id, limit)?;
+        cuts.reverse(); // oldest first: the dependence direction
+        let mut units = Vec::new();
+        for cut in cuts {
+            let after = match self.content.get(&cut.manifest_hash)? {
+                Some(body) => serde_json::from_str::<BTreeMap<String, String>>(&body)
+                    .map_err(StoreError::from)?,
+                None => continue,
+            };
+            let before = match cut.parent_cut_id.as_deref() {
+                None => BTreeMap::new(),
+                Some(parent_cut) => match self.branches.get_cut(parent_cut)? {
+                    None => BTreeMap::new(),
+                    Some(parent) => match self.content.get(&parent.manifest_hash)? {
+                        Some(body) => serde_json::from_str(&body).map_err(StoreError::from)?,
+                        None => continue,
+                    },
+                },
+            };
+            for path in Self::diff_paths(&before, &after) {
+                units.push(crate::selection::ChangeUnit {
+                    seq: units.len(),
+                    cut_id: cut.cut_id.clone(),
+                    change_id: cut.change_id.clone(),
+                    branch_id: cut.branch_id.clone(),
+                    path: path.clone(),
+                    before: before.get(&path).cloned(),
+                    after: after.get(&path).cloned(),
+                    origin: cut.origin.clone(),
+                    recorded_at: cut.recorded_at.clone(),
+                });
+            }
+        }
+        Ok(units)
+    }
+
+    /// Plan `undo <selection>` (vw note §7.3; selective-undo.maude): the
+    /// proposal = current head minus the selected writes; the stranding
+    /// check refuses when a RETAINED later unit consumed an undone
+    /// write's output. Pure preview — `None` = no such branch.
+    pub fn plan_undo_selection(
+        &self,
+        branch_id: &str,
+        expr: &crate::selection::SelExpr,
+    ) -> StoreResult<Option<UndoSelectionPlan>> {
+        if self.branches.get_branch(branch_id)?.is_none() {
+            return Ok(None);
+        }
+        let universe = self.change_units(branch_id, 500)?;
+        let selected = crate::selection::eval(expr, &universe);
+        let stranded = crate::selection::stranded_by_undo(&selected, &universe);
+        // Per affected path, revert to the OLDEST selected unit's before
+        // (the net exclusion of every selected write on that path).
+        let mut reverts: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for &index in &selected {
+            let unit = &universe[index];
+            reverts
+                .entry(unit.path.clone())
+                .or_insert_with(|| unit.before.clone());
+        }
+        Ok(Some(UndoSelectionPlan {
+            selected: selected.iter().map(|&i| universe[i].clone()).collect(),
+            stranded: stranded.iter().map(|&i| universe[i].clone()).collect(),
+            reverts,
+        }))
+    }
+
+    /// Apply an undo-selection plan: one proposal cut on the branch —
+    /// honestly a counterfactual state (a state that never ran), tagged
+    /// by its origin until gates revalidate. Refuses a stranding plan.
+    pub fn apply_undo_selection(
+        &mut self,
+        branch_id: &str,
+        expr: &crate::selection::SelExpr,
+        cut_id: &str,
+        at: &str,
+    ) -> StoreResult<UndoSelectionOutcome> {
+        let Some(plan) = self.plan_undo_selection(branch_id, expr)? else {
+            return Ok(UndoSelectionOutcome::BranchMissing);
+        };
+        if !plan.stranded.is_empty() {
+            return Ok(UndoSelectionOutcome::WouldStrand {
+                stranded: plan.stranded,
+            });
+        }
+        if plan.reverts.is_empty() {
+            return Ok(UndoSelectionOutcome::NothingSelected);
+        }
+        let Some(row) = self.branches.get_branch(branch_id)? else {
+            return Ok(UndoSelectionOutcome::BranchMissing);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(UndoSelectionOutcome::BranchNotActive);
+        }
+        let mut manifest = self.load_manifest(row.head_manifest_hash.as_deref())?;
+        for (path, before) in &plan.reverts {
+            match before {
+                Some(hash) => {
+                    manifest.insert(path.clone(), hash.clone());
+                }
+                None => {
+                    manifest.remove(path);
+                }
+            }
+        }
+        let manifest_hash = self.store_manifest(&manifest)?;
+        match self.branches.advance_head(
+            branch_id,
+            row.head_cut_id.as_deref(),
+            cut_id,
+            &manifest_hash,
+            at,
+        )? {
+            AdvanceOutcome::Advanced(advanced) => {
+                // A counterfactual proposal is a NEW intent; the origin
+                // is the synthetic tag until gates revalidate.
+                self.branches.record_cut(CutRecord {
+                    cut_id,
+                    change_id: cut_id,
+                    branch_id,
+                    manifest_hash: &manifest_hash,
+                    parent_cut_id: row.head_cut_id.as_deref(),
+                    origin: Some("undo-selection"),
+                    recorded_at: at,
+                })?;
+                self.log_op(
+                    &format!("op-{cut_id}"),
+                    "undo-selection",
+                    vec![Self::op_delta(Some(&row), &advanced)],
+                    Some("undo-selection"),
+                    at,
+                )?;
+                Ok(UndoSelectionOutcome::Proposed {
+                    cut_id: cut_id.to_owned(),
+                    manifest_hash,
+                    reverted_paths: plan.reverts.keys().cloned().collect(),
+                })
+            }
+            AdvanceOutcome::Stale { .. } => Err(StoreError::Conflict(
+                "branch head moved during the undo; retry".to_owned(),
+            )),
+            AdvanceOutcome::NotActive { .. } => Ok(UndoSelectionOutcome::BranchNotActive),
+            AdvanceOutcome::NotFound => Ok(UndoSelectionOutcome::BranchMissing),
+        }
+    }
+
+    /// `transport <selection> onto <target>` — cherry-pick done right:
+    /// the selected units' net content lands on the target as one cut
+    /// that PRESERVES IDENTITY when the whole selection is one change
+    /// (the eventual full merge reunifies instead of duplicating).
+    /// Certified precondition per path: the target currently holds the
+    /// unit's recorded BEFORE (or already holds the after — idempotent
+    /// skip); anything else is an honest conflict and nothing moves.
+    pub fn transport_selection(
+        &mut self,
+        branch_id: &str,
+        expr: &crate::selection::SelExpr,
+        onto: &str,
+        cut_id: &str,
+        at: &str,
+    ) -> StoreResult<TransportOutcome> {
+        if self.branches.get_branch(branch_id)?.is_none() {
+            return Ok(TransportOutcome::BranchMissing);
+        }
+        let Some(target) = self.branches.get_branch(onto)? else {
+            return Ok(TransportOutcome::TargetMissing);
+        };
+        if target.status != BranchStatus::Active {
+            return Ok(TransportOutcome::TargetNotActive);
+        }
+        let universe = self.change_units(branch_id, 500)?;
+        let selected = crate::selection::eval(expr, &universe);
+        if selected.is_empty() {
+            return Ok(TransportOutcome::NothingSelected);
+        }
+        // Net effect per path = the NEWEST selected unit; its BEFORE is
+        // the certified precondition on the target.
+        let mut net: BTreeMap<String, &crate::selection::ChangeUnit> = BTreeMap::new();
+        for &index in &selected {
+            let unit = &universe[index];
+            let entry = net.entry(unit.path.clone()).or_insert(unit);
+            if unit.seq > entry.seq {
+                *entry = unit;
+            }
+        }
+        let mut manifest = self.load_manifest(target.head_manifest_hash.as_deref())?;
+        let mut conflicts = Vec::new();
+        let mut moved = Vec::new();
+        for (path, unit) in &net {
+            let current = manifest.get(path);
+            if current == unit.after.as_ref() {
+                continue; // already there: the idempotent skip
+            }
+            if current != unit.before.as_ref() {
+                conflicts.push(PathConflict {
+                    path: path.clone(),
+                    base: unit.before.clone(),
+                    ours: current.cloned(),
+                    theirs: unit.after.clone(),
+                    ours_side: MergeSide {
+                        label: onto.to_owned(),
+                        cut_id: target.head_cut_id.clone(),
+                    },
+                    theirs_side: MergeSide {
+                        label: branch_id.to_owned(),
+                        cut_id: Some(unit.cut_id.clone()),
+                    },
+                });
+                continue;
+            }
+            moved.push((path.clone(), unit.after.clone()));
+        }
+        if !conflicts.is_empty() {
+            return Ok(TransportOutcome::Conflicted { conflicts });
+        }
+        if moved.is_empty() {
+            return Ok(TransportOutcome::UpToDate);
+        }
+        for (path, after) in &moved {
+            match after {
+                Some(hash) => {
+                    manifest.insert(path.clone(), hash.clone());
+                }
+                None => {
+                    manifest.remove(path);
+                }
+            }
+        }
+        // Identity preservation: a single-change selection carries its
+        // change id; a mixed selection is honestly a new intent.
+        let changes: std::collections::BTreeSet<&str> = selected
+            .iter()
+            .map(|&i| universe[i].change_id.as_str())
+            .collect();
+        let transported_change = if changes.len() == 1 {
+            (*changes.iter().next().expect("one")).to_owned()
+        } else {
+            cut_id.to_owned()
+        };
+        let manifest_hash = self.store_manifest(&manifest)?;
+        match self.branches.advance_head(
+            onto,
+            target.head_cut_id.as_deref(),
+            cut_id,
+            &manifest_hash,
+            at,
+        )? {
+            AdvanceOutcome::Advanced(advanced) => {
+                let origin = format!("transport:{branch_id}");
+                self.branches.record_cut(CutRecord {
+                    cut_id,
+                    change_id: &transported_change,
+                    branch_id: onto,
+                    manifest_hash: &manifest_hash,
+                    parent_cut_id: target.head_cut_id.as_deref(),
+                    origin: Some(&origin),
+                    recorded_at: at,
+                })?;
+                self.log_op(
+                    &format!("op-{cut_id}"),
+                    "transport",
+                    vec![Self::op_delta(Some(&target), &advanced)],
+                    Some(&origin),
+                    at,
+                )?;
+                Ok(TransportOutcome::Transported {
+                    cut_id: cut_id.to_owned(),
+                    change_id: transported_change,
+                    moved_paths: moved.into_iter().map(|(path, _)| path).collect(),
+                })
+            }
+            AdvanceOutcome::Stale { .. } => Err(StoreError::Conflict(
+                "target head moved during the transport; retry".to_owned(),
+            )),
+            AdvanceOutcome::NotActive { .. } => Ok(TransportOutcome::TargetNotActive),
+            AdvanceOutcome::NotFound => Ok(TransportOutcome::TargetMissing),
+        }
+    }
+
+    /// `adopt --only <selection>`: partial adoption — the selected
+    /// fraction of the branch's delta lands on its parent line, the
+    /// REMAINDER stays live on the branch (never festering as
+    /// uncommitted state; the branch is not adopted).
+    pub fn adopt_only(
+        &mut self,
+        branch_id: &str,
+        expr: &crate::selection::SelExpr,
+        cut_id: &str,
+        at: &str,
+    ) -> StoreResult<TransportOutcome> {
+        let Some(branch) = self.branches.get_branch(branch_id)? else {
+            return Ok(TransportOutcome::BranchMissing);
+        };
+        let Some(parent_id) = branch.parent_branch_id else {
+            return Ok(TransportOutcome::TargetMissing);
+        };
+        self.transport_selection(branch_id, expr, &parent_id, cut_id, at)
+    }
+
+    /// Write-attribution (vw note §7.3: blame is a weak projection of
+    /// "which cut/change/effect wrote this, under what intent"): the
+    /// newest recorded unit per live path on the branch. `None` = no
+    /// such branch.
+    pub fn attribution(&self, branch_id: &str) -> StoreResult<Option<Vec<PathAttribution>>> {
+        let Some(manifest) = self.manifest(branch_id)? else {
+            return Ok(None);
+        };
+        let units = self.change_units(branch_id, 500)?;
+        let mut attributions = Vec::new();
+        for path in manifest.keys() {
+            let last = units.iter().rev().find(|unit| unit.path == *path);
+            attributions.push(PathAttribution {
+                path: path.clone(),
+                cut_id: last.map(|unit| unit.cut_id.clone()),
+                change_id: last.map(|unit| unit.change_id.clone()),
+                origin: last.and_then(|unit| unit.origin.clone()),
+                recorded_at: last.map(|unit| unit.recorded_at.clone()),
+            });
+        }
+        Ok(Some(attributions))
+    }
+
+    /// The cut chain from `descendant` back to `ancestor`, inclusive,
+    /// via recorded parent pointers — checkout-free bisect's substrate.
+    /// `None` = no recorded path between them.
+    pub fn cut_chain(&self, descendant: &str, ancestor: &str) -> StoreResult<Option<Vec<CutRow>>> {
+        let mut chain = Vec::new();
+        let mut cursor = Some(descendant.to_owned());
+        let mut guard = 0usize;
+        while let Some(cut_id) = cursor {
+            let Some(cut) = self.branches.get_cut(&cut_id)? else {
+                return Ok(None);
+            };
+            cursor = cut.parent_cut_id.clone();
+            let done = cut.cut_id == ancestor;
+            chain.push(cut);
+            if done {
+                chain.reverse(); // ancestor first
+                return Ok(Some(chain));
+            }
+            guard += 1;
+            if guard > 10_000 {
+                return Err(StoreError::Conflict(
+                    "cut lineage exceeds the walk bound".to_owned(),
+                ));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A recorded cut's manifest (bisect materializes these directly —
+    /// no branch pointer ever moves). `None` = unrecorded cut.
+    pub fn cut_manifest(&self, cut_id: &str) -> StoreResult<Option<BTreeMap<String, String>>> {
+        let Some(cut) = self.branches.get_cut(cut_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.load_manifest(Some(&cut.manifest_hash))?))
     }
 
     /// The transferable-unit ids this store can serve for the branch's
@@ -2170,6 +2945,364 @@ mod tests {
         };
         assert_eq!(change_id, "cut_a1");
         assert_ne!(ours_manifest_hash, theirs_manifest_hash);
+    }
+
+    /// Op-undo mirrors op-undo.maude: undo re-points to the recorded
+    /// before-state as a NEW op (append-only; undo-of-undo returns);
+    /// the moved-head bite refuses instead of losing the newer work;
+    /// undoing a merge re-opens the adopted branch and re-points the
+    /// parent; undoing a create closes the head.
+    #[test]
+    fn undo_op_repoints_appends_and_refuses_moved_heads() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("create");
+        vcs.write("draft_a", "a.md", Some("v1"), "cut_a1", "t2")
+            .expect("write");
+        vcs.write("draft_a", "a.md", Some("v2"), "cut_a2", "t3")
+            .expect("write");
+        // Undo the second write: head returns to cut_a1, the log grew.
+        assert_eq!(
+            vcs.undo_op("op-cut_a2", "undo_1", "t4").expect("undo"),
+            UndoOpOutcome::Undone {
+                undo_op_id: "undo_1".to_owned()
+            }
+        );
+        assert_eq!(
+            vcs.read("draft_a", "a.md").expect("read").as_deref(),
+            Some("v1")
+        );
+        // The moved-head bite: op-cut_a1's after-state is no longer
+        // where the branch is (the undo moved it) — refused, honest.
+        assert!(matches!(
+            vcs.undo_op("op-cut_a2", "undo_dup", "t5").expect("undo"),
+            UndoOpOutcome::HeadMoved { .. },
+        ));
+        // Undo-of-undo: the same verb on the compensator returns to v2.
+        assert_eq!(
+            vcs.undo_op("undo_1", "undo_2", "t6").expect("undo"),
+            UndoOpOutcome::Undone {
+                undo_op_id: "undo_2".to_owned()
+            }
+        );
+        assert_eq!(
+            vcs.read("draft_a", "a.md").expect("read").as_deref(),
+            Some("v2")
+        );
+        // Undo the merge: mainline re-points AND the branch re-opens.
+        vcs.merge("draft_a", "cut_merge_1", "t7").expect("merge");
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "a.md")
+                .expect("read")
+                .as_deref(),
+            Some("v2")
+        );
+        assert_eq!(
+            vcs.undo_op("op-cut_merge_1", "undo_3", "t8").expect("undo"),
+            UndoOpOutcome::Undone {
+                undo_op_id: "undo_3".to_owned()
+            }
+        );
+        assert_eq!(vcs.read(MAINLINE_BRANCH_ID, "a.md").expect("read"), None);
+        assert_eq!(
+            vcs.get_branch("draft_a").expect("get").expect("row").status,
+            BranchStatus::Active,
+            "undoing the adopt re-opens the branch"
+        );
+        // Undo a create: the compensator closes the head.
+        vcs.create_branch("draft_b", None, MAINLINE_BRANCH_ID, "t9")
+            .expect("create");
+        assert_eq!(
+            vcs.undo_op("op-create-draft_b", "undo_4", "t10")
+                .expect("undo"),
+            UndoOpOutcome::Undone {
+                undo_op_id: "undo_4".to_owned()
+            }
+        );
+        assert_eq!(
+            vcs.get_branch("draft_b").expect("get").expect("row").status,
+            BranchStatus::Discarded
+        );
+        // The log is append-only: every op is still there, plus the
+        // compensators.
+        let kinds: Vec<String> = vcs
+            .list_ops(20)
+            .expect("ops")
+            .into_iter()
+            .map(|op| op.kind)
+            .collect();
+        assert_eq!(kinds.iter().filter(|kind| *kind == "undo").count(), 4);
+        assert!(kinds.iter().any(|kind| kind == "merge"));
+    }
+
+    /// The structured conflict surface mirrors resolution-memory.maude:
+    /// a conflicted reconcile records open conflict objects (the tagged
+    /// state — work proceeds atop it, adoption refuses); per-item
+    /// resolution is an ordinary provenance-carrying write that stores
+    /// content-addressed memory; the daemon auto-applies the memory to a
+    /// descendant's IDENTICAL pair (and never to a different base).
+    #[test]
+    fn conflict_objects_gate_adoption_and_memory_propagates() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.write(MAINLINE_BRANCH_ID, "a.md", Some("A0"), "cut_m1", "t1")
+            .expect("write");
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("create");
+        vcs.write("draft_a", "a.md", Some("ours A"), "cut_d1", "t3")
+            .expect("write");
+        vcs.write(MAINLINE_BRANCH_ID, "a.md", Some("theirs A"), "cut_m2", "t4")
+            .expect("write");
+        // The conflicted reconcile records the open conflict object with
+        // both sides' provenance.
+        assert!(matches!(
+            vcs.reconcile_branch("draft_a", true, "cut_r1", "t5")
+                .expect("reconcile"),
+            ReconcileOutcome::Conflicts { .. }
+        ));
+        let open = vcs.open_conflicts("draft_a").expect("open");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].path, "a.md");
+        assert_eq!(open[0].ours_label, "draft_a");
+        assert_eq!(open[0].theirs_label, MAINLINE_BRANCH_ID);
+        // Work proceeds atop the tagged state...
+        assert!(matches!(
+            vcs.write("draft_a", "other.md", Some("more work"), "cut_d2", "t6")
+                .expect("write"),
+            VcsWriteOutcome::Written { .. }
+        ));
+        // ...but adoption refuses while a conflict is open.
+        assert!(matches!(
+            vcs.merge("draft_a", "cut_merge_1", "t7").expect("merge"),
+            VcsMergeOutcome::Conflicted { .. }
+        ));
+        // Per-item authored resolution: closes the row, stores memory,
+        // and the branch then merges clean.
+        let outcome = vcs
+            .resolve_conflict(
+                "draft_a",
+                "a.md",
+                ResolutionChoice::Body("ours A + theirs A"),
+                "cut_res1",
+                "t8",
+            )
+            .expect("resolve");
+        let ResolveOutcome::Resolved {
+            resolution: Some(resolution),
+            ..
+        } = outcome
+        else {
+            panic!("expected a stored resolution, got {outcome:?}");
+        };
+        assert!(vcs.open_conflicts("draft_a").expect("open").is_empty());
+        assert!(matches!(
+            vcs.merge("draft_a", "cut_merge_2", "t9").expect("merge"),
+            VcsMergeOutcome::Adopted { .. }
+        ));
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "a.md")
+                .expect("read")
+                .as_deref(),
+            Some("ours A + theirs A")
+        );
+        // Propagation: a sibling with the IDENTICAL triple (same base
+        // A0, same ours, same theirs) auto-resolves from memory during
+        // its reconcile — no ask, no authored input.
+        // Rebuild the shape on a fresh pair of branches: mainline back
+        // to A0, sibling writes "ours A", mainline moves to "theirs A".
+        vcs.write(MAINLINE_BRANCH_ID, "a.md", Some("A0"), "cut_m3", "t10")
+            .expect("write");
+        vcs.create_branch("draft_b", None, MAINLINE_BRANCH_ID, "t11")
+            .expect("create");
+        vcs.write("draft_b", "a.md", Some("ours A"), "cut_b1", "t12")
+            .expect("write");
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "a.md",
+            Some("theirs A"),
+            "cut_m4",
+            "t13",
+        )
+        .expect("write");
+        assert!(matches!(
+            vcs.reconcile_branch("draft_b", true, "cut_r2", "t14")
+                .expect("reconcile"),
+            ReconcileOutcome::Rebased { .. },
+        ));
+        assert_eq!(
+            vcs.read("draft_b", "a.md").expect("read").as_deref(),
+            Some("ours A + theirs A"),
+            "the stored resolution auto-propagated to the identical pair"
+        );
+        assert_eq!(
+            vcs.branches.cut_change_id("cut_res1").expect("cut"),
+            Some("cut_res1".to_owned()),
+            "the resolution was an ordinary provenance-carrying cut"
+        );
+        let _ = resolution;
+        // The bite: a DIFFERENT base with the same sides does NOT
+        // auto-apply — content addressing, not similarity.
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "a.md",
+            Some("B0 different base"),
+            "cut_m5",
+            "t15",
+        )
+        .expect("write");
+        vcs.create_branch("draft_c", None, MAINLINE_BRANCH_ID, "t16")
+            .expect("create");
+        vcs.write("draft_c", "a.md", Some("ours A"), "cut_c1", "t17")
+            .expect("write");
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "a.md",
+            Some("theirs A"),
+            "cut_m6",
+            "t18",
+        )
+        .expect("write");
+        assert!(matches!(
+            vcs.reconcile_branch("draft_c", true, "cut_r3", "t19")
+                .expect("reconcile"),
+            ReconcileOutcome::Conflicts { .. },
+        ));
+    }
+
+    /// The selective verbs over the recorded universe: undo <selection>
+    /// refuses a stranding exclusion and proposes a counterfactual cut
+    /// otherwise (selective-undo.maude); dependents-of repairs the
+    /// selection; transport carries identity and refuses overlap;
+    /// adopt --only moves a fraction while the remainder stays live.
+    #[test]
+    fn selective_verbs_undo_transport_and_partial_adopt() {
+        use crate::selection::parse;
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("create");
+        vcs.write("draft_a", "p1.md", Some("e1 out"), "e1", "t2")
+            .expect("write");
+        vcs.write("draft_a", "p2.md", Some("e2 out"), "e2", "t3")
+            .expect("write");
+        vcs.write("draft_a", "p2.md", Some("e3 out"), "e3", "t4")
+            .expect("write");
+        // The universe records three units with lineage.
+        let units = vcs.change_units("draft_a", 100).expect("units");
+        assert_eq!(units.len(), 3);
+        assert_eq!(units[0].path, "p1.md");
+        assert_eq!(units[2].before, units[1].after);
+        // Undoing e2 alone strands e3 (the model's bite): refused, and
+        // the dry-run plan names the stranded unit.
+        let plan = vcs
+            .plan_undo_selection("draft_a", &parse("cut(e2)").expect("parse"))
+            .expect("plan")
+            .expect("branch");
+        assert_eq!(plan.stranded.len(), 1);
+        assert_eq!(plan.stranded[0].cut_id, "e3");
+        assert!(matches!(
+            vcs.apply_undo_selection("draft_a", &parse("cut(e2)").expect("parse"), "u1", "t5")
+                .expect("undo"),
+            UndoSelectionOutcome::WouldStrand { .. }
+        ));
+        assert_eq!(
+            vcs.read("draft_a", "p2.md").expect("read").as_deref(),
+            Some("e3 out"),
+            "a refused undo moves nothing"
+        );
+        // dependents-of(e2) closes the selection; the undo applies and
+        // p2 returns to its pre-e2 state (absent).
+        let outcome = vcs
+            .apply_undo_selection(
+                "draft_a",
+                &parse("dependents-of(cut(e2))").expect("parse"),
+                "u2",
+                "t6",
+            )
+            .expect("undo");
+        assert!(matches!(outcome, UndoSelectionOutcome::Proposed { .. }));
+        assert_eq!(vcs.read("draft_a", "p2.md").expect("read"), None);
+        assert_eq!(
+            vcs.read("draft_a", "p1.md").expect("read").as_deref(),
+            Some("e1 out"),
+            "unselected work is untouched"
+        );
+        // Transport e1 onto mainline: identity-preserving (one change).
+        let outcome = vcs
+            .transport_selection(
+                "draft_a",
+                &parse("cut(e1)").expect("parse"),
+                MAINLINE_BRANCH_ID,
+                "tp1",
+                "t7",
+            )
+            .expect("transport");
+        let TransportOutcome::Transported { change_id, .. } = outcome else {
+            panic!("expected a transport, got {outcome:?}");
+        };
+        assert_eq!(change_id, "e1", "cherry-pick preserves the change id");
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "p1.md")
+                .expect("read")
+                .as_deref(),
+            Some("e1 out")
+        );
+        // A conflicting transport refuses honestly: mainline's p1 moved.
+        vcs.write(MAINLINE_BRANCH_ID, "p1.md", Some("main p1"), "m1", "t8")
+            .expect("write");
+        vcs.write("draft_a", "p1.md", Some("e4 out"), "e4", "t9")
+            .expect("write");
+        assert!(matches!(
+            vcs.transport_selection(
+                "draft_a",
+                &parse("cut(e4)").expect("parse"),
+                MAINLINE_BRANCH_ID,
+                "tp2",
+                "t10",
+            )
+            .expect("transport"),
+            TransportOutcome::Conflicted { .. }
+        ));
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "p1.md")
+                .expect("read")
+                .as_deref(),
+            Some("main p1"),
+            "a conflicted transport moves nothing"
+        );
+        // adopt --only: a fraction lands on the parent, the branch stays
+        // active with its remainder.
+        vcs.write("draft_a", "keep.md", Some("stays"), "e5", "t11")
+            .expect("write");
+        vcs.write("draft_a", "give.md", Some("goes"), "e6", "t12")
+            .expect("write");
+        assert!(matches!(
+            vcs.adopt_only(
+                "draft_a",
+                &parse("path(give.md)").expect("parse"),
+                "ao1",
+                "t13"
+            )
+            .expect("adopt-only"),
+            TransportOutcome::Transported { .. }
+        ));
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "give.md")
+                .expect("read")
+                .as_deref(),
+            Some("goes")
+        );
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "keep.md").expect("read"),
+            None,
+            "the remainder did not adopt"
+        );
+        assert_eq!(
+            vcs.get_branch("draft_a").expect("get").expect("row").status,
+            BranchStatus::Active,
+            "partial adoption never closes the branch"
+        );
     }
 
     #[test]

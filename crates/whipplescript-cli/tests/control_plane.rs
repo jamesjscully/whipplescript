@@ -19814,6 +19814,193 @@ fn branch_probe_status_restore_and_op_log_surface() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// The interactive VCS surface end to end: the selection algebra
+/// (select / undo with dry-run default + stranding refusal / adopt-only),
+/// structured conflicts with per-item resolution and memory, op-undo of
+/// a selective undo, and the archaeology views (attribution, log,
+/// checkout-free bisect).
+#[test]
+fn branch_selective_verbs_conflicts_and_archaeology() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("branch-selective");
+    let branches = dir.join("branches.sqlite");
+    let content = dir.join("vcs-content.sqlite");
+    let envs: &[(&str, &str)] = &[
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE",
+            branches.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            content.to_str().expect("utf-8"),
+        ),
+    ];
+    let branch = |args: &[&str]| {
+        let mut full = vec!["--json", "branch"];
+        full.extend_from_slice(args);
+        run_json_with_env(bin, &full, envs)
+    };
+    let branch_expect_fail = |args: &[&str]| {
+        let mut full = vec!["--json", "branch"];
+        full.extend_from_slice(args);
+        let out = Command::new(bin)
+            .args(&full)
+            .envs(
+                envs.iter()
+                    .copied()
+                    .map(|(k, v)| (k.to_owned(), v.to_owned())),
+            )
+            .output()
+            .expect("runs");
+        assert!(!out.status.success(), "expected a refusal for {args:?}");
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+
+    branch(&["create", "draft_a"]);
+    branch(&["write", "draft_a", "p1.md", "--body", "e1 out"]);
+    branch(&["write", "draft_a", "p2.md", "--body", "e2 out"]);
+    branch(&["write", "draft_a", "p2.md", "--body", "e3 out"]);
+
+    // The selection surface: two units on p2.md.
+    let selected = branch(&["select", "draft_a", "path(p2.md)"]);
+    assert_eq!(selected.as_array().map(Vec::len), Some(2));
+    let e2_cut = selected
+        .pointer("/0/cut_id")
+        .and_then(Value::as_str)
+        .expect("cut id")
+        .to_owned();
+
+    // Undo is dry-run by default: the plan for the stranding selection
+    // NAMES what it would strand, and nothing moves.
+    let dry = branch(&["undo", "draft_a", &format!("cut({e2_cut})")]);
+    assert_eq!(dry.get("dry_run").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        dry.pointer("/plan/stranded")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    // Applying the stranding selection refuses.
+    let stderr = branch_expect_fail(&["undo", "draft_a", &format!("cut({e2_cut})"), "--apply"]);
+    assert!(stderr.contains("strands"), "got: {stderr}");
+    assert_eq!(
+        branch(&["read", "draft_a", "p2.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("e3 out"),
+        "a refused undo moves nothing"
+    );
+    // The closure repairs it; the apply proposes the counterfactual cut.
+    let undone = branch(&[
+        "undo",
+        "draft_a",
+        &format!("dependents-of(cut({e2_cut}))"),
+        "--apply",
+    ]);
+    assert_eq!(
+        undone.get("undone").and_then(Value::as_str),
+        Some("draft_a")
+    );
+    let read_gone = Command::new(bin)
+        .args(["--json", "branch", "read", "draft_a", "p2.md"])
+        .envs(
+            envs.iter()
+                .copied()
+                .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        )
+        .output()
+        .expect("runs");
+    assert!(!read_gone.status.success(), "p2.md was undone");
+    // Op-undo of the selective undo brings it straight back.
+    let opundo = branch(&["undo-op"]);
+    assert!(opundo.get("undone").is_some());
+    assert_eq!(
+        branch(&["read", "draft_a", "p2.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("e3 out"),
+        "undo-op reverses the selective undo"
+    );
+
+    // Structured conflicts: divergent same-path edits escalate, the
+    // conflict object is recorded with provenance, resolution is
+    // per-item and the branch then merges clean.
+    branch(&["write", "main", "clash.md", "--body", "base"]);
+    branch(&["create", "draft_b"]);
+    branch(&["write", "draft_b", "clash.md", "--body", "ours"]);
+    branch(&["write", "main", "clash.md", "--body", "theirs"]);
+    branch_expect_fail(&["merge", "draft_b"]);
+    let conflicts = branch(&["conflicts", "draft_b"]);
+    assert_eq!(
+        conflicts.pointer("/0/path").and_then(Value::as_str),
+        Some("clash.md")
+    );
+    assert_eq!(
+        conflicts.pointer("/0/theirs_label").and_then(Value::as_str),
+        Some("main")
+    );
+    let resolved = branch(&[
+        "resolve", "draft_b", "clash.md", "--body", "ours + theirs",
+    ]);
+    assert!(resolved.get("resolution").and_then(Value::as_str).is_some());
+    let merged = branch(&["merge", "draft_b"]);
+    assert_eq!(merged.get("into").and_then(Value::as_str), Some("main"));
+    assert_eq!(
+        branch(&["read", "main", "clash.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("ours + theirs")
+    );
+
+    // Archaeology: attribution names the last writer per path; the log
+    // walks recorded cuts; bisect finds the first bad cut checkout-free.
+    let attribution = branch(&["attribution", "draft_a"]);
+    let p1 = attribution
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row.get("path").and_then(Value::as_str) == Some("p1.md"))
+        .expect("p1 attribution");
+    assert_eq!(
+        p1.get("origin").and_then(Value::as_str),
+        Some("write:p1.md")
+    );
+    let log = branch(&["log", "draft_a"]);
+    assert!(log.as_array().map(Vec::len).unwrap_or(0) >= 4);
+
+    // Bisect over a fresh chain: v1..v4 of quality.md, "bug" enters at v3.
+    branch(&["create", "draft_c"]);
+    branch(&["write", "draft_c", "quality.md", "--body", "v1 fine"]);
+    branch(&["write", "draft_c", "quality.md", "--body", "v2 fine"]);
+    branch(&["write", "draft_c", "quality.md", "--body", "v3 bug"]);
+    branch(&["write", "draft_c", "quality.md", "--body", "v4 bug"]);
+    let chain = branch(&["log", "draft_c"]);
+    let cuts: Vec<&str> = chain
+        .as_array()
+        .expect("cuts")
+        .iter()
+        .filter_map(|cut| cut.get("cut_id").and_then(Value::as_str))
+        .collect();
+    // Newest first: cuts[0]=v4(bad), cuts[3]=v1(good).
+    let verdict = branch(&[
+        "bisect",
+        "draft_c",
+        "--good",
+        cuts[3],
+        "--bad",
+        cuts[0],
+        "--run",
+        "! grep -q bug quality.md",
+    ]);
+    assert_eq!(
+        verdict.get("first_bad_cut").and_then(Value::as_str),
+        Some(cuts[1]),
+        "the v3 cut introduced the bug"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// Per-instance effect dispatch onto branch working sets: `whip dev
 /// --branch` binds the instance at birth, so its `file.write` effect
 /// resolves through the branch's COW working set — the real directory
