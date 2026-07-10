@@ -1861,7 +1861,7 @@ impl GovernedHostRuntime {
             .store()
             .list_effects(&command.instance_ref)
             .map_err(HostRuntimeError::Store)?;
-        match effects
+        let resumed_effect = match effects
             .iter()
             .find(|effect| effect.effect_id == command.command_id)
         {
@@ -1873,7 +1873,7 @@ impl GovernedHostRuntime {
             Some(effect) if is_terminal_effect(&effect.status) => {
                 return self.finish_execution(command);
             }
-            Some(_) => {}
+            Some(_) => true,
             None => {
                 self.kernel
                     .commit_rule(RuleCommit {
@@ -1908,28 +1908,37 @@ impl GovernedHostRuntime {
                         ])),
                     })
                     .map_err(HostRuntimeError::Store)?;
+                false
             }
-        }
+        };
 
-        let images = command
-            .input
-            .images
-            .iter()
-            .map(|image| {
-                let resolved = resources
-                    .resolve_image(image)
-                    .map_err(HostRuntimeError::Resolver)?;
-                if resolved.media_type.trim().is_empty() {
-                    return Err(HostRuntimeError::Resolver(
-                        "resolved image has no media type".to_owned(),
-                    ));
-                }
-                Ok(ImageBlock {
-                    media_type: resolved.media_type,
-                    data_base64: base64_encode(&resolved.bytes),
+        // Message-scoped image handles are resolved only when the effect is
+        // first committed. A suspended effect already has its exact brokered
+        // transcript; resumption must not require the embedding host to retain
+        // or replay the original ephemeral bytes.
+        let images = if resumed_effect {
+            Vec::new()
+        } else {
+            command
+                .input
+                .images
+                .iter()
+                .map(|image| {
+                    let resolved = resources
+                        .resolve_image(image)
+                        .map_err(HostRuntimeError::Resolver)?;
+                    if resolved.media_type.trim().is_empty() {
+                        return Err(HostRuntimeError::Resolver(
+                            "resolved image has no media type".to_owned(),
+                        ));
+                    }
+                    Ok(ImageBlock {
+                        media_type: resolved.media_type,
+                        data_base64: base64_encode(&resolved.bytes),
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, HostRuntimeError>>()?;
+                .collect::<Result<Vec<_>, HostRuntimeError>>()?
+        };
         let executor = ResolverToolExecutor {
             offered: &package.tools,
             admitted_resources: &command.resources,
