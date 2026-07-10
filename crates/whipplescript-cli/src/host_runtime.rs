@@ -132,9 +132,6 @@ impl AuthoredAgentPackage {
         let mut capabilities = manifest.capabilities;
         capabilities.sort();
         capabilities.dedup();
-        if capabilities.is_empty() {
-            return Err("agent package capability registry is empty".to_owned());
-        }
         for capability in &capabilities {
             if !matches!(
                 capability.as_str(),
