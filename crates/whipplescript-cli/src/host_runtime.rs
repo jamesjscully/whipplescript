@@ -38,6 +38,226 @@ use crate::host_protocol::{
 };
 use crate::ifc::VerifiedEnvelope;
 
+/// Canonical manifest name for an authored agent package consumed by the
+/// persistent host facade.
+pub const AGENT_PACKAGE_MANIFEST: &str = "package.json";
+pub const AGENT_PACKAGE_SCHEMA: &str = "whipplescript.agent_package.v0";
+
+/// The authored, immutable input to an owned agent turn.
+///
+/// The package owns persona, executable WhippleScript source, and the exact
+/// capability registry from which the model-facing tool surface is derived.
+/// Embedding products may choose and pin a package version, but cannot bolt on
+/// a prompt or tool after package resolution.
+#[derive(Clone, Debug)]
+pub struct AuthoredAgentPackage {
+    version_ref: String,
+    source: String,
+    workflow: String,
+    agent: String,
+    system_prompt: String,
+    capabilities: Vec<String>,
+    max_steps: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthoredAgentPackageManifest {
+    schema: String,
+    source: String,
+    workflow: String,
+    agent: String,
+    system_prompt: String,
+    capabilities: Vec<String>,
+    max_steps: usize,
+}
+
+impl AuthoredAgentPackage {
+    /// Load and validate the canonical three-file package rooted at `root`.
+    /// Referenced files must be direct, non-symlink children of the package
+    /// directory. Their exact bytes, plus the manifest, determine the immutable
+    /// package version reference.
+    pub fn load(root: impl AsRef<Path>) -> Result<Self, String> {
+        let root = root
+            .as_ref()
+            .canonicalize()
+            .map_err(|error| format!("cannot open agent package: {error}"))?;
+        if !root.is_dir() {
+            return Err("agent package root is not a directory".to_owned());
+        }
+        let manifest_text = read_package_child(&root, AGENT_PACKAGE_MANIFEST)?;
+        let manifest: AuthoredAgentPackageManifest = serde_json::from_str(&manifest_text)
+            .map_err(|error| format!("invalid agent package manifest: {error}"))?;
+        if manifest.schema != AGENT_PACKAGE_SCHEMA {
+            return Err(format!(
+                "unsupported agent package schema `{}`",
+                manifest.schema
+            ));
+        }
+        let source = read_package_child(&root, &manifest.source)?;
+        let system_prompt = read_package_child(&root, &manifest.system_prompt)?;
+        Self::from_parts(manifest_text, manifest, source, system_prompt)
+    }
+
+    fn from_parts(
+        manifest_text: String,
+        manifest: AuthoredAgentPackageManifest,
+        source: String,
+        system_prompt: String,
+    ) -> Result<Self, String> {
+        if manifest.workflow.trim().is_empty()
+            || manifest.agent.trim().is_empty()
+            || system_prompt.trim().is_empty()
+            || manifest.max_steps == 0
+        {
+            return Err(
+                "agent package requires workflow, agent, persona, and positive max_steps"
+                    .to_owned(),
+            );
+        }
+        let mut capabilities = manifest.capabilities;
+        capabilities.sort();
+        capabilities.dedup();
+        if capabilities.is_empty() {
+            return Err("agent package capability registry is empty".to_owned());
+        }
+        for capability in &capabilities {
+            if !matches!(
+                capability.as_str(),
+                "workspace.read" | "workspace.write" | "command.run" | "human.ask"
+            ) {
+                return Err(format!(
+                    "agent package declares unsupported capability `{capability}`"
+                ));
+            }
+        }
+        if capabilities.iter().any(|item| item == "workspace.write")
+            && !capabilities.iter().any(|item| item == "workspace.read")
+        {
+            return Err("workspace.write requires workspace.read".to_owned());
+        }
+
+        let compiled = whipplescript_parser::compile_program_with_root(
+            &source,
+            Some(manifest.workflow.as_str()),
+        );
+        let program = compiled.ir.ok_or_else(|| {
+            compiled
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })?;
+        let declared_agent = program
+            .agents
+            .iter()
+            .find(|agent| agent.name == manifest.agent)
+            .ok_or_else(|| format!("agent package has no agent `{}`", manifest.agent))?;
+        let mut source_capabilities = declared_agent.capabilities.clone();
+        source_capabilities.sort();
+        source_capabilities.dedup();
+        if source_capabilities != capabilities {
+            return Err(format!(
+                "agent `{}` capabilities do not match the package capability registry",
+                manifest.agent
+            ));
+        }
+
+        let identity = json!({
+            "manifest": &manifest_text,
+            "source": &source,
+            "system_prompt": &system_prompt,
+        });
+        let version_ref = format!(
+            "whip:agent-package:{}",
+            sha256_hex(identity.to_string().as_bytes())
+        );
+        Ok(Self {
+            version_ref,
+            source,
+            workflow: manifest.workflow,
+            agent: manifest.agent,
+            system_prompt,
+            capabilities,
+            max_steps: manifest.max_steps,
+        })
+    }
+
+    pub fn version_ref(&self) -> &str {
+        &self.version_ref
+    }
+
+    pub fn capabilities(&self) -> &[String] {
+        &self.capabilities
+    }
+
+    /// Resolve this exact authored package. The caller must present the pinned
+    /// reference; a mutable directory whose bytes changed therefore cannot
+    /// impersonate an already-open package version.
+    pub fn resolve(&self, version_ref: &str) -> Result<ResolvedPackage, String> {
+        if version_ref != self.version_ref {
+            return Err("agent package bytes do not match the pinned version ref".to_owned());
+        }
+        let writable = self
+            .capabilities
+            .iter()
+            .any(|capability| capability == "workspace.write");
+        let command = self
+            .capabilities
+            .iter()
+            .any(|capability| capability == "command.run");
+        let human = self
+            .capabilities
+            .iter()
+            .any(|capability| capability == "human.ask");
+        ResolvedPackage::compile(
+            self.version_ref.clone(),
+            &self.source,
+            Some(&self.workflow),
+            self.agent.clone(),
+            self.system_prompt.clone(),
+            native_workspace_tool_specs_with_capabilities(writable, command, human),
+            self.max_steps,
+        )
+    }
+}
+
+impl PackageResolver for AuthoredAgentPackage {
+    fn resolve_package(&self, version_ref: &str) -> Result<ResolvedPackage, String> {
+        self.resolve(version_ref)
+    }
+}
+
+fn read_package_child(root: &Path, relative: &str) -> Result<String, String> {
+    let relative = Path::new(relative);
+    if relative.as_os_str().is_empty()
+        || relative.components().count() != 1
+        || !matches!(relative.components().next(), Some(Component::Normal(_)))
+    {
+        return Err("agent package file references must name direct children".to_owned());
+    }
+    let path = root.join(relative);
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        format!(
+            "cannot open agent package file `{}`: {error}",
+            relative.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "agent package file `{}` must be a regular non-symlink file",
+            relative.display()
+        ));
+    }
+    fs::read_to_string(path).map_err(|error| {
+        format!(
+            "cannot read agent package file `{}`: {error}",
+            relative.display()
+        )
+    })
+}
+
 /// A package version resolved from WhippleScript's package store.
 ///
 /// Tool schemas come from the pinned package. The embedding host cannot add a
@@ -3878,6 +4098,100 @@ workflow Fingerprint {
         )
         .expect("package compiles");
         assert_ne!(original.source_hash, more_steps.source_hash);
+    }
+
+    #[test]
+    fn authored_agent_package_owns_prompt_tools_and_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "whip-authored-package-{}-{}",
+            std::process::id(),
+            idempotency_key(&["authored-package"])
+        ));
+        fs::create_dir_all(&root).expect("package dir");
+        fs::write(
+            root.join(AGENT_PACKAGE_MANIFEST),
+            format!(
+                r#"{{
+  "schema": "{AGENT_PACKAGE_SCHEMA}",
+  "source": "method.whip",
+  "workflow": "Method",
+  "agent": "assistant",
+  "system_prompt": "persona.md",
+  "capabilities": ["workspace.write", "workspace.read", "human.ask"],
+  "max_steps": 8
+}}"#
+            ),
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("method.whip"),
+            r#"
+file store project { root "." allow read ["**"] allow write ["**"] }
+workflow Method {
+  agent assistant {
+    provider owned
+    profile "repo-writer"
+    capacity 1
+    capabilities ["human.ask", "workspace.read", "workspace.write"]
+  }
+  rule converse when started => {
+    tell assistant requires ["workspace.read", "workspace.write", "human.ask"]
+      with access to project { read ["**"] write ["**"] }
+      with access to human { ask }
+      "Run the method."
+  }
+}
+"#,
+        )
+        .expect("source");
+        fs::write(root.join("persona.md"), "Own the method.").expect("persona");
+
+        let package = AuthoredAgentPackage::load(&root).expect("valid package");
+        let first_ref = package.version_ref().to_owned();
+        let resolved = package
+            .resolve(&first_ref)
+            .expect("pinned package resolves");
+        assert!(resolved.tools.iter().any(|tool| tool.name == "read"));
+        assert!(resolved.tools.iter().any(|tool| tool.name == "write"));
+        assert!(resolved.tools.iter().any(|tool| tool.name == "ask_human"));
+        assert!(!resolved.tools.iter().any(|tool| tool.name == "bash"));
+        assert!(package.resolve("whip:agent-package:stale").is_err());
+
+        fs::write(root.join("persona.md"), "Changed method.").expect("changed persona");
+        let changed = AuthoredAgentPackage::load(&root).expect("changed package");
+        assert_ne!(first_ref, changed.version_ref());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn authored_agent_package_rejects_manifest_source_capability_drift() {
+        let manifest = AuthoredAgentPackageManifest {
+            schema: AGENT_PACKAGE_SCHEMA.to_owned(),
+            source: "method.whip".to_owned(),
+            workflow: "Method".to_owned(),
+            agent: "assistant".to_owned(),
+            system_prompt: "persona.md".to_owned(),
+            capabilities: vec!["workspace.read".to_owned()],
+            max_steps: 8,
+        };
+        let source = r#"
+workflow Method {
+  agent assistant {
+    provider owned
+    profile "repo-writer"
+    capacity 1
+    capabilities ["workspace.read", "workspace.write"]
+  }
+}
+"#;
+        let error = AuthoredAgentPackage::from_parts(
+            "{}".to_owned(),
+            manifest,
+            source.to_owned(),
+            "persona".to_owned(),
+        )
+        .expect_err("registry drift must fail");
+        assert!(error.contains("capabilities do not match"));
     }
 
     #[test]
