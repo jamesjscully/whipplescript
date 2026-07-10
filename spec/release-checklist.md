@@ -144,11 +144,13 @@ tools are built per their accepted notes (native owned harness).
 
 **Blocking the cut — maintainer decisions/input:**
 
-1. **Improve/evals scope (Jack).** The second half of 0.4's banner is
-   pre-ADR (`experimentation-subsystem-research-note.md`,
-   `improve-design-note.md`; not yet a registered tracker). Decide: design
-   + build it into 0.4 (design discussion first, per house rule), or re-cut
-   0.4 as the version-control release and move improve/evals to 0.5.
+1. **Improve/evals scope (Jack).** The second half of 0.4's banner is now
+   formally tracked (`experimentation-improve-tracker.md`, registered
+   2026-07-10) with the settled design ground, the four open Jack-held
+   design questions, and the scope analysis. **Lean recorded there: re-cut
+   0.4 as the version-control release; improve/evals becomes 0.5's banner.**
+   The tree is staged at 0.4.0 with an Unreleased CHANGELOG entry either
+   way; only the scope sentence and the date change at cut.
 2. **Sequencing fork** (untie tracker, ⚑): git-backed workspace API in
    gaugedesk first? Analysis written 2026-07-10; whip-build-order
    independent — this gates gaugedesk sequencing, not the whip cut.

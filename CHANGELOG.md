@@ -8,6 +8,57 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 > separately and is **not** part of 0.3. Native provider support is validated for
 > **Codex and Claude**; the Pi native provider is deferred.
 
+## [0.4.0] — Unreleased (staged 2026-07-10; date set at cut)
+
+WhippleScript gains its own version control. The versioned workspace replaces
+the git seam for agent work: workspace-as-database with O(1) branches over a
+content-addressed store, and every instance's files, conversation, and effects
+move as one coherent, provenance-carrying line.
+
+### Versioned workspace (the git-replacement surface)
+- Branches, cuts, and virtual working sets: O(1) branch creation, per-instance
+  copy-on-write file surfaces, branch-distinct effect keys, and
+  materialize-on-exec with an O(touched) racy-window-sound import-back.
+- The mapped 13-operation workspace API (`workspace_api.rs`, refusals as
+  data), the op log as a first-class reflog with `whip branch undo-op`,
+  review-grade Myers diffs, handoff bundles (`whipplescript.bundle.v1`) with
+  chunk-granular delta transfer and pack objects, and per-blob erasure that
+  discharges `HISTORY_PRESERVED` / `EXPORTED_COPY_NOT_RECALLED` by test.
+- Selection algebra (`path()`/`by-effect()`/`since()`/`dependents-of()` with
+  `| ~ &`) behind selective `undo`/`transport`/`adopt --only` — dry-run by
+  default, stranding-checked, no destructive verbs.
+- Structured conflicts with rerere-style resolution memory the reconciliation
+  daemon auto-propagates; checkout-free `bisect`, `attribution`, and `log`.
+- `whip fork` — the chat fork: a new instance seeded from the source's
+  completed turns on a fresh branch forked at the source line's head, both
+  planes from one quiescent coordinate.
+
+### Policy plane, auth, and the store seam
+- DR-0036: turn receipts now carry a witnessed workspace cut
+  (`workspace_cut_ref`; honest decline when a native command mutated outside
+  the mediated surface) and a dynamic guarantee section
+  (`guarantee writes_within:<scope>` / `no_reads_beyond_grant` /
+  `no_tainted_reads:<class>` declared in the governance envelope) evaluated
+  per turn under the cited policy epoch.
+- Host-resolved provider profiles (`WHIPPLESCRIPT_PROVIDER_PROFILES`): the
+  policy channel hands whip resolved credentials; whip's own auth is the thin
+  standalone fallback.
+- The store seam: `whip handles` (stable pointers for external admission
+  logs), `whip checkpoint --external-positions` (the position-pair cut for
+  cross-store backup/handoff), and the seam-contract draft.
+
+### Owned-harness web tools
+- `web_search` (SearchProvider trait; Brave first-party, model-provider floor,
+  honest absent tier) and `web_fetch` (structurally GET-only behind a central
+  SSRF guard with pinned connections and redirect re-entry; HTML→markdown),
+  granted via `with access to web { search fetch }`.
+
+### Formal models
+- Six new gate-registered Maude models with verified bites: merge-slice,
+  merge-confluence, workstream, branch-effect-key, selective-undo, stat-cache
+  (P0), plus op-undo, resolution-memory, chat-fork, turn-witness, and
+  seam-crossing, and the ReconciliationDaemonLifecycle TLA+ model.
+
 ## [0.3.0] — 2026-07-10
 
 WhippleScript is a small scripting language for AI to orchestrate AI. This release

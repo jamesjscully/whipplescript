@@ -58,8 +58,7 @@ radio-style choice lists are excluded from checkbox counting.
 **Release** targets (tagged 2026-07-05; plan = [[project-release-plan]] memory):
 **v0.2** language + std packages + native runtime (polished) · **v0.3** cloud
 deployment + owned harness · **v0.4** improve/evals + version control. Blank =
-closed/archived (shipped or historical). The v0.4 improve/evals subsystem is not
-yet a registered tracker (pre-ADR research notes).
+closed/archived (shipped or historical).
 
 | Tracker | Status | Scope (one line, non-overlapping) | Last triaged | Release |
 |---------|--------|-----------------------------------|--------------|---------|
@@ -70,6 +69,7 @@ yet a registered tracker (pre-ADR research notes).
 | `spec/workflow-encapsulation-implementation-tracker.md` | closed | v1 workflow-encapsulation + invocation-authorization theorem — all phases shipped 2026-07-02; open remnants re-homed to owned-harness-tool-surface.md | 2026-07-02 |
 | `spec/durable-object-runtime-tracker.md` | active | Sans-IO async refactor + Cloudflare Durable Object host binding (run whip in a wasm isolate) | 2026-07-01 | v0.3 |
 | `spec/context-assembly-tracker.md` | closed | Owned-harness context assembly (mirror pi): system-prompt seam, skills registry/catalogue, project-instructions, and pluggable cache-aware compaction | 2026-07-04 | v0.3 |
+| `spec/experimentation-improve-tracker.md` | active | Experimentation/improve subsystem (the v0.4 banner's second half): release-scope decision + the four open design passes + the gauge/mark/campaign build — registered 2026-07-10, previously pre-ADR notes | 2026-07-10 | v0.4 (lean: re-cut → v0.5) |
 | `spec/untie-substrate-readiness-tracker.md` | active | Whip-side capabilities for the un-tie substrate replacement (canonical build home for the versioned workspace + workspace API + conversational runtime + policy/auth + store seam) — Phases 0–5 ALL SHIPPED 2026-07-10; open: the ⚑ sequencing-fork decision (Jack) + the presigned-transfer `[~]` (rides container billing) | 2026-07-10 | v0.3–v0.4 |
 | `spec/decision-records/language-ergonomics-tracker.md` | active | v2 language-surface ergonomics decisions + build-out; **canonical home** for the small-language-follow-ups (see dedup) — Part B reconciled 2026-07-01; B1g closed 2026-07-02, only B1a-refactor / `consume`-removal remain | 2026-07-02 | v0.2 (B1a→v0.3) |
 | `spec/decision-records/standard-package-design-tracker.md` | active | Open design todos for the standard packages | 2026-06-30 | v0.2 |
