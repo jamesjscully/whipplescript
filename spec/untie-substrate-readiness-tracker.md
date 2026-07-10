@@ -105,8 +105,20 @@ Per-heading `· vN` tags below restate this at each phase.
       parent head, branch point pinned at creation, divergent children,
       optimistic head advance + atomic `rebase_branch`, fail-closed
       terminal statuses, idempotent create. Integrated + exercised
-      end-to-end through `vcs.rs`/`whip branch` (P1h); instance-cut wiring
-      rides the later working-set-dispatch slice.)*
+      end-to-end through `vcs.rs`/`whip branch` (P1h). **DO-host parity
+      2026-07-10:** the VCS core is generic over the `Branches` +
+      `ContentBlobs` seams; `whipplescript-host-do/src/do_branches.rs`
+      implements both over the shared `DoSql` handle (same schema/
+      semantics, single-writer posture), `DurableInstance::create` selects
+      the branch working set as the instance's file surface when bound
+      (cut seed = hash(instance, head) — collision-free across
+      rehydrations since minting moves the head), and
+      `DurableInstance::bind_branch` is the DO-side birth bind (row +
+      `branch.bound` event + live surface swap). DO test: bound instance's
+      `file.write` lands on the branch through the same generic
+      `WorkspaceVcs`, plain DO file plane untouched, rebind refused.
+      Deploy-shell verb routing (index.ts) for bind/branch ops is the
+      remaining production-enable step.)*
 - [ ] Virtual working set: sandbox-mediated per-branch file surface,
       copy-on-write. *(Progress 2026-07-10: the surface landed —
       `crates/whipplescript-store/src/working_set.rs`:
@@ -125,8 +137,9 @@ Per-heading `· vN` tags below restate this at each phase.
       the binding from the instance log, so bound instances derive
       branch-distinct effect keys host-agnostically. End-to-end test:
       branch-bound `file.write` lands on the branch (real root untouched),
-      merge propagates to main, unbound runs write natively. Remaining for
-      the box: the stat cache + DO-host parity for branch dispatch.)*
+      merge propagates to main, unbound runs write natively. **DO parity +
+      stat cache DONE 2026-07-10** (see below) — box stays open only for
+      the materialize/import-back consumer wiring of the stat cache.)*
 - [ ] Two-plane consistent cut: substance manifest + workspace-plane
       **high-water positions** (the plane-store enumeration is the pump
       audit walked twice — do both in one pass).
@@ -200,9 +213,18 @@ Per-heading `· vN` tags below restate this at each phase.
       ids; dedup properties tested (append shares all but tail, mid-file
       edit contained). Remaining for the box: wiring into the tiered
       blob store + chunk-level erasure with retained root.)*
-- [ ] **Stat cache** in the virtual working set: mtime/size/inode
+- [x] **Stat cache** in the virtual working set: mtime/size/inode
       fingerprints so import-back is O(touched) not O(tree); implements
-      the P0 soundness invariant.
+      the P0 soundness invariant. *(2026-07-10:
+      `crates/whipplescript-store/src/stat_cache.rs` — `scan_dir` over a
+      previous `StatCache` (size+mtime fingerprints + the scan STAMP);
+      trust iff fingerprint matches AND entry mtime strictly older than
+      the stamp; racy-granule entries re-hash. Tests: O(touched) trust
+      path observable via trusted/rehashed counts, and THE bite — a
+      same-size change with mtime forced back into the recorded granule
+      is detected, never dropped (stat-cache.maude at runtime). Deletions
+      reported, nested walk, JSON round-trip. Consumer =
+      materialize-on-exec import-back when that slice lands.)*
 - [ ] **Partial materialization**: manifest-subset materialization from
       slicer-computed input closures; fetch-on-demand; clear failure at
       disk bounds (required for Class-B sidecars; optional-lazy on

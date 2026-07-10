@@ -20,33 +20,26 @@
 //! head guards make a racing writer a refused normal outcome rather
 //! than a lost update.
 
-#[cfg(feature = "native")]
 use std::collections::BTreeMap;
-#[cfg(feature = "native")]
 use std::path::Path;
 
 #[cfg(feature = "native")]
+use crate::branches::BranchStore;
 use crate::branches::{
-    AdvanceOutcome, BranchRow, BranchStatus, BranchStore, Branches, CreateBranch,
-    CreateBranchOutcome, StatusOutcome, MAINLINE_BRANCH_ID,
+    AdvanceOutcome, BranchRow, BranchStatus, Branches, CreateBranch, CreateBranchOutcome,
+    StatusOutcome, MAINLINE_BRANCH_ID,
 };
+use crate::content::ContentBlobs;
 #[cfg(feature = "native")]
 use crate::content::ContentStore;
-#[cfg(feature = "native")]
 use crate::files::FileStore;
-#[cfg(feature = "native")]
 use crate::merge::MergeSide;
-#[cfg(feature = "native")]
 use crate::merge::PathConflict;
-#[cfg(feature = "native")]
 use crate::reconcile::{plan_merge_up, plan_rebase_down, MergeUpPlan, RebaseDownPlan};
-#[cfg(feature = "native")]
 use crate::working_set::VirtualWorkingSet;
-#[cfg(feature = "native")]
 use crate::{StoreError, StoreResult};
 
 /// One VCS write/remove outcome: the new cut, or the refusal.
-#[cfg(feature = "native")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VcsWriteOutcome {
     Written {
@@ -60,7 +53,6 @@ pub enum VcsWriteOutcome {
 /// One merge outcome. `Conflicted` moves nothing; the conflicts are the
 /// notification-and-ask payload (resolve by writing the merged content on
 /// the branch, then merge again).
-#[cfg(feature = "native")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VcsMergeOutcome {
     Adopted {
@@ -76,14 +68,17 @@ pub enum VcsMergeOutcome {
     NoParent,
 }
 
-#[cfg(feature = "native")]
-pub struct WorkspaceVcs {
-    branches: BranchStore,
-    content: ContentStore,
+pub struct WorkspaceVcs<B: Branches, C: ContentBlobs> {
+    branches: B,
+    content: C,
 }
 
+/// The native workspace VCS: rusqlite-backed branch + content stores.
 #[cfg(feature = "native")]
-impl WorkspaceVcs {
+pub type NativeWorkspaceVcs = WorkspaceVcs<BranchStore, ContentStore>;
+
+#[cfg(feature = "native")]
+impl NativeWorkspaceVcs {
     pub fn open(
         branches_path: impl AsRef<Path>,
         content_path: impl AsRef<Path>,
@@ -92,6 +87,14 @@ impl WorkspaceVcs {
             branches: BranchStore::open(branches_path)?,
             content: ContentStore::open(content_path)?,
         })
+    }
+}
+
+impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
+    /// Compose a workspace VCS from any host's branch + content seams
+    /// (the DO host passes its `DoSql`-backed implementations).
+    pub fn from_parts(branches: B, content: C) -> Self {
+        Self { branches, content }
     }
 
     /// Bootstrap the workspace: the mainline branch exists after this.
@@ -363,18 +366,16 @@ impl WorkspaceVcs {
 /// derive from the effect id (`<effect>-f<n>`), so one effect's file
 /// operations are attributable cuts. Interior mutability because the
 /// `FileStore` seam takes `&self`.
-#[cfg(feature = "native")]
-pub struct BranchFileStore {
-    vcs: std::cell::RefCell<WorkspaceVcs>,
+pub struct BranchFileStore<B: Branches, C: ContentBlobs> {
+    vcs: std::cell::RefCell<WorkspaceVcs<B, C>>,
     branch_id: String,
     cut_seed: String,
     at: String,
     counter: std::cell::Cell<u64>,
 }
 
-#[cfg(feature = "native")]
-impl BranchFileStore {
-    pub fn new(vcs: WorkspaceVcs, branch_id: &str, cut_seed: &str, at: &str) -> Self {
+impl<B: Branches, C: ContentBlobs> BranchFileStore<B, C> {
+    pub fn new(vcs: WorkspaceVcs<B, C>, branch_id: &str, cut_seed: &str, at: &str) -> Self {
         Self {
             vcs: std::cell::RefCell::new(vcs),
             branch_id: branch_id.to_owned(),
@@ -416,8 +417,7 @@ impl BranchFileStore {
     }
 }
 
-#[cfg(feature = "native")]
-impl FileStore for BranchFileStore {
+impl<B: Branches, C: ContentBlobs> FileStore for BranchFileStore<B, C> {
     fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
         let path_key = path.to_string_lossy();
         match self
@@ -483,7 +483,7 @@ impl FileStore for BranchFileStore {
 mod tests {
     use super::*;
 
-    fn vcs() -> WorkspaceVcs {
+    fn vcs() -> NativeWorkspaceVcs {
         let dir = std::env::temp_dir().join(format!(
             "whipplescript-vcs-{}-{}",
             std::process::id(),
@@ -505,7 +505,7 @@ mod tests {
         // Seed mainline.
         assert!(matches!(
             vcs.write(
-                WorkspaceVcs::mainline(),
+                MAINLINE_BRANCH_ID,
                 "notes/a.md",
                 Some("base A"),
                 "cut_m1",
@@ -516,7 +516,7 @@ mod tests {
         ));
         // Branch and diverge.
         assert!(matches!(
-            vcs.create_branch("draft_a", Some("triage"), WorkspaceVcs::mainline(), "t2")
+            vcs.create_branch("draft_a", Some("triage"), MAINLINE_BRANCH_ID, "t2")
                 .expect("create"),
             CreateBranchOutcome::Created(_)
         ));
@@ -527,8 +527,7 @@ mod tests {
         ));
         // Isolation both ways.
         assert_eq!(
-            vcs.read(WorkspaceVcs::mainline(), "notes/a.md")
-                .expect("read"),
+            vcs.read(MAINLINE_BRANCH_ID, "notes/a.md").expect("read"),
             Some("base A".to_owned())
         );
         assert_eq!(
@@ -541,12 +540,11 @@ mod tests {
             vcs.merge("draft_a", "cut_merge_1", "t4").expect("merge"),
             VcsMergeOutcome::Adopted {
                 merge_cut_id: "cut_merge_1".to_owned(),
-                into_branch_id: WorkspaceVcs::mainline().to_owned(),
+                into_branch_id: MAINLINE_BRANCH_ID.to_owned(),
             }
         );
         assert_eq!(
-            vcs.read(WorkspaceVcs::mainline(), "notes/a.md")
-                .expect("read"),
+            vcs.read(MAINLINE_BRANCH_ID, "notes/a.md").expect("read"),
             Some("draft A".to_owned())
         );
         let adopted = vcs.get_branch("draft_a").expect("get").expect("row");
@@ -565,25 +563,25 @@ mod tests {
     fn merge_auto_rebases_disjoint_parent_advance() {
         let mut vcs = vcs();
         vcs.init("t0").expect("init");
-        vcs.write(WorkspaceVcs::mainline(), "a.md", Some("A0"), "cut_m1", "t1")
+        vcs.write(MAINLINE_BRANCH_ID, "a.md", Some("A0"), "cut_m1", "t1")
             .expect("write");
-        vcs.create_branch("draft_a", None, WorkspaceVcs::mainline(), "t2")
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t2")
             .expect("create");
         vcs.write("draft_a", "a.md", Some("A1"), "cut_d1", "t3")
             .expect("write");
         // Mainline advances on a DIFFERENT path after the branch point.
-        vcs.write(WorkspaceVcs::mainline(), "b.md", Some("B1"), "cut_m2", "t4")
+        vcs.write(MAINLINE_BRANCH_ID, "b.md", Some("B1"), "cut_m2", "t4")
             .expect("write");
         assert!(matches!(
             vcs.merge("draft_a", "cut_merge_1", "t5").expect("merge"),
             VcsMergeOutcome::Adopted { .. }
         ));
         assert_eq!(
-            vcs.read(WorkspaceVcs::mainline(), "a.md").expect("read"),
+            vcs.read(MAINLINE_BRANCH_ID, "a.md").expect("read"),
             Some("A1".to_owned())
         );
         assert_eq!(
-            vcs.read(WorkspaceVcs::mainline(), "b.md").expect("read"),
+            vcs.read(MAINLINE_BRANCH_ID, "b.md").expect("read"),
             Some("B1".to_owned())
         );
     }
@@ -598,21 +596,15 @@ mod tests {
     fn conflicting_merge_escalates_and_resolves_by_branch_write() {
         let mut vcs = vcs();
         vcs.init("t0").expect("init");
-        vcs.write(WorkspaceVcs::mainline(), "a.md", Some("A0"), "cut_m1", "t1")
+        vcs.write(MAINLINE_BRANCH_ID, "a.md", Some("A0"), "cut_m1", "t1")
             .expect("write");
-        vcs.create_branch("draft_a", None, WorkspaceVcs::mainline(), "t2")
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t2")
             .expect("create");
         vcs.write("draft_a", "a.md", Some("draft A"), "cut_d1", "t3")
             .expect("write");
         // Mainline advances on the SAME path: a real conflict.
-        vcs.write(
-            WorkspaceVcs::mainline(),
-            "a.md",
-            Some("main A"),
-            "cut_m2",
-            "t4",
-        )
-        .expect("write");
+        vcs.write(MAINLINE_BRANCH_ID, "a.md", Some("main A"), "cut_m2", "t4")
+            .expect("write");
         let VcsMergeOutcome::Conflicted { conflicts } =
             vcs.merge("draft_a", "cut_merge_1", "t5").expect("merge")
         else {
@@ -623,7 +615,7 @@ mod tests {
         assert_eq!(conflicts[0].ours_side.label, "draft_a");
         // Nothing moved.
         assert_eq!(
-            vcs.read(WorkspaceVcs::mainline(), "a.md").expect("read"),
+            vcs.read(MAINLINE_BRANCH_ID, "a.md").expect("read"),
             Some("main A".to_owned())
         );
         assert_eq!(
@@ -647,7 +639,7 @@ mod tests {
         // resolution as an ordinary edit (manual override — plain editing
         // is complete over states), after which the branch merges clean.
         vcs.write(
-            WorkspaceVcs::mainline(),
+            MAINLINE_BRANCH_ID,
             "a.md",
             Some("main A + draft A"),
             "cut_m3",
@@ -666,7 +658,7 @@ mod tests {
     fn discard_closes_a_head_without_deleting_history() {
         let mut vcs = vcs();
         vcs.init("t0").expect("init");
-        vcs.create_branch("draft_a", None, WorkspaceVcs::mainline(), "t1")
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t1")
             .expect("create");
         vcs.write("draft_a", "x.md", Some("scratch"), "cut_d1", "t2")
             .expect("write");

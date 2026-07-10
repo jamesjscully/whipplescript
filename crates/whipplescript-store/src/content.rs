@@ -19,6 +19,18 @@ use std::path::Path;
 #[cfg(feature = "native")]
 use rusqlite::{params, Connection, OptionalExtension};
 
+/// The content-addressed put/get seam, object-safe so the versioned
+/// workspace (working sets, manifests) runs over any host's blob table:
+/// natively `ContentStore`, on the durable object a thin impl over the
+/// shared `DoSql` handle. Identical bytes dedupe to one id.
+pub trait ContentBlobs {
+    /// Store `body`, returning its content id (a stable hash of the
+    /// bytes). Idempotent.
+    fn put(&self, body: &str) -> crate::StoreResult<String>;
+    /// Read the full stored bytes for a content id, or `None` if unknown.
+    fn get(&self, id: &str) -> crate::StoreResult<Option<String>>;
+}
+
 use crate::StoreResult;
 
 #[cfg(feature = "native")]
@@ -49,6 +61,18 @@ impl ContentStore {
     /// Store `body`, returning its content id (a stable hash of the bytes).
     /// Idempotent: identical bytes dedupe to the same id and one row.
     pub fn put(&self, body: &str) -> StoreResult<String> {
+        ContentBlobs::put(self, body)
+    }
+
+    /// Read the full stored bytes for a content id, or `None` if unknown.
+    pub fn get(&self, id: &str) -> StoreResult<Option<String>> {
+        ContentBlobs::get(self, id)
+    }
+}
+
+#[cfg(feature = "native")]
+impl ContentBlobs for ContentStore {
+    fn put(&self, body: &str) -> StoreResult<String> {
         let id = crate::stable_hash_hex(body);
         self.connection.execute(
             "INSERT OR IGNORE INTO content_blobs (id, body, byte_len, created_at) \
@@ -58,8 +82,7 @@ impl ContentStore {
         Ok(id)
     }
 
-    /// Read the full stored bytes for a content id, or `None` if unknown.
-    pub fn get(&self, id: &str) -> StoreResult<Option<String>> {
+    fn get(&self, id: &str) -> StoreResult<Option<String>> {
         Ok(self
             .connection
             .query_row(

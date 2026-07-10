@@ -611,36 +611,36 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
     }
 }
 
-fn sql_err(message: String) -> StoreError {
+pub(crate) fn sql_err(message: String) -> StoreError {
     StoreError::Io(std::io::Error::other(message))
 }
 
-fn text(value: &str) -> SqlValue {
+pub(crate) fn text(value: &str) -> SqlValue {
     SqlValue::Text(value.to_string())
 }
 
-fn opt_text(value: Option<&str>) -> SqlValue {
+pub(crate) fn opt_text(value: Option<&str>) -> SqlValue {
     match value {
         Some(v) => SqlValue::Text(v.to_string()),
         None => SqlValue::Null,
     }
 }
 
-fn as_i64(value: &SqlValue) -> i64 {
+pub(crate) fn as_i64(value: &SqlValue) -> i64 {
     match value {
         SqlValue::Int(n) => *n,
         _ => 0,
     }
 }
 
-fn as_text(value: &SqlValue) -> String {
+pub(crate) fn as_text(value: &SqlValue) -> String {
     match value {
         SqlValue::Text(s) => s.clone(),
         _ => String::new(),
     }
 }
 
-fn as_opt_text(value: &SqlValue) -> Option<String> {
+pub(crate) fn as_opt_text(value: &SqlValue) -> Option<String> {
     match value {
         SqlValue::Text(s) => Some(s.clone()),
         _ => None,
@@ -665,7 +665,7 @@ fn bool_int(value: bool) -> SqlValue {
 /// FNV-1a, byte-identical to the native store's `stable_hash_hex` — the DO must
 /// compute the same skill `content_hash` the native path does so a skill
 /// registered under either backend has a stable identity.
-fn stable_hash_hex(value: &str) -> String {
+pub(crate) fn stable_hash_hex(value: &str) -> String {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in value.as_bytes() {
         hash ^= u64::from(*byte);

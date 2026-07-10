@@ -19,32 +19,24 @@
 //! outcomes (a tombstone in the overlay), not absences, so `manifest()`
 //! reflects them and restore/merge see the delete.
 
-#[cfg(feature = "native")]
 use std::cell::RefCell;
-#[cfg(feature = "native")]
 use std::collections::BTreeMap;
-#[cfg(feature = "native")]
 use std::io;
-#[cfg(feature = "native")]
 use std::path::Path;
 
-#[cfg(feature = "native")]
-use crate::content::ContentStore;
-#[cfg(feature = "native")]
+use crate::content::ContentBlobs;
 use crate::files::FileStore;
 
-#[cfg(feature = "native")]
 pub struct VirtualWorkingSet<'a> {
-    content: &'a ContentStore,
+    content: &'a dyn ContentBlobs,
     /// The branch head's manifest (path → content id), fixed at open.
     base: BTreeMap<String, String>,
     /// Branch-local divergence: `Some(id)` = written, `None` = deleted.
     overlay: RefCell<BTreeMap<String, Option<String>>>,
 }
 
-#[cfg(feature = "native")]
 impl<'a> VirtualWorkingSet<'a> {
-    pub fn new(content: &'a ContentStore, base_manifest: BTreeMap<String, String>) -> Self {
+    pub fn new(content: &'a dyn ContentBlobs, base_manifest: BTreeMap<String, String>) -> Self {
         Self {
             content,
             base: base_manifest,
@@ -89,12 +81,10 @@ impl<'a> VirtualWorkingSet<'a> {
     }
 }
 
-#[cfg(feature = "native")]
 fn store_error(error: crate::StoreError) -> io::Error {
     io::Error::other(format!("content store: {error:?}"))
 }
 
-#[cfg(feature = "native")]
 impl FileStore for VirtualWorkingSet<'_> {
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
         let Some(id) = self.resolve(path) else {
@@ -166,6 +156,7 @@ impl FileStore for VirtualWorkingSet<'_> {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+    use crate::content::ContentStore;
     use crate::merge::{merge_manifests, MergeOutcome, MergeSide};
 
     fn content() -> ContentStore {

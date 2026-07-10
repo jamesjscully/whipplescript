@@ -22,6 +22,7 @@ use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::sansio::{HttpRequest, HttpResponse, TransportError};
 use whipplescript_kernel::{idempotency_key, ProgramVersionInput, RuntimeKernel};
 use whipplescript_parser::IrProgram;
+use whipplescript_store::branches::Branches;
 use whipplescript_store::files::FileStore;
 use whipplescript_store::{
     CheckpointCapture, ClaimableEffect, NewInstanceAuthority, RestoreDecision, RuntimeStore,
@@ -265,6 +266,39 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                 instance_id
             }
         };
+        // Per-instance branch dispatch, DO parity (untie-substrate P1): an
+        // instance born on a branch gets the branch working set as its file
+        // surface — the same WorkspaceVcs/BranchFileStore logic as native,
+        // over the DO's own Branches/ContentBlobs seams. The cut seed
+        // derives from (instance, current head): minting a cut moves the
+        // head, so a rehydrated isolate can never reuse a seed that already
+        // produced cuts. An explicit port override still wins; unbound
+        // instances keep the plain DO file plane.
+        let default_files: Box<dyn FileStore> = {
+            let branches = crate::do_branches::DoBranches::new(Rc::clone(&sql))
+                .map_err(|error| format!("branch store unavailable: {error:?}"))?;
+            match branches.instance_branch(&instance_id) {
+                Ok(Some(branch_id)) => {
+                    let head = branches
+                        .get_branch(&branch_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|row| row.head_cut_id)
+                        .unwrap_or_default();
+                    let seed = crate::do_store::stable_hash_hex(&format!("{instance_id}|{head}"));
+                    let content = crate::do_branches::DoContentBlobs::new(Rc::clone(&sql))
+                        .map_err(|error| format!("content blobs unavailable: {error:?}"))?;
+                    let vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+                    Box::new(whipplescript_store::vcs::BranchFileStore::new(
+                        vcs,
+                        &branch_id,
+                        &format!("cut-{seed}"),
+                        &format!("after:{head}"),
+                    ))
+                }
+                _ => Box::new(DoFileStore::new(DoSqlStorage::new(Rc::clone(&sql)))),
+            }
+        };
         Ok(Self {
             kernel: Some(kernel),
             ir,
@@ -272,11 +306,9 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             in_flight: None,
             // P1: files work by default on the DO — the file plane is intrinsic
             // to having DO SQLite, so a live instance always gets a real
-            // `DoFileStore` over the shared handle (an explicit port override,
+            // file surface over the shared handle (an explicit port override,
             // e.g. a `TieredFileStore`, still wins).
-            files: ports
-                .files
-                .unwrap_or_else(|| Box::new(DoFileStore::new(DoSqlStorage::new(Rc::clone(&sql))))),
+            files: ports.files.unwrap_or(default_files),
             coerce: ports.coerce,
             agent_model: ports.agent_model,
             // P4: the DO agent turn gets a real in-isolate tool executor over
@@ -290,6 +322,78 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             exec: ports.exec,
             turn: ports.turn,
         })
+    }
+
+    /// Bind THIS durable instance to the branch it works on (write-once;
+    /// the operator's DO-side counterpart of `whip dev --branch` /
+    /// `whip branch bind`): records the `branch_instances` row, appends the
+    /// `branch.bound` event so the kernel derives branch-distinct effect
+    /// keys, and swaps the live file surface onto the branch working set
+    /// so effects dispatched after the bind land on the branch.
+    pub fn bind_branch(&mut self, branch_id: &str, at: &str) -> Result<(), String> {
+        use whipplescript_store::branches::BindOutcome;
+        use whipplescript_store::RuntimeStore;
+        let kernel = self
+            .kernel
+            .as_ref()
+            .ok_or_else(|| "instance kernel already consumed".to_owned())?;
+        let sql = Rc::clone(&kernel.store().sql);
+        let mut branches = crate::do_branches::DoBranches::new(Rc::clone(&sql))
+            .map_err(|error| format!("branch store unavailable: {error:?}"))?;
+        match branches
+            .bind_instance(&self.instance_id, branch_id, at)
+            .map_err(|error| format!("bind failed: {error:?}"))?
+        {
+            BindOutcome::Bound => {}
+            BindOutcome::AlreadyBound { branch_id: other } => {
+                return Err(format!("instance is already bound to branch `{other}`"));
+            }
+            BindOutcome::BranchMissing => {
+                return Err(format!("no such branch `{branch_id}`"));
+            }
+            BindOutcome::BranchNotActive { status } => {
+                return Err(format!(
+                    "branch `{branch_id}` is {} — instances cannot be born on a closed line",
+                    status.as_str()
+                ));
+            }
+        }
+        let payload = format!("{{\"branch_id\":\"{branch_id}\"}}");
+        kernel
+            .store()
+            .append_event(whipplescript_store::NewEvent {
+                instance_id: &self.instance_id,
+                event_type: "branch.bound",
+                payload_json: &payload,
+                source: "do",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some(&whipplescript_kernel::idempotency_key(&[
+                    &self.instance_id,
+                    branch_id,
+                    "branch-bind",
+                ])),
+            })
+            .map_err(|error| format!("could not record the binding event: {error:?}"))?;
+        // Swap the live surface: the head is fresh-read, so the cut seed
+        // stays collision-free by the head-moves-on-mint argument.
+        let head = branches
+            .get_branch(branch_id)
+            .ok()
+            .flatten()
+            .and_then(|row| row.head_cut_id)
+            .unwrap_or_default();
+        let seed = crate::do_store::stable_hash_hex(&format!("{}|{head}", self.instance_id));
+        let content = crate::do_branches::DoContentBlobs::new(Rc::clone(&sql))
+            .map_err(|error| format!("content blobs unavailable: {error:?}"))?;
+        let vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+        self.files = Box::new(whipplescript_store::vcs::BranchFileStore::new(
+            vcs,
+            branch_id,
+            &format!("cut-{seed}"),
+            at,
+        ));
+        Ok(())
     }
 
     /// Advance the instance until it next needs an HTTP round or settles. `incoming`
@@ -880,5 +984,113 @@ mod tests {
             1,
             "import + operator scripts => the capability row is seeded"
         );
+    }
+}
+
+#[cfg(test)]
+mod branch_dispatch_tests {
+    use super::*;
+    use crate::do_branches::{DoBranches, DoContentBlobs};
+    use crate::do_store::test_support::store;
+    use whipplescript_store::branches::{
+        Branches, CreateBranch, CreateBranchOutcome, MAINLINE_BRANCH_ID,
+    };
+    use whipplescript_store::vcs::WorkspaceVcs;
+
+    const TEST_NOW_MS: i64 = 1_767_225_600_000;
+
+    /// DO parity for per-instance branch dispatch: an instance bound to a
+    /// branch runs its `file.write` effect through the branch working set —
+    /// the content lands as a cut on the branch (readable through the same
+    /// generic `WorkspaceVcs` the native CLI uses), the plain DO file plane
+    /// stays untouched, and the workflow still reaches its terminal.
+    #[test]
+    fn branch_bound_instance_dispatches_file_effects_onto_the_branch() {
+        let sql = Rc::new(store().sql);
+
+        // The branch exists before the instance is born on it.
+        {
+            let mut branches = DoBranches::new(Rc::clone(&sql)).expect("branch store");
+            branches.ensure_mainline("t0").expect("mainline");
+            assert!(matches!(
+                branches
+                    .create_branch(CreateBranch {
+                        branch_id: "draft_a",
+                        name: None,
+                        parent_branch_id: MAINLINE_BRANCH_ID,
+                        at_cut: None,
+                        created_at: "t0",
+                        idempotency_key: None,
+                    })
+                    .expect("create branch"),
+                CreateBranchOutcome::Created(_)
+            ));
+        }
+
+        let source = "workflow BranchDispatch\n\noutput result Result\n\n\
+             class Result {\n  status string\n}\n\n\
+             file store out_files {\n  root \"/ws\"\n}\n\n\
+             rule pick\n  when started\n=> {\n\
+             \x20 write text to out_files at \"note.md\" {\n\
+             \x20   body \"branch body\"\n    mode create\n  } as written\n\n\
+             \x20 after written succeeds as result {\n\
+             \x20   complete result {\n      status \"wrote\"\n    }\n  }\n}\n";
+        let mut instance = DurableInstance::create(
+            Rc::clone(&sql),
+            source,
+            "{}",
+            "local/BranchDispatch",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        )
+        .expect("create");
+        // Born on the branch: bind before any step runs; the live file
+        // surface swaps onto the branch working set.
+        instance.bind_branch("draft_a", "t1").expect("bind");
+        assert!(
+            matches!(
+                instance.step(None, TEST_NOW_MS),
+                DurableStepOutcome::Terminal
+            ),
+            "the branch-dispatched write settles and the instance terminates"
+        );
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed")
+        );
+
+        // The content is a cut on the branch, keyed by the resolved full
+        // path — read back through the same generic VCS the native CLI uses.
+        let vcs = WorkspaceVcs::from_parts(
+            DoBranches::new(Rc::clone(&sql)).expect("branch store"),
+            DoContentBlobs::new(Rc::clone(&sql)).expect("content blobs"),
+        );
+        assert_eq!(
+            vcs.read("draft_a", "/ws/note.md").expect("read").as_deref(),
+            Some("branch body")
+        );
+        // Mainline is isolated until a merge.
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "/ws/note.md").expect("read"),
+            None
+        );
+
+        // The plain DO file plane never saw the write.
+        let plain_rows = sql
+            .query("SELECT COUNT(*) FROM files WHERE path LIKE '%note.md'", &[])
+            .map(|rows| {
+                rows.first()
+                    .map(|row| crate::do_store::as_i64(&row[0]))
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            plain_rows, 0,
+            "a branch-bound instance's file effect must not touch the plain DO file plane"
+        );
+
+        // A rebind to a different branch is refused (write-once birth).
+        assert!(instance.bind_branch("main", "t2").is_err());
     }
 }

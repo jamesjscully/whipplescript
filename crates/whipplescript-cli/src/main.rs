@@ -31239,7 +31239,7 @@ fn vcs_content_store_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".whipplescript/vcs-content.sqlite"))
 }
 
-fn open_vcs() -> Result<whipplescript_store::vcs::WorkspaceVcs, ExitCode> {
+fn open_vcs() -> Result<whipplescript_store::vcs::NativeWorkspaceVcs, ExitCode> {
     whipplescript_store::vcs::WorkspaceVcs::open(branch_store_path(), vcs_content_store_path())
         .map_err(|error| {
             eprintln!("could not open the branch stores: {error:?}");
@@ -31367,7 +31367,7 @@ fn conflict_json(conflict: &whipplescript_store::merge::PathConflict) -> Value {
 /// immutable content; no destructive verb exists.
 fn branch_command(options: &CliOptions) -> ExitCode {
     use whipplescript_store::branches::BranchStatus;
-    use whipplescript_store::vcs::{VcsMergeOutcome, VcsWriteOutcome, WorkspaceVcs};
+    use whipplescript_store::vcs::{VcsMergeOutcome, VcsWriteOutcome};
 
     let mut args = options.args.iter().map(String::as_str);
     let Some(verb) = args.next() else {
@@ -31383,7 +31383,7 @@ fn branch_command(options: &CliOptions) -> ExitCode {
     match verb {
         "create" => {
             let mut name: Option<&str> = None;
-            let mut parent: &str = WorkspaceVcs::mainline();
+            let mut parent: &str = whipplescript_store::branches::MAINLINE_BRANCH_ID;
             let mut branch_id: Option<&str> = None;
             let mut iter = rest.iter();
             while let Some(arg) = iter.next() {

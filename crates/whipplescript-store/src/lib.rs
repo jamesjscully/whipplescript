@@ -11,6 +11,7 @@ pub mod merge;
 pub mod native_stores;
 pub mod reconcile;
 pub mod skill_frontmatter;
+pub mod stat_cache;
 pub mod vcs;
 pub mod working_set;
 pub mod workstreams;
