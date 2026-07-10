@@ -117,7 +117,14 @@ Per-heading `· vN` tags below restate this at each phase.
 - [ ] Merge engine v1: path-level three-way over manifests with
       provenance-carrying conflict detection + escalation (never fake
       auto-merge); declaration-granularity whip-source merge with slice
-      certificates (whole-declaration, fail-closed).
+      certificates (whole-declaration, fail-closed). *(Progress
+      2026-07-10: the blob half landed — pure, host-agnostic
+      `merge::merge_manifests` in whipplescript-store (three-way over
+      content-addressed manifests; structured `PathConflict` with base +
+      both sides + provenance; identical-outcome reunification; deletes
+      as outcomes; per-item escalation, remainder still folds). Remaining
+      for the box: the declaration-granularity whip-source merge against
+      the slicer seam.)*
 - [ ] Reconciliation daemon v1: silent rebase-down of slice-disjoint
       mainline deltas; quiescence points (terminals, marks, task
       completion); staleness bound; merge-up serialized by the adoption

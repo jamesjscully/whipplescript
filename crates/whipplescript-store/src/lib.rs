@@ -5,6 +5,7 @@ pub mod content;
 pub mod coordination;
 pub mod files;
 pub mod items;
+pub mod merge;
 #[cfg(feature = "native")]
 pub mod native_stores;
 pub mod skill_frontmatter;
