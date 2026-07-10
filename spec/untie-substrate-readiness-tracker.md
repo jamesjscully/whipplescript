@@ -162,7 +162,14 @@ Per-heading `· vN` tags below restate this at each phase.
 - [ ] **Content-defined chunking** for large blobs (vw note §10.1):
       FastCDC-style chunk trees, file identity = stable Merkle root
       (nothing upstream re-keys); whole-blob below threshold; erasure at
-      chunk level with retained root.
+      chunk level with retained root. *(Progress 2026-07-10: the pure
+      chunking core landed — `crates/whipplescript-store/src/chunking.rs`:
+      FastCDC boundaries over a frozen splitmix64 gear table (explicitly
+      identity-bearing), normalized masks, whole-blob-below-threshold
+      keeps plain content-hash identity, root = hash over ordered chunk
+      ids; dedup properties tested (append shares all but tail, mid-file
+      edit contained). Remaining for the box: wiring into the tiered
+      blob store + chunk-level erasure with retained root.)*
 - [ ] **Stat cache** in the virtual working set: mtime/size/inode
       fingerprints so import-back is O(touched) not O(tree); implements
       the P0 soundness invariant.
