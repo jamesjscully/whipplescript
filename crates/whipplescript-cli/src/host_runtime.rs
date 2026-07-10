@@ -1671,8 +1671,14 @@ impl GovernedHostRuntime {
         S: SecretResolver + ?Sized,
         R: ResourceResolver + ?Sized,
     {
+        let pending_command = self.human_answer_turn_command(answer, packages)?;
+        let binding = self.resolve_provider(&pending_command, secrets)?;
         let (turn_command, answer_receipt) = self.admit_human_answer(answer, packages)?;
-        let binding = self.resolve_provider(&turn_command, secrets)?;
+        if turn_command != pending_command {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "human answer turn changed during admission",
+            )));
+        }
         let driver = NativeHttpDriver::new(binding.timeout);
         let turn = self.run_admitted_turn(&turn_command, packages, resources, binding, &driver)?;
         Ok(HumanAnswerExecution {
@@ -1696,13 +1702,66 @@ impl GovernedHostRuntime {
         R: ResourceResolver + ?Sized,
         H: HostDriver,
     {
+        let pending_command = self.human_answer_turn_command(answer, packages)?;
+        let binding = self.resolve_provider(&pending_command, secrets)?;
         let (turn_command, answer_receipt) = self.admit_human_answer(answer, packages)?;
-        let binding = self.resolve_provider(&turn_command, secrets)?;
+        if turn_command != pending_command {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "human answer turn changed during admission",
+            )));
+        }
         let turn = self.run_admitted_turn(&turn_command, packages, resources, binding, driver)?;
         Ok(HumanAnswerExecution {
             answer_receipt,
             turn,
         })
+    }
+
+    /// Recover and validate the suspended turn without consuming the answer.
+    /// Provider resolution happens against this immutable command before the
+    /// inbox item is mutated, so a missing credential leaves the ask pending.
+    fn human_answer_turn_command<P>(
+        &self,
+        answer: &AnswerHumanAskCommand,
+        packages: &P,
+    ) -> Result<StartTurnCommand, HostRuntimeError>
+    where
+        P: PackageResolver + ?Sized,
+    {
+        answer.validate()?;
+        self.require_policy(&answer.policy)?;
+        let item = self
+            .kernel
+            .store()
+            .get_inbox_item(&answer.ask_ref)
+            .map_err(HostRuntimeError::Store)?
+            .ok_or_else(|| HostRuntimeError::Incomplete(answer.ask_ref.clone()))?;
+        if item.instance_id != answer.instance_ref {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "human ask instance",
+            )));
+        }
+        let effect_id = item.effect_id.as_deref().ok_or_else(|| {
+            HostRuntimeError::Incomplete("human ask has no suspended turn".to_owned())
+        })?;
+        let effect = self
+            .kernel
+            .store()
+            .list_effects(&answer.instance_ref)
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .find(|effect| effect.effect_id == effect_id)
+            .ok_or_else(|| HostRuntimeError::Incomplete(effect_id.to_owned()))?;
+        let turn_command: StartTurnCommand =
+            serde_json::from_str(&effect.input_json).map_err(HostRuntimeError::Json)?;
+        if turn_command.instance_ref != answer.instance_ref || turn_command.policy != answer.policy
+        {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "human answer turn/policy",
+            )));
+        }
+        self.admit_command(&turn_command, packages)?;
+        Ok(turn_command)
     }
 
     fn admit_human_answer<P>(
@@ -2967,6 +3026,18 @@ workflow HumanHostChat {
         }
     }
 
+    struct FailingSecrets;
+
+    impl SecretResolver for FailingSecrets {
+        fn resolve_provider(
+            &self,
+            _binding: &ProviderBindingRef,
+            _placement_ceiling_ref: &str,
+        ) -> Result<ResolvedProviderBinding, String> {
+            Err("provider credential is unavailable".to_owned())
+        }
+    }
+
     struct Resources {
         calls: Cell<usize>,
     }
@@ -3344,6 +3415,22 @@ workflow HumanHostChat {
             respondent_ref: "authority:alice".to_owned(),
             answer: "blue".to_owned(),
         };
+        let unavailable = runtime
+            .answer_human_ask_with_driver(
+                &answer,
+                &HumanPackages,
+                &FailingSecrets,
+                &resources,
+                &ScriptedDriver::new(Vec::new()),
+            )
+            .expect_err("unavailable provider must not consume the answer");
+        assert!(matches!(unavailable, HostRuntimeError::Resolver(_)));
+        let still_pending = runtime
+            .pending_human_turn(&instance.instance_ref, &HumanPackages)
+            .expect("recover ask after provider failure")
+            .expect("provider failure leaves ask pending");
+        assert_eq!(still_pending.ask.ask_ref, answer.ask_ref);
+
         let resumed_driver = ScriptedDriver::new(vec![json!({
             "output_text": "Blue it is.",
             "usage": { "input_tokens": 16, "output_tokens": 4 }
