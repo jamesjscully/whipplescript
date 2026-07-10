@@ -292,6 +292,26 @@ pub enum ResolveOutcome {
 }
 
 /// Outcome of `undo-op`.
+/// Outcome of [`WorkspaceVcs::fork_binding_for_instance`] — the branch
+/// half of a chat fork. Refusals are data, not errors.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InstanceForkBinding {
+    /// The fork branch was created at the source line's head and the
+    /// target instance bound to it at birth.
+    Forked {
+        source_branch_id: String,
+        fork_branch: Box<BranchRow>,
+    },
+    /// The source instance has no branch binding: the fork is thread-only.
+    SourceUnbound,
+    /// The source's recorded branch is missing or no longer active.
+    SourceBranchUnavailable { branch_id: String },
+    /// The requested fork branch id (or name) is held by an unrelated line.
+    ForkBranchIdTaken { branch_id: String },
+    /// The target instance is already bound elsewhere (bind is write-once).
+    TargetAlreadyBound { branch_id: String },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UndoOpOutcome {
     Undone {
@@ -2399,6 +2419,76 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         self.branches.list_bound_instances(branch_id)
     }
 
+    /// The branch half of a chat fork (chat-fork.maude): give the forked
+    /// instance its OWN line — a fresh branch forked at the source line's
+    /// current head, bound to the target at birth. Never rebinds the fork
+    /// to the source's branch (two instances stepping one line would be
+    /// divergent histories of the same run) and never moves the source.
+    /// An unbound source is an honest outcome, not an error: the fork is
+    /// thread-only, like the source itself.
+    pub fn fork_binding_for_instance(
+        &mut self,
+        source_instance: &str,
+        target_instance: &str,
+        fork_branch_id: &str,
+        name: Option<&str>,
+        at: &str,
+    ) -> StoreResult<InstanceForkBinding> {
+        let Some(source_branch_id) = self.instance_branch(source_instance)? else {
+            return Ok(InstanceForkBinding::SourceUnbound);
+        };
+        let fork_branch =
+            match self.fork_with_lineage(fork_branch_id, name, &source_branch_id, None, at)? {
+                CreateBranchOutcome::Created(row) => row,
+                // Replay tolerance: the same fork re-issued finds its branch;
+                // an unrelated branch squatting on the id is a refusal.
+                CreateBranchOutcome::Existing(row)
+                    if row.parent_branch_id.as_deref() == Some(source_branch_id.as_str()) =>
+                {
+                    row
+                }
+                CreateBranchOutcome::Existing(row) => {
+                    return Ok(InstanceForkBinding::ForkBranchIdTaken {
+                        branch_id: row.branch_id,
+                    });
+                }
+                CreateBranchOutcome::NameTaken { holder_branch_id } => {
+                    return Ok(InstanceForkBinding::ForkBranchIdTaken {
+                        branch_id: holder_branch_id,
+                    });
+                }
+                CreateBranchOutcome::ParentMissing => {
+                    return Ok(InstanceForkBinding::SourceBranchUnavailable {
+                        branch_id: source_branch_id,
+                    });
+                }
+                CreateBranchOutcome::ParentNotActive { .. } => {
+                    return Ok(InstanceForkBinding::SourceBranchUnavailable {
+                        branch_id: source_branch_id,
+                    });
+                }
+            };
+        match self.bind_instance(target_instance, &fork_branch.branch_id, at)? {
+            crate::branches::BindOutcome::Bound => {}
+            crate::branches::BindOutcome::AlreadyBound { branch_id }
+                if branch_id == fork_branch.branch_id => {}
+            crate::branches::BindOutcome::AlreadyBound { branch_id } => {
+                return Ok(InstanceForkBinding::TargetAlreadyBound { branch_id });
+            }
+            crate::branches::BindOutcome::BranchMissing
+            | crate::branches::BindOutcome::BranchNotActive { .. } => {
+                return Err(StoreError::Conflict(format!(
+                    "fork branch `{}` closed underneath its own creation",
+                    fork_branch.branch_id
+                )));
+            }
+        }
+        Ok(InstanceForkBinding::Forked {
+            source_branch_id,
+            fork_branch: Box::new(fork_branch),
+        })
+    }
+
     /// Mainline's id, for callers that don't hardcode it.
     pub fn mainline() -> &'static str {
         MAINLINE_BRANCH_ID
@@ -3324,6 +3414,102 @@ mod tests {
             vcs.read("draft_a", "x.md").expect("read"),
             Some("scratch".to_owned()),
             "discard closes the head; the content remains addressable"
+        );
+    }
+
+    /// The branch half of a chat fork (chat-fork.maude): the fork gets its
+    /// OWN line forked at the source line's head, the source binding never
+    /// moves, and the two lines diverge independently afterwards.
+    #[test]
+    fn instance_fork_binding_mints_own_line_and_refuses_rebinds() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.create_branch("chat_main", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("create");
+        vcs.write("chat_main", "note.md", Some("turn one"), "cut_c1", "t2")
+            .expect("write");
+        assert!(matches!(
+            vcs.bind_instance("ins_source", "chat_main", "t3")
+                .expect("bind"),
+            crate::branches::BindOutcome::Bound
+        ));
+
+        // An unbound source forks thread-only.
+        assert_eq!(
+            vcs.fork_binding_for_instance("ins_stranger", "ins_target0", "fork_x", None, "t4")
+                .expect("fork"),
+            InstanceForkBinding::SourceUnbound
+        );
+
+        // The real fork: fresh branch at the source head, bound at birth.
+        let outcome = vcs
+            .fork_binding_for_instance("ins_source", "ins_target", "chat_fork", None, "t5")
+            .expect("fork");
+        let InstanceForkBinding::Forked {
+            source_branch_id,
+            fork_branch,
+        } = outcome
+        else {
+            panic!("expected Forked, got {outcome:?}");
+        };
+        assert_eq!(source_branch_id, "chat_main");
+        assert_eq!(fork_branch.parent_branch_id.as_deref(), Some("chat_main"));
+        let source_row = vcs.get_branch("chat_main").expect("get").expect("row");
+        assert_eq!(
+            fork_branch.head_manifest_hash, source_row.head_manifest_hash,
+            "the fork starts exactly at the source line's head"
+        );
+        assert_eq!(
+            vcs.instance_branch("ins_source").expect("lookup"),
+            Some("chat_main".to_owned()),
+            "the source binding never moves"
+        );
+        assert_eq!(
+            vcs.instance_branch("ins_target").expect("lookup"),
+            Some("chat_fork".to_owned())
+        );
+
+        // Divergence is line-local both ways.
+        vcs.write("chat_fork", "note.md", Some("fork turn"), "cut_f1", "t6")
+            .expect("write");
+        assert_eq!(
+            vcs.read("chat_main", "note.md").expect("read"),
+            Some("turn one".to_owned())
+        );
+        assert_eq!(
+            vcs.read("chat_fork", "note.md").expect("read"),
+            Some("fork turn".to_owned())
+        );
+
+        // Replay of the same fork is tolerated; a squatted id is refused.
+        assert!(matches!(
+            vcs.fork_binding_for_instance("ins_source", "ins_target", "chat_fork", None, "t7")
+                .expect("replay"),
+            InstanceForkBinding::Forked { .. }
+        ));
+        assert_eq!(
+            vcs.fork_binding_for_instance("ins_source", "ins_target2", "chat_main", None, "t8")
+                .expect("squat"),
+            InstanceForkBinding::ForkBranchIdTaken {
+                branch_id: "chat_main".to_owned()
+            }
+        );
+        // A target already bound elsewhere is a write-once refusal.
+        assert_eq!(
+            vcs.fork_binding_for_instance("ins_source", "ins_target", "chat_fork2", None, "t9")
+                .expect("rebind"),
+            InstanceForkBinding::TargetAlreadyBound {
+                branch_id: "chat_fork".to_owned()
+            }
+        );
+        // A closed source line refuses honestly.
+        vcs.discard_branch("chat_main", "t10").expect("discard");
+        assert_eq!(
+            vcs.fork_binding_for_instance("ins_source", "ins_target3", "chat_fork3", None, "t11")
+                .expect("closed"),
+            InstanceForkBinding::SourceBranchUnavailable {
+                branch_id: "chat_main".to_owned()
+            }
         );
     }
 }

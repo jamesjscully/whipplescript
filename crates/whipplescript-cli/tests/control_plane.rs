@@ -19939,9 +19939,7 @@ fn branch_selective_verbs_conflicts_and_archaeology() {
         conflicts.pointer("/0/theirs_label").and_then(Value::as_str),
         Some("main")
     );
-    let resolved = branch(&[
-        "resolve", "draft_b", "clash.md", "--body", "ours + theirs",
-    ]);
+    let resolved = branch(&["resolve", "draft_b", "clash.md", "--body", "ours + theirs"]);
     assert!(resolved.get("resolution").and_then(Value::as_str).is_some());
     let merged = branch(&["merge", "draft_b"]);
     assert_eq!(merged.get("into").and_then(Value::as_str), Some("main"));
@@ -20154,6 +20152,322 @@ rule pick
 
     let _ = fs::remove_file(&src);
     let _ = fs::remove_file(store_path);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Phase 3 fork item (chat fork over branches; chat-fork.maude): `whip fork`
+/// births a new instance whose agent thread seeds from the source's
+/// completed turns and whose file surface is a FRESH branch forked at the
+/// source line's head, bound at birth — one quiescent coordinate for both
+/// planes. The fork continues the conversation with the seeded context and
+/// its writes land on its OWN line; the source's thread and branch never
+/// move.
+#[test]
+fn fork_seeds_thread_and_mints_own_branch_line() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("chat-fork");
+    let store_path = dir.join("store.sqlite");
+    let store = store_path.to_str().expect("utf-8 store path");
+    let branches = dir.join("branches.sqlite");
+    let content = dir.join("vcs-content.sqlite");
+    let ws = dir.join("workspace");
+    fs::create_dir_all(&ws).expect("workspace dir");
+    let root = dir.join("file-root");
+    fs::create_dir_all(&root).expect("file root");
+    let envs: &[(&str, &str)] = &[
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE",
+            branches.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            content.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_HARNESS_WORKSPACE",
+            ws.to_str().expect("utf-8"),
+        ),
+    ];
+
+    let src = dir.join("chat.whip");
+    fs::write(
+        &src,
+        format!(
+            r#"
+workflow ChatForkSmoke
+
+signal user.message {{
+  text string
+}}
+
+file store out_files {{
+  root "{}"
+}}
+
+agent helper {{
+  provider owned
+  profile "repo-reader"
+  capacity 1
+  thread continue
+}}
+
+rule greet
+  when started
+  when helper is available
+=> {{
+  tell helper "the codeword is heliotrope"
+  write text to out_files at "note.md" {{
+    body "source turn body"
+    mode create
+  }} as noted
+}}
+
+rule follow_up
+  when user.message as m
+  when helper is available
+=> {{
+  tell helper "what is the codeword?"
+  write text to out_files at "fork-note.md" {{
+    body "written on the fork line"
+    mode create
+  }} as forked_note
+}}
+"#,
+            root.display()
+        ),
+    )
+    .expect("write workflow");
+    let program = src.to_str().expect("utf-8 source path");
+
+    // The source chat instance: born on its own line, one completed turn.
+    run_json_with_env(bin, &["--json", "branch", "create", "chat_main"], envs);
+    let dev = run_json_with_env(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            program,
+            "--provider",
+            "owned",
+            "--until",
+            "idle",
+            "--branch",
+            "chat_main",
+        ],
+        envs,
+    );
+    let source_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("source instance id")
+        .to_owned();
+    let source_head = run_json_with_env(bin, &["--json", "branch", "show", "chat_main"], envs);
+    let source_head_hash = source_head
+        .get("head_manifest_hash")
+        .and_then(Value::as_str)
+        .expect("source head")
+        .to_owned();
+
+    // The fork: thread seeded, fresh branch at the source head, bound at birth.
+    let fork = run_json_with_env(bin, &["--store", store, "--json", "fork", &source_id], envs);
+    let target_id = fork
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("fork instance id")
+        .to_owned();
+    assert_ne!(target_id, source_id);
+    assert_eq!(fork.get("agent").and_then(Value::as_str), Some("helper"));
+    assert!(
+        fork.get("seeded_messages").and_then(Value::as_u64) >= Some(2),
+        "the seed carries the source turn (user + assistant): {fork}"
+    );
+    let fork_branch = fork
+        .pointer("/branch/fork_branch_id")
+        .and_then(Value::as_str)
+        .expect("fork branch id")
+        .to_owned();
+    assert_eq!(
+        fork.pointer("/branch/source_branch_id")
+            .and_then(Value::as_str),
+        Some("chat_main")
+    );
+    let shown = run_json_with_env(bin, &["--json", "branch", "show", &fork_branch], envs);
+    assert_eq!(
+        shown.get("parent_branch_id").and_then(Value::as_str),
+        Some("chat_main")
+    );
+    assert_eq!(
+        shown.get("head_manifest_hash").and_then(Value::as_str),
+        Some(source_head_hash.as_str()),
+        "the fork line starts exactly at the source line's head"
+    );
+    // The fork inherits the source turn's file state through its own line.
+    let note_key = root.join("note.md").to_string_lossy().into_owned();
+    let inherited = run_json_with_env(
+        bin,
+        &["--json", "branch", "read", &fork_branch, &note_key],
+        envs,
+    );
+    assert_eq!(
+        inherited.get("body").and_then(Value::as_str),
+        Some("source turn body")
+    );
+    // The seed event records the conversation and its exact source coordinate.
+    let fork_log = run_json_with_env(bin, &["--store", store, "--json", "log", &target_id], envs);
+    let fork_events = fork_log.as_array().expect("fork event array");
+    let seeded = fork_events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("agent.thread.seeded")
+        })
+        .expect("thread seed event");
+    assert!(
+        seeded
+            .get("payload")
+            .map(|payload| payload.to_string())
+            .unwrap_or_default()
+            .contains("heliotrope"),
+        "the seeded thread carries the source conversation"
+    );
+    assert_eq!(
+        seeded
+            .pointer("/payload/source_instance_id")
+            .and_then(Value::as_str),
+        Some(source_id.as_str())
+    );
+    assert!(fork_events.iter().any(|event| {
+        event.get("event_type").and_then(Value::as_str) == Some("branch.bound")
+            && event.pointer("/payload/branch_id").and_then(Value::as_str)
+                == Some(fork_branch.as_str())
+    }));
+
+    // Drive the fork with a new user message: the turn continues from the
+    // seeded thread and the rule's write lands on the fork's line only.
+    run_json_with_env(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "signal",
+            &target_id,
+            "--name",
+            "user.message",
+            "--data",
+            r#"{"text":"what is the codeword?"}"#,
+            "--program",
+            program,
+        ],
+        envs,
+    );
+    let mut command = Command::new(bin);
+    command.args(["--store", store, "step", &target_id, "--program", program]);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    assert!(command.output().expect("step runs").status.success());
+    let mut worker = Command::new(bin);
+    worker.args([
+        "--store",
+        store,
+        "--json",
+        "worker",
+        &target_id,
+        "--provider",
+        "owned",
+        "--program",
+        program,
+    ]);
+    for (name, value) in envs {
+        worker.env(name, value);
+    }
+    let worker_out = worker.output().expect("worker runs");
+    assert!(
+        worker_out.status.success(),
+        "worker failed: {}",
+        String::from_utf8_lossy(&worker_out.stderr)
+    );
+
+    // The fork's turn saw the seeded conversation (thread continuation
+    // across the fork boundary).
+    let fork_log = run_json_with_env(bin, &["--store", store, "--json", "log", &target_id], envs);
+    let fork_events = fork_log.as_array().expect("fork event array");
+    let transcript = fork_events
+        .iter()
+        .rfind(|event| {
+            event.get("event_type").and_then(Value::as_str)
+                == Some("agent.turn.brokered.transcript")
+        })
+        .expect("fork turn transcript");
+    let transcript_text = transcript
+        .get("payload")
+        .map(|payload| payload.to_string())
+        .unwrap_or_default();
+    assert!(
+        transcript_text.contains("heliotrope"),
+        "the fork's turn ran over the seeded thread: {transcript_text}"
+    );
+    assert_eq!(
+        fork_events
+            .iter()
+            .filter(|event| event.get("event_type").and_then(Value::as_str)
+                == Some("agent.turn.completed"))
+            .count(),
+        1,
+        "the fork completed its own turn"
+    );
+
+    // Divergence: the fork's write is on the fork's line only, never the
+    // source's line, never the real root.
+    let fork_note_key = root.join("fork-note.md").to_string_lossy().into_owned();
+    let on_fork = run_json_with_env(
+        bin,
+        &["--json", "branch", "read", &fork_branch, &fork_note_key],
+        envs,
+    );
+    assert_eq!(
+        on_fork.get("body").and_then(Value::as_str),
+        Some("written on the fork line")
+    );
+    let mut on_source_line = Command::new(bin);
+    on_source_line.args(["--json", "branch", "read", "chat_main", &fork_note_key]);
+    for (name, value) in envs {
+        on_source_line.env(name, value);
+    }
+    assert!(
+        !on_source_line.output().expect("read runs").status.success(),
+        "the fork's write never reaches the source's line"
+    );
+    assert!(
+        !root.join("fork-note.md").exists(),
+        "the fork's write never touches the real root"
+    );
+
+    // The source never moved: same branch head, still exactly one
+    // completed turn on its log.
+    let source_after = run_json_with_env(bin, &["--json", "branch", "show", "chat_main"], envs);
+    assert_eq!(
+        source_after
+            .get("head_manifest_hash")
+            .and_then(Value::as_str),
+        Some(source_head_hash.as_str()),
+        "the source line's head never moves under the fork"
+    );
+    let source_log = run_json_with_env(bin, &["--store", store, "--json", "log", &source_id], envs);
+    assert_eq!(
+        source_log
+            .as_array()
+            .expect("source event array")
+            .iter()
+            .filter(|event| event.get("event_type").and_then(Value::as_str)
+                == Some("agent.turn.completed"))
+            .count(),
+        1,
+        "the source's thread is untouched by the fork's turn"
+    );
+
     let _ = fs::remove_dir_all(dir);
 }
 

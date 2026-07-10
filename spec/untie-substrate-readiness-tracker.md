@@ -550,7 +550,27 @@ replace git for working branches + workstreams.)*
       the thread ends on the answer. Persistent thread = the recorded
       transcript events — survives restarts by construction. Branching (chat
       fork) stays v0.4 per the fork item below.
-- [ ] Instance fork surface (chat fork) over branches. **[v0.4 — needs Phase 1 branches.]**
+- [x] Instance fork surface (chat fork) over branches. **[v0.4 — needs Phase 1
+      branches.]** *(2026-07-10: `whip fork <instance>` — births a NEW
+      instance whose agent thread seeds from the source's completed turns
+      (`seed_agent_thread`, the host-protocol seam reused) and whose file
+      surface is a fresh branch forked at the source line's head, bound at
+      birth (`WorkspaceVcs::fork_binding_for_instance`) — both planes from
+      ONE quiescent coordinate (a running effect refuses). The fork carries
+      the source's program version/input/authority but no event history and
+      no `external.started` replay; it reacts to new input (`whip signal`/
+      `message`) and its next `thread continue` turn resumes the seeded
+      conversation while file effects land on its own line with
+      branch-distinct keys (P1b/P1i). Modeled first:
+      `models/maude/chat-fork.maude` — the corruption pattern (a quiet
+      instance whose own line folds turns its thread never heard of) is
+      reachable via all three naive forkers (shared-branch, mid-turn,
+      stale-coordinate seed) and unreachable under the sound fork; shared
+      bindings unreachable. E2e:
+      `fork_seeds_thread_and_mints_own_branch_line`. Residuals: the
+      host-protocol `fork_instance_from` stays thread-only (its embedding
+      hosts own their branch stores; composition rides the workspace-DO
+      broker decision), and a DO-side fork op rides the DO tracker.)*
 - [x] **Pi-conformance checklist**: extraction pass DONE 2026-07-07 →
       **`spec/pi-conformance-checklist.md`** (pi-mono @ 351efc8; tool
       ergonomics, turn lifecycle, abort, thread continuation, error

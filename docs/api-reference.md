@@ -28,7 +28,7 @@ package, check, compile, verify-report, gov, agent, agents, providers, skills,
 skill, lint, lsp, fmt, test, run, revise, step, worker, dev, accept, instances,
 status, log, facts, effects, runs, artifacts, inbox, signal, message, issue,
 leases, ledger, counters, evidence, diagnostics, trace, otel-export, telemetry,
-pause, resume, cancel, checkpoint, restore, retry, recover, auth, deploy,
+pause, resume, cancel, checkpoint, restore, fork, retry, recover, auth, deploy,
 executor, doctor
 ```
 
@@ -1033,6 +1033,27 @@ file reconcile (writing manifest paths back to cut content and removing post-cut
 files), and commits a `context.restored` marker that folds the instance and
 transcript planes to the cut. The success line names the `auto-before-<cut-id>`
 checkpoint you can restore to in order to undo. Exit `1` if the cut is refused.
+
+### `fork`
+
+```sh
+whip [--json] fork <instance> [--agent <name>] [--branch-id <id>]
+```
+
+The chat fork: births a **new** instance whose agent thread is seeded from the
+source's completed turns and — when the source is branch-bound — whose file
+surface is a fresh branch forked at the source line's head, bound at birth.
+Both planes are taken from one quiescent coordinate: a running effect refuses
+the fork. The fork inherits the source's program version, input, and authority,
+but not its event history — it never pretends to have executed the source's
+effects. It does not replay the workflow start; drive it with `whip signal` or
+`whip message`, and its next `thread continue` turn resumes the seeded
+conversation while file effects land on its own line with branch-distinct
+effect keys. `--agent` picks the thread when several agents completed turns
+(default: the newest completed turn's agent); `--branch-id` names the fork
+branch. An unbound source forks thread-only, reported honestly. JSON output
+carries the new instance id, the seeded message count, the source coordinate,
+and the branch pair (or `null`).
 
 ## Credentials
 

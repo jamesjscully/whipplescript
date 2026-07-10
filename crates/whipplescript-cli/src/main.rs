@@ -215,6 +215,7 @@ fn main() -> ExitCode {
         Some("cancel") => cancel(&options),
         Some("checkpoint") => checkpoint(&options),
         Some("restore") => restore(&options),
+        Some("fork") => fork_instance_command(&options),
         Some("branch") => branch_command(&options),
         Some("stream") => stream_command(&options),
         Some("retry") => retry(&options),
@@ -617,7 +618,7 @@ fn print_usage() {
     println!(
         "          artifacts, inbox, signal, issue, leases, ledger, counters, evidence, diagnostics, trace"
     );
-    println!("          otel-export, pause, resume, cancel, checkpoint, restore, retry, recover, doctor, deploy");
+    println!("          otel-export, pause, resume, cancel, checkpoint, restore, fork, retry, recover, doctor, deploy");
     println!("run `whip <command> --help` or `whip help <command>` for command usage");
 }
 
@@ -660,6 +661,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "cancel" => "usage: whip cancel <instance>",
         "checkpoint" => "usage: whip [--json] checkpoint <instance> [--cut-id <id>]",
         "restore" => "usage: whip [--json] restore <instance> <cut-id>",
+        "fork" => "usage: whip [--json] fork <instance> [--agent <name>] [--branch-id <id>]",
         "branch" => BRANCH_USAGE,
         "stream" => STREAM_USAGE,
         "retry" => "usage: whip retry <instance> <effect>",
@@ -31312,6 +31314,297 @@ fn restore(options: &CliOptions) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => report_store_error("failed to commit restore", error),
+    }
+}
+
+/// `whip fork <instance>` — the chat-fork surface (Phase 3 fork item over
+/// Phase 1 branches; chat-fork.maude): birth a NEW instance whose agent
+/// thread seeds from the source's completed turns and whose file surface
+/// is a fresh branch forked at the source line's head — both planes taken
+/// from one quiescent coordinate. The fork does not replay the source's
+/// workflow start (no `external.started`): it inherits the conversation
+/// and reacts to new input (`whip signal`/`whip message`), with
+/// branch-distinct effect keys by construction. An unbound source forks
+/// thread-only, honestly reported.
+fn fork_instance_command(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip [--json] fork <instance> [--agent <name>] [--branch-id <id>]";
+    let mut source_id: Option<&str> = None;
+    let mut agent_flag: Option<String> = None;
+    let mut branch_id_flag: Option<String> = None;
+    let mut iter = options.args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--agent" => {
+                let Some(name) = iter.next() else {
+                    eprintln!("expected a name after `--agent`");
+                    return ExitCode::from(2);
+                };
+                agent_flag = Some(name.clone());
+            }
+            "--branch-id" => {
+                let Some(id) = iter.next() else {
+                    eprintln!("expected an id after `--branch-id`");
+                    return ExitCode::from(2);
+                };
+                branch_id_flag = Some(id.clone());
+            }
+            other if source_id.is_none() => source_id = Some(other),
+            other => {
+                eprintln!("unexpected argument `{other}`");
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(source_id) = source_id else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let source = match store.get_instance(source_id) {
+        Ok(Some(view)) => view,
+        Ok(None) => {
+            eprintln!("no such instance `{source_id}`");
+            return ExitCode::from(2);
+        }
+        Err(error) => return report_store_error("failed to load the instance", error),
+    };
+    // The fork coordinate must be quiescent (chat-fork.maude's mid-turn
+    // bite): a running effect means the branch may already carry writes
+    // the completed-turn transcript has never heard of.
+    match store.list_effects(source_id) {
+        Ok(effects) => {
+            if let Some(running) = effects.iter().find(|effect| effect.status == "running") {
+                eprintln!(
+                    "fork refused: effect `{}` is running — the thread/branch coordinate is not quiescent; let the worker drain first",
+                    running.effect_id
+                );
+                return ExitCode::from(2);
+            }
+        }
+        Err(error) => return report_store_error("failed to list effects", error),
+    }
+    let events = match store.list_events(source_id) {
+        Ok(events) => events,
+        Err(error) => return report_store_error("failed to list events", error),
+    };
+    let source_sequence = events.last().map(|event| event.sequence).unwrap_or(0);
+    let agent = match agent_flag.or_else(|| {
+        events.iter().rev().find_map(|event| {
+            if event.event_type != "agent.turn.completed" {
+                return None;
+            }
+            serde_json::from_str::<Value>(&event.payload_json)
+                .ok()?
+                .get("agent")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+    }) {
+        Some(agent) => agent,
+        None => {
+            eprintln!(
+                "fork refused: `{source_id}` has no completed agent turn — nothing to seed (pass --agent to pick one explicitly)"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let mut kernel = RuntimeKernel::new(store);
+    let messages = match kernel.snapshot_agent_thread(source_id, &agent, Some(source_sequence)) {
+        Ok(messages) => messages,
+        Err(error) => return report_store_error("failed to snapshot the thread", error),
+    };
+    if messages.is_empty() {
+        eprintln!(
+            "fork refused: agent `{agent}` has no live thread on `{source_id}` — nothing to seed"
+        );
+        return ExitCode::from(2);
+    }
+    // Branch pre-flight BEFORE minting the target, so a refusable branch
+    // state never leaves a half-forked instance behind.
+    let branch_stores_present = branch_store_path().exists();
+    if branch_stores_present {
+        let vcs = match whipplescript_store::vcs::WorkspaceVcs::open(
+            branch_store_path(),
+            vcs_content_store_path(),
+        ) {
+            Ok(vcs) => vcs,
+            Err(error) => return report_store_error("branch stores unavailable", error),
+        };
+        match vcs.instance_branch(source_id) {
+            Ok(Some(branch_id)) => match vcs.get_branch(&branch_id) {
+                Ok(Some(row))
+                    if row.status == whipplescript_store::branches::BranchStatus::Active => {}
+                Ok(Some(row)) => {
+                    eprintln!(
+                        "fork refused: source branch `{branch_id}` is {} — a closed line cannot fork",
+                        row.status.as_str()
+                    );
+                    return ExitCode::from(2);
+                }
+                Ok(None) => {
+                    eprintln!("fork refused: source branch `{branch_id}` no longer exists");
+                    return ExitCode::from(2);
+                }
+                Err(error) => return report_store_error("failed to load the branch", error),
+            },
+            Ok(None) => {}
+            Err(error) => return report_store_error("failed to look up the binding", error),
+        }
+        if let Some(requested) = branch_id_flag.as_deref() {
+            match vcs.get_branch(requested) {
+                Ok(Some(_)) => {
+                    eprintln!("fork refused: branch id `{requested}` is already taken");
+                    return ExitCode::from(2);
+                }
+                Ok(None) => {}
+                Err(error) => return report_store_error("failed to check the branch id", error),
+            }
+        }
+    }
+    // Mint the target: same program version, input, and authority — a
+    // fresh event history that never pretends to have executed the
+    // source's effects.
+    let target = match kernel.store().create_instance_with_authority(
+        whipplescript_store::NewInstance {
+            program_id: &source.program_id,
+            version_id: &source.version_id,
+            input_json: &source.input_json,
+        },
+        whipplescript_store::NewInstanceAuthority {
+            workflow_principal: &source.workflow_principal,
+            effective_authority_json: &source.effective_authority_json,
+        },
+    ) {
+        Ok(record) => record,
+        Err(error) => return report_store_error("failed to create the fork instance", error),
+    };
+    let target_id = target.instance_id.clone();
+    if let Err(error) = kernel.seed_agent_thread(whipplescript_kernel::AgentThreadSeed {
+        instance_id: &target_id,
+        agent: &agent,
+        messages: &messages,
+        source_instance_id: source_id,
+        source_sequence,
+        idempotency_key: &idempotency_key(&[&target_id, source_id, "fork-thread-seed"]),
+    }) {
+        return report_store_error("failed to seed the fork thread", error);
+    }
+    // The branch half (chat-fork.maude's sound fork): a fresh line forked
+    // at the source line's head, bound to the target at birth.
+    let mut branch_json = Value::Null;
+    if branch_stores_present {
+        let mut vcs = match whipplescript_store::vcs::WorkspaceVcs::open(
+            branch_store_path(),
+            vcs_content_store_path(),
+        ) {
+            Ok(vcs) => vcs,
+            Err(error) => return report_store_error("branch stores unavailable", error),
+        };
+        let fork_branch_id = branch_id_flag.unwrap_or_else(|| {
+            format!(
+                "fork_{}",
+                target_id
+                    .trim_start_matches("ins_")
+                    .chars()
+                    .take(8)
+                    .collect::<String>()
+            )
+        });
+        use whipplescript_store::vcs::InstanceForkBinding;
+        match vcs.fork_binding_for_instance(
+            source_id,
+            &target_id,
+            &fork_branch_id,
+            None,
+            &now_stamp(),
+        ) {
+            Ok(InstanceForkBinding::Forked {
+                source_branch_id,
+                fork_branch,
+            }) => {
+                // The `branch.bound` birth event on the fork's own log, so
+                // the kernel derives branch-distinct effect keys from state
+                // it already reads (P1i).
+                let payload = json!({ "branch_id": fork_branch.branch_id }).to_string();
+                if let Err(error) = kernel.store().append_event(whipplescript_store::NewEvent {
+                    instance_id: &target_id,
+                    event_type: "branch.bound",
+                    payload_json: &payload,
+                    source: "cli",
+                    causation_id: None,
+                    correlation_id: None,
+                    idempotency_key: Some(&idempotency_key(&[
+                        &target_id,
+                        &fork_branch.branch_id,
+                        "branch-bind",
+                    ])),
+                }) {
+                    return report_store_error("failed to record the binding event", error);
+                }
+                branch_json = json!({
+                    "source_branch_id": source_branch_id,
+                    "fork_branch_id": fork_branch.branch_id,
+                    "head_cut_id": fork_branch.head_cut_id,
+                    "head_manifest_hash": fork_branch.head_manifest_hash,
+                });
+            }
+            Ok(InstanceForkBinding::SourceUnbound) => {}
+            Ok(refusal) => {
+                eprintln!("fork branch refused: {refusal:?}");
+                return ExitCode::FAILURE;
+            }
+            Err(error) => return report_store_error("failed to fork the branch", error),
+        }
+    }
+    let forked_payload = json!({
+        "source_instance_id": source_id,
+        "source_sequence": source_sequence,
+        "agent": agent,
+        "branch": branch_json,
+    })
+    .to_string();
+    if let Err(error) = kernel.store().append_event(whipplescript_store::NewEvent {
+        instance_id: &target_id,
+        event_type: "instance.forked",
+        payload_json: &forked_payload,
+        source: "cli",
+        causation_id: None,
+        correlation_id: None,
+        idempotency_key: Some(&idempotency_key(&[
+            &target_id,
+            source_id,
+            "instance-forked",
+        ])),
+    }) {
+        return report_store_error("failed to record the fork event", error);
+    }
+    if options.json {
+        emit_json(json!({
+            "instance_id": target_id,
+            "source_instance_id": source_id,
+            "source_sequence": source_sequence,
+            "agent": agent,
+            "seeded_messages": messages.len(),
+            "branch": branch_json,
+        }))
+    } else {
+        println!(
+            "forked `{source_id}` into `{target_id}` (agent `{agent}`, {} seeded messages)",
+            messages.len()
+        );
+        if let Some(fork_branch) = branch_json.get("fork_branch_id").and_then(Value::as_str) {
+            println!(
+                "fork branch `{fork_branch}` created at the source line's head and bound at birth"
+            );
+        } else {
+            println!("source has no branch binding: the fork is thread-only");
+        }
+        println!("drive it with `whip signal {target_id} ...` or `whip message {target_id} ...`, then `whip worker {target_id}`");
+        ExitCode::SUCCESS
     }
 }
 
