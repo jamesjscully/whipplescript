@@ -144,6 +144,26 @@ produces an Apalache counterexample at the `NoForge`/`CarriagePreserved` invaria
 Label *crossings* (declassify/endorse) are authorized exceptions modeled in the
 crossing models, not here.
 
+## Versioned-workspace models
+
+```text
+ReconciliationDaemonLifecycle.tla
+```
+
+`ReconciliationDaemonLifecycle.tla` (versioned-workspace research note §7.1,
+untie-substrate tracker Phase 1) checks the reconciliation daemon's lifecycle
+policies over all interleavings of two branches and a moving mainline: a
+slice-DISJOINT mainline delta rebases down silently at any time, an
+INTERSECTING delta is applied only at a quiescence point (`NoMidRunIntrusion` —
+per-run snapshot isolation), merge-up happens only under the adoption lease
+with the staleness bound discharged at merge time (`NoStaleMerge` — the guard
+re-checks freshness after the lease was acquired), and the pending-delta
+bookkeeping stays consistent. The merge CONTENT semantics (certificates,
+confluence, joint escalation) live in the Maude `merge-slice` /
+`merge-confluence` models. *Bite (verified to fail):* dropping the quiescence
+guard on `RebaseIntersecting` produces an Apalache counterexample at
+`NoMidRunIntrusion` within 3 steps.
+
 The default script typechecks these formulas with Apalache and runs a bounded
 safety check over `SafetyInvariants` using `ConstInit`, a small finite harness.
 It does not treat full temporal liveness proof as a v0 release gate; the
