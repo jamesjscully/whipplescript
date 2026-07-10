@@ -1552,6 +1552,32 @@ impl GovernedHostRuntime {
         })
     }
 
+    /// The turn's guarantee report (DR-0036): the `host.turn.guarantee`
+    /// evidence body for `command`'s run — the static admission set plus the
+    /// dynamic per-turn section a host consumer matches **by name** (GaugeWright
+    /// ADR 0082 §5; consumers never re-evaluate semantics). `Ok(None)` when the
+    /// run has not produced a report (the turn has not finished here).
+    pub fn turn_guarantee_report(
+        &self,
+        command: &StartTurnCommand,
+    ) -> Result<Option<Value>, HostRuntimeError> {
+        let run_id =
+            idempotency_key(&[&command.instance_ref, &command.command_id, "brokered-run"]);
+        let item = self
+            .kernel
+            .store()
+            .list_evidence_for_subject("run", &run_id)
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .find(|item| item.kind == "host.turn.guarantee");
+        match item {
+            Some(item) => Ok(Some(
+                serde_json::from_str(&item.metadata_json).map_err(HostRuntimeError::Json)?,
+            )),
+            None => Ok(None),
+        }
+    }
+
     /// Mint the out-of-band cancel capability for a command before driving it.
     /// The handle contains no provider secret or resource body.
     pub fn cancellation_handle(
@@ -4598,6 +4624,13 @@ workflow HostChat {
             .and_then(Value::as_str)
             .is_some_and(|hash| !hash.is_empty()));
         let guarantee1 = guarantee_metadata(&runtime, &command1);
+        // The public consumer path (GaugeWright ADR 0082 §5) resolves the same
+        // report without reaching into the kernel.
+        let via_accessor = runtime
+            .turn_guarantee_report(&command1)
+            .expect("report accessor")
+            .expect("report present after a finished turn");
+        assert_eq!(via_accessor, guarantee1, "accessor returns the report body");
         assert_eq!(
             dynamic_outcome(&guarantee1, "writes_within:src").0,
             "held",
