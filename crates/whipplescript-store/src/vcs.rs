@@ -1034,6 +1034,42 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         }
     }
 
+    /// Review-grade diff of the branch's head against a target (diff.rs):
+    /// the branch point by default ("what did this branch change" — the
+    /// review question), or an explicit branch head / recorded cut.
+    /// `None` = no such branch.
+    pub fn diff_against(
+        &self,
+        branch_id: &str,
+        target: Option<&str>,
+        context: usize,
+    ) -> StoreResult<Option<Vec<crate::diff::DiffEntry>>> {
+        let Some(branch) = self.branches.get_branch(branch_id)? else {
+            return Ok(None);
+        };
+        let head = self.load_manifest(branch.head_manifest_hash.as_deref())?;
+        let base = match target {
+            None => self.load_manifest(branch.branch_point_manifest_hash.as_deref())?,
+            Some(target_ref) => {
+                if let Some(row) = self.branches.get_branch(target_ref)? {
+                    self.load_manifest(row.head_manifest_hash.as_deref())?
+                } else if let Some(cut) = self.branches.get_cut(target_ref)? {
+                    self.load_manifest(Some(&cut.manifest_hash))?
+                } else {
+                    return Err(StoreError::Conflict(format!(
+                        "no branch or recorded cut `{target_ref}` to diff against"
+                    )));
+                }
+            }
+        };
+        Ok(Some(crate::diff::diff_manifests(
+            &base,
+            &head,
+            &self.content,
+            context,
+        )?))
+    }
+
     /// Status + hash plumbing for one branch. `None` = no such branch.
     pub fn status_report(&self, branch_id: &str) -> StoreResult<Option<BranchStatusReport>> {
         let Some(branch) = self.branches.get_branch(branch_id)? else {

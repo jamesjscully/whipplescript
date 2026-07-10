@@ -31328,6 +31328,7 @@ const BRANCH_USAGE: &str =
   whip branch ls <branch>\n\
   whip branch remove <branch> <path>\n\
   whip branch cut <branch>\n\
+  whip branch diff <branch> [--against <branch-or-cut>] [--context <n>]\n\
   whip branch probe <branch>\n\
   whip branch merge <branch>\n\
   whip branch restore <branch> <cut>\n\
@@ -32377,6 +32378,53 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 }
                 Err(error) => {
                     eprintln!("branch cut failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "diff" => {
+            let Some(branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let against = rest
+                .iter()
+                .position(|arg| *arg == "--against")
+                .and_then(|index| rest.get(index + 1))
+                .copied();
+            let context = rest
+                .iter()
+                .position(|arg| *arg == "--context")
+                .and_then(|index| rest.get(index + 1))
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(3);
+            match vcs.diff_against(branch_id, against, context) {
+                Ok(Some(entries)) => {
+                    if options.json {
+                        match serde_json::to_value(&entries) {
+                            Ok(payload) => emit_json(json!({
+                                "branch_id": branch_id,
+                                "against": against.unwrap_or("branch-point"),
+                                "entries": payload,
+                            })),
+                            Err(error) => {
+                                eprintln!("branch diff failed: {error}");
+                                ExitCode::FAILURE
+                            }
+                        }
+                    } else {
+                        for entry in &entries {
+                            print!("{}", entry.to_unified());
+                        }
+                        ExitCode::SUCCESS
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch diff failed: {error:?}");
                     ExitCode::FAILURE
                 }
             }

@@ -4,6 +4,7 @@ pub mod branches;
 pub mod chunking;
 pub mod content;
 pub mod coordination;
+pub mod diff;
 pub mod files;
 pub mod items;
 pub mod materialize;

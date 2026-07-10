@@ -19713,6 +19713,32 @@ fn branch_probe_status_restore_and_op_log_surface() {
         "the probe moved nothing"
     );
 
+    // Review-grade diff against the branch point: line-level hunks.
+    let diff = branch(&["diff", "draft_a"]);
+    assert_eq!(
+        diff.pointer("/entries/0/path").and_then(Value::as_str),
+        Some("a.md")
+    );
+    assert_eq!(
+        diff.pointer("/entries/0/kind").and_then(Value::as_str),
+        Some("modified")
+    );
+    assert_eq!(
+        diff.pointer("/entries/0/hunks/0/lines/0/tag")
+            .and_then(Value::as_str),
+        Some("removed")
+    );
+    assert_eq!(
+        diff.pointer("/entries/0/hunks/0/lines/0/text")
+            .and_then(Value::as_str),
+        Some("base")
+    );
+    assert_eq!(
+        diff.pointer("/entries/0/hunks/0/lines/1/text")
+            .and_then(Value::as_str),
+        Some("draft")
+    );
+
     // Status: ahead on a.md, not behind, with head hash plumbing.
     let status = branch(&["status", "draft_a"]);
     assert_eq!(

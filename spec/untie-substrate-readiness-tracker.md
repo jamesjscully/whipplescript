@@ -390,8 +390,18 @@ replace git for working branches + workstreams.)*
       CLI: `whip branch fork/status/cut/probe/restore/ops/reconcile-list`.
       Protocol + op-log unit tests, CLI e2e
       (`branch_probe_status_restore_and_op_log_surface`).
-- [ ] Review-grade diff: an against-target diff surface consumable by an
+- [x] Review-grade diff: an against-target diff surface consumable by an
       external UI (presentation quality, not just manifest delta).
+      **DONE 2026-07-10:** `diff.rs` — pure, host-agnostic Myers
+      O((N+M)D) line diff over the content seam; per-path `DiffEntry`
+      (kind, hashes both sides, hunks with unified `@@` coordinates +
+      context lines, `to_unified()` rendering) — a side whose payload is
+      unavailable (erased/missing) degrades to an honest hash-only entry,
+      never a fabricated body. `WorkspaceVcs::diff_against` diffs the
+      head against the branch point by default (the review question) or
+      an explicit branch/recorded cut. CLI `whip branch diff` (JSON =
+      structured entries; human = unified text). Reconstructs-the-target
+      property test on the edit script.
 - [ ] Workspace export/import bundle: manifest + reachable blobs;
       idempotent re-materialization on the receiving side (the handoff
       `STATE_BEFORE_HOME` carrier); **erasure-respecting** (tombstoned
