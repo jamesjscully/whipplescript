@@ -31,6 +31,7 @@ principals and never contain the resource body.
 | `open(store_path, epoch, signed_envelope)` | Open/reopen SQLite and bind the runtime to the exact verified policy epoch. |
 | `open_with_verifier(store_path, epoch, signed_envelope, verifier)` | Open an embedded runtime under an externally signed envelope; requires the host's pinned `GovernanceAttestationVerifier` and never consults process-global admin state. |
 | `open_instance(command, packages)` | Resolve a pinned package and issue a durable WhippleScript instance ref; replaying the same request id reopens that exact instance. |
+| `fork_instance_from(source, command, packages)` | Seed a distinct instance from an exact source coordinate. Source and target packages are independently resolved and validated, so an explicit cross-version fork preserves a live thread across package upgrades. |
 | `run_turn(...)` | Run the owned brokered loop with the native HTTP driver and persistent transcript. Returns either a terminal receipt or a labeled pending human ask, never both. |
 | `run_turn_with_driver(...)` | Drive the same sans-I/O machine with a host-supplied transport (tests and remote placements). |
 | `pending_human_turn(...)` | Recover the original admitted command and labeled question after a host restart without inspecting WhippleScript's runtime store. |

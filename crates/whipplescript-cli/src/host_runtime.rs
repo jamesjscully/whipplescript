@@ -1313,7 +1313,9 @@ impl GovernedHostRuntime {
     }
 
     /// Fork the source runtime's live agent thread into a distinct target
-    /// instance. The source coordinate, package, and policy are all validated;
+    /// instance. The source coordinate, each side's immutable package, and the
+    /// shared policy are all validated. Source and target package versions may
+    /// differ, making this the explicit thread-preserving package-upgrade seam;
     /// the target records an idempotent seed event rather than copying a store
     /// file or pretending to have executed the source effects.
     pub fn fork_instance_from<P: PackageResolver + ?Sized>(
@@ -1326,15 +1328,35 @@ impl GovernedHostRuntime {
         self.require_policy(&command.policy)?;
         source_runtime.require_policy(&command.policy)?;
 
-        let package = packages
+        let target_package = packages
             .resolve_package(&command.package_version_ref)
             .map_err(HostRuntimeError::Resolver)?;
-        validate_package(&package, &command.package_version_ref)?;
-        self.check_package_ifc(&package)?;
-        source_runtime.check_package_ifc(&package)?;
+        validate_package(&target_package, &command.package_version_ref)?;
+        self.check_package_ifc(&target_package)?;
+
+        let source_instance = source_runtime
+            .kernel
+            .store()
+            .get_instance(&command.source.instance_ref)
+            .map_err(HostRuntimeError::Store)?
+            .ok_or_else(|| {
+                HostRuntimeError::UnknownInstance(command.source.instance_ref.clone())
+            })?;
+        let source_metadata: InstanceMetadata =
+            serde_json::from_str(&source_instance.input_json).map_err(HostRuntimeError::Json)?;
+        if source_metadata.protocol != HOST_PROTOCOL || source_metadata.policy != command.policy {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "fork source package/policy binding",
+            )));
+        }
+        let source_package = packages
+            .resolve_package(&source_metadata.package_version_ref)
+            .map_err(HostRuntimeError::Resolver)?;
+        validate_package(&source_package, &source_metadata.package_version_ref)?;
+        source_runtime.check_package_ifc(&source_package)?;
         source_runtime.validate_instance_binding(
             &command.source.instance_ref,
-            &command.package_version_ref,
+            &source_metadata.package_version_ref,
             &command.policy,
             packages,
         )?;
@@ -1374,14 +1396,14 @@ impl GovernedHostRuntime {
             .kernel
             .snapshot_agent_thread(
                 &command.source.instance_ref,
-                &package.agent,
+                &source_package.agent,
                 Some(command.source.sequence as i64),
             )
             .map_err(HostRuntimeError::Store)?;
         self.kernel
             .seed_agent_thread(AgentThreadSeed {
                 instance_id: &target.instance_ref,
-                agent: &package.agent,
+                agent: &target_package.agent,
                 messages: &messages,
                 source_instance_id: &command.source.instance_ref,
                 source_sequence: command.source.sequence as i64,
@@ -2788,6 +2810,11 @@ mod tests {
 
     impl PackageResolver for Packages {
         fn resolve_package(&self, version_ref: &str) -> Result<ResolvedPackage, String> {
+            let system_prompt = if version_ref == "package:v2" {
+                "Help through the governed resource tools (v2)."
+            } else {
+                "Help through the governed resource tools."
+            };
             ResolvedPackage::compile(
                 version_ref,
                 r#"
@@ -2818,7 +2845,7 @@ workflow HostChat {
 "#,
                 Some("HostChat"),
                 "assistant",
-                "Help through the governed resource tools.",
+                system_prompt,
                 vec![ToolSpec {
                     name: "read".to_owned(),
                     description: "Read an admitted resource.".to_owned(),
@@ -3033,12 +3060,21 @@ workflow HumanHostChat {
     }
 
     fn turn(instance_ref: &str, policy: &PolicyEpochRef, number: usize) -> StartTurnCommand {
+        turn_with_package(instance_ref, policy, number, "package:v1")
+    }
+
+    fn turn_with_package(
+        instance_ref: &str,
+        policy: &PolicyEpochRef,
+        number: usize,
+        package_version_ref: &str,
+    ) -> StartTurnCommand {
         StartTurnCommand {
             protocol: HOST_PROTOCOL.to_owned(),
             command_id: format!("command-{number}"),
             run_ref: format!("gaugedesk:run:{number}"),
             instance_ref: instance_ref.to_owned(),
-            package_version_ref: "package:v1".to_owned(),
+            package_version_ref: package_version_ref.to_owned(),
             policy: policy.clone(),
             input: TurnInput {
                 text: format!("turn {number}"),
@@ -3398,7 +3434,7 @@ workflow HumanHostChat {
             request_id: "fork-source-into-target".to_owned(),
             source: source_position,
             target_request_id: "open-target-chat".to_owned(),
-            package_version_ref: "package:v1".to_owned(),
+            package_version_ref: "package:v2".to_owned(),
             policy: target.policy_ref().clone(),
         };
         let forked = target
@@ -3406,6 +3442,7 @@ workflow HumanHostChat {
             .expect("fork succeeds");
         forked.validate_for(&fork).expect("fork binding");
         assert_ne!(forked.target.instance_ref, source_instance.instance_ref);
+        assert_eq!(forked.target.package_version_ref, "package:v2");
         let replayed = target
             .fork_instance_from(&source, &fork, &Packages)
             .expect("fork replays");
@@ -3417,7 +3454,7 @@ workflow HumanHostChat {
         })]);
         target
             .run_turn_with_driver(
-                &turn(&forked.target.instance_ref, &fork.policy, 2),
+                &turn_with_package(&forked.target.instance_ref, &fork.policy, 2, "package:v2"),
                 &Packages,
                 &Secrets {
                     calls: Cell::new(0),
