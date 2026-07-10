@@ -100,6 +100,7 @@ pub trait Workstreams {
         idempotency_key: Option<&str>,
     ) -> StoreResult<CreateStreamOutcome>;
     fn get_stream(&self, stream_id: &str) -> StoreResult<Option<WorkstreamRow>>;
+    fn list_streams(&self, status: Option<StreamStatus>) -> StoreResult<Vec<WorkstreamRow>>;
     fn join(&mut self, branch_id: &str, stream_id: &str, at: &str) -> StoreResult<JoinOutcome>;
     /// Leave = re-home to mainline (drop the membership row). Returns the
     /// stream left, if any.
@@ -259,6 +260,33 @@ impl Workstreams for WorkstreamStore {
 
     fn get_stream(&self, stream_id: &str) -> StoreResult<Option<WorkstreamRow>> {
         Self::stream_by_id(&self.connection, stream_id)
+    }
+
+    fn list_streams(&self, status: Option<StreamStatus>) -> StoreResult<Vec<WorkstreamRow>> {
+        let mut rows = Vec::new();
+        match status {
+            Some(status) => {
+                let mut stmt = self.connection.prepare(
+                    "SELECT stream_id, name, line_branch_id, status, created_at, updated_at \
+                     FROM workstreams WHERE status = ?1 ORDER BY stream_id",
+                )?;
+                let mapped = stmt.query_map(params![status.as_str()], map_stream_row)?;
+                for row in mapped {
+                    rows.push(row?);
+                }
+            }
+            None => {
+                let mut stmt = self.connection.prepare(
+                    "SELECT stream_id, name, line_branch_id, status, created_at, updated_at \
+                     FROM workstreams ORDER BY stream_id",
+                )?;
+                let mapped = stmt.query_map([], map_stream_row)?;
+                for row in mapped {
+                    rows.push(row?);
+                }
+            }
+        }
+        Ok(rows)
     }
 
     fn join(&mut self, branch_id: &str, stream_id: &str, at: &str) -> StoreResult<JoinOutcome> {

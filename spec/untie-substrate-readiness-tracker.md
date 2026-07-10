@@ -201,18 +201,23 @@ Per-heading `· vN` tags below restate this at each phase.
       divergence survives. Read-set-aware mid-run silent folds (the
       slicer's read tracking) and a self-scheduling background cadence
       remain future refinements; the tick is worker/operator-invoked.)*
-- [ ] Workstream tier: named shared lines + membership (single-valued,
+- [x] Workstream tier: named shared lines + membership (single-valued,
       fail-closed to mainline); certificate-gated auto-admit in-stream;
-      boundary-gated promotion; archive re-homes members. *(Progress
-      2026-07-10: the membership/lifecycle store landed —
-      `crates/whipplescript-store/src/workstreams.rs`, `Workstreams` trait
-      for DO parity; single-valued membership by schema (PK = branch id,
-      join is an atomic leave-then-join), no-membership = mainline, archive
-      closes the line and re-homes every member in one transaction
-      returning them for the rebase-down pass, active-only name
-      uniqueness. Remaining for the box: the certificate-gated auto-admit
-      + boundary-gated promotion, which live in the reconciliation daemon
-      against the merge engine.)*
+      boundary-gated promotion; archive re-homes members. *(2026-07-10
+      complete: the membership/lifecycle store (`workstreams.rs`,
+      single-valued by schema, archive re-homes atomically, active-only
+      names) + the sync mechanics (`WorkspaceVcs::sync_to_line` — fold
+      the line down, certified merges refine, then advance the line and
+      re-point the member fully in sync, NEVER adopted) + the daemon
+      wiring: `whip branch reconcile` auto-admits quiescent stream
+      members greedily (certificate-gated; a colliding contribution
+      isolates per-contribution without moving the line) and
+      `whip stream promote` is the boundary hop to mainline under the
+      adoption lease; `whip stream create/join/leave/archive/list/show`
+      is the surface. E2E: two members admit disjoint work, the sibling
+      pick-up converges on the next tick, a collision isolates, promotion
+      lands the line on main with the stream surviving, archive re-homes
+      all members.)*
 - [x] Branch-distinct effect keys as a general rule (branch/cut id joins
       program_version + revision_epoch in the idempotency key).
       *(2026-07-10: `rule_pass::revision_branch_key` — the composed

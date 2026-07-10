@@ -108,6 +108,28 @@ pub enum ReconcileOutcome {
     NoParent,
 }
 
+/// One greedy in-stream sync (auto-admit) or boundary promotion: the
+/// branch's divergence lands on the line and the branch re-points fully
+/// in sync — it KEEPS WORKING (never adopted), per the workstream tier's
+/// per-contribution model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SyncOutcome {
+    /// Nothing to admit (already in sync with the line).
+    UpToDate,
+    Synced {
+        sync_cut_id: String,
+    },
+    /// Per-contribution isolation: this member's sync failed honestly;
+    /// the stream stays active, siblings proceed.
+    Conflicts {
+        conflicts: Vec<PathConflict>,
+    },
+    BranchMissing,
+    BranchNotActive,
+    LineMissing,
+    LineNotActive,
+}
+
 pub struct WorkspaceVcs<B: Branches, C: ContentBlobs> {
     branches: B,
     content: C,
@@ -328,13 +350,31 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         rebase_cut_id: &str,
         at: &str,
     ) -> StoreResult<ReconcileOutcome> {
+        self.reconcile_branch_against(branch_id, None, quiescent, rebase_cut_id, at)
+    }
+
+    /// `reconcile_branch` with an explicit sync target — a workstream
+    /// member folds its STREAM LINE's deltas down (the caller resolves
+    /// membership; store seams stay separate). `None` = the lineage
+    /// parent.
+    pub fn reconcile_branch_against(
+        &mut self,
+        branch_id: &str,
+        target_id: Option<&str>,
+        quiescent: bool,
+        rebase_cut_id: &str,
+        at: &str,
+    ) -> StoreResult<ReconcileOutcome> {
         let Some(branch) = self.branches.get_branch(branch_id)? else {
             return Ok(ReconcileOutcome::BranchMissing);
         };
         if branch.status != BranchStatus::Active {
             return Ok(ReconcileOutcome::BranchNotActive);
         }
-        let Some(parent_id) = branch.parent_branch_id.clone() else {
+        let Some(parent_id) = target_id
+            .map(str::to_owned)
+            .or_else(|| branch.parent_branch_id.clone())
+        else {
             return Ok(ReconcileOutcome::NoParent);
         };
         let Some(parent) = self.branches.get_branch(&parent_id)? else {
@@ -573,6 +613,104 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             }
             AdvanceOutcome::NotActive { .. } => Ok(VcsWriteOutcome::BranchNotActive),
             AdvanceOutcome::NotFound => Ok(VcsWriteOutcome::BranchMissing),
+        }
+    }
+
+    /// Greedy in-stream sync (workstream auto-admit) and boundary
+    /// promotion share one mechanism: fold the LINE's deltas down
+    /// (certified source merges refine; conflicts isolate this
+    /// contribution), then advance the line to the branch's content and
+    /// re-point the branch fully in sync — zero divergence, still
+    /// active. The caller runs this at quiescence and under the adoption
+    /// lease where the line is a promotion boundary.
+    pub fn sync_to_line(
+        &mut self,
+        branch_id: &str,
+        line_id: &str,
+        sync_cut_id: &str,
+        at: &str,
+    ) -> StoreResult<SyncOutcome> {
+        if branch_id == line_id {
+            return Ok(SyncOutcome::UpToDate);
+        }
+        match self.branches.get_branch(line_id)? {
+            None => return Ok(SyncOutcome::LineMissing),
+            Some(line) if line.status != BranchStatus::Active => {
+                return Ok(SyncOutcome::LineNotActive)
+            }
+            Some(_) => {}
+        }
+        match self.reconcile_branch_against(
+            branch_id,
+            Some(line_id),
+            true,
+            &format!("{sync_cut_id}-rebase"),
+            at,
+        )? {
+            ReconcileOutcome::UpToDate | ReconcileOutcome::Rebased { .. } => {}
+            ReconcileOutcome::DeferredMidRun => unreachable!("synced at quiescence"),
+            ReconcileOutcome::Conflicts { conflicts } => {
+                return Ok(SyncOutcome::Conflicts { conflicts });
+            }
+            ReconcileOutcome::BranchMissing => return Ok(SyncOutcome::BranchMissing),
+            ReconcileOutcome::BranchNotActive => return Ok(SyncOutcome::BranchNotActive),
+            ReconcileOutcome::NoParent => return Ok(SyncOutcome::LineMissing),
+        }
+        let branch = self
+            .branches
+            .get_branch(branch_id)?
+            .ok_or_else(|| StoreError::Conflict("branch vanished mid-sync".to_owned()))?;
+        let line = self
+            .branches
+            .get_branch(line_id)?
+            .ok_or_else(|| StoreError::Conflict("line vanished mid-sync".to_owned()))?;
+        if branch.head_manifest_hash == branch.branch_point_manifest_hash {
+            return Ok(SyncOutcome::UpToDate);
+        }
+        if branch.branch_point_cut_id != line.head_cut_id {
+            return Err(StoreError::Conflict(
+                "line advanced mid-sync; retry".to_owned(),
+            ));
+        }
+        let head_manifest = branch
+            .head_manifest_hash
+            .clone()
+            .unwrap_or_else(|| self.store_manifest(&BTreeMap::new()).unwrap_or_default());
+        match self.branches.advance_head(
+            line_id,
+            line.head_cut_id.as_deref(),
+            sync_cut_id,
+            &head_manifest,
+            at,
+        )? {
+            AdvanceOutcome::Advanced(_) => {}
+            AdvanceOutcome::Stale { .. } => {
+                return Err(StoreError::Conflict(
+                    "line advanced mid-sync; retry".to_owned(),
+                ))
+            }
+            AdvanceOutcome::NotActive { .. } => return Ok(SyncOutcome::LineNotActive),
+            AdvanceOutcome::NotFound => return Ok(SyncOutcome::LineMissing),
+        }
+        // The member re-points fully in sync (point == head == the sync
+        // cut) and keeps working.
+        match self.branches.rebase_branch(
+            branch_id,
+            branch.head_cut_id.as_deref(),
+            sync_cut_id,
+            &head_manifest,
+            sync_cut_id,
+            &head_manifest,
+            at,
+        )? {
+            AdvanceOutcome::Advanced(_) => Ok(SyncOutcome::Synced {
+                sync_cut_id: sync_cut_id.to_owned(),
+            }),
+            AdvanceOutcome::Stale { .. } => Err(StoreError::Conflict(
+                "branch head moved mid-sync; retry".to_owned(),
+            )),
+            AdvanceOutcome::NotActive { .. } => Ok(SyncOutcome::BranchNotActive),
+            AdvanceOutcome::NotFound => Ok(SyncOutcome::BranchMissing),
         }
     }
 
@@ -997,6 +1135,102 @@ mod tests {
         assert_eq!(
             vcs.read("draft_a", "b.md").expect("read").as_deref(),
             Some("B new")
+        );
+    }
+
+    /// The workstream sync loop: members greedily admit into the shared
+    /// line (rebasing each other's admitted work down first), stay
+    /// active with zero divergence, and a colliding contribution
+    /// isolates without moving the line or blocking siblings.
+    #[test]
+    fn stream_members_sync_greedily_and_conflicts_isolate() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        // The stream's shared line is an ordinary branch off mainline.
+        vcs.create_branch("line_ws", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("line");
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("member a");
+        vcs.create_branch("draft_b", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("member b");
+        vcs.write("draft_a", "a.md", Some("A work"), "cut_a1", "t2")
+            .expect("write");
+        assert_eq!(
+            vcs.sync_to_line("draft_a", "line_ws", "sync_a1", "t3")
+                .expect("sync"),
+            SyncOutcome::Synced {
+                sync_cut_id: "sync_a1".to_owned()
+            }
+        );
+        assert_eq!(
+            vcs.read("line_ws", "a.md").expect("read").as_deref(),
+            Some("A work")
+        );
+        let member = vcs.get_branch("draft_a").expect("get").expect("row");
+        assert_eq!(member.status, BranchStatus::Active, "never adopted");
+        assert_eq!(
+            member.branch_point_manifest_hash, member.head_manifest_hash,
+            "fully in sync — zero divergence"
+        );
+        // Second member: the greedy sync folds a's admitted work down
+        // first, then admits b's disjoint contribution.
+        vcs.write("draft_b", "b.md", Some("B work"), "cut_b1", "t4")
+            .expect("write");
+        assert!(matches!(
+            vcs.sync_to_line("draft_b", "line_ws", "sync_b1", "t5")
+                .expect("sync"),
+            SyncOutcome::Synced { .. }
+        ));
+        assert_eq!(
+            vcs.read("line_ws", "a.md").expect("read").as_deref(),
+            Some("A work")
+        );
+        assert_eq!(
+            vcs.read("line_ws", "b.md").expect("read").as_deref(),
+            Some("B work")
+        );
+        assert_eq!(
+            vcs.read("draft_b", "a.md").expect("read").as_deref(),
+            Some("A work"),
+            "the member picked up its sibling's admitted work"
+        );
+        // A colliding contribution isolates: the line does not move and
+        // the member stays live for repair.
+        vcs.create_branch("draft_c", None, MAINLINE_BRANCH_ID, "t6")
+            .expect("member c");
+        vcs.write("draft_c", "a.md", Some("C collides"), "cut_c1", "t7")
+            .expect("write");
+        assert!(matches!(
+            vcs.sync_to_line("draft_c", "line_ws", "sync_c1", "t8")
+                .expect("sync"),
+            SyncOutcome::Conflicts { .. }
+        ));
+        assert_eq!(
+            vcs.read("line_ws", "a.md").expect("read").as_deref(),
+            Some("A work"),
+            "a failed contribution never moves the line"
+        );
+        assert_eq!(
+            vcs.get_branch("draft_c").expect("get").expect("row").status,
+            BranchStatus::Active
+        );
+        // Promotion is the same mechanism at the boundary: the line's
+        // state lands on mainline and the line keeps going.
+        assert!(matches!(
+            vcs.sync_to_line("line_ws", MAINLINE_BRANCH_ID, "promote_1", "t9")
+                .expect("promote"),
+            SyncOutcome::Synced { .. }
+        ));
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "b.md")
+                .expect("read")
+                .as_deref(),
+            Some("B work")
+        );
+        assert_eq!(
+            vcs.get_branch("line_ws").expect("get").expect("row").status,
+            BranchStatus::Active,
+            "the stream line survives promotion"
         );
     }
 

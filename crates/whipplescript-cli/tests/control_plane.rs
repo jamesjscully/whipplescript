@@ -20109,3 +20109,158 @@ fn branch_reconcile_folds_disjoint_mainline_deltas_down() {
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_dir_all(dir);
 }
+
+/// The workstream tier end to end: members join a stream, `whip branch
+/// reconcile` greedily auto-admits their quiescent work into the shared
+/// line (each member picking up admitted siblings), a colliding
+/// contribution isolates without moving the line, and `whip stream
+/// promote` lands the line's state on mainline while the stream keeps
+/// going.
+#[test]
+fn workstream_members_auto_admit_and_promote() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let dir = unique_temp_dir("workstream");
+    let envs_owned = [
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE".to_owned(),
+            dir.join("branches.sqlite").to_string_lossy().into_owned(),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE".to_owned(),
+            dir.join("vcs-content.sqlite")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "WHIPPLESCRIPT_WORKSTREAM_STORE".to_owned(),
+            dir.join("workstreams.sqlite")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "WHIPPLESCRIPT_COORDINATION_STORE".to_owned(),
+            dir.join("coordination.sqlite")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ];
+    let envs: Vec<(&str, &str)> = envs_owned
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let whip = |args: &[&str]| {
+        let mut full = vec!["--store", store, "--json"];
+        full.extend_from_slice(args);
+        run_json_with_env(bin, &full, &envs)
+    };
+
+    // A stream with two members.
+    whip(&["stream", "create", "triage", "--name", "triage"]);
+    whip(&["branch", "create", "draft_a"]);
+    whip(&["branch", "create", "draft_b"]);
+    whip(&["stream", "join", "triage", "draft_a"]);
+    whip(&["stream", "join", "triage", "draft_b"]);
+
+    // Disjoint member work auto-admits on reconcile; the second member
+    // picks up the first's admitted work through the line.
+    whip(&["branch", "write", "draft_a", "a.md", "--body", "A work"]);
+    whip(&["branch", "write", "draft_b", "b.md", "--body", "B work"]);
+    let report = whip(&["branch", "reconcile"]);
+    let outcomes: Vec<(&str, &str)> = report
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|entry| {
+            Some((
+                entry.get("branch_id").and_then(Value::as_str)?,
+                entry.get("outcome").and_then(Value::as_str)?,
+            ))
+        })
+        .collect();
+    assert!(
+        outcomes
+            .iter()
+            .filter(|(branch, outcome)| branch.starts_with("draft_") && outcome == &"admitted")
+            .count()
+            == 2,
+        "both quiescent members auto-admitted: {report}"
+    );
+    assert_eq!(
+        whip(&["branch", "read", "line-triage", "a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("A work")
+    );
+    assert_eq!(
+        whip(&["branch", "read", "line-triage", "b.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("B work")
+    );
+    // Greedy convergence: draft_a admitted before b.md landed on the
+    // line; the NEXT tick folds it back down.
+    whip(&["branch", "reconcile"]);
+    assert_eq!(
+        whip(&["branch", "read", "draft_a", "b.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("B work"),
+        "the sibling's admitted work flowed back through the line"
+    );
+
+    // A colliding member isolates: the line keeps the admitted content.
+    whip(&["branch", "create", "draft_c"]);
+    whip(&["stream", "join", "triage", "draft_c"]);
+    whip(&["branch", "write", "draft_c", "a.md", "--body", "C collides"]);
+    let report = whip(&["branch", "reconcile"]);
+    let conflicted = report
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|entry| entry.get("branch_id").and_then(Value::as_str) == Some("draft_c"))
+        .expect("draft_c entry");
+    assert_eq!(
+        conflicted.get("outcome").and_then(Value::as_str),
+        Some("conflicts"),
+        "the colliding contribution isolates: {report}"
+    );
+    assert_eq!(
+        whip(&["branch", "read", "line-triage", "a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("A work"),
+        "a failed contribution never moves the line"
+    );
+
+    // Promotion: the boundary hop lands the line's state on mainline;
+    // the stream survives.
+    let promoted = whip(&["stream", "promote", "triage"]);
+    assert_eq!(promoted.get("into").and_then(Value::as_str), Some("main"));
+    assert_eq!(
+        whip(&["branch", "read", "main", "a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("A work")
+    );
+    let show = whip(&["stream", "show", "triage"]);
+    assert_eq!(show.get("status").and_then(Value::as_str), Some("active"));
+    assert_eq!(
+        show.get("members").and_then(Value::as_array).map(Vec::len),
+        Some(3)
+    );
+
+    // Archive re-homes the members (their next reconcile targets main).
+    let archived = whip(&["stream", "archive", "triage"]);
+    assert_eq!(
+        archived
+            .get("rehomed_branch_ids")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(3)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_dir_all(dir);
+}

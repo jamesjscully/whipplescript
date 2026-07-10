@@ -216,6 +216,7 @@ fn main() -> ExitCode {
         Some("checkpoint") => checkpoint(&options),
         Some("restore") => restore(&options),
         Some("branch") => branch_command(&options),
+        Some("stream") => stream_command(&options),
         Some("retry") => retry(&options),
         Some("recover") => recover(&options),
         Some("auth") => auth_command(&options),
@@ -660,6 +661,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "checkpoint" => "usage: whip [--json] checkpoint <instance> [--cut-id <id>]",
         "restore" => "usage: whip [--json] restore <instance> <cut-id>",
         "branch" => BRANCH_USAGE,
+        "stream" => STREAM_USAGE,
         "retry" => "usage: whip retry <instance> <effect>",
         "recover" => "usage: whip recover <instance>",
         "doctor" => "usage: whip doctor [--providers] [--provider-config <path>] [--record-provider-evidence <instance>]",
@@ -31283,6 +31285,301 @@ const BRANCH_USAGE: &str =
   whip branch bind <branch> <instance>\n\
   whip branch reconcile";
 
+const STREAM_USAGE: &str =
+    "usage: whip [--json] stream <create|join|leave|archive|promote|list|show> ...\n\
+  whip stream create <stream> [--name <label>]\n\
+  whip stream join <stream> <branch>\n\
+  whip stream leave <branch>\n\
+  whip stream archive <stream>\n\
+  whip stream promote <stream>\n\
+  whip stream list\n\
+  whip stream show <stream>";
+
+fn workstream_store_path() -> PathBuf {
+    env::var("WHIPPLESCRIPT_WORKSTREAM_STORE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".whipplescript/workstreams.sqlite"))
+}
+
+fn open_streams() -> Result<whipplescript_store::workstreams::WorkstreamStore, ExitCode> {
+    whipplescript_store::workstreams::WorkstreamStore::open(workstream_store_path()).map_err(
+        |error| {
+            eprintln!("could not open the workstream store: {error:?}");
+            ExitCode::FAILURE
+        },
+    )
+}
+
+fn stream_row_json(row: &whipplescript_store::workstreams::WorkstreamRow) -> Value {
+    json!({
+        "stream_id": row.stream_id,
+        "name": row.name,
+        "line_branch_id": row.line_branch_id,
+        "status": row.status.as_str(),
+    })
+}
+
+/// `whip stream …` — the workstream tier: named shared lines +
+/// membership. Members auto-admit during `whip branch reconcile`
+/// (greedy, certificate-gated); promotion is the explicit boundary hop
+/// to mainline under the adoption lease.
+fn stream_command(options: &CliOptions) -> ExitCode {
+    use whipplescript_store::workstreams::{
+        ArchiveOutcome, CreateStreamOutcome, JoinOutcome, StreamStatus, Workstreams,
+    };
+    let mut args = options.args.iter().map(String::as_str);
+    let Some(verb) = args.next() else {
+        eprintln!("{STREAM_USAGE}");
+        return ExitCode::from(2);
+    };
+    let rest: Vec<&str> = args.collect();
+    let at = now_stamp();
+    let mut streams = match open_streams() {
+        Ok(streams) => streams,
+        Err(code) => return code,
+    };
+    match verb {
+        "create" => {
+            let mut name: Option<&str> = None;
+            let mut stream_id: Option<&str> = None;
+            let mut iter = rest.iter();
+            while let Some(arg) = iter.next() {
+                match *arg {
+                    "--name" => name = iter.next().copied(),
+                    other if stream_id.is_none() => stream_id = Some(other),
+                    other => {
+                        eprintln!("unexpected argument `{other}`\n{STREAM_USAGE}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let Some(stream_id) = stream_id else {
+                eprintln!("{STREAM_USAGE}");
+                return ExitCode::from(2);
+            };
+            // The stream's shared line is an ordinary branch off mainline.
+            let line_branch_id = format!("line-{stream_id}");
+            let mut vcs = match open_vcs() {
+                Ok(vcs) => vcs,
+                Err(code) => return code,
+            };
+            if let Err(error) = vcs.init(&at) {
+                eprintln!("stream create failed: {error:?}");
+                return ExitCode::FAILURE;
+            }
+            match vcs.create_branch(
+                &line_branch_id,
+                None,
+                whipplescript_store::branches::MAINLINE_BRANCH_ID,
+                &at,
+            ) {
+                Ok(whipplescript_store::branches::CreateBranchOutcome::Created(_))
+                | Ok(whipplescript_store::branches::CreateBranchOutcome::Existing(_)) => {}
+                Ok(other) => {
+                    eprintln!("stream line not created: {other:?}");
+                    return ExitCode::FAILURE;
+                }
+                Err(error) => {
+                    eprintln!("stream line create failed: {error:?}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            match streams.create_stream(stream_id, name, &line_branch_id, &at, None) {
+                Ok(CreateStreamOutcome::Created(row)) => {
+                    emit_json(json!({"created": stream_row_json(&row)}))
+                }
+                Ok(CreateStreamOutcome::Existing(row)) => {
+                    emit_json(json!({"existing": stream_row_json(&row)}))
+                }
+                Ok(CreateStreamOutcome::NameTaken { holder_stream_id }) => {
+                    eprintln!("stream name taken by `{holder_stream_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("stream create failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "join" => {
+            let (Some(stream_id), Some(branch_id)) = (rest.first(), rest.get(1)) else {
+                eprintln!("{STREAM_USAGE}");
+                return ExitCode::from(2);
+            };
+            match streams.join(branch_id, stream_id, &at) {
+                Ok(JoinOutcome::Joined { left_stream_id }) => emit_json(json!({
+                    "joined": branch_id, "stream_id": stream_id,
+                    "left_stream_id": left_stream_id,
+                })),
+                Ok(other) => {
+                    eprintln!("join refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("join failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "leave" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{STREAM_USAGE}");
+                return ExitCode::from(2);
+            };
+            match streams.leave(branch_id) {
+                Ok(left) => emit_json(json!({"left": branch_id, "stream_id": left})),
+                Err(error) => {
+                    eprintln!("leave failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "archive" => {
+            let Some(stream_id) = rest.first() else {
+                eprintln!("{STREAM_USAGE}");
+                return ExitCode::from(2);
+            };
+            match streams.archive_stream(stream_id, &at) {
+                Ok(ArchiveOutcome::Archived { rehomed_branch_ids }) => emit_json(json!({
+                    "archived": stream_id,
+                    "rehomed_branch_ids": rehomed_branch_ids,
+                })),
+                Ok(other) => {
+                    eprintln!("archive refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("archive failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "promote" => {
+            let Some(stream_id) = rest.first() else {
+                eprintln!("{STREAM_USAGE}");
+                return ExitCode::from(2);
+            };
+            let Ok(Some(stream)) = streams.get_stream(stream_id) else {
+                eprintln!("no such stream `{stream_id}`");
+                return ExitCode::FAILURE;
+            };
+            if stream.status != StreamStatus::Active {
+                eprintln!("stream `{stream_id}` is archived");
+                return ExitCode::FAILURE;
+            }
+            let mut vcs = match open_vcs() {
+                Ok(vcs) => vcs,
+                Err(code) => return code,
+            };
+            // The boundary hop runs under the adoption lease on mainline.
+            let holder = format!("whip-{}", std::process::id());
+            let lease_key = format!(
+                "{}::{}",
+                branch_store_path().display(),
+                whipplescript_store::branches::MAINLINE_BRANCH_ID
+            );
+            let mut coordination = match whipplescript_store::coordination::CoordinationStore::open(
+                coordination_store_path(),
+            ) {
+                Ok(coordination) => coordination,
+                Err(error) => {
+                    eprintln!("coordination store unavailable: {error:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match coordination.try_acquire("adoption", &lease_key, 1, 60, &holder) {
+                Ok(whipplescript_store::coordination::AcquireOutcome::Held) => {}
+                Ok(whipplescript_store::coordination::AcquireOutcome::Contended { holders }) => {
+                    eprintln!("adoption lease is held by {holders:?}; retry");
+                    return ExitCode::FAILURE;
+                }
+                Err(error) => {
+                    eprintln!("adoption lease unavailable: {error:?}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            let sync_cut = generated_cut_id();
+            let outcome = vcs.sync_to_line(
+                &stream.line_branch_id,
+                whipplescript_store::branches::MAINLINE_BRANCH_ID,
+                &format!("{sync_cut}-promote"),
+                &at,
+            );
+            let _ = coordination.release("adoption", &lease_key, &holder);
+            match outcome {
+                Ok(whipplescript_store::vcs::SyncOutcome::Synced { sync_cut_id }) => {
+                    emit_json(json!({
+                        "promoted": stream_id, "into": "main",
+                        "sync_cut_id": sync_cut_id,
+                    }))
+                }
+                Ok(whipplescript_store::vcs::SyncOutcome::UpToDate) => {
+                    emit_json(json!({"promoted": stream_id, "outcome": "up_to_date"}))
+                }
+                Ok(whipplescript_store::vcs::SyncOutcome::Conflicts { conflicts }) => {
+                    let payload = json!({
+                        "conflicted": stream_id,
+                        "conflicts": conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+                    });
+                    eprintln!("promotion conflicted: {payload}");
+                    ExitCode::FAILURE
+                }
+                Ok(other) => {
+                    eprintln!("promotion refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("promotion failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "list" => {
+            let all = rest.contains(&"--all");
+            let status = if all {
+                None
+            } else {
+                Some(StreamStatus::Active)
+            };
+            match streams.list_streams(status) {
+                Ok(rows) => emit_json(Value::Array(
+                    rows.iter().map(stream_row_json).collect::<Vec<_>>(),
+                )),
+                Err(error) => {
+                    eprintln!("stream list failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "show" => {
+            let Some(stream_id) = rest.first() else {
+                eprintln!("{STREAM_USAGE}");
+                return ExitCode::from(2);
+            };
+            match streams.get_stream(stream_id) {
+                Ok(Some(row)) => {
+                    let members = streams.members(stream_id).unwrap_or_default();
+                    let mut value = stream_row_json(&row);
+                    insert_json_field(&mut value, "members", json!(members));
+                    emit_json(value)
+                }
+                Ok(None) => {
+                    eprintln!("no such stream `{stream_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("stream show failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        other => {
+            eprintln!("unknown stream verb `{other}`\n{STREAM_USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// The versioned-workspace branch stores, workspace-scoped like the
 /// coordination store (env-overridable for tests).
 fn branch_store_path() -> PathBuf {
@@ -31822,6 +32119,12 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 }
             };
             let store = SqliteStore::open(&options.store_path).ok();
+            // Stream membership redirects a member's sync target to its
+            // stream's line, and quiescent members AUTO-ADMIT greedily
+            // (certificate-gated; conflicts isolate per contribution).
+            let streams =
+                whipplescript_store::workstreams::WorkstreamStore::open(workstream_store_path())
+                    .ok();
             let mut report = Vec::new();
             for row in branches {
                 if row.parent_branch_id.is_none() {
@@ -31838,7 +32141,54 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                     }),
                     (None, _) | (_, Err(_)) => false,
                 };
+                use whipplescript_store::workstreams::{StreamStatus, Workstreams};
+                let stream_line = streams.as_ref().and_then(|streams| {
+                    let stream_id = streams.home_of(&row.branch_id).ok().flatten()?;
+                    let stream = streams.get_stream(&stream_id).ok().flatten()?;
+                    (stream.status == StreamStatus::Active).then_some(stream.line_branch_id)
+                });
                 let cut_id = generated_cut_id();
+                if let Some(line_id) = stream_line {
+                    if quiescent {
+                        use whipplescript_store::vcs::SyncOutcome;
+                        let entry = match vcs.sync_to_line(
+                            &row.branch_id,
+                            &line_id,
+                            &format!("{cut_id}-admit"),
+                            &at,
+                        ) {
+                            Ok(SyncOutcome::Synced { sync_cut_id }) => json!({
+                                "branch_id": row.branch_id, "outcome": "admitted",
+                                "line_branch_id": line_id, "sync_cut_id": sync_cut_id,
+                            }),
+                            Ok(SyncOutcome::UpToDate) => json!({
+                                "branch_id": row.branch_id, "outcome": "up_to_date",
+                                "line_branch_id": line_id,
+                            }),
+                            Ok(SyncOutcome::Conflicts { conflicts }) => json!({
+                                "branch_id": row.branch_id, "outcome": "conflicts",
+                                "line_branch_id": line_id,
+                                "conflicts":
+                                    conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+                            }),
+                            Ok(other) => json!({
+                                "branch_id": row.branch_id,
+                                "outcome": format!("{other:?}"),
+                            }),
+                            Err(error) => {
+                                eprintln!("auto-admit `{}` failed: {error:?}", row.branch_id);
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        report.push(entry);
+                    } else {
+                        report.push(json!({
+                            "branch_id": row.branch_id, "outcome": "deferred_mid_run",
+                            "line_branch_id": line_id,
+                        }));
+                    }
+                    continue;
+                }
                 let outcome = match vcs.reconcile_branch(
                     &row.branch_id,
                     quiescent,
