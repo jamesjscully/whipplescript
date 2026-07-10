@@ -25,3 +25,42 @@ for MODEL in "$ROOT/models/tla/ControlPlaneLifecycle.tla" "$ROOT/models/tla/Nati
     --length="$LENGTH" \
     "$MODEL"
 done
+
+# --- Requeue-necessity bite (see models/tla/EffectRequeueNecessity.tla) -----------
+# ControlPlaneLifecycle enforces "a blocked effect must be requeued before it can be
+# claimed" structurally, via ClaimEffect's `effects[e] = "queued"` guard, but no
+# state invariant there is *violated* if that guard is weakened (claim-from-blocked
+# leaves no bad state, only a bad step, and Apalache 0.56 has no --trace-inv). This
+# focused model gives the necessity real teeth with a history variable, and we prove
+# the guard is load-bearing by mutation.
+REQ_MODEL="$ROOT/models/tla/EffectRequeueNecessity.tla"
+echo "== requeue-necessity: correct model must hold"
+"${APALACHE[@]}" typecheck "$REQ_MODEL"
+"${APALACHE[@]}" check --init=Init --next=Next --inv=Invariants --length=6 "$REQ_MODEL"
+
+echo "== requeue-necessity: mutant (guard dropped) must be caught"
+MUT_DIR="$(mktemp -d)"
+trap 'rm -rf "$MUT_DIR"' EXIT
+awk '
+  /^Claim ==/ {inclaim=1}
+  inclaim && /status = "queued"/ {print "  \\* MUTANT: guard removed"; inclaim=0; next}
+  {print}
+' "$REQ_MODEL" > "$MUT_DIR/EffectRequeueNecessity.tla"
+if "${APALACHE[@]}" check --init=Init --next=Next --inv=Invariants --length=6 \
+      "$MUT_DIR/EffectRequeueNecessity.tla" > "$MUT_DIR/out.log" 2>&1; then
+  echo "requeue-necessity bite FAILED: the guard-dropped mutant did not violate ClaimsOnlyFromQueued" >&2
+  exit 1
+fi
+if ! grep -qiE 'invariant .* violated|outcome is: Error' "$MUT_DIR/out.log"; then
+  echo "requeue-necessity bite FAILED: mutant erred for the wrong reason (not an invariant violation)" >&2
+  cat "$MUT_DIR/out.log" >&2
+  exit 1
+fi
+echo "requeue-necessity bite OK (guard is load-bearing)"
+
+# The main spec's guard must actually be present for the bite above to protect it.
+echo "== requeue-necessity: ControlPlaneLifecycle Claimable retains its queued guard"
+if ! grep -Eq 'effects\[e\] = "queued"' "$ROOT/models/tla/ControlPlaneLifecycle.tla"; then
+  echo "ControlPlaneLifecycle.tla no longer guards ClaimEffect on effects[e] = \"queued\"" >&2
+  exit 1
+fi

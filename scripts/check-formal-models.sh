@@ -8,6 +8,44 @@ if ! command -v maude >/dev/null 2>&1; then
   exit 1
 fi
 
+# Ordered per-search verdict signature for a test file (S=Solution, N=No solution),
+# in search order. Catches a swapped Solution/No-solution PAIR that leaves the
+# aggregate counts unchanged. The maude runs below do NOT read the platform catalog
+# (WHIPPLESCRIPT_PLATFORM_CATALOG_PATH is unset when the loop runs `maude`), so this
+# signature is reproducible without the catalog / a workspace build.
+VERDICTS_FILE="$ROOT/models/maude/tests/expected-verdicts.tsv"
+
+verdict_signature() {
+  grep -oE '^Solution 1|^No solution\.' \
+    | sed 's/Solution 1/S/; s/No solution\./N/' \
+    | paste -sd '' -
+}
+
+# `check-formal-models.sh --update-verdicts` regenerates the signature golden. Needs
+# only maude (no cargo/store), so it works even mid-refactor elsewhere in the tree.
+if [[ "${1:-}" == "--update-verdicts" ]]; then
+  {
+    echo "# Ordered per-search verdict signature for each Maude test (S=Solution, N=No solution),"
+    echo "# in search order. check-formal-models.sh asserts each file's actual signature matches;"
+    echo "# this catches a swapped Solution/No-solution PAIR that leaves the aggregate counts equal."
+    echo "# Regenerate with: scripts/check-formal-models.sh --update-verdicts"
+    echo "# filename<TAB>signature"
+  } > "$VERDICTS_FILE"
+  for test_file in "$ROOT"/models/maude/tests/*.maude; do
+    name="$(basename "$test_file")"
+    sig="$(maude "$test_file" 2>/dev/null | verdict_signature)"
+    printf '%s\t%s\n' "$name" "$sig" >> "$VERDICTS_FILE"
+  done
+  echo "wrote $VERDICTS_FILE"
+  exit 0
+fi
+
+declare -A EXPECTED_SIGNATURE=()
+while IFS=$'\t' read -r vname vsig; do
+  [[ -z "$vname" || "$vname" == \#* ]] && continue
+  EXPECTED_SIGNATURE["$vname"]="$vsig"
+done < "$VERDICTS_FILE"
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 PLATFORM_CATALOG_PATH="$TMP_DIR/platform-construct-catalog.json"
@@ -65,6 +103,7 @@ else:
 PY
 
 declare -A EXPECTED_NO_SOLUTION=(
+  ["trace-lifecycle-conformance.maude"]=3
   ["action-expansion.maude"]=3
   ["effect-key.maude"]=2
   ["merge-slice.maude"]=4
@@ -153,6 +192,7 @@ declare -A EXPECTED_NO_SOLUTION=(
 )
 
 declare -A EXPECTED_SOLUTION=(
+  ["trace-lifecycle-conformance.maude"]=10
   ["action-expansion.maude"]=2
   ["effect-key.maude"]=3
   ["merge-slice.maude"]=6
@@ -259,6 +299,18 @@ for test_file in "$ROOT"/models/maude/tests/*.maude; do
 
   if [[ "${EXPECTED_SOLUTION[$test_name]:-}" != "$actual_solution" ]]; then
     echo "unexpected Solution 1 count for $test_name: got $actual_solution, expected ${EXPECTED_SOLUTION[$test_name]:-unset}" >&2
+    exit 1
+  fi
+
+  # Identity, not just totals: the ordered verdict signature must match. This is what
+  # catches a swapped Solution/No-solution pair (which keeps the counts balanced).
+  actual_signature="$(verdict_signature <<<"$output")"
+  if [[ -z "${EXPECTED_SIGNATURE[$test_name]+set}" ]]; then
+    echo "no expected verdict signature for $test_name (run scripts/check-formal-models.sh --update-verdicts)" >&2
+    exit 1
+  fi
+  if [[ "${EXPECTED_SIGNATURE[$test_name]}" != "$actual_signature" ]]; then
+    echo "verdict signature mismatch for $test_name: got '$actual_signature', expected '${EXPECTED_SIGNATURE[$test_name]}'" >&2
     exit 1
   fi
 done

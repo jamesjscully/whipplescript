@@ -83,6 +83,7 @@ run_check required "expression provider routing" "cd '$ROOT' && scripts/check-ex
 run_check required "operator incident UX" "cd '$ROOT' && scripts/check-operator-incident-ux.sh"
 run_check required "cancellation policy matrix" "cd '$ROOT' && scripts/check-cancellation-policy-matrix.sh"
 run_check required "store replay conformance" "cd '$ROOT' && scripts/check-store-replay-conformance.sh"
+run_check required "trace<->model conformance" "cd '$ROOT' && scripts/check-trace-model-conformance.sh"
 run_check required "provider doctor posture" "cd '$ROOT' && cargo run --quiet -p whipplescript -- --json doctor --providers >/dev/null"
 run_check required "artifact metadata redaction" \
   "cd '$ROOT' && cargo test -p whipplescript --test control_plane artifacts_command_lists_metadata_without_raw_content"

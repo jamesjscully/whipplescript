@@ -1,0 +1,47 @@
+# Effect-lifecycle transition corpus — SINGLE SOURCE OF TRUTH.
+#
+# This file is the conformance bridge between the Rust trace-conformance checker
+# (crates/whipplescript-kernel/src/trace.rs `check_trace`) and the executable
+# lifecycle models (models/maude/kernel.maude, models/tla/ControlPlaneLifecycle.tla).
+# Both sides are pinned to it:
+#   - Rust:  crates/whipplescript-kernel/src/trace.rs test `checker_matches_transition_corpus`
+#            asserts check_trace ACCEPTS exactly these transitions and REJECTS every
+#            other (from_status, event) cell.
+#   - Maude: models/maude/tests/trace-lifecycle-conformance.maude is GENERATED from the
+#            `model_pinned=yes` rows (scripts/gen-trace-lifecycle-maude.py) and proves
+#            kernel.maude permits each (and forbids it without its enabling fact).
+# Regenerate + verify both sides:  scripts/check-trace-model-conformance.sh
+#
+# Only LEGAL transitions are listed; the Rust test treats every unlisted
+# (from_status, event) pair as expected-REJECT (exhaustive negative coverage).
+#
+# Trace-level (folded) semantics: the models model a blocked effect returning to the
+# ready set as blocked -> queued -> claimed; the observable trace folds the store's
+# atomic re-check-and-unblock into a single claim, so the trace edge is blocked ->
+# claimed. `whip retry` IS an observable event (effect.retried), so it is a first-class
+# edge. See models/trace-conformance.md.
+#
+# Columns: from_status <TAB> event <TAB> to_status <TAB> model_pinned
+#
+# Events: claim start_run terminal_completed terminal_failed terminal_timed_out
+#         block retry lease_expire cancel cancel_request
+# Statuses: queued blocked claimed running completed failed timed_out cancelled
+#
+from_status	event	to_status	model_pinned
+queued	claim	claimed	yes
+blocked	claim	claimed	yes
+claimed	start_run	running	yes
+running	terminal_completed	completed	yes
+running	terminal_failed	failed	yes
+running	terminal_timed_out	timed_out	yes
+queued	block	blocked	no
+blocked	block	blocked	no
+claimed	block	blocked	no
+failed	retry	queued	yes
+timed_out	retry	queued	yes
+running	lease_expire	queued	yes
+queued	cancel	cancelled	no
+blocked	cancel	cancelled	no
+claimed	cancel	cancelled	no
+running	cancel	cancelled	no
+running	cancel_request	running	no

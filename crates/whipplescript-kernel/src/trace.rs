@@ -1047,6 +1047,282 @@ mod tests {
         assert!(violation.message.contains("Completed"));
     }
 
+    // -- Conformance bridge: check_trace <-> models/effect-lifecycle-transitions.tsv --
+    //
+    // The `.tsv` is the single source of truth for the effect-lifecycle transition
+    // relation, shared with the executable models (the Maude side is generated from
+    // the same file; see scripts/check-trace-model-conformance.sh). This test asserts
+    // check_trace ACCEPTS exactly the transitions the corpus marks legal and REJECTS
+    // every other (from_status, event) cell — the exhaustive negative coverage that
+    // makes the "checker silently diverged from the model" bug class impossible to
+    // reintroduce (it is what would have caught the blocked->claim / failed->retry
+    // regressions).
+
+    fn cancel_record(sequence: u64, effect_id: &str) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::EffectCancelled {
+                effect_id: effect_id.to_owned(),
+            },
+        }
+    }
+
+    fn expire_lease_run(sequence: u64, effect_id: &str, run_id: &str) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::LeaseExpired {
+                run_id: run_id.to_owned(),
+                effect_id: effect_id.to_owned(),
+            },
+        }
+    }
+
+    /// Minimal legal prefix that leaves effect `e` in `from`, using a stable live run
+    /// id `setup-run` where a run is involved.
+    fn setup_to_status(from: &str) -> Vec<TraceRecord> {
+        let e = "e";
+        let mut r = vec![effect_created(1, e)];
+        match from {
+            "queued" => {}
+            "blocked" => r.push(capacity_block(2, e)),
+            "claimed" => r.push(claim(2, e)),
+            "running" => {
+                r.push(claim(2, e));
+                r.push(start_run_id(3, e, "setup-run"));
+            }
+            "completed" => {
+                r.push(claim(2, e));
+                r.push(start_run_id(3, e, "setup-run"));
+                r.push(terminal_run_id(4, e, "setup-run", EffectStatus::Completed));
+            }
+            "failed" => {
+                r.push(claim(2, e));
+                r.push(start_run_id(3, e, "setup-run"));
+                r.push(terminal_run_id(4, e, "setup-run", EffectStatus::Failed));
+            }
+            "timed_out" => {
+                r.push(claim(2, e));
+                r.push(start_run_id(3, e, "setup-run"));
+                r.push(terminal_run_id(4, e, "setup-run", EffectStatus::TimedOut));
+            }
+            "cancelled" => r.push(cancel_record(2, e)),
+            other => panic!("unknown from_status {other}"),
+        }
+        r
+    }
+
+    /// The event under test, applied to effect `e` at `sequence`. Terminal/lease
+    /// events reference the setup's live run so that, from `running`, the rejection
+    /// (or acceptance) is decided by the effect status rather than a run-id artifact;
+    /// `start_run` uses a fresh run id for the same reason.
+    fn transition_event(sequence: u64, event: &str) -> TraceRecord {
+        let e = "e";
+        match event {
+            "claim" => claim(sequence, e),
+            "start_run" => start_run_id(sequence, e, "probe-run"),
+            "terminal_completed" => {
+                terminal_run_id(sequence, e, "setup-run", EffectStatus::Completed)
+            }
+            "terminal_failed" => terminal_run_id(sequence, e, "setup-run", EffectStatus::Failed),
+            "terminal_timed_out" => {
+                terminal_run_id(sequence, e, "setup-run", EffectStatus::TimedOut)
+            }
+            "block" => capacity_block(sequence, e),
+            "retry" => retried(sequence, e),
+            "lease_expire" => expire_lease_run(sequence, e, "setup-run"),
+            "cancel" => cancel_record(sequence, e),
+            "cancel_request" => cancellation_request(sequence, e),
+            other => panic!("unknown event {other}"),
+        }
+    }
+
+    #[test]
+    fn checker_matches_transition_corpus() {
+        const CORPUS: &str = include_str!("../../../models/effect-lifecycle-transitions.tsv");
+
+        let legal: BTreeSet<(String, String)> = CORPUS
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter(|line| !line.starts_with("from_status"))
+            .map(|line| {
+                let cols: Vec<&str> = line.split('\t').collect();
+                assert!(cols.len() >= 3, "malformed corpus row: {line:?}");
+                (cols[0].to_owned(), cols[1].to_owned())
+            })
+            .collect();
+        assert!(!legal.is_empty(), "corpus parsed to zero legal transitions");
+
+        let statuses = [
+            "queued",
+            "blocked",
+            "claimed",
+            "running",
+            "completed",
+            "failed",
+            "timed_out",
+            "cancelled",
+        ];
+        let events = [
+            "claim",
+            "start_run",
+            "terminal_completed",
+            "terminal_failed",
+            "terminal_timed_out",
+            "block",
+            "retry",
+            "lease_expire",
+            "cancel",
+            "cancel_request",
+        ];
+
+        // Every listed legal transition must correspond to a real cell we probe.
+        for (from, event) in &legal {
+            assert!(
+                statuses.contains(&from.as_str()) && events.contains(&event.as_str()),
+                "corpus lists unknown transition {from} --{event}-->"
+            );
+        }
+
+        for from in statuses {
+            for event in events {
+                let mut records = setup_to_status(from);
+                let sequence = records.len() as u64 + 1;
+                records.push(transition_event(sequence, event));
+                let verdict = check_trace(&records);
+                let expected_legal = legal.contains(&(from.to_owned(), event.to_owned()));
+                assert_eq!(
+                    verdict.is_ok(),
+                    expected_legal,
+                    "transition {from} --{event}--> : check_trace said {}, corpus says {}; verdict = {verdict:?}",
+                    if verdict.is_ok() { "ACCEPT" } else { "REJECT" },
+                    if expected_legal { "LEGAL" } else { "ILLEGAL" },
+                );
+            }
+        }
+    }
+
+    fn paused(sequence: u64) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::InstancePaused,
+        }
+    }
+
+    fn instance_cancelled(sequence: u64) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::InstanceCancelled,
+        }
+    }
+
+    fn dep_edge(sequence: u64, upstream: &str, downstream: &str) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::DependencyCreated(DependencyEdge {
+                upstream_effect_id: upstream.to_owned(),
+                predicate: DependencyPredicate::Succeeds,
+                downstream_effect_id: downstream.to_owned(),
+            }),
+        }
+    }
+
+    /// A trace that VIOLATES the richer check_trace invariant named `key` (see
+    /// models/trace-invariant-correspondence.tsv). check_trace must reject each.
+    fn richer_invariant_violation(key: &str) -> Vec<TraceRecord> {
+        match key {
+            "dependency_ordering" => vec![
+                effect_created(1, "up"),
+                effect_created(2, "down"),
+                dep_edge(3, "up", "down"),
+                claim(4, "down"), // upstream not completed
+            ],
+            "run_starts_from_claimed" => vec![
+                effect_created(1, "e"),
+                start_run_id(2, "e", "r1"), // run started for a queued (not claimed) effect
+            ],
+            "terminal_from_stale_run" => vec![
+                effect_created(1, "e"),
+                claim(2, "e"),
+                start_run_id(3, "e", "r1"),
+                expire_lease_run(4, "e", "r1"), // r1 is now stale
+                terminal_run_id(5, "e", "r1", EffectStatus::Completed),
+            ],
+            "terminal_not_duplicated" => vec![
+                effect_created(1, "e"),
+                claim(2, "e"),
+                start_run_id(3, "e", "r1"),
+                terminal_run_id(4, "e", "r1", EffectStatus::Completed),
+                terminal_run_id(5, "e", "r1", EffectStatus::Completed),
+            ],
+            "no_claim_while_paused" => vec![effect_created(1, "e"), paused(2), claim(3, "e")],
+            "no_claim_after_cancel" => {
+                vec![effect_created(1, "e"), instance_cancelled(2), claim(3, "e")]
+            }
+            "blocked_not_from_terminal" => vec![
+                effect_created(1, "e"),
+                claim(2, "e"),
+                start_run_id(3, "e", "r1"),
+                terminal_run_id(4, "e", "r1", EffectStatus::Completed),
+                capacity_block(5, "e"), // blocking a terminal effect
+            ],
+            "revision_epoch_advances" => vec![revision_activated(1, 0, 0)], // 0 -> 0 does not advance
+            other => panic!("no violation builder for correspondence key {other}"),
+        }
+    }
+
+    // -- Bridge to ControlPlaneLifecycle.tla's richer invariants --
+    //
+    // For each row of models/trace-invariant-correspondence.tsv, build a trace that
+    // violates the invariant and assert check_trace rejects it with the recorded
+    // message. Removing the invariant from check_trace makes its row's trace conform,
+    // failing this test. The paired assertion that the TLA counterpart is present and
+    // conjoined into SafetyInvariants lives in scripts/check-trace-model-conformance.sh.
+    #[test]
+    fn richer_invariants_have_bite() {
+        const MAP: &str = include_str!("../../../models/trace-invariant-correspondence.tsv");
+
+        let mut keys_seen = BTreeSet::new();
+        for line in MAP.lines() {
+            let line = line.trim_end();
+            if line.is_empty() || line.starts_with('#') || line.starts_with("key\t") {
+                continue;
+            }
+            let cols: Vec<&str> = line.split('\t').collect();
+            assert!(cols.len() >= 3, "malformed correspondence row: {line:?}");
+            let (key, substring, tla_invariant) = (cols[0], cols[1], cols[2]);
+            assert!(!tla_invariant.is_empty(), "row {key} has no tla_invariant");
+            keys_seen.insert(key.to_owned());
+
+            let trace = richer_invariant_violation(key);
+            let violation = check_trace(&trace).expect_err(&format!(
+                "richer invariant `{key}` trace should be rejected"
+            ));
+            assert!(
+                violation.message.contains(substring),
+                "richer invariant `{key}`: expected message containing {substring:?}, got {:?}",
+                violation.message,
+            );
+        }
+
+        // Every builder arm must correspond to a corpus row (no orphan builders).
+        for key in [
+            "dependency_ordering",
+            "run_starts_from_claimed",
+            "terminal_from_stale_run",
+            "terminal_not_duplicated",
+            "no_claim_while_paused",
+            "no_claim_after_cancel",
+            "blocked_not_from_terminal",
+            "revision_epoch_advances",
+        ] {
+            assert!(
+                keys_seen.contains(key),
+                "builder key {key} is not in the correspondence corpus"
+            );
+        }
+    }
+
     #[test]
     fn rejects_duplicate_terminal_completion() {
         let trace = vec![

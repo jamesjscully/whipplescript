@@ -210,7 +210,11 @@ BindBlock(r) ==
 
 \* The binding prerequisite becomes available: a blocked effect returns to
 \* `queued` and is claimable again, so a fixed config/credential resumes work
-\* without a manual re-trigger.
+\* without a manual re-trigger. This requeue is NECESSARY: `ClaimEffect` can only
+\* fire from `queued` (via `Claimable`), so a blocked effect can never go directly
+\* to `claimed`. That necessity is given executable teeth -- and the guard proven
+\* load-bearing by mutation -- in models/tla/EffectRequeueNecessity.tla (run by
+\* scripts/check-tla-models.sh).
 UnblockEffect(e) ==
   /\ e \in Effects
   /\ ~recovering
