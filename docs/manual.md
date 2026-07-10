@@ -219,19 +219,19 @@ tracker backlog {
 }
 
 rule pick_up
-  when backlog has ready item as item
+  when backlog has ready issue as issue
   when worker is available
 => {
-  claim item as work
+  claim issue as work
   tell worker as turn "Resolve {{ work.title }}."
 
   after work fails as taken {
-    // another claimant won the race — just wait for the next ready item
+    // another claimant won the race — just wait for the next ready issue
   }
 }
 ```
 
-The verbs are `file item into <tracker> { ... }`, `claim`, `release`, and
+The verbs are `file issue into <tracker> { ... }`, `claim`, `release`, and
 `finish`. A losing `claim` is a normal branchable failure, not an error, so a
 contended tracker stays correct without locks in source.
 

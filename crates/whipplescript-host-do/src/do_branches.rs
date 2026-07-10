@@ -426,6 +426,18 @@ impl<S: DoSql> Branches for DoBranches<S> {
             .map_err(sql_err)?;
         Ok(rows.first().map(|row| as_text(&row[0])))
     }
+
+    fn list_bound_instances(&self, branch_id: &str) -> StoreResult<Vec<String>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT instance_id FROM branch_instances \
+                 WHERE branch_id = ?1 ORDER BY instance_id",
+                &[text(branch_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|row| as_text(&row[0])).collect())
+    }
 }
 
 /// Content blobs over the DO's `content_blobs` table — the same table

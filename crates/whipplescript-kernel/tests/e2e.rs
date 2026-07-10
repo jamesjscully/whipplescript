@@ -292,10 +292,41 @@ fn e2e_lease_expiry_and_retry_recover_effects() {
         })
         .expect("effect retries");
 
+    // Re-run the retried effect to completion. This exercises the recovery
+    // transition `failed -> queued -> claimed -> running -> completed`; before the
+    // trace model learned about `EffectRetried`, this second claim tripped a
+    // "claimed from ... status Failed" conformance violation.
+    kernel
+        .start_run(RunStart {
+            instance_id: &instance_id,
+            effect_id: "tell",
+            run_id: "run-tell-3",
+            provider: "mock-agent",
+            worker_id: "worker-1",
+            lease_id: "lease-tell-3",
+            lease_expires_at: "2030-01-04T00:00:00Z",
+            metadata_json: "{}",
+        })
+        .expect("third run starts after retry");
+    kernel
+        .complete_run(EffectCompletion {
+            instance_id: &instance_id,
+            effect_id: "tell",
+            run_id: "run-tell-3",
+            provider: "mock-agent",
+            worker_id: "worker-1",
+            status: "ignored",
+            exit_code: Some(0),
+            summary: Some("succeeded on retry"),
+            metadata_json: "{}",
+            idempotency_key: Some("complete-run-tell-3"),
+        })
+        .expect("third run completes");
+
     assert_e2e_trace("lease-retry", &kernel);
     let store = kernel.into_store();
     let effects = store.list_effects(&instance_id).expect("effects list");
-    assert_eq!(effects[0].status, "queued");
+    assert_eq!(effects[0].status, "completed");
 }
 
 #[test]

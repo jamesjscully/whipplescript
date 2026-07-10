@@ -188,6 +188,9 @@ pub trait Branches {
     ) -> StoreResult<BindOutcome>;
     /// The branch an instance was born on; `None` = mainline (unbound).
     fn instance_branch(&self, instance_id: &str) -> StoreResult<Option<String>>;
+    /// Every instance born on the branch (quiescence detection: the
+    /// daemon treats a branch as mid-run while any bound instance runs).
+    fn list_bound_instances(&self, branch_id: &str) -> StoreResult<Vec<String>>;
 }
 
 #[cfg(feature = "native")]
@@ -570,6 +573,18 @@ impl Branches for BranchStore {
             )
             .optional()?;
         Ok(branch)
+    }
+
+    fn list_bound_instances(&self, branch_id: &str) -> StoreResult<Vec<String>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT instance_id FROM branch_instances              WHERE branch_id = ?1 ORDER BY instance_id",
+        )?;
+        let mapped = stmt.query_map(params![branch_id], |row| row.get(0))?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row?);
+        }
+        Ok(rows)
     }
 
     fn discard_branch(&mut self, branch_id: &str, at: &str) -> StoreResult<StatusOutcome> {

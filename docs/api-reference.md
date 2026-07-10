@@ -233,7 +233,7 @@ the file untouched rather than damaging it):
   top-level declaration (or a file header) and **trailing** comments on a
   single-line declaration (`workflow Demo  # ...`); comments inside a `rule`/
   `apply`/`coerce`/`table`/`flow` body; and — inside
-  `class`/`agent`/`enum`/`signal`/`queue`/`file store` bodies (including a
+  `class`/`agent`/`enum`/`signal`/`tracker`/`file store` bodies (including a
   data-carrying `enum` variant's nested field block) — both own-line comments
   (interleaved by source position) and trailing comments on a field/clause line.
   The only comments `fmt` cannot place are ones with nowhere to attach — e.g. a
@@ -274,7 +274,7 @@ program but is never referenced (so it is unambiguously dead — no false positi
 - **`lint.unused_lease`** — a `lease` declared but never acquired.
 - **`lint.unused_ledger`** — a `ledger` declared but never appended to.
 - **`lint.unused_counter`** — a `counter` declared but never consumed.
-- **`lint.unused_queue`** — a `queue` declared but never filed into or claimed.
+- **`lint.unused_tracker`** — a `tracker` declared but never filed into or claimed.
 - **`lint.unused_file_store`** — a `file store` declared but never read or written.
 - **`lint.unused_class`** — a `class` declared but referenced nowhere.
 - **`lint.unused_enum`** — an `enum` declared but referenced nowhere.
@@ -1199,7 +1199,7 @@ This section is a compact index of source constructs.
 | `decide "..." -> { ... } as result` | Inline typed `schema.coerce` effect. |
 | `exec "<command>" as result` | Dev-profile `exec.command` effect (requires `use std.script` + a non-empty `WHIPPLESCRIPT_EXEC_ALLOW`, which seed the `script.raw` capability; exposes `exit_code`, `stdout`). |
 | `exec <capability> with <record> -> Type as result` | Hosted `exec.command` effect requiring `script.<capability>`, typed JSON stdin, SHA-256 manifest verification, and typed stdout ingestion. |
-| `file item into <tracker> { ... }` | `tracker.file` effect. |
+| `file issue into <tracker> { ... }` | `tracker.file` effect. |
 | `claim <item> [as x]` | `tracker.claim` effect (already-claimed is a branchable failure). |
 | `release <item>` | `tracker.release` effect. |
 | `finish <item> [{ summary ... }]` | `tracker.finish` effect. |

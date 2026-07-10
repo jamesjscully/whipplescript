@@ -194,9 +194,10 @@ guide. A few common snags:
   provider credentials as DO secrets with `--set-secrets`
   (`whip deploy [--worker-dir <path>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]`).
 - The `whip executor` Class-A compute sidecar is not on by default; enabling the
-  compute plane in production is a follow-on configuration step. The sidecar
-  refuses non-loopback calls without a bearer token — set `WHIP_EXECUTOR_TOKEN`
-  (it binds `127.0.0.1:8080` by default; override with `--bind <addr:port>`).
+  compute plane in production is a follow-on configuration step. A bearer token
+  (`WHIP_EXECUTOR_TOKEN`) is required to bind a non-loopback address and is used
+  to authenticate in-cluster calls — set it before exposing the sidecar (it binds
+  `127.0.0.1:8080` by default; override with `--bind <addr:port>`).
 - `whip checkpoint <instance>` captures a cut and `whip restore <instance> <cut-id>`
   rewinds file state, agent transcript, and event-log position together as one
   coherence-checked cut; `restore` reconciles fully and auto-checkpoints head

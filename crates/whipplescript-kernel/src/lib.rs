@@ -23,6 +23,7 @@ pub mod provider;
 pub mod rule_lowering;
 pub mod rule_pass;
 pub mod sansio;
+pub mod source_merge;
 pub mod time_pass;
 pub mod trace;
 
@@ -1532,7 +1533,10 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
     }
 
     pub fn retry_effect(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
-        self.store.retry_effect(retry)
+        let effect_id = retry.effect_id.to_owned();
+        let event = self.store.retry_effect(retry)?;
+        self.emit(TraceEvent::EffectRetried { effect_id });
+        Ok(event)
     }
 
     pub fn run_agent_turn(

@@ -73,6 +73,12 @@ pub enum TraceEvent {
         status: Option<String>,
         reason: String,
     },
+    /// An operator (`whip retry`) re-queued a terminally-failed effect. Mirrors the
+    /// lifecycle models' `retry-failed`/`retry-timeout` rules (kernel.maude) and the
+    /// store's `retry_effect` (`status IN ('failed','timed_out') -> 'queued'`).
+    EffectRetried {
+        effect_id: String,
+    },
     EffectCancelled {
         effect_id: String,
     },
@@ -182,10 +188,21 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
             let Some(status) = state.effects.get(effect_id) else {
                 return violation(record, format!("unknown effect {effect_id} claimed"));
             };
-            if *status != EffectStatus::Queued {
+            // A claim is legal from `Queued` and also directly from `Blocked`
+            // (policy/capacity/dependency block). The store's `start_run` re-checks
+            // the block condition and, if it now clears, transitions the effect
+            // straight to `running` in one atomic step — there is no separate
+            // observable "unblock" event to re-queue first (unlike lease expiry,
+            // which does emit one). So the claim absorbs the store's unblock: this
+            // is the folded refinement of the lifecycle models' explicit
+            // `blocked -> queued -> claimed` (see models/trace-conformance.md,
+            // kernel.maude `policy-release`/`capacity-release`, and
+            // ControlPlaneLifecycle.tla `UnblockEffect`). The dependency-ordering
+            // invariant below is what gives this rule its bite.
+            if !matches!(status, EffectStatus::Queued | EffectStatus::Blocked) {
                 return violation(
                     record,
-                    format!("effect {effect_id} claimed from non-queued status {status:?}"),
+                    format!("effect {effect_id} claimed from invalid status {status:?}"),
                 );
             }
             if state.cancel_requested_effects.contains(effect_id) {
@@ -386,6 +403,25 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
             state
                 .effects
                 .insert(effect_id.clone(), EffectStatus::Blocked);
+        }
+        TraceEvent::EffectRetried { effect_id } => {
+            let Some(status) = state.effects.get(effect_id) else {
+                return violation(record, format!("retried unknown effect {effect_id}"));
+            };
+            // `whip retry` only re-queues a terminally failed/timed-out effect. Any
+            // other source status (queued/blocked/claimed/running/completed/cancelled)
+            // is illegal — this is the invariant's bite.
+            if !matches!(status, EffectStatus::Failed | EffectStatus::TimedOut) {
+                return violation(
+                    record,
+                    format!("effect {effect_id} retried from non-retryable status {status:?}"),
+                );
+            }
+            // Re-queue: clear the terminal mark so a fresh claim/run/terminal is legal.
+            state.terminal_effects.remove(effect_id);
+            state
+                .effects
+                .insert(effect_id.clone(), EffectStatus::Queued);
         }
         TraceEvent::EffectCancelled { effect_id } => {
             let Some(status) = state.effects.get(effect_id) else {
@@ -630,6 +666,37 @@ mod tests {
         }
     }
 
+    fn capacity_block(sequence: u64, effect_id: &str) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::EffectBlocked {
+                effect_id: effect_id.to_owned(),
+                status: Some("blocked_by_capacity".to_owned()),
+                reason: "agent capacity exhausted".to_owned(),
+            },
+        }
+    }
+
+    fn policy_block(sequence: u64, effect_id: &str) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::EffectBlocked {
+                effect_id: effect_id.to_owned(),
+                status: Some("blocked".to_owned()),
+                reason: "provider_health: provider is unhealthy".to_owned(),
+            },
+        }
+    }
+
+    fn retried(sequence: u64, effect_id: &str) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::EffectRetried {
+                effect_id: effect_id.to_owned(),
+            },
+        }
+    }
+
     #[test]
     fn accepts_claim_after_success_dependency() {
         let trace = vec![
@@ -771,6 +838,213 @@ mod tests {
         assert!(violation
             .message
             .contains("without an unsatisfied dependency"));
+    }
+
+    // Recovery-from-block coverage. The store re-checks the block condition on the
+    // next `start_run` and, if it clears, claims + starts the effect straight from
+    // its blocked status (no separate observable unblock event). These traces are
+    // exactly what `whip trace --check` reconstructs for a capacity/policy-contended
+    // effect, and they must be accepted. Regression for the tutorial-repro bug where
+    // a `capacity 1` agent's second turn tripped "claimed from non-queued status".
+
+    #[test]
+    fn accepts_claim_after_capacity_block() {
+        let trace = vec![
+            effect_created(1, "turn"),
+            capacity_block(2, "turn"),
+            claim(3, "turn"),
+            start(4, "turn"),
+            terminal(5, "turn", EffectStatus::Completed),
+        ];
+
+        assert_eq!(check_trace(&trace), Ok(()));
+    }
+
+    #[test]
+    fn accepts_claim_after_policy_block() {
+        let trace = vec![
+            effect_created(1, "turn"),
+            policy_block(2, "turn"),
+            claim(3, "turn"),
+            start(4, "turn"),
+            terminal(5, "turn", EffectStatus::Completed),
+        ];
+
+        assert_eq!(check_trace(&trace), Ok(()));
+    }
+
+    #[test]
+    fn accepts_reblock_then_claim() {
+        // An effect can be blocked more than once (capacity frees, is retaken, then
+        // frees again) before it finally claims. Every EffectBlocked/claim cycle is legal.
+        let trace = vec![
+            effect_created(1, "turn"),
+            capacity_block(2, "turn"),
+            capacity_block(3, "turn"),
+            claim(4, "turn"),
+            start(5, "turn"),
+            terminal(6, "turn", EffectStatus::Completed),
+        ];
+
+        assert_eq!(check_trace(&trace), Ok(()));
+    }
+
+    // Bite preserved: relaxing the claim guard to `Queued | Blocked` must NOT let
+    // through claims from live/terminal statuses or dependency-unsatisfied claims.
+
+    #[test]
+    fn rejects_claim_from_running() {
+        let trace = vec![
+            effect_created(1, "turn"),
+            claim(2, "turn"),
+            start(3, "turn"),
+            claim(4, "turn"),
+        ];
+
+        let violation =
+            check_trace(&trace).expect_err("double-claim of a running effect must fail");
+        assert!(violation.message.contains("claimed from invalid status"));
+        assert!(violation.message.contains("Running"));
+    }
+
+    #[test]
+    fn rejects_claim_after_terminal() {
+        let trace = vec![
+            effect_created(1, "turn"),
+            claim(2, "turn"),
+            start(3, "turn"),
+            terminal(4, "turn", EffectStatus::Completed),
+            claim(5, "turn"),
+        ];
+
+        let violation = check_trace(&trace).expect_err("claim of a completed effect must fail");
+        assert!(violation.message.contains("claimed from invalid status"));
+        assert!(violation.message.contains("Completed"));
+    }
+
+    #[test]
+    fn rejects_claim_before_dependency_satisfied_even_when_blocked() {
+        // A dependency-blocked effect is abstract-`Blocked`; the relaxed guard lets it
+        // reach the dependency check, which must still reject the premature claim.
+        let trace = vec![
+            effect_created(1, "upstream"),
+            effect_created(2, "downstream"),
+            TraceRecord {
+                sequence: 3,
+                event: TraceEvent::DependencyCreated(DependencyEdge {
+                    upstream_effect_id: "upstream".to_owned(),
+                    predicate: DependencyPredicate::Succeeds,
+                    downstream_effect_id: "downstream".to_owned(),
+                }),
+            },
+            dependency_block(4, "downstream"),
+            claim(5, "downstream"),
+        ];
+
+        let violation =
+            check_trace(&trace).expect_err("claim before dependency satisfied must fail");
+        assert!(violation
+            .message
+            .contains("before dependency on upstream was satisfied"));
+    }
+
+    // Retry recovery coverage. `whip retry` re-queues a terminally-failed effect
+    // (effect.retried event), after which it is claimed and run again. Before this
+    // was modeled the second claim tripped "claimed from ... status Failed". Mirrors
+    // kernel.maude `retry-failed`/`retry-timeout`.
+
+    // The retried effect is re-run under a FRESH run id (a run id can never be
+    // reused), so the second run/terminal are built explicitly rather than via the
+    // effect-derived `start`/`terminal` helpers.
+    fn start_run_id(sequence: u64, effect_id: &str, run_id: &str) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::RunStarted {
+                run_id: run_id.to_owned(),
+                effect_id: effect_id.to_owned(),
+            },
+        }
+    }
+
+    fn terminal_run_id(
+        sequence: u64,
+        effect_id: &str,
+        run_id: &str,
+        status: EffectStatus,
+    ) -> TraceRecord {
+        TraceRecord {
+            sequence,
+            event: TraceEvent::EffectTerminal {
+                run_id: run_id.to_owned(),
+                effect_id: effect_id.to_owned(),
+                status,
+            },
+        }
+    }
+
+    #[test]
+    fn accepts_retry_then_reclaim() {
+        let trace = vec![
+            effect_created(1, "turn"),
+            claim(2, "turn"),
+            start(3, "turn"),
+            terminal(4, "turn", EffectStatus::Failed),
+            retried(5, "turn"),
+            claim(6, "turn"),
+            start_run_id(7, "turn", "run-turn-2"),
+            terminal_run_id(8, "turn", "run-turn-2", EffectStatus::Completed),
+        ];
+
+        assert_eq!(check_trace(&trace), Ok(()));
+    }
+
+    #[test]
+    fn accepts_retry_after_timeout() {
+        let trace = vec![
+            effect_created(1, "turn"),
+            claim(2, "turn"),
+            start(3, "turn"),
+            terminal(4, "turn", EffectStatus::TimedOut),
+            retried(5, "turn"),
+            claim(6, "turn"),
+            start_run_id(7, "turn", "run-turn-2"),
+            terminal_run_id(8, "turn", "run-turn-2", EffectStatus::Completed),
+        ];
+
+        assert_eq!(check_trace(&trace), Ok(()));
+    }
+
+    #[test]
+    fn rejects_retry_of_running_effect() {
+        let trace = vec![
+            effect_created(1, "turn"),
+            claim(2, "turn"),
+            start(3, "turn"),
+            retried(4, "turn"),
+        ];
+
+        let violation = check_trace(&trace).expect_err("retry of a running effect must fail");
+        assert!(violation
+            .message
+            .contains("retried from non-retryable status"));
+        assert!(violation.message.contains("Running"));
+    }
+
+    #[test]
+    fn rejects_retry_of_completed_effect() {
+        let trace = vec![
+            effect_created(1, "turn"),
+            claim(2, "turn"),
+            start(3, "turn"),
+            terminal(4, "turn", EffectStatus::Completed),
+            retried(5, "turn"),
+        ];
+
+        let violation = check_trace(&trace).expect_err("retry of a completed effect must fail");
+        assert!(violation
+            .message
+            .contains("retried from non-retryable status"));
+        assert!(violation.message.contains("Completed"));
     }
 
     #[test]

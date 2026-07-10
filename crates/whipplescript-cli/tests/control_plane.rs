@@ -19948,3 +19948,164 @@ rule go
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_dir_all(dir);
 }
+
+/// Declaration-granularity source merge through the full CLI pipeline:
+/// a branch and mainline both edit ONE `.whip` file. Disjoint rule edits
+/// (branch rewrites `close`; mainline adds an independent audit rule)
+/// certify — the blob-level conflict refines to a merged source carrying
+/// BOTH edits — while interfering edits (branch changes what `triage`
+/// writes; mainline's changed rule reads it) stay an honest conflict.
+#[test]
+fn branch_source_merge_certifies_disjoint_rules_and_refuses_interference() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("source-merge");
+    let envs_owned = [
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE".to_owned(),
+            dir.join("branches.sqlite").to_string_lossy().into_owned(),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE".to_owned(),
+            dir.join("vcs-content.sqlite")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ];
+    let envs: Vec<(&str, &str)> = envs_owned
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let branch = |args: &[&str]| {
+        let mut full = vec!["--json", "branch"];
+        full.extend_from_slice(args);
+        run_json_with_env(bin, &full, &envs)
+    };
+
+    let base = "workflow Demo\n\noutput result Report\n\nclass Report {\n  message string\n}\n\nclass Ticket {\n  status string\n}\n\nrule triage\n  when started\n=> {\n  record Ticket {\n    status \"open\"\n  }\n}\n\nrule close\n  when Ticket as t\n=> {\n  complete result {\n    message \"done\"\n  }\n}\n";
+    branch(&["write", "main", "demo.whip", "--body", base]);
+    branch(&["create", "draft_a"]);
+
+    // Branch rewrites `close`; mainline adds an independent audit rule.
+    let ours = base.replace("message \"done\"", "message \"finished\"");
+    branch(&["write", "draft_a", "demo.whip", "--body", &ours]);
+    let theirs = format!(
+        "{base}\nclass Audit {{\n  note string\n}}\n\nrule log_start\n  when started\n=> {{\n  record Audit {{\n    note \"started\"\n  }}\n}}\n"
+    );
+    branch(&["write", "main", "demo.whip", "--body", &theirs]);
+
+    let merged = branch(&["merge", "draft_a"]);
+    assert_eq!(
+        merged.get("into").and_then(Value::as_str),
+        Some("main"),
+        "disjoint rule edits to one file certify: {merged}"
+    );
+    let source = branch(&["read", "main", "demo.whip"]);
+    let body = source.get("body").and_then(Value::as_str).expect("body");
+    assert!(body.contains("message \"finished\""), "ours' edit survived");
+    assert!(body.contains("rule log_start"), "theirs' rule survived");
+
+    // Interference: draft_b changes what `triage` WRITES while mainline's
+    // current source has `close` READING it — write∩read refuses.
+    branch(&["create", "draft_b"]);
+    let interfering = body.replace("status \"open\"", "status \"reopened\"");
+    branch(&["write", "draft_b", "demo.whip", "--body", &interfering]);
+    let mainline_edit = body.replace("message \"finished\"", "message \"closed out\"");
+    branch(&["write", "main", "demo.whip", "--body", &mainline_edit]);
+    let conflicted = Command::new(bin)
+        .args(["--json", "branch", "merge", "draft_b"])
+        .envs(envs_owned.iter().cloned())
+        .output()
+        .expect("merge runs");
+    assert!(
+        !conflicted.status.success(),
+        "write-meets-read interference across declarations stays an honest conflict"
+    );
+    let payload: Value = serde_json::from_slice(&conflicted.stdout).expect("conflict JSON");
+    assert_eq!(
+        payload.pointer("/conflicts/0/path").and_then(Value::as_str),
+        Some("demo.whip")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// The reconciliation daemon pass (`whip branch reconcile`): a quiescent
+/// branch silently folds mainline's disjoint delta down (its base
+/// re-points at mainline's head), an up-to-date branch reports as such,
+/// and the folded content is readable on the branch.
+#[test]
+fn branch_reconcile_folds_disjoint_mainline_deltas_down() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let dir = unique_temp_dir("reconcile");
+    let envs_owned = [
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE".to_owned(),
+            dir.join("branches.sqlite").to_string_lossy().into_owned(),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE".to_owned(),
+            dir.join("vcs-content.sqlite")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ];
+    let envs: Vec<(&str, &str)> = envs_owned
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let branch = |args: &[&str]| {
+        let mut full = vec!["--store", store, "--json", "branch"];
+        full.extend_from_slice(args);
+        run_json_with_env(bin, &full, &envs)
+    };
+
+    branch(&["write", "main", "a.md", "--body", "A0"]);
+    branch(&["create", "draft_a"]);
+    branch(&["write", "draft_a", "mine.md", "--body", "branch work"]);
+    // Mainline advances on a DISJOINT path after the branch point.
+    branch(&["write", "main", "b.md", "--body", "B1"]);
+
+    let report = branch(&["reconcile"]);
+    let entries = report.as_array().expect("report array");
+    let draft_entry = entries
+        .iter()
+        .find(|entry| entry.get("branch_id").and_then(Value::as_str) == Some("draft_a"))
+        .expect("draft_a reconciled");
+    assert_eq!(
+        draft_entry.get("outcome").and_then(Value::as_str),
+        Some("rebased"),
+        "the quiescent branch folded mainline's disjoint delta: {report}"
+    );
+
+    // The branch now sees mainline's delta AND kept its own divergence.
+    assert_eq!(
+        branch(&["read", "draft_a", "b.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("B1")
+    );
+    assert_eq!(
+        branch(&["read", "draft_a", "mine.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("branch work")
+    );
+    // Its branch point re-pointed at mainline's head: a second pass is
+    // up-to-date.
+    let second = branch(&["reconcile"]);
+    let entry = second
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|entry| entry.get("branch_id").and_then(Value::as_str) == Some("draft_a"))
+        .expect("entry");
+    assert_eq!(
+        entry.get("outcome").and_then(Value::as_str),
+        Some("up_to_date")
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_dir_all(dir);
+}

@@ -27002,6 +27002,9 @@ fn trace_event_mentions_effect(event: &TraceEvent, effect_id: &str) -> bool {
             effect_id: candidate,
             ..
         }
+        | TraceEvent::EffectRetried {
+            effect_id: candidate,
+        }
         | TraceEvent::EffectCancelled {
             effect_id: candidate,
         }
@@ -30874,6 +30877,17 @@ fn reconstruct_trace_records(events: &[EventView]) -> Vec<TraceRecord> {
                     },
                 );
             }
+            "effect.retried" => {
+                let Some(effect_id) = payload.get("effect_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                push_trace_record(
+                    &mut records,
+                    TraceEvent::EffectRetried {
+                        effect_id: effect_id.to_owned(),
+                    },
+                );
+            }
             "effect.cancelled" => {
                 let Some(effect_id) = payload.get("effect_id").and_then(Value::as_str) else {
                     continue;
@@ -31266,7 +31280,8 @@ const BRANCH_USAGE: &str =
   whip branch remove <branch> <path>\n\
   whip branch merge <branch>\n\
   whip branch discard <branch>\n\
-  whip branch bind <branch> <instance>";
+  whip branch bind <branch> <instance>\n\
+  whip branch reconcile";
 
 /// The versioned-workspace branch stores, workspace-scoped like the
 /// coordination store (env-overridable for tests).
@@ -31284,6 +31299,16 @@ fn vcs_content_store_path() -> PathBuf {
 
 fn open_vcs() -> Result<whipplescript_store::vcs::NativeWorkspaceVcs, ExitCode> {
     whipplescript_store::vcs::WorkspaceVcs::open(branch_store_path(), vcs_content_store_path())
+        .map(|mut vcs| {
+            // Declaration-granularity source merges (kernel parser-backed):
+            // conflicted `.whip` paths refine to certified merges where the
+            // anti-dependence discipline holds; absent this, every source
+            // conflict escalates.
+            vcs.set_source_merger(Box::new(
+                whipplescript_kernel::source_merge::WhipSourceMerger,
+            ));
+            vcs
+        })
         .map_err(|error| {
             eprintln!("could not open the branch stores: {error:?}");
             ExitCode::FAILURE
@@ -31682,8 +31707,55 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 eprintln!("{BRANCH_USAGE}");
                 return ExitCode::from(2);
             };
+            // Merge-up is serialized by the ADOPTION LEASE on the target
+            // line (vw note §7.1; ReconciliationDaemonLifecycle.tla):
+            // multi-writer hosts contend here instead of racing head
+            // advances.
+            let target = match vcs.get_branch(branch_id) {
+                Ok(Some(row)) => row.parent_branch_id.unwrap_or_default(),
+                _ => String::new(),
+            };
+            let holder = format!("whip-{}", std::process::id());
+            // The lease guards THIS workspace's target line: the key
+            // carries the branch-store identity so distinct workspaces
+            // sharing one coordination store never contend.
+            let lease_key = format!("{}::{target}", branch_store_path().display());
+            let mut adoption_lease = None;
+            if !target.is_empty() {
+                match whipplescript_store::coordination::CoordinationStore::open(
+                    coordination_store_path(),
+                ) {
+                    Ok(mut coordination) => {
+                        match coordination.try_acquire("adoption", &lease_key, 1, 60, &holder) {
+                            Ok(whipplescript_store::coordination::AcquireOutcome::Held) => {
+                                adoption_lease = Some((coordination, lease_key.clone()));
+                            }
+                            Ok(whipplescript_store::coordination::AcquireOutcome::Contended {
+                                holders,
+                            }) => {
+                                eprintln!(
+                                    "adoption lease for `{target}` is held by {holders:?}; retry"
+                                );
+                                return ExitCode::FAILURE;
+                            }
+                            Err(error) => {
+                                eprintln!("adoption lease unavailable: {error:?}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("coordination store unavailable: {error:?}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             let merge_cut_id = generated_cut_id();
-            match vcs.merge(branch_id, &merge_cut_id, &at) {
+            let outcome = vcs.merge(branch_id, &merge_cut_id, &at);
+            if let Some((mut coordination, lease_key)) = adoption_lease {
+                let _ = coordination.release("adoption", &lease_key, &holder);
+            }
+            match outcome {
                 Ok(VcsMergeOutcome::Adopted {
                     merge_cut_id,
                     into_branch_id,
@@ -31736,6 +31808,72 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        "reconcile" => {
+            // One reconciliation-daemon pass over every live branch:
+            // fold parent deltas down. Quiescence is detected from the
+            // branch's bound instances — any still-running instance keeps
+            // the branch mid-run, so intersecting deltas defer.
+            let branches = match vcs.list_branches(Some(BranchStatus::Active)) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    eprintln!("branch list failed: {error:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let store = SqliteStore::open(&options.store_path).ok();
+            let mut report = Vec::new();
+            for row in branches {
+                if row.parent_branch_id.is_none() {
+                    continue; // mainline has nothing to fold down from
+                }
+                let quiescent = match (&store, vcs.list_bound_instances_of(&row.branch_id)) {
+                    (Some(store), Ok(instances)) => instances.iter().all(|instance_id| {
+                        store
+                            .status(instance_id)
+                            .ok()
+                            .flatten()
+                            .map(|status| status.instance.status != "running")
+                            .unwrap_or(true)
+                    }),
+                    (None, _) | (_, Err(_)) => false,
+                };
+                let cut_id = generated_cut_id();
+                let outcome = match vcs.reconcile_branch(
+                    &row.branch_id,
+                    quiescent,
+                    &format!("{cut_id}-reconcile"),
+                    &at,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        eprintln!("reconcile `{}` failed: {error:?}", row.branch_id);
+                        return ExitCode::FAILURE;
+                    }
+                };
+                use whipplescript_store::vcs::ReconcileOutcome;
+                let entry = match outcome {
+                    ReconcileOutcome::UpToDate => json!({
+                        "branch_id": row.branch_id, "outcome": "up_to_date",
+                    }),
+                    ReconcileOutcome::Rebased { rebase_cut_id } => json!({
+                        "branch_id": row.branch_id, "outcome": "rebased",
+                        "rebase_cut_id": rebase_cut_id,
+                    }),
+                    ReconcileOutcome::DeferredMidRun => json!({
+                        "branch_id": row.branch_id, "outcome": "deferred_mid_run",
+                    }),
+                    ReconcileOutcome::Conflicts { conflicts } => json!({
+                        "branch_id": row.branch_id, "outcome": "conflicts",
+                        "conflicts": conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+                    }),
+                    other => json!({
+                        "branch_id": row.branch_id, "outcome": format!("{other:?}"),
+                    }),
+                };
+                report.push(entry);
+            }
+            emit_json(Value::Array(report))
         }
         "discard" => {
             let Some(branch_id) = rest.first() else {
@@ -35613,6 +35751,10 @@ fn trace_event_to_json(event: &TraceEvent) -> Value {
             "effect_id": effect_id,
             "status": status,
             "reason": reason,
+        }),
+        TraceEvent::EffectRetried { effect_id } => json!({
+            "type": "effect_retried",
+            "effect_id": effect_id,
         }),
         TraceEvent::EffectCancelled { effect_id } => json!({
             "type": "effect_cancelled",
@@ -46009,6 +46151,92 @@ case classification {
 
         assert_eq!(records.len(), 9);
         check_trace(&records).expect("reconstructed trace conforms");
+        check_local_trace(&events, &records).expect("local trace conforms");
+    }
+
+    #[test]
+    fn reconstructs_and_conforms_capacity_block_then_claim() {
+        // A capacity-contended effect: blocked, then claimed straight from blocked.
+        // This is the store-event shape `whip trace --check` reconstructs for a
+        // `capacity 1` agent's second turn; it must conform.
+        let events = vec![
+            event_view(
+                1,
+                "rule.committed",
+                json!({
+                    "rule": "dispatch",
+                    "facts": [],
+                    "effects": [{"effect_id": "turn", "status": "queued"}],
+                    "dependencies": []
+                }),
+            ),
+            event_view(
+                2,
+                "effect.blocked",
+                json!({
+                    "effect_id": "turn",
+                    "status": "blocked_by_capacity",
+                    "reason": "agent capacity exhausted"
+                }),
+            ),
+            event_view(
+                3,
+                "effect.run_started",
+                json!({"effect_id": "turn", "run_id": "run_turn"}),
+            ),
+            event_view(
+                4,
+                "effect.terminal",
+                json!({"effect_id": "turn", "run_id": "run_turn", "status": "completed"}),
+            ),
+        ];
+
+        let records = reconstruct_trace_records(&events);
+        check_trace(&records).expect("capacity-block-then-claim trace conforms");
+        check_local_trace(&events, &records).expect("local trace conforms");
+    }
+
+    #[test]
+    fn reconstructs_and_conforms_retry_then_reclaim() {
+        // A failed effect re-queued by `whip retry` (effect.retried) and re-run under
+        // a fresh run id. This is the store-event shape `whip trace --check`
+        // reconstructs after an operator retry; it must conform.
+        let events = vec![
+            event_view(
+                1,
+                "rule.committed",
+                json!({
+                    "rule": "dispatch",
+                    "facts": [],
+                    "effects": [{"effect_id": "turn", "status": "queued"}],
+                    "dependencies": []
+                }),
+            ),
+            event_view(
+                2,
+                "effect.run_started",
+                json!({"effect_id": "turn", "run_id": "run_turn_1"}),
+            ),
+            event_view(
+                3,
+                "effect.terminal",
+                json!({"effect_id": "turn", "run_id": "run_turn_1", "status": "failed"}),
+            ),
+            event_view(4, "effect.retried", json!({"effect_id": "turn"})),
+            event_view(
+                5,
+                "effect.run_started",
+                json!({"effect_id": "turn", "run_id": "run_turn_2"}),
+            ),
+            event_view(
+                6,
+                "effect.terminal",
+                json!({"effect_id": "turn", "run_id": "run_turn_2", "status": "completed"}),
+            ),
+        ];
+
+        let records = reconstruct_trace_records(&events);
+        check_trace(&records).expect("retry-then-reclaim trace conforms");
         check_local_trace(&events, &records).expect("local trace conforms");
     }
 

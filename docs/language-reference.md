@@ -545,7 +545,8 @@ source clock as daily_triage {
 `source clock as <name>` is the `clock_source` construct (provided by
 [`std.time`](providers.md)); a generic `source <provider> as <name> { observe; emit }`
 is the `signal_source` construct. Both belong to the `source_declaration`
-construct family and lower to an admission template — they emit a durable signal
+construct family and lower to an admission template — the `emit <event> { ... }`
+clause is the `event.emit` effect kind, admitting a durable signal
 fact, never a rule. Static checks: a recurring clock source must declare a
 `missed` policy (no silent default), and a calendar schedule should declare a
 `timezone` (otherwise it defaults to UTC with a diagnostic). Each clock
@@ -593,10 +594,11 @@ source http as feed {
 ```
 
 `http` fetches are GET-only and pass through an SSRF/egress policy: only
-`http`/`https` URLs are accepted, private and loopback addresses are blocked, and
-the destination host must appear on an allowlist configured through
-`WHIPPLESCRIPT_HTTP_SOURCE_ALLOW` (with `WHIPPLESCRIPT_HTTP_SOURCE_ALLOW_PRIVATE`
-to opt private/loopback hosts back in for local testing). A scheme-less or
+`http`/`https` URLs are accepted, and private and loopback addresses are always
+blocked. When `WHIPPLESCRIPT_HTTP_SOURCE_ALLOW` is set, the destination host must
+match one of its (comma-separated, `*.`-wildcardable) entries; when it is unset,
+any public host is allowed. `WHIPPLESCRIPT_HTTP_SOURCE_ALLOW_PRIVATE` opts
+private/loopback hosts back in for local testing. A scheme-less or
 non-http(s) URL is rejected at `whip check` time. Web *search* is designed but
 deferred — it is not yet available. See `ingress-file-source.whip` and
 `ingress-http-source.whip` in the examples for complete workflows.
@@ -654,13 +656,13 @@ rule start
 | `when Class as x [where ...]` | An unconsumed fact of `Class`. |
 | `when human answered <label> as x` | A `human.answer.received` fact from an answered inbox item. |
 | `when <agent> completed turn ... [as x]` | An `agent.turn.completed` fact. A declared agent name matches only that agent's turns; the generic word `worker` matches any agent. |
-| `when <queue> has ready item as x` | An item that is ready to be claimed in a [work queue](#work-queues). |
+| `when <tracker> has ready issue as x` | An issue that is ready to be claimed in a [work queue](#work-queues). |
 | `when fact <dotted.name> as x [where ...]` | The general form: any derived fact whose name matches the dotted path. |
 
 All of the readiness patterns above are sugar over `when fact`. `when human
 answered signoff as x` is shorthand for matching a `human.answer.received`
 fact; `when reviewer completed turn as x` matches `agent.turn.completed`; and
-`when backlog has ready item as x` matches a work-queue readiness fact. Reach
+`when backlog has ready issue as x` matches a work-queue readiness fact. Reach
 for the general `when fact <dotted.name>` form when the event you need does
 not yet have a dedicated phrase, for example
 `when fact agent.turn.completed as turn`.
@@ -752,7 +754,7 @@ becomes an effect, and a later rule branches on its completion.
 | `coerce fn(...) as x` | Enqueue a typed `schema.coerce` effect. |
 | `decide "..." -> { ... } as x` | Enqueue an inline typed model decision (see [Inline `decide`](#inline-decide)). |
 | `askHuman [as x] [choices [...]] "..."` | Enqueue a human review request. |
-| `file item into <queue> { ... }` | File a new item into a [work queue](#work-queues). |
+| `file issue into <tracker> { ... }` | File a new issue into a [work queue](#work-queues). |
 | `claim <item> [as x]` | Claim a queue item; already-claimed is a branchable failure. |
 | `release <item>` | Return a claimed item to the queue. |
 | `finish <item> [{ summary ... }]` | Mark a queue item done. |
@@ -976,7 +978,7 @@ separate progressions, one per ticket, unless a consumed fact or terminal state
 prevents a later progression.
 
 Readiness clauses that are not facts, such as `when worker is available` or
-`when backlog has ready item as item`, are projected facts or policy gates
+`when backlog has ready issue as issue`, are projected facts or policy gates
 checked at the same boundary. Guards run after bindings are selected and before
 the commit is built.
 
@@ -1180,20 +1182,20 @@ four categories — `open`, `in_progress`, `done`, `cancelled`.
 Rule and flow bodies act on the queue with these verbs:
 
 ```whip
-file item into backlog { title "Fix login" body "Users report 500s." }
-claim item as work
-release work
-finish work { summary "patched and verified" }
+file issue into backlog { title "Fix login" body "Users report 500s." }
+claim issue as work
+release issue
+finish issue { summary "patched and verified" }
 ```
 
 React to ready work with the readiness pattern:
 
 ```whip
 rule pick_up
-  when backlog has ready item as item
+  when backlog has ready issue as issue
   when worker is available
 => {
-  claim item as work
+  claim issue as work
   tell worker as turn "Resolve {{ work.title }}."
 }
 ```
@@ -1386,8 +1388,9 @@ is an ordinary failure routed to `after written fails`, leaving the file
 untouched. The `body` is an expression resolved when the effect runs, so a write
 inside `after <read> succeeds as r { … }` can write `r.content`.
 
-`read` and `write` are effects — they never run in guards or during static
-checking. The store's `root` is the scope boundary: the path is taken relative to
+`read`, `write`, `import`, and `export` lower to the `file.read`, `file.write`,
+`file.import`, and `file.export` effect kinds. They are effects — they never run
+in guards or during static checking. The store's `root` is the scope boundary: the path is taken relative to
 `root`, a path that is absolute or uses `..` to climb out of the root is refused
 before any disk access, and (when declared) the path must match the store's
 `allow read`/`allow write` globs — a denied path fails the operation rather than

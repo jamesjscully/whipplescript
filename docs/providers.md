@@ -101,7 +101,7 @@ Current scope is **experimental**:
   the whole enforcement boundary, and anything subtler is the operator's
   allow-list judgment.
 - Tracker tools (`list_todos`/`add_todo`/`update_todo`), offered only when
-  `WHIPPLESCRIPT_HARNESS_TRACKER=<queue>` is set: the agent participates in the
+  `WHIPPLESCRIPT_HARNESS_TRACKER=<tracker>` is set: the agent participates in the
   durable work tracker (files/updates items the workflow's rules observe).
   `list_todos` remains read-only and ungated; mutating tools are surfaced and
   executed only when the turn delegates tracker authority with

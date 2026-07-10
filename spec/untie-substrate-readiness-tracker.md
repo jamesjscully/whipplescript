@@ -163,32 +163,44 @@ Per-heading `· vN` tags below restate this at each phase.
       re-recorded, merge carries the product to mainline. DO-side exec
       materialization rides the compute-plane sidecar (P8) protocol, not
       this seam.)*
-- [ ] Merge engine v1: path-level three-way over manifests with
+- [x] Merge engine v1: path-level three-way over manifests with
       provenance-carrying conflict detection + escalation (never fake
       auto-merge); declaration-granularity whip-source merge with slice
-      certificates (whole-declaration, fail-closed). *(Progress
-      2026-07-10: the blob half landed — pure, host-agnostic
-      `merge::merge_manifests` in whipplescript-store (three-way over
-      content-addressed manifests; structured `PathConflict` with base +
-      both sides + provenance; identical-outcome reunification; deletes
-      as outcomes; per-item escalation, remainder still folds). Remaining
-      for the box: the declaration-granularity whip-source merge against
-      the slicer seam.)*
-- [ ] Reconciliation daemon v1: silent rebase-down of slice-disjoint
+      certificates (whole-declaration, fail-closed). *(2026-07-10: blob
+      half = pure `merge::merge_manifests` (structured `PathConflict`,
+      identical-outcome reunification, deletes as outcomes, per-item
+      escalation). Declaration half =
+      `whipplescript-kernel/src/source_merge.rs` (`WhipSourceMerger`)
+      behind the store's `SourceMerger` seam: whole-declaration three-way
+      over the branch-point base; both-modified-same-declaration
+      conflicts unless identical; disjoint changed rules certify iff the
+      anti-dependence discipline holds over parser fact footprints
+      (write-or-consume ∩ read-or-write-or-consume = ∅, unioned across
+      each rule's versions — merge-slice.maude at source granularity).
+      Fail-closed walls: non-compiling side, lossy split, modified/
+      deleted non-rule decls (added ones are safe — they cannot interfere
+      with edits that compiled without them), projection reads, merged
+      result must re-compile. E2E: disjoint rule edits to ONE file
+      certify through `whip branch merge`; a cross-declaration write∩read
+      pair stays an honest conflict.)*
+- [x] Reconciliation daemon v1: silent rebase-down of slice-disjoint
       mainline deltas; quiescence points (terminals, marks, task
       completion); staleness bound; merge-up serialized by the adoption
-      lease. *(Progress 2026-07-10: the pure decision core landed —
-      `crates/whipplescript-store/src/reconcile.rs`: `plan_rebase_down`
-      (silent disjoint fold in any phase; intersecting deltas defer
-      mid-run and arrive as the structured ask at quiescence) +
-      `plan_merge_up` (lease → quiescence → staleness-at-merge-time
-      guards, in the TLA-modeled order). The plans are EXECUTED by
-      `vcs.rs::merge` (P1h): auto rebase-down (silent disjoint / honest
-      escalation) then staleness-checked merge-up, end-to-end through
-      `whip branch merge`. Remaining for the box: the background daemon
-      loop (continuous rebase-down across live branches, the coordination
-      adoption lease for multi-writer hosts, quiescence-point detection
-      from instance terminals/marks).)*
+      lease. *(2026-07-10 complete: decision core `reconcile.rs`
+      (TLA-modeled guard order) + executor
+      `WorkspaceVcs::reconcile_branch` (blob-disjoint deltas fold in ANY
+      phase; contested paths wait for quiescence where certified source
+      merges refine and the residue escalates as the ask) + the daemon
+      tick `whip branch reconcile` (every live branch; quiescence
+      detected from the branch's bound instances — none `running`;
+      per-branch JSON report) + merge-up serialized by the ADOPTION LEASE
+      (coordination store; key = branch-store identity :: target line, so
+      workspaces never cross-contend; contention is a refused normal
+      outcome). E2E: a quiescent branch folds mainline's disjoint delta
+      and re-points its base (second pass = up_to_date); its own
+      divergence survives. Read-set-aware mid-run silent folds (the
+      slicer's read tracking) and a self-scheduling background cadence
+      remain future refinements; the tick is worker/operator-invoked.)*
 - [ ] Workstream tier: named shared lines + membership (single-valued,
       fail-closed to mainline); certificate-gated auto-admit in-stream;
       boundary-gated promotion; archive re-homes members. *(Progress

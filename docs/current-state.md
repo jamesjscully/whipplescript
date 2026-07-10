@@ -24,8 +24,8 @@ an internal implementation-stage marker.
   `whip inbox`, answers matched by `when human answered ...` rules.
 - Sequential `flow` blocks, which lower to ordinary rules visible in
   `whip check`.
-- Work queues with the `builtin` tracker (`queue`, `file`/`claim`/`release`/
-  `finish`, `when <queue> has ready item`) and the `whip issue` command family.
+- Work queues with the `builtin` tracker (`file`/`claim`/`release`/
+  `finish`, `when <tracker> has ready issue`) and the `whip issue` command family.
 - Time effects: `timeout` clauses, `timer`, and `cancel`, fired on worker
   passes.
 - Inline `decide` decisions, `case` over string-literal unions, the general

@@ -24,7 +24,7 @@ nav:
       - JSON Reference: json-reference.md
       - Rust API Reference: rust-api.md
       - Runtime & Operations: runtime-operations.md
-      - Providers & Plugins: providers.md
+      - Providers & packages: providers.md
   - Help:
       - Install: install.md
       - Diagnostics Guide: diagnostics.md

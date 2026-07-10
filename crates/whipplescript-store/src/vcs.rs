@@ -68,9 +68,50 @@ pub enum VcsMergeOutcome {
     NoParent,
 }
 
+/// Verdict of a source-aware merge attempt on one conflicted path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SourceMergeVerdict {
+    /// The edits' slices are provably disjoint: this is the certified
+    /// merged source (the composition theorem's crossover).
+    Certified { merged: String },
+    /// No certificate — stays an honest conflict.
+    Conflict,
+}
+
+/// The declaration-granularity source-merge seam (vw note §6.1): the
+/// store crate owns WHERE source-aware refinement applies (conflicted
+/// `.whip` paths); the host installs HOW (the kernel's parser-backed
+/// merger). Absent merger = every source conflict escalates (fail
+/// closed).
+pub trait SourceMerger {
+    fn merge_source(&self, base: Option<&str>, ours: &str, theirs: &str) -> SourceMergeVerdict;
+}
+
+/// One reconciliation-daemon tick over one branch (the executor of
+/// reconcile.rs's plans; lifecycle in ReconciliationDaemonLifecycle.tla).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReconcileOutcome {
+    UpToDate,
+    /// The parent's delta folded in (silently when blob-disjoint; via
+    /// certified source merges at quiescence).
+    Rebased {
+        rebase_cut_id: String,
+    },
+    /// Mid-run and the delta intersects: nothing moves until quiescence.
+    DeferredMidRun,
+    /// At quiescence the residual conflicts are the notification-and-ask.
+    Conflicts {
+        conflicts: Vec<PathConflict>,
+    },
+    BranchMissing,
+    BranchNotActive,
+    NoParent,
+}
+
 pub struct WorkspaceVcs<B: Branches, C: ContentBlobs> {
     branches: B,
     content: C,
+    source_merger: Option<Box<dyn SourceMerger>>,
 }
 
 /// The native workspace VCS: rusqlite-backed branch + content stores.
@@ -86,6 +127,7 @@ impl NativeWorkspaceVcs {
         Ok(Self {
             branches: BranchStore::open(branches_path)?,
             content: ContentStore::open(content_path)?,
+            source_merger: None,
         })
     }
 }
@@ -94,7 +136,18 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// Compose a workspace VCS from any host's branch + content seams
     /// (the DO host passes its `DoSql`-backed implementations).
     pub fn from_parts(branches: B, content: C) -> Self {
-        Self { branches, content }
+        Self {
+            branches,
+            content,
+            source_merger: None,
+        }
+    }
+
+    /// Install the host's declaration-granularity source merger (the
+    /// kernel's parser-backed implementation). Fail-closed default: no
+    /// merger, no source-aware refinement.
+    pub fn set_source_merger(&mut self, merger: Box<dyn SourceMerger>) {
+        self.source_merger = Some(merger);
     }
 
     /// Bootstrap the workspace: the mainline branch exists after this.
@@ -215,6 +268,159 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         }
     }
 
+    /// Source-aware conflict refinement: for each conflicted `.whip` path
+    /// with both sides present, ask the installed merger for a certified
+    /// declaration-granularity merge; certified content is stored and
+    /// folded, everything else stays an honest conflict (fail closed:
+    /// no merger, delete-vs-modify, or non-source paths never refine).
+    fn refine_source_conflicts(
+        &self,
+        conflicts: Vec<PathConflict>,
+    ) -> StoreResult<(BTreeMap<String, String>, Vec<PathConflict>)> {
+        let Some(merger) = self.source_merger.as_deref() else {
+            return Ok((BTreeMap::new(), conflicts));
+        };
+        let mut resolved = BTreeMap::new();
+        let mut remaining = Vec::new();
+        for conflict in conflicts {
+            let refinable = conflict.path.ends_with(".whip")
+                && conflict.ours.is_some()
+                && conflict.theirs.is_some();
+            if !refinable {
+                remaining.push(conflict);
+                continue;
+            }
+            let base_body = match conflict.base.as_deref() {
+                Some(hash) => self.content.get(hash)?,
+                None => None,
+            };
+            let (Some(ours_body), Some(theirs_body)) = (
+                self.content
+                    .get(conflict.ours.as_deref().expect("present"))?,
+                self.content
+                    .get(conflict.theirs.as_deref().expect("present"))?,
+            ) else {
+                remaining.push(conflict);
+                continue;
+            };
+            match merger.merge_source(base_body.as_deref(), &ours_body, &theirs_body) {
+                SourceMergeVerdict::Certified { merged } => {
+                    let hash = self.content.put(&merged)?;
+                    resolved.insert(conflict.path.clone(), hash);
+                }
+                SourceMergeVerdict::Conflict => remaining.push(conflict),
+            }
+        }
+        Ok((resolved, remaining))
+    }
+
+    /// One reconciliation-daemon tick for one branch: fold the parent's
+    /// delta down. Blob-disjoint deltas fold in ANY phase (silent
+    /// continuous rebase); everything that touches contested paths waits
+    /// for quiescence, where certified source merges refine and the
+    /// residue escalates as the ask. Executes reconcile.rs's plans
+    /// against the branch store; lifecycle per
+    /// ReconciliationDaemonLifecycle.tla.
+    pub fn reconcile_branch(
+        &mut self,
+        branch_id: &str,
+        quiescent: bool,
+        rebase_cut_id: &str,
+        at: &str,
+    ) -> StoreResult<ReconcileOutcome> {
+        let Some(branch) = self.branches.get_branch(branch_id)? else {
+            return Ok(ReconcileOutcome::BranchMissing);
+        };
+        if branch.status != BranchStatus::Active {
+            return Ok(ReconcileOutcome::BranchNotActive);
+        }
+        let Some(parent_id) = branch.parent_branch_id.clone() else {
+            return Ok(ReconcileOutcome::NoParent);
+        };
+        let Some(parent) = self.branches.get_branch(&parent_id)? else {
+            return Ok(ReconcileOutcome::NoParent);
+        };
+        if branch.branch_point_cut_id == parent.head_cut_id {
+            return Ok(ReconcileOutcome::UpToDate);
+        }
+        let branch_side = MergeSide {
+            label: branch_id.to_owned(),
+            cut_id: branch.head_cut_id.clone(),
+        };
+        let parent_side = MergeSide {
+            label: parent_id.clone(),
+            cut_id: parent.head_cut_id.clone(),
+        };
+        let point = self.load_manifest(branch.branch_point_manifest_hash.as_deref())?;
+        let head = self.load_manifest(branch.head_manifest_hash.as_deref())?;
+        let target = self.load_manifest(parent.head_manifest_hash.as_deref())?;
+        let new_head = match plan_rebase_down(
+            &point,
+            &head,
+            &target,
+            &branch_side,
+            &parent_side,
+            quiescent,
+        ) {
+            RebaseDownPlan::UpToDate => return Ok(ReconcileOutcome::UpToDate),
+            RebaseDownPlan::Silent { new_head_manifest } => new_head_manifest,
+            RebaseDownPlan::DeferredMidRun => return Ok(ReconcileOutcome::DeferredMidRun),
+            RebaseDownPlan::AskAtQuiescence { conflicts } => {
+                // At quiescence, certified source merges refine the
+                // contested paths; any residue is the honest ask. The
+                // refined manifest = clean remainder + certified content,
+                // recomputed here from the same three-way.
+                let crate::merge::MergeOutcome::Conflicted {
+                    merged_remainder,
+                    conflicts: raw,
+                } = crate::merge::merge_manifests(
+                    &point,
+                    &head,
+                    &target,
+                    &branch_side,
+                    &parent_side,
+                )
+                else {
+                    unreachable!("plan reported conflicts");
+                };
+                debug_assert_eq!(raw.len(), conflicts.len());
+                let (resolved, remaining) = self.refine_source_conflicts(raw)?;
+                if !remaining.is_empty() {
+                    return Ok(ReconcileOutcome::Conflicts {
+                        conflicts: remaining,
+                    });
+                }
+                let mut manifest = merged_remainder;
+                manifest.extend(resolved);
+                manifest
+            }
+        };
+        let rebased_hash = self.store_manifest(&new_head)?;
+        let parent_head_cut = parent.head_cut_id.clone().unwrap_or_default();
+        let parent_head_hash = parent
+            .head_manifest_hash
+            .clone()
+            .unwrap_or_else(|| self.store_manifest(&BTreeMap::new()).unwrap_or_default());
+        match self.branches.rebase_branch(
+            branch_id,
+            branch.head_cut_id.as_deref(),
+            &parent_head_cut,
+            &parent_head_hash,
+            rebase_cut_id,
+            &rebased_hash,
+            at,
+        )? {
+            AdvanceOutcome::Advanced(_) => Ok(ReconcileOutcome::Rebased {
+                rebase_cut_id: rebase_cut_id.to_owned(),
+            }),
+            AdvanceOutcome::Stale { .. } => Err(StoreError::Conflict(
+                "branch head moved during the rebase; retry".to_owned(),
+            )),
+            AdvanceOutcome::NotActive { .. } => Ok(ReconcileOutcome::BranchNotActive),
+            AdvanceOutcome::NotFound => Ok(ReconcileOutcome::BranchMissing),
+        }
+    }
+
     /// Merge a branch into its parent line, running the reconciliation
     /// pipeline: rebase-down first when the parent advanced (silent when
     /// clean, honest conflicts when not), then the staleness-checked
@@ -238,58 +444,26 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let Some(parent) = self.branches.get_branch(&parent_id)? else {
             return Ok(VcsMergeOutcome::NoParent);
         };
-        let branch_side = MergeSide {
-            label: branch_id.to_owned(),
-            cut_id: branch.head_cut_id.clone(),
-        };
-        let parent_side = MergeSide {
-            label: parent_id.clone(),
-            cut_id: parent.head_cut_id.clone(),
-        };
-
         // Rebase-down when the parent moved past our branch point. The
         // CLI merge runs at a quiescence point by definition (no run in
         // flight inside this verb), so a conflicting delta escalates as
-        // the ask instead of deferring.
-        if branch.branch_point_cut_id != parent.head_cut_id {
-            let point = self.load_manifest(branch.branch_point_manifest_hash.as_deref())?;
-            let head = self.load_manifest(branch.head_manifest_hash.as_deref())?;
-            let target = self.load_manifest(parent.head_manifest_hash.as_deref())?;
-            match plan_rebase_down(&point, &head, &target, &branch_side, &parent_side, true) {
-                RebaseDownPlan::UpToDate => {}
-                RebaseDownPlan::Silent { new_head_manifest } => {
-                    let rebased_hash = self.store_manifest(&new_head_manifest)?;
-                    let rebase_cut = format!("{merge_cut_id}-rebase");
-                    let parent_head_cut = parent.head_cut_id.clone().unwrap_or_default();
-                    let parent_head_hash = parent.head_manifest_hash.clone().unwrap_or_else(|| {
-                        self.store_manifest(&BTreeMap::new()).unwrap_or_default()
-                    });
-                    match self.branches.rebase_branch(
-                        branch_id,
-                        branch.head_cut_id.as_deref(),
-                        &parent_head_cut,
-                        &parent_head_hash,
-                        &rebase_cut,
-                        &rebased_hash,
-                        at,
-                    )? {
-                        AdvanceOutcome::Advanced(row) => branch = *row,
-                        AdvanceOutcome::Stale { .. } => {
-                            return Err(StoreError::Conflict(
-                                "branch head moved during the merge; retry".to_owned(),
-                            ))
-                        }
-                        AdvanceOutcome::NotActive { .. } => {
-                            return Ok(VcsMergeOutcome::BranchNotActive)
-                        }
-                        AdvanceOutcome::NotFound => return Ok(VcsMergeOutcome::BranchMissing),
-                    }
-                }
-                RebaseDownPlan::DeferredMidRun => unreachable!("planned at quiescence"),
-                RebaseDownPlan::AskAtQuiescence { conflicts } => {
-                    return Ok(VcsMergeOutcome::Conflicted { conflicts });
-                }
+        // the ask instead of deferring; source-certified refinement
+        // applies (quiescent).
+        match self.reconcile_branch(branch_id, true, &format!("{merge_cut_id}-rebase"), at)? {
+            ReconcileOutcome::UpToDate => {}
+            ReconcileOutcome::Rebased { .. } => {
+                branch = self
+                    .branches
+                    .get_branch(branch_id)?
+                    .ok_or_else(|| StoreError::Conflict("branch vanished mid-merge".to_owned()))?;
             }
+            ReconcileOutcome::DeferredMidRun => unreachable!("reconciled at quiescence"),
+            ReconcileOutcome::Conflicts { conflicts } => {
+                return Ok(VcsMergeOutcome::Conflicted { conflicts });
+            }
+            ReconcileOutcome::BranchMissing => return Ok(VcsMergeOutcome::BranchMissing),
+            ReconcileOutcome::BranchNotActive => return Ok(VcsMergeOutcome::BranchNotActive),
+            ReconcileOutcome::NoParent => return Ok(VcsMergeOutcome::NoParent),
         }
 
         let head = self.load_manifest(branch.head_manifest_hash.as_deref())?;
@@ -452,6 +626,10 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
 
     pub fn instance_branch(&self, instance_id: &str) -> StoreResult<Option<String>> {
         self.branches.instance_branch(instance_id)
+    }
+
+    pub fn list_bound_instances_of(&self, branch_id: &str) -> StoreResult<Vec<String>> {
+        self.branches.list_bound_instances(branch_id)
     }
 
     /// Mainline's id, for callers that don't hardcode it.
