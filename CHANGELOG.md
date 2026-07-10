@@ -8,7 +8,7 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 > separately and is **not** part of 0.3. Native provider support is validated for
 > **Codex and Claude**; the Pi native provider is deferred.
 
-## [0.3.0] — 2026-07-09
+## [0.3.0] — 2026-07-10
 
 WhippleScript is a small scripting language for AI to orchestrate AI. This release
 takes the language onto the edge: the same durable, replayable rule/effect kernel
