@@ -107,7 +107,14 @@ Per-heading `· vN` tags below restate this at each phase.
       advance, fail-closed terminal statuses, idempotent create. Remaining
       for the box: wire to real checkpoint cuts + the virtual working set.)*
 - [ ] Virtual working set: sandbox-mediated per-branch file surface,
-      copy-on-write.
+      copy-on-write. *(Progress 2026-07-10: the surface landed —
+      `crates/whipplescript-store/src/working_set.rs`:
+      `VirtualWorkingSet` implements the `FileStore` seam over (head
+      manifest → ContentStore) reads + a COW overlay for writes/deletes
+      (tombstoned outcomes); `manifest()` folds the next cut and feeds
+      `merge_manifests` directly (integration-tested); identical bodies
+      dedupe. Remaining for the box: wiring the effect-handler dispatch
+      to select a branch's working set per instance + the stat cache.)*
 - [ ] Two-plane consistent cut: substance manifest + workspace-plane
       **high-water positions** (the plane-store enumeration is the pump
       audit walked twice — do both in one pass).
