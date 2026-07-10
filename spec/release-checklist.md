@@ -126,6 +126,49 @@ Web search/fetch tools and the deferred DO `[~]` residuals were moved to v0.4.
    then `whip --version` (0.3.0) · `whip doctor --json` ·
    `whip check examples/minimal-noop.whip`.
 
+## v0.4.0 Cut Runbook (draft — engineering complete 2026-07-10, decisions pending)
+
+0.4 = **version control (the versioned workspace + untie substrate
+capabilities) + improve/evals**, plus the items moved here at the 0.3 cut
+(web search/fetch tools; deferred DO `[~]` residuals).
+
+**Engineering state (2026-07-10).** The version-control half is COMPLETE:
+untie-substrate readiness tracker Phases 0–5 all shipped on branch `v0.4`
+(formal models; the versioned-workspace floor; the 13-op workspace API with
+diff/bundles/erasure/chunk transfer/selective verbs/conflict
+surface/archaeology/op-undo; the chat fork; policy-epoch consumption with
+DR-0036 witnessed workspace cuts + dynamic guarantee reports; auth
+simplification via host-resolved provider profiles; the store-seam handles
+surface, position-pair cut, and seam-contract draft). The web search + fetch
+tools are built per their accepted notes (native owned harness).
+
+**Blocking the cut — maintainer decisions/input:**
+
+1. **Improve/evals scope (Jack).** The second half of 0.4's banner is
+   pre-ADR (`experimentation-subsystem-research-note.md`,
+   `improve-design-note.md`; not yet a registered tracker). Decide: design
+   + build it into 0.4 (design discussion first, per house rule), or re-cut
+   0.4 as the version-control release and move improve/evals to 0.5.
+2. **Sequencing fork** (untie tracker, ⚑): git-backed workspace API in
+   gaugedesk first? Analysis written 2026-07-10; whip-build-order
+   independent — this gates gaugedesk sequencing, not the whip cut.
+3. **Production container enable** (DO tracker; Cloudflare Containers
+   billing + image push) — also gates the Phase 2 presigned-transfer
+   residual and the web tools' DO build boxes (`NeedsHttp` executor,
+   TS-shell guard/egress entries).
+4. **Workspace-DO broker, egress deny, P7 object tier** (DO tracker
+   decisions).
+5. **Seam-contract ratification** rides the un-tie side's co-authoring
+   (`store-seam-contract-draft.md` open items: Quint twin, admitted-erasure
+   command, handoff format).
+6. **crates.io publishing** remains on the 0.3.1 vendoring track (above),
+   independent of the 0.4 tree.
+
+**Mechanical steps once scope is decided** (mirror the 0.3 runbook): version
+bump + CHANGELOG date; full readiness gate
+(`WHIPPLESCRIPT_RELEASE_READINESS_FULL=1`) green; tag → mirror publish
+(preserve the grafted infra files); post-publish smoke.
+
 ## Native Provider Release Gate
 
 For a release that advertises usable native Codex, Claude, and Pi providers,
