@@ -228,7 +228,14 @@ impl AuthoredAgentPackage {
             Some(&self.workflow),
             self.agent.clone(),
             self.system_prompt.clone(),
-            native_workspace_tool_specs_with_capabilities(writable, command, human),
+            native_workspace_tool_specs_from_registry(
+                self.capabilities
+                    .iter()
+                    .any(|capability| capability == "workspace.read"),
+                writable,
+                command,
+                human,
+            ),
             self.max_steps,
         )
     }
@@ -1055,44 +1062,57 @@ pub fn native_workspace_tool_specs_with_capabilities(
     command_execution: bool,
     human_interaction: bool,
 ) -> Vec<ToolSpec> {
-    let mut tools = vec![
-        tool_spec(
-            "read",
-            "Read a workspace text file.",
-            json!({
-                "type": "object", "properties": {
-                    "path": { "type": "string" }, "offset": { "type": "integer" },
-                    "limit": { "type": "integer" }
-                }, "required": ["path"], "additionalProperties": false
-            }),
-        ),
-        tool_spec(
-            "grep",
-            "Search text in workspace files.",
-            json!({
-                "type": "object", "properties": {
-                    "pattern": { "type": "string" }, "path": { "type": "string" }
-                }, "required": ["pattern"], "additionalProperties": false
-            }),
-        ),
-        tool_spec(
-            "find",
-            "Find workspace paths by wildcard pattern.",
-            json!({
-                "type": "object", "properties": {
-                    "pattern": { "type": "string" }, "path": { "type": "string" }
-                }, "required": ["pattern"], "additionalProperties": false
-            }),
-        ),
-        tool_spec(
-            "ls",
-            "List a workspace directory.",
-            json!({
-                "type": "object", "properties": { "path": { "type": "string" } },
-                "additionalProperties": false
-            }),
-        ),
-    ];
+    native_workspace_tool_specs_from_registry(true, writable, command_execution, human_interaction)
+}
+
+pub fn native_workspace_tool_specs_from_registry(
+    readable: bool,
+    writable: bool,
+    command_execution: bool,
+    human_interaction: bool,
+) -> Vec<ToolSpec> {
+    let mut tools = if readable {
+        vec![
+            tool_spec(
+                "read",
+                "Read a workspace text file.",
+                json!({
+                    "type": "object", "properties": {
+                        "path": { "type": "string" }, "offset": { "type": "integer" },
+                        "limit": { "type": "integer" }
+                    }, "required": ["path"], "additionalProperties": false
+                }),
+            ),
+            tool_spec(
+                "grep",
+                "Search text in workspace files.",
+                json!({
+                    "type": "object", "properties": {
+                        "pattern": { "type": "string" }, "path": { "type": "string" }
+                    }, "required": ["pattern"], "additionalProperties": false
+                }),
+            ),
+            tool_spec(
+                "find",
+                "Find workspace paths by wildcard pattern.",
+                json!({
+                    "type": "object", "properties": {
+                        "pattern": { "type": "string" }, "path": { "type": "string" }
+                    }, "required": ["pattern"], "additionalProperties": false
+                }),
+            ),
+            tool_spec(
+                "ls",
+                "List a workspace directory.",
+                json!({
+                    "type": "object", "properties": { "path": { "type": "string" } },
+                    "additionalProperties": false
+                }),
+            ),
+        ]
+    } else {
+        Vec::new()
+    };
     if writable {
         tools.extend([
             tool_spec(
@@ -4901,6 +4921,40 @@ workflow Method {
         )
         .expect_err("registry drift must fail");
         assert!(error.contains("capabilities do not match"));
+    }
+
+    #[test]
+    fn authored_agent_package_can_offer_no_tools() {
+        let package = AuthoredAgentPackage::from_documents(
+            format!(
+                r#"{{
+  "schema":"{AGENT_PACKAGE_SCHEMA}",
+  "source":"method.whip",
+  "workflow":"Method",
+  "agent":"assistant",
+  "system_prompt":"persona.md",
+  "capabilities":[],
+  "max_steps":4
+}}"#
+            ),
+            r#"
+workflow Method {
+  agent assistant {
+    provider owned
+    profile "plain"
+    capacity 1
+    capabilities []
+  }
+  rule converse when started => { tell assistant "Answer without tools." }
+}
+"#,
+            "Be helpful.",
+        )
+        .expect("tool-free package");
+        let resolved = package
+            .resolve(package.version_ref())
+            .expect("resolve tool-free package");
+        assert!(resolved.tools.is_empty());
     }
 
     #[test]
