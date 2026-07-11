@@ -36,8 +36,49 @@ use crate::files::FileStore;
 use crate::merge::MergeSide;
 use crate::merge::PathConflict;
 use crate::reconcile::{plan_merge_up, plan_rebase_down, MergeUpPlan, RebaseDownPlan};
+use crate::text_merge::{MergePiece, Provenance, RegionResolution, TextMergeOutcome};
 use crate::working_set::VirtualWorkingSet;
 use crate::{StoreError, StoreResult};
+
+/// Outcome of a base-carrying editor save (spec/text-merge-spec.md §12.1).
+/// `Conflicted` wrote NOTHING and is transient — never persisted as an
+/// open-conflict row (the resolving human is present; branch-merge
+/// conflicts keep their rows).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SaveWithBaseOutcome {
+    /// The head hadn't moved (or the path's content hadn't): a plain
+    /// mediated write.
+    Written {
+        cut_id: String,
+    },
+    /// The head had moved; draft and head composed cleanly (possibly via
+    /// region memory) and the merged body is the new head. `pieces`
+    /// carries provenance for the editor's review fold.
+    Merged {
+        cut_id: String,
+        merged: String,
+        pieces: Vec<MergePiece>,
+    },
+    /// Real divergence: nothing written; the regions are the fold payload.
+    Conflicted {
+        head_cut_id: Option<String>,
+        pieces: Vec<MergePiece>,
+    },
+    BranchMissing,
+    BranchNotActive,
+    /// The claimed base cut is not a recorded cut — the client's read
+    /// base is unverifiable, so nothing is merged or written.
+    UnknownBaseCut,
+}
+
+/// A read-only merge preview (spec §12.1): exactly what `save_with_base`
+/// would compute, without writing — the editor's live fold.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergePreview {
+    pub head_cut_id: Option<String>,
+    pub clean: bool,
+    pub pieces: Vec<MergePiece>,
+}
 
 /// One VCS write/remove outcome: the new cut, or the refusal.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -617,17 +658,25 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         }
     }
 
-    /// Conflict refinement, two stages. First the RESOLUTION MEMORY
+    /// Conflict refinement, three stages. First the RESOLUTION MEMORY
     /// (resolution-memory.maude): a conflict whose content-addressed
     /// triple was resolved before applies the stored resolution — the
     /// daemon's auto-propagation to descendants; rerere as ordinary
     /// workspace-plane knowledge, exact triple match only. Then
     /// source-aware refinement: for each conflicted `.whip` path with
     /// both sides present, ask the installed merger for a certified
-    /// declaration-granularity merge. Remembered/certified content is
-    /// stored and folded, everything else stays an honest conflict
-    /// (fail closed: no merger, delete-vs-modify, or non-source paths
-    /// never refine).
+    /// declaration-granularity merge. Last the token-level TEXT MERGE
+    /// (spec/text-merge-spec.md; text-merge-compose.maude) for
+    /// modify/modify on non-source text paths — word-atom composition
+    /// under the certified never-fabricate/proximity rules; a clean
+    /// composition folds, anything conflicted stays escalated (the
+    /// region detail is deterministically recomputable from the
+    /// content-addressed triple, so the conflict row needs no new
+    /// fields). Remembered/certified/composed content is stored and
+    /// folded, everything else stays an honest conflict (fail closed:
+    /// delete-vs-modify, add/add, oversized, or erased bodies never
+    /// refine; `.whip` sources never reach the text tier — the
+    /// merge-slice bite is untouched).
     fn refine_source_conflicts(
         &self,
         conflicts: Vec<PathConflict>,
@@ -653,40 +702,330 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             }
             unremembered.push(conflict);
         }
-        let Some(merger) = self.source_merger.as_deref() else {
-            return Ok((resolved, unremembered));
-        };
         let mut remaining = Vec::new();
-        for conflict in unremembered {
-            let refinable = conflict.path.ends_with(".whip")
+        if let Some(merger) = self.source_merger.as_deref() {
+            for conflict in unremembered {
+                let refinable = conflict.path.ends_with(".whip")
+                    && conflict.ours.is_some()
+                    && conflict.theirs.is_some();
+                if !refinable {
+                    remaining.push(conflict);
+                    continue;
+                }
+                let base_body = match conflict.base.as_deref() {
+                    Some(hash) => self.content.get(hash)?,
+                    None => None,
+                };
+                let (Some(ours_body), Some(theirs_body)) = (
+                    self.content
+                        .get(conflict.ours.as_deref().expect("present"))?,
+                    self.content
+                        .get(conflict.theirs.as_deref().expect("present"))?,
+                ) else {
+                    remaining.push(conflict);
+                    continue;
+                };
+                match merger.merge_source(base_body.as_deref(), &ours_body, &theirs_body) {
+                    SourceMergeVerdict::Certified { merged } => {
+                        let hash = self.content.put(&merged)?;
+                        resolved.insert(conflict.path.clone(), hash);
+                    }
+                    SourceMergeVerdict::Conflict => remaining.push(conflict),
+                }
+            }
+        } else {
+            remaining = unremembered;
+        }
+        let text_config = crate::text_merge::TextMergeConfig::from_env();
+        let mut still_conflicted = Vec::new();
+        for conflict in remaining {
+            // Eligibility (spec section 3): modify/modify with a present
+            // base, non-source path; deletes and add/add stay escalated.
+            let refinable = !conflict.path.ends_with(".whip")
+                && conflict.base.is_some()
                 && conflict.ours.is_some()
                 && conflict.theirs.is_some();
             if !refinable {
-                remaining.push(conflict);
+                still_conflicted.push(conflict);
                 continue;
             }
-            let base_body = match conflict.base.as_deref() {
-                Some(hash) => self.content.get(hash)?,
-                None => None,
-            };
-            let (Some(ours_body), Some(theirs_body)) = (
+            let (Some(base_body), Some(ours_body), Some(theirs_body)) = (
+                self.content
+                    .get(conflict.base.as_deref().expect("present"))?,
                 self.content
                     .get(conflict.ours.as_deref().expect("present"))?,
                 self.content
                     .get(conflict.theirs.as_deref().expect("present"))?,
             ) else {
-                remaining.push(conflict);
+                still_conflicted.push(conflict);
                 continue;
             };
-            match merger.merge_source(base_body.as_deref(), &ours_body, &theirs_body) {
-                SourceMergeVerdict::Certified { merged } => {
+            if !text_config.within_size(&base_body, &ours_body, &theirs_body) {
+                still_conflicted.push(conflict);
+                continue;
+            }
+            let outcome =
+                crate::text_merge::text_merge(&base_body, &ours_body, &theirs_body, &text_config);
+            match self.apply_region_memory(outcome)? {
+                TextMergeOutcome::Clean { merged, .. } => {
                     let hash = self.content.put(&merged)?;
                     resolved.insert(conflict.path.clone(), hash);
                 }
-                SourceMergeVerdict::Conflict => remaining.push(conflict),
+                TextMergeOutcome::Conflicted { .. } => still_conflicted.push(conflict),
             }
         }
-        Ok((resolved, remaining))
+        Ok((resolved, still_conflicted))
+    }
+
+    /// Region-level resolution memory key (spec §12.2): content hashes of
+    /// the three region texts under a prefix distinct from the path-level
+    /// triple key.
+    fn region_key(base_text: &str, ours_text: &str, theirs_text: &str) -> String {
+        format!(
+            "rk|{}|{}|{}",
+            crate::chunking::content_hash_hex(base_text.as_bytes()),
+            crate::chunking::content_hash_hex(ours_text.as_bytes()),
+            crate::chunking::content_hash_hex(theirs_text.as_bytes()),
+        )
+    }
+
+    /// Record the region resolutions a resolved save carries (spec §12.2).
+    /// Payloads land in the content store (erasure honesty applies for
+    /// free); keys land in the shared resolution-memory table, first-wins,
+    /// in BOTH side orientations — a conflict is symmetric in its sides,
+    /// and the editor's (head, draft) orientation need not match a later
+    /// branch merge's (branch, target).
+    pub fn record_region_resolutions(
+        &mut self,
+        resolutions: &[RegionResolution],
+        at: &str,
+    ) -> StoreResult<()> {
+        for resolution in resolutions {
+            let payload = self.content.put(&resolution.resolution_text)?;
+            self.branches.record_resolution_memory(
+                &Self::region_key(
+                    &resolution.base_text,
+                    &resolution.ours_text,
+                    &resolution.theirs_text,
+                ),
+                &payload,
+                at,
+            )?;
+            self.branches.record_resolution_memory(
+                &Self::region_key(
+                    &resolution.base_text,
+                    &resolution.theirs_text,
+                    &resolution.ours_text,
+                ),
+                &payload,
+                at,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Refine a text-merge outcome through region memory (spec §12.3): a
+    /// conflict region whose exact triple was resolved before — and whose
+    /// payload is still live — becomes a `resolved` piece; partial memory
+    /// stays honestly Conflicted (`TextMergeOutcome::from_pieces`, the
+    /// invariant pinned in text-merge-compose.maude's memory tier).
+    fn apply_region_memory(&self, outcome: TextMergeOutcome) -> StoreResult<TextMergeOutcome> {
+        let TextMergeOutcome::Conflicted { pieces } = outcome else {
+            return Ok(outcome);
+        };
+        let mut refined = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+            match piece {
+                MergePiece::Conflict {
+                    base_text,
+                    ours_text,
+                    theirs_text,
+                } => {
+                    let key = Self::region_key(&base_text, &ours_text, &theirs_text);
+                    let mut applied = None;
+                    if let Some(payload) = self.branches.resolution_memory(&key)? {
+                        if matches!(
+                            self.content.status(&payload)?,
+                            crate::content::BlobStatus::Live { .. }
+                        ) {
+                            applied = self.content.get(&payload)?;
+                        }
+                    }
+                    refined.push(match applied {
+                        Some(text) => MergePiece::Merged {
+                            text,
+                            provenance: Provenance::Resolved,
+                        },
+                        None => MergePiece::Conflict {
+                            base_text,
+                            ours_text,
+                            theirs_text,
+                        },
+                    });
+                }
+                merged => refined.push(merged),
+            }
+        }
+        Ok(TextMergeOutcome::from_pieces(refined))
+    }
+
+    /// A path's body at a specific recorded cut (the editor's read base).
+    fn body_at_cut(&self, cut_id: &str, path: &str) -> StoreResult<Option<String>> {
+        let Some(cut) = self.branches.get_cut(cut_id)? else {
+            return Ok(None);
+        };
+        let manifest = self.load_manifest(Some(&cut.manifest_hash))?;
+        let Some(id) = manifest.get(path) else {
+            return Ok(None);
+        };
+        self.content.get(id)
+    }
+
+    /// The base-carrying editor save (spec §12.1). `resolutions` from a
+    /// resolved fold are recorded FIRST — they are settled human knowledge
+    /// regardless of this save's outcome. Head unmoved (by cut or by
+    /// content) → plain write. Moved → three-way with ours = head (the
+    /// line's content) and theirs = draft (the editor's proposal) through
+    /// the same region-memory-aware merge as branch reconciliation: clean
+    /// writes and returns provenance pieces; conflicted writes NOTHING and
+    /// returns the regions as the fold payload. Bounded optimistic
+    /// retries absorb a head advance racing the write.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_with_base(
+        &mut self,
+        branch_id: &str,
+        path: &str,
+        draft: &str,
+        base_cut_id: &str,
+        resolutions: &[RegionResolution],
+        cut_id: &str,
+        at: &str,
+    ) -> StoreResult<SaveWithBaseOutcome> {
+        self.record_region_resolutions(resolutions, at)?;
+        if self.branches.get_cut(base_cut_id)?.is_none() {
+            return Ok(SaveWithBaseOutcome::UnknownBaseCut);
+        }
+        for _ in 0..3 {
+            let Some(branch) = self.branches.get_branch(branch_id)? else {
+                return Ok(SaveWithBaseOutcome::BranchMissing);
+            };
+            let head_cut = branch.head_cut_id.clone();
+            let base_body = self.body_at_cut(base_cut_id, path)?;
+            let head_body = self.read(branch_id, path)?;
+            if Self::cut_ref(&head_cut) == Some(base_cut_id) || head_body == base_body {
+                return Ok(
+                    match self.write(branch_id, path, Some(draft), cut_id, at)? {
+                        VcsWriteOutcome::Written { cut_id, .. } => {
+                            SaveWithBaseOutcome::Written { cut_id }
+                        }
+                        VcsWriteOutcome::BranchMissing => SaveWithBaseOutcome::BranchMissing,
+                        VcsWriteOutcome::BranchNotActive => SaveWithBaseOutcome::BranchNotActive,
+                    },
+                );
+            }
+            let config = crate::text_merge::TextMergeConfig::from_env();
+            let outcome = match (&base_body, &head_body) {
+                (Some(base), Some(head)) if config.within_size(base, head, draft) => {
+                    crate::text_merge::text_merge(base, head, draft, &config)
+                }
+                _ => {
+                    // Concurrent create/delete, or oversized: one whole-
+                    // file region — still eligible for exact-triple
+                    // memory, never a silent winner.
+                    TextMergeOutcome::from_pieces(vec![MergePiece::Conflict {
+                        base_text: base_body.clone().unwrap_or_default(),
+                        ours_text: head_body.clone().unwrap_or_default(),
+                        theirs_text: draft.to_owned(),
+                    }])
+                }
+            };
+            match self.apply_region_memory(outcome)? {
+                TextMergeOutcome::Clean { merged, pieces } => {
+                    match self.write(branch_id, path, Some(&merged), cut_id, at) {
+                        Ok(VcsWriteOutcome::Written { cut_id, .. }) => {
+                            return Ok(SaveWithBaseOutcome::Merged {
+                                cut_id,
+                                merged,
+                                pieces,
+                            })
+                        }
+                        Ok(VcsWriteOutcome::BranchMissing) => {
+                            return Ok(SaveWithBaseOutcome::BranchMissing)
+                        }
+                        Ok(VcsWriteOutcome::BranchNotActive) => {
+                            return Ok(SaveWithBaseOutcome::BranchNotActive)
+                        }
+                        // The head advanced between merge and write:
+                        // recompute against the new head.
+                        Err(StoreError::Conflict(_)) => continue,
+                        Err(other) => return Err(other),
+                    }
+                }
+                TextMergeOutcome::Conflicted { pieces } => {
+                    return Ok(SaveWithBaseOutcome::Conflicted {
+                        head_cut_id: head_cut,
+                        pieces,
+                    })
+                }
+            }
+        }
+        Err(StoreError::Conflict(
+            "branch head kept moving during save_with_base; retry".to_owned(),
+        ))
+    }
+
+    /// Read-only twin of `save_with_base` (spec §12.1): what the save
+    /// would compute, for the editor's live fold. `Ok(None)` = unknown
+    /// base cut or branch.
+    pub fn merge_preview(
+        &self,
+        branch_id: &str,
+        path: &str,
+        draft: &str,
+        base_cut_id: &str,
+    ) -> StoreResult<Option<MergePreview>> {
+        if self.branches.get_cut(base_cut_id)?.is_none() {
+            return Ok(None);
+        }
+        let Some(branch) = self.branches.get_branch(branch_id)? else {
+            return Ok(None);
+        };
+        let head_cut = branch.head_cut_id.clone();
+        let base_body = self.body_at_cut(base_cut_id, path)?;
+        let head_body = self.read(branch_id, path)?;
+        if Self::cut_ref(&head_cut) == Some(base_cut_id) || head_body == base_body {
+            return Ok(Some(MergePreview {
+                head_cut_id: head_cut,
+                clean: true,
+                pieces: vec![MergePiece::Merged {
+                    text: draft.to_owned(),
+                    provenance: Provenance::Theirs,
+                }],
+            }));
+        }
+        let config = crate::text_merge::TextMergeConfig::from_env();
+        let outcome = match (&base_body, &head_body) {
+            (Some(base), Some(head)) if config.within_size(base, head, draft) => {
+                crate::text_merge::text_merge(base, head, draft, &config)
+            }
+            _ => TextMergeOutcome::from_pieces(vec![MergePiece::Conflict {
+                base_text: base_body.clone().unwrap_or_default(),
+                ours_text: head_body.clone().unwrap_or_default(),
+                theirs_text: draft.to_owned(),
+            }]),
+        };
+        Ok(Some(match self.apply_region_memory(outcome)? {
+            TextMergeOutcome::Clean { pieces, .. } => MergePreview {
+                head_cut_id: head_cut,
+                clean: true,
+                pieces,
+            },
+            TextMergeOutcome::Conflicted { pieces } => MergePreview {
+                head_cut_id: head_cut,
+                clean: false,
+                pieces,
+            },
+        }))
     }
 
     /// Record the CURRENT three-way's residue as the branch's open
@@ -2793,6 +3132,350 @@ mod tests {
         assert_eq!(
             vcs.read(MAINLINE_BRANCH_ID, "b.md").expect("read"),
             Some("B1".to_owned())
+        );
+    }
+
+    /// Token-level text merge (spec/text-merge-spec.md): disjoint word
+    /// edits to the SAME file — even the same sentence — compose during
+    /// the merge instead of escalating; both sides' words land on
+    /// mainline. The case the path-level merge could never grant.
+    #[test]
+    fn disjoint_text_edits_to_one_file_compose_on_merge() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        let base = "The quick brown fox jumps over the lazy dog tonight.";
+        vcs.write(MAINLINE_BRANCH_ID, "notes/a.md", Some(base), "cut_m1", "t1")
+            .expect("write");
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("create");
+        vcs.write(
+            "draft_a",
+            "notes/a.md",
+            Some("The swift brown fox jumps over the lazy dog tonight."),
+            "cut_d1",
+            "t3",
+        )
+        .expect("write");
+        // Mainline advances on the SAME path after the branch point.
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "notes/a.md",
+            Some("The quick brown fox jumps over the lazy cat tonight."),
+            "cut_m2",
+            "t4",
+        )
+        .expect("write");
+        assert!(matches!(
+            vcs.merge("draft_a", "cut_merge_1", "t5").expect("merge"),
+            VcsMergeOutcome::Adopted { .. }
+        ));
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "notes/a.md").expect("read"),
+            Some("The swift brown fox jumps over the lazy cat tonight.".to_owned())
+        );
+    }
+
+    /// The text tier stays honest: overlapping rewrites of the same words
+    /// still escalate, and `.whip` sources never reach it (fail closed
+    /// without a source merger installed) — the merge-slice bite is
+    /// untouched.
+    #[test]
+    fn overlapping_text_edits_and_whip_sources_still_escalate() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        let prose = "The quick brown fox jumps over the lazy dog.";
+        // Would text-compose cleanly, but lives in a .whip source path.
+        let source = "agent triage does classify tickets by urgency every hour.";
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "notes/a.md",
+            Some(prose),
+            "cut_m1",
+            "t1",
+        )
+        .expect("write");
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "prog.whip",
+            Some(source),
+            "cut_m2",
+            "t2",
+        )
+        .expect("write");
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t3")
+            .expect("create");
+        vcs.write(
+            "draft_a",
+            "notes/a.md",
+            Some("The nimble crimson fox jumps over the lazy dog."),
+            "cut_d1",
+            "t4",
+        )
+        .expect("write");
+        vcs.write(
+            "draft_a",
+            "prog.whip",
+            Some("agent sorting does classify tickets by urgency every hour."),
+            "cut_d2",
+            "t5",
+        )
+        .expect("write");
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "notes/a.md",
+            Some("The slow grey fox jumps over the lazy dog."),
+            "cut_m3",
+            "t6",
+        )
+        .expect("write");
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "prog.whip",
+            Some("agent triage does classify tickets by severity every hour."),
+            "cut_m4",
+            "t7",
+        )
+        .expect("write");
+        let outcome = vcs.merge("draft_a", "cut_merge_1", "t8").expect("merge");
+        let VcsMergeOutcome::Conflicted { conflicts } = outcome else {
+            panic!("expected escalation, got {outcome:?}");
+        };
+        let paths: Vec<&str> = conflicts
+            .iter()
+            .map(|conflict| conflict.path.as_str())
+            .collect();
+        assert!(
+            paths.contains(&"notes/a.md"),
+            "overlap escalates: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"prog.whip"),
+            ".whip never text-merges: {paths:?}"
+        );
+    }
+
+    /// The editor save verb (spec §12.1): unmoved head writes plain; a
+    /// disjoint concurrent head advance MERGES draft and head; an
+    /// overlapping one returns Conflicted and writes NOTHING.
+    #[test]
+    fn save_with_base_fast_path_merge_and_conflict() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        let base = "The quick brown fox jumps over the lazy dog tonight.";
+        vcs.write(MAINLINE_BRANCH_ID, "notes/a.md", Some(base), "cut_m1", "t1")
+            .expect("write");
+        // Fast path: head is exactly the editor's base.
+        let draft1 = "The swift brown fox jumps over the lazy dog tonight.";
+        assert_eq!(
+            vcs.save_with_base(
+                MAINLINE_BRANCH_ID,
+                "notes/a.md",
+                draft1,
+                "cut_m1",
+                &[],
+                "cut_s1",
+                "t2",
+            )
+            .expect("save"),
+            SaveWithBaseOutcome::Written {
+                cut_id: "cut_s1".to_owned()
+            }
+        );
+        // Concurrent DISJOINT advance: an agent changes "brown" -> "grey"
+        // while the editor (based at cut_s1) changes "tonight" -> "today"
+        // — six words apart, well past the proximity dial.
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "notes/a.md",
+            Some("The swift grey fox jumps over the lazy dog tonight."),
+            "cut_m2",
+            "t3",
+        )
+        .expect("write");
+        let draft2 = "The swift brown fox jumps over the lazy dog today.";
+        let outcome = vcs
+            .save_with_base(
+                MAINLINE_BRANCH_ID,
+                "notes/a.md",
+                draft2,
+                "cut_s1",
+                &[],
+                "cut_s2",
+                "t4",
+            )
+            .expect("save");
+        let SaveWithBaseOutcome::Merged { merged, .. } = &outcome else {
+            panic!("expected merged save, got {outcome:?}");
+        };
+        assert_eq!(merged, "The swift grey fox jumps over the lazy dog today.");
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "notes/a.md").expect("read"),
+            Some("The swift grey fox jumps over the lazy dog today.".to_owned())
+        );
+        // Concurrent OVERLAPPING advance: both rewrite "today"; nothing
+        // moves and the fold payload carries all three slices.
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "notes/a.md",
+            Some("The swift grey fox jumps over the lazy dog tomorrow."),
+            "cut_m3",
+            "t5",
+        )
+        .expect("write");
+        let outcome = vcs
+            .save_with_base(
+                MAINLINE_BRANCH_ID,
+                "notes/a.md",
+                "The swift grey fox jumps over the lazy dog tonight.",
+                "cut_s2",
+                &[],
+                "cut_s3",
+                "t6",
+            )
+            .expect("save");
+        let SaveWithBaseOutcome::Conflicted { pieces, .. } = &outcome else {
+            panic!("expected conflicted save, got {outcome:?}");
+        };
+        assert!(pieces
+            .iter()
+            .any(|piece| matches!(piece, crate::text_merge::MergePiece::Conflict { .. })));
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "notes/a.md").expect("read"),
+            Some("The swift grey fox jumps over the lazy dog tomorrow.".to_owned()),
+            "a conflicted save writes NOTHING"
+        );
+    }
+
+    /// merge_preview computes the fold without writing, and an unknown
+    /// base cut is refused rather than guessed at.
+    #[test]
+    fn merge_preview_reads_only() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "a.md",
+            Some("alpha beta gamma delta epsilon zeta eta"),
+            "cut_m1",
+            "t1",
+        )
+        .expect("write");
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "a.md",
+            Some("alpha BETA gamma delta epsilon zeta eta"),
+            "cut_m2",
+            "t2",
+        )
+        .expect("write");
+        let preview = vcs
+            .merge_preview(
+                MAINLINE_BRANCH_ID,
+                "a.md",
+                "alpha beta gamma delta epsilon zeta ETA",
+                "cut_m1",
+            )
+            .expect("preview")
+            .expect("known base");
+        assert!(preview.clean, "disjoint edits preview clean: {preview:?}");
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "a.md").expect("read"),
+            Some("alpha BETA gamma delta epsilon zeta eta".to_owned()),
+            "preview never writes"
+        );
+        assert!(vcs
+            .merge_preview(MAINLINE_BRANCH_ID, "a.md", "x", "no_such_cut")
+            .expect("preview")
+            .is_none());
+    }
+
+    /// The payforward loop (spec §12.2–12.3): a region resolved in the
+    /// EDITOR (resolved save → region memory, both orientations) auto-
+    /// applies when a BRANCH merge later hits the identical region triple
+    /// — rerere for prose, minted at the save surface.
+    #[test]
+    fn region_resolution_pays_forward_to_branch_merge() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        let base = "alpha beta gamma delta epsilon";
+        let head_edit = "alpha beta GAMMA delta epsilon";
+        let draft_edit = "alpha beta gamma-two delta epsilon";
+        vcs.write(MAINLINE_BRANCH_ID, "a.md", Some(base), "cut_m1", "t1")
+            .expect("write");
+        vcs.write(MAINLINE_BRANCH_ID, "a.md", Some(head_edit), "cut_m2", "t2")
+            .expect("write");
+        // The editor (based at cut_m1) collides with the head edit.
+        let outcome = vcs
+            .save_with_base(
+                MAINLINE_BRANCH_ID,
+                "a.md",
+                draft_edit,
+                "cut_m1",
+                &[],
+                "cut_s1",
+                "t3",
+            )
+            .expect("save");
+        let SaveWithBaseOutcome::Conflicted {
+            pieces,
+            head_cut_id,
+        } = outcome
+        else {
+            panic!("expected conflict");
+        };
+        let (region_base, region_ours, region_theirs) = pieces
+            .iter()
+            .find_map(|piece| match piece {
+                crate::text_merge::MergePiece::Conflict {
+                    base_text,
+                    ours_text,
+                    theirs_text,
+                } => Some((base_text.clone(), ours_text.clone(), theirs_text.clone())),
+                _ => None,
+            })
+            .expect("one region");
+        // The user settles the region and re-saves against the fresh head.
+        let resolved_body = "alpha beta GAMMA-TWO delta epsilon";
+        let resolutions = vec![crate::text_merge::RegionResolution {
+            base_text: region_base,
+            ours_text: region_ours.clone(),
+            theirs_text: region_theirs,
+            resolution_text: region_ours.replace("GAMMA", "GAMMA-TWO"),
+        }];
+        let outcome = vcs
+            .save_with_base(
+                MAINLINE_BRANCH_ID,
+                "a.md",
+                resolved_body,
+                head_cut_id.as_deref().expect("head cut"),
+                &resolutions,
+                "cut_s2",
+                "t4",
+            )
+            .expect("save");
+        assert!(
+            matches!(outcome, SaveWithBaseOutcome::Written { .. }),
+            "resolved re-save against the fresh head writes plain: {outcome:?}"
+        );
+        // A BRANCH now reproduces the identical region triple on another
+        // path: branch takes the draft-side edit, mainline the head-side
+        // edit. The remembered resolution folds it — the merge adopts.
+        vcs.write(MAINLINE_BRANCH_ID, "b.md", Some(base), "cut_m4", "t5")
+            .expect("write");
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t6")
+            .expect("create");
+        vcs.write("draft_a", "b.md", Some(head_edit), "cut_d1", "t7")
+            .expect("write");
+        vcs.write(MAINLINE_BRANCH_ID, "b.md", Some(draft_edit), "cut_m5", "t8")
+            .expect("write");
+        assert!(matches!(
+            vcs.merge("draft_a", "cut_merge_1", "t9").expect("merge"),
+            VcsMergeOutcome::Adopted { .. }
+        ));
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "b.md").expect("read"),
+            Some("alpha beta GAMMA-TWO delta epsilon".to_owned()),
+            "the editor's region resolution propagated to the branch merge"
         );
     }
 

@@ -28,14 +28,12 @@
 
 #[cfg(feature = "native")]
 use std::collections::BTreeMap;
-#[cfg(feature = "native")]
 use std::path::{Component, Path};
 
 #[cfg(feature = "native")]
 use crate::content::ContentBlobs;
 #[cfg(feature = "native")]
 use crate::stat_cache::{scan_dir, CachedEntry, StatCache};
-#[cfg(feature = "native")]
 use crate::{StoreError, StoreResult};
 
 /// A materialized scratch: the seeded stat cache and the scratch-relative
@@ -69,7 +67,6 @@ pub struct ScratchImport {
 /// (`whip branch import`), so this validation is the choke point that
 /// keeps a hostile bundle from writing outside the scratch on
 /// materialize-on-exec. Returns the re-rooted, scratch-relative form.
-#[cfg(feature = "native")]
 pub(crate) fn safe_scratch_relative(key: &str) -> StoreResult<String> {
     let trimmed = key.trim_start_matches('/');
     if trimmed.is_empty() {
@@ -94,7 +91,6 @@ pub(crate) fn safe_scratch_relative(key: &str) -> StoreResult<String> {
 /// Validate a manifest key without materializing it — the import-time
 /// choke point (`import_bundle`) so a bundle carrying a traversal key is
 /// refused before any of its state is persisted.
-#[cfg(feature = "native")]
 pub(crate) fn validate_manifest_key(key: &str) -> StoreResult<()> {
     safe_scratch_relative(key).map(|_| ())
 }

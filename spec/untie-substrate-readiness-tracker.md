@@ -194,6 +194,42 @@ Per-heading `· vN` tags below restate this at each phase.
       result must re-compile. E2E: disjoint rule edits to ONE file
       certify through `whip branch merge`; a cross-declaration write∩read
       pair stays an honest conflict.)*
+- [x] Text-merge tier: recursive token-level three-way merge for
+      non-source text blobs in the both-modified path (word atoms;
+      efficiency-only content-defined anchors; certified compose).
+      *(2026-07-11 built, design settled with Jack same day — flat line
+      diff rejected for prose, sentence atoms rejected for semantic
+      dependence; SSOT spec/text-merge-spec.md. Certified layer modeled
+      in text-merge-compose.maude (never-fabricate + overlap/proximity
+      escalation; 5 solutions + 3 no-solutions in the gate). Impl =
+      pure `whipplescript-store/src/text_merge.rs` (char-class
+      tokenizer, ephemeral CDC anchor segments over token hashes —
+      NOT identity-bearing, unlike chunking.rs — two-tier patience
+      diff, compose with proximity dial WHIPPLESCRIPT_TEXT_MERGE_GAP
+      default 2 words, provenance-tagged pieces, three-slice conflict
+      regions). Wired as stage 3 of `refine_source_conflicts` after
+      resolution memory and certified .whip merge; fail-closed:
+      deletes, add/add, oversized (8 MiB dial), erased bodies, and
+      .whip paths never text-merge (merge-slice bite untouched).
+      Conflict rows carry no new fields: region detail is
+      deterministically recomputable from the content-addressed
+      triple. SAME-DAY FOLLOW-ONS BUILT: the evaluation corpus v1
+      (tests/text_merge_corpus.rs — executable failure-mode registry
+      with pinned dispositions, zero-bad-merge hard gate, 500-seed
+      metamorphic sweep; corpus finding folded into spec §7.2: pure
+      insertion pairs at distinct points are exempt from proximity,
+      which composes block-reorder-vs-interior-edit to the ideal
+      moved-block-carries-the-edit result) and the §12 editor-save
+      surface (SUB-6 co-design: `save_with_base` base-carrying CAS
+      verb with transient conflicts, `merge_preview`, region-level
+      resolution memory — exact triple both orientations, live-only,
+      auto-apply, `resolved` provenance; partial-memory-never-fakes-
+      clean pinned in the model's memory tier). STILL OPEN, deferred
+      by design: move detection (needs its own design pass — weakens
+      never-fabricate to atom level; corpus-gated), corpus mining +
+      agent red-team (candidate gauge/mark campaign; dials ratchet
+      only on corpus evidence), and the gaugedesk fold UI consumer
+      (SUB-6 there, gated on the whip pin repoint).)*
 - [x] Reconciliation daemon v1: silent rebase-down of slice-disjoint
       mainline deltas; quiescence points (terminals, marks, task
       completion); staleness bound; merge-up serialized by the adoption
