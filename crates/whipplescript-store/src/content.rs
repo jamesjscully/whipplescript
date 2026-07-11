@@ -34,13 +34,12 @@ const MAX_REASSEMBLE_PREALLOC: usize = 8 * 1024 * 1024;
 /// There is no structural way to tell the two apart, so an absolute size
 /// ceiling is the only real defense. Content-store bodies are UTF-8 text, so
 /// this is generous for real files. Override with `WHIPPLESCRIPT_MAX_BLOB_BYTES`.
-#[cfg(feature = "native")]
 const DEFAULT_MAX_BLOB_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The active per-blob size ceiling, read from `WHIPPLESCRIPT_MAX_BLOB_BYTES`
 /// (bytes) or the 256 MiB default. A malformed/zero override falls back to the
-/// default rather than disabling the guard.
-#[cfg(feature = "native")]
+/// default rather than disabling the guard. Un-gated: the bundle-import
+/// choke point in vcs.rs is host-agnostic and consults it too.
 pub(crate) fn max_blob_bytes() -> u64 {
     std::env::var("WHIPPLESCRIPT_MAX_BLOB_BYTES")
         .ok()
