@@ -229,7 +229,21 @@ Per-heading `· vN` tags below restate this at each phase.
       never-fabricate to atom level; corpus-gated), corpus mining +
       agent red-team (candidate gauge/mark campaign; dials ratchet
       only on corpus evidence), and the gaugedesk fold UI consumer
-      (SUB-6 there, gated on the whip pin repoint).)*
+      (SUB-6 there, gated on the whip pin repoint). CONVERGENCE PORT
+      LANDED 2026-07-11: gaugedesk dropped its standalone
+      whipplescript-workspace mirror crate and rides WorkspaceVcs
+      end-to-end (worktrees via materialize/import-back with persisted
+      stat caches; cut-carrying editor saves through `save_with_base`;
+      region memory minted from fold resolutions and applied on saves
+      AND the `merge_preview` live fold). Two branch-tier verbs grew
+      out of it, both implemented for BranchStore + DoBranches and
+      op-logged: `retarget` (mutable lineage parent, cycle-guarded,
+      pointer-only — branch point stays the three-way base) and
+      `merge_keeping` (keep-open merge for long-lived member lines:
+      parent adopts the content, the branch rebases onto the merge cut
+      with an empty delta; `VcsMergeOutcome::Landed`). Tests
+      `retarget_rehomes_merge_target_and_refuses_cycles`,
+      `merge_keeping_lands_content_and_line_lives_on`.)*
 - [x] Reconciliation daemon v1: silent rebase-down of slice-disjoint
       mainline deltas; quiescence points (terminals, marks, task
       completion); staleness bound; merge-up serialized by the adoption
