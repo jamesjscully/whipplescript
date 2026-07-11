@@ -3440,6 +3440,7 @@ impl HostDriver for NativeHttpDriver {
 fn assemble_responses_sse(raw: &str) -> Value {
     let mut completed: Option<Value> = None;
     let mut deltas = String::new();
+    let mut done_items: Vec<Value> = Vec::new();
     for line in raw.lines() {
         let Some(payload) = line.trim().strip_prefix("data:") else {
             continue;
@@ -3458,10 +3459,29 @@ fn assemble_responses_sse(raw: &str) -> Value {
                     deltas.push_str(delta);
                 }
             }
+            // The codex backend's `response.completed` payload often carries an
+            // EMPTY `output[]`; the real items — function calls included — are
+            // delivered only as per-item `response.output_item.done` events.
+            // Collect them so a tool-calling turn survives assembly (verified
+            // against the live backend 2026-07-10: a `write` call arrived
+            // exclusively through these events).
+            Some("response.output_item.done") => {
+                if let Some(item) = event.get("item") {
+                    done_items.push(item.clone());
+                }
+            }
             _ => {}
         }
     }
     let mut response = completed.unwrap_or_else(|| json!({}));
+    let output_missing = response
+        .get("output")
+        .and_then(Value::as_array)
+        .map(|output| output.is_empty())
+        .unwrap_or(true);
+    if output_missing && !done_items.is_empty() {
+        response["output"] = Value::Array(done_items);
+    }
     if !deltas.is_empty() {
         response["output_text"] = Value::String(deltas);
     }
@@ -5212,5 +5232,39 @@ workflow Method {
         assert_eq!(response["output_text"], "done");
         assert_eq!(response["output"][0]["call_id"], "c1");
         assert_eq!(response["usage"]["input_tokens"], 3);
+    }
+
+    /// The live codex backend (verified 2026-07-10) sends `response.completed`
+    /// with an EMPTY `output[]`; the reasoning and function-call items arrive
+    /// only as `response.output_item.done` events. A tool-calling turn must
+    /// survive assembly from those events, or the model's work is silently
+    /// dropped (the empty-reply bug: 113 output tokens, no text, no calls).
+    #[test]
+    fn codex_sse_assembly_recovers_items_from_output_item_done_events() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\"}}\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"summary\":[]}}\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"path\\\"\"}\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"status\":\"completed\",\"arguments\":\"{\\\"path\\\":\\\"poem.md\\\",\\\"content\\\":\\\"ode\\\"}\",\"call_id\":\"call_1\",\"name\":\"write\"}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":503,\"output_tokens\":113}}}\n",
+            "data: [DONE]\n",
+        );
+        let response = assemble_responses_sse(raw);
+        let output = response["output"].as_array().expect("collected items");
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[1]["name"], "write");
+        assert_eq!(output[1]["call_id"], "call_1");
+        assert_eq!(response["usage"]["output_tokens"], 113);
+        // A completed payload that DOES carry output wins over the collected
+        // items (no duplication).
+        let raw_full = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"dup\",\"name\":\"read\",\"arguments\":\"{}\"}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"call_id\":\"real\",\"name\":\"read\",\"arguments\":\"{}\"}]}}\n",
+        );
+        let full = assemble_responses_sse(raw_full);
+        let output = full["output"].as_array().expect("authoritative output");
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["call_id"], "real");
     }
 }

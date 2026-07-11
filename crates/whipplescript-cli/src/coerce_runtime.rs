@@ -308,6 +308,7 @@ fn read_response(response: ureq::Response, expect_sse: bool) -> HttpResponse {
 fn assemble_responses_sse(raw: &str) -> Value {
     let mut completed: Option<Value> = None;
     let mut deltas = String::new();
+    let mut done_items: Vec<Value> = Vec::new();
     for line in raw.lines() {
         let Some(payload) = line.trim().strip_prefix("data:") else {
             continue;
@@ -326,20 +327,40 @@ fn assemble_responses_sse(raw: &str) -> Value {
                     deltas.push_str(delta);
                 }
             }
+            // The codex backend's `response.completed` payload often carries an
+            // EMPTY `output[]`; the real items — function calls included — are
+            // delivered only as per-item `response.output_item.done` events.
+            // Collect them so a tool-calling turn survives assembly.
+            Some("response.output_item.done") => {
+                if let Some(item) = event.get("item") {
+                    done_items.push(item.clone());
+                }
+            }
             _ => {}
         }
     }
+    let mut completed = completed.unwrap_or(Value::Null);
+    let output_missing = completed
+        .get("output")
+        .and_then(Value::as_array)
+        .map(|output| output.is_empty())
+        .unwrap_or(true);
+    if output_missing && !done_items.is_empty() {
+        completed["output"] = Value::Array(done_items);
+    }
     if !deltas.is_empty() {
-        let usage = completed
-            .as_ref()
-            .and_then(|response| response.get("usage"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        return serde_json::json!({ "output_text": deltas, "usage": usage });
+        let usage = completed.get("usage").cloned().unwrap_or(Value::Null);
+        let mut assembled = serde_json::json!({ "output_text": deltas, "usage": usage });
+        // Keep any collected items alongside the text: a turn may carry both
+        // an assistant message and tool calls.
+        if let Some(output) = completed.get("output") {
+            assembled["output"] = output.clone();
+        }
+        return assembled;
     }
     // No text deltas: fall back to the completed response object (the kernel
     // parser walks output[].content[].text).
-    completed.unwrap_or(Value::Null)
+    completed
 }
 
 #[cfg(test)]
@@ -358,6 +379,21 @@ mod tests {
         let body = assemble_responses_sse(raw);
         assert_eq!(body["output_text"].as_str(), Some("{\"v\":1}"));
         assert_eq!(body["usage"]["input_tokens"], 3);
+    }
+
+    /// The live codex backend sends `response.completed` with an empty
+    /// `output[]`; items arrive only as `response.output_item.done` events
+    /// (same quirk the host runtime handles) — assembly must recover them.
+    #[test]
+    fn assemble_responses_sse_recovers_items_from_output_item_done_events() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c9\",\"name\":\"write\",\"arguments\":\"{}\"}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":7}}}\n",
+            "data: [DONE]\n",
+        );
+        let body = assemble_responses_sse(raw);
+        assert_eq!(body["output"][0]["call_id"], "c9");
+        assert_eq!(body["usage"]["input_tokens"], 7);
     }
 
     #[test]
