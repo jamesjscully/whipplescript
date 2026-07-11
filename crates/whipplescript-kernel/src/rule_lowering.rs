@@ -479,6 +479,8 @@ pub fn empty_ir_program() -> IrProgram {
         harnesses: Vec::new(),
         trackers: Vec::new(),
         channels: Vec::new(),
+        gauges: Vec::new(),
+        campaigns: Vec::new(),
         file_stores: Vec::new(),
         memory_pools: Vec::new(),
         events: Vec::new(),

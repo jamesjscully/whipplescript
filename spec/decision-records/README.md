@@ -183,6 +183,17 @@ others are active workshop material.
   cited policy epoch, so hosts match guarantee names instead of re-deriving
   semantics. Drafted as the cross-repo dependency of GaugeWright ADR 0082
   (advancement policy). *Proposed.*
+- [0037-gauge-campaign-improve-surface.md](0037-gauge-campaign-improve-surface.md):
+  the experimentation surface's v1 build — `gauge` + `campaign` as hand-parsed
+  core declarations (`judge via coerce|prompt|exec|labels`, chance/stat bars in
+  `at least`/`at most` word form, derived gauges via `inputs`), the sibling
+  improve store (append-only evidence rows, pinned scenarios, cumulative
+  scenario wear, event-sourced campaign records), and the `whip improve` loop:
+  naming-is-the-partition, dominance-invariant acceptance
+  (`improve-acceptance.maude`), holdout sealing with wear-out and honest
+  `unheld-out` degradation (`improve-holdout.maude`), holdout-blind reflective
+  proposer, propose-don't-apply with baseline-hash-guarded `whip adopt`.
+  *Accepted + built.*
 
 ## Historical Decision Trackers
 

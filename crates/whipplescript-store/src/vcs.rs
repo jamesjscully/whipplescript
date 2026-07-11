@@ -1946,8 +1946,19 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         for key in bundle.manifest.keys() {
             crate::materialize::validate_manifest_key(key)?;
         }
+        let max_blob_bytes = crate::content::max_blob_bytes();
         for blob in &bundle.blobs {
             if let Some(chunk_ids) = &blob.chunk_ids {
+                // Fail-fast on an honestly-declared oversize root before doing
+                // any work; a lying (small) `byte_len` is still caught at read
+                // time by the reassembly ceiling in `ContentStore::get`.
+                if blob.byte_len > max_blob_bytes {
+                    return Err(StoreError::Conflict(format!(
+                        "bundle chunk-root `{}` declares {} bytes, over the {max_blob_bytes}-byte \
+                         blob ceiling (WHIPPLESCRIPT_MAX_BLOB_BYTES)",
+                        blob.id, blob.byte_len
+                    )));
+                }
                 // A chunk ROOT id is the content hash over the ordered
                 // child chunk ids (their hex bytes concatenated); verify
                 // the claimed root id re-derives from the chunk list so an

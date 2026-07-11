@@ -218,7 +218,12 @@ near-mechanical.
   transfer the slicer cannot certify (a semantics-preserving refactor):
   audited, honesty-tagged, revocable by drift monitors (declassify's twin,
   §6).
-- **`whip improve <gauge>`** — **reserved, undesigned** (§15).
+- **`whip improve <gauge>`** — designed in `improve-design-note.md`; v1
+  built 2026-07-11 (DR-0037) together with the `gauge`/`campaign`
+  declarations and the step-1 evidence floor (ambient scoring, `whip pin`,
+  `whip gauges` — the estimate view; the `evidence` verb name is currently
+  held by the runtime instance-evidence command, a recorded naming
+  residual).
 
 Ambient integration: `whip check`/`whip dev` grow one evidence line — the
 edit's blast radius plus what carried (`edit touched summarize.extract · 2

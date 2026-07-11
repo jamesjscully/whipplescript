@@ -1073,6 +1073,77 @@ branch. An unbound source forks thread-only, reported honestly. JSON output
 carries the new instance id, the seeded message count, the source coordinate,
 and the branch pair (or `null`).
 
+## Improve (experimentation surface)
+
+Gauge evidence, pinned scenarios, and campaign records live in a
+workspace-scoped improve store (`.whipplescript/improve.sqlite`, env
+`WHIPPLESCRIPT_IMPROVE_STORE`), separate from disposable run stores.
+
+### `pin`
+
+```
+whip [--json] pin <instance> --as <name>
+```
+
+Pins a run as a named scenario — the regression corpus grows out of use,
+not authoring. v1 scenario identity is the run's frozen input; campaign
+evaluation regenerates it by re-running the workflow on that input in a
+disposable store.
+
+### `gauges`
+
+```
+whip [--json] gauges [<gauge>]
+```
+
+The accumulated gauge evidence: mean, N with the regen/live decomposition,
+and pass counts. Ambient rows land from `whip dev` automatically for
+deterministic judges (exec + builtins).
+
+### `improve`
+
+```
+whip [--json] improve [<gauge>[>=<target>] ... [then ...] | <campaign>]
+     [--program <workflow.whip>] [--sacrifice <gauge>] [--within <gauge>=<band>%]
+     [--spend-cap $<n>] [--proposer fixture|native] [--provider <name>]
+```
+
+Runs an improvement campaign. The partition is expressed by which gauges
+you name: named gauges ascend, unnamed gauges are guarded within
+indifference bands, `--sacrifice` releases, declared bars are always hard.
+Inline targets (`extract_quality>=0.9`) become reach bounds; `then`
+separates lexicographic stages (v1 executes the first; later stages are
+recorded). A single positional naming a declared `campaign` adopts its
+spec. Bare `whip improve` is repair mode. The loop: seal a holdout
+(20% / floor 2 of pinned scenarios; below 4 scenarios the campaign runs
+tagged `unheld-out`), evaluate the baseline, then propose → static-gate →
+evaluate → dominance verdict → sealed promotion gate. A candidate is
+proposed only if it improves an ascend gauge, regresses nothing guarded,
+and meets every bar; a genuine tradeoff is surfaced as a decision, never
+auto-accepted. The proposer never sees sealed scenario contents
+(aggregates only). Terminal state is an evidence card per candidate —
+propose, don't apply.
+
+### `campaigns` / `campaign`
+
+```
+whip [--json] campaigns
+whip [--json] campaign <id>
+```
+
+The folded campaign records: candidates considered, evidence cards as they
+stood, sealing, adoption decisions — program archaeology's data.
+
+### `adopt`
+
+```
+whip [--json] adopt <campaign>:<candidate> [--program <workflow.whip>]
+```
+
+Writes a proposed candidate's source into the program — the explicit human
+adoption act. Refuses honestly if the program changed since the campaign
+evaluated its baseline.
+
 ## Credentials
 
 ### `auth`
@@ -1216,6 +1287,8 @@ This section is a compact index of source constructs.
 | Pattern | `pattern Name<T> { ... }` | Compile-time reusable fragment. |
 | Apply | `apply Name<Type> as Alias { ... }` | Pattern specialization. |
 | Assertion | `assert expression` | Deterministic projection check in `dev`. |
+| Gauge | `gauge name [on site] { judge via ... expect ... }` | Named quality dimension: judge + optional bar; scored ambiently, optimized by `whip improve`. |
+| Campaign | `campaign name { ascend ... reach ... guard ... sacrifice ... }` | Versioned objective intent: the partition of the gauge vector. |
 
 ### Rule constructs
 

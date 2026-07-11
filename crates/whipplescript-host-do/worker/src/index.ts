@@ -226,6 +226,49 @@ function redactedUrlForLog(url: string): string {
   }
 }
 
+// Cap on a suspended-effect HTTP response buffered into the isolate. A
+// provider or fetch target (possibly attacker-influenced) that answers with a
+// huge body would otherwise be read whole into the Durable Object's memory and
+// terminate the in-flight instance. Real JSON API responses are far smaller.
+const MAX_FETCH_RESPONSE_BYTES = 16 * 1024 * 1024;
+
+// Read a response body as JSON while enforcing a byte ceiling: reject a
+// declared oversize Content-Length up front, then stream the body and abort
+// the moment the accumulated bytes cross the cap (a lying/absent Content-Length
+// cannot get past this). Throws on violation; performFetch's catch maps that to
+// a TransportError terminal, exactly like any other fetch failure.
+async function readJsonCapped(resp: Response, maxBytes: number): Promise<unknown> {
+  const declared = resp.headers.get("content-length");
+  if (declared && Number(declared) > maxBytes) {
+    throw new Error(`response body (${declared} bytes) exceeds the ${maxBytes}-byte cap`);
+  }
+  if (!resp.body) {
+    throw new Error("response had no body");
+  }
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new Error(`response body exceeds the ${maxBytes}-byte cap`);
+      }
+      chunks.push(value);
+    }
+  }
+  const buffer = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    buffer.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(buffer));
+}
+
 // Perform one suspended HTTP round and marshal the result back for `step`.
 // Requests targeting the executor sentinel host are routed to a
 // getRandom-picked container in the EXECUTOR pool instead of the network.
@@ -258,7 +301,10 @@ async function performFetch(
     } else {
       resp = await fetch(req.url, init);
     }
-    return JSON.stringify({ status: resp.status, body: await resp.json() });
+    return JSON.stringify({
+      status: resp.status,
+      body: await readJsonCapped(resp, MAX_FETCH_RESPONSE_BYTES),
+    });
   } catch (error) {
     // The core maps `{"error": ...}` to a TransportError terminal.
     console.log(`performFetch failed for ${redactedUrlForLog(req.url)}: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);

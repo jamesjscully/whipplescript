@@ -101,6 +101,7 @@ mod auth;
 mod coerce_runtime;
 mod exec_server;
 mod harness_tools;
+mod improve;
 mod project_context;
 mod skills_loader;
 mod turn_server;
@@ -209,6 +210,12 @@ fn main() -> ExitCode {
         Some("counters") => coordination_list(&options, "counters"),
         Some("issue") => issue(&options),
         Some("evidence") => evidence(&options),
+        Some("improve") => improve::improve_command(&options),
+        Some("campaigns") => improve::campaigns_command(&options),
+        Some("campaign") => improve::campaign_detail_command(&options),
+        Some("adopt") => improve::adopt_command(&options),
+        Some("pin") => improve::pin_command(&options),
+        Some("gauges") => improve::gauges_command(&options),
         Some("diagnostics") => diagnostics(&options),
         Some("trace") => trace(&options),
         Some("pause") => pause(&options),
@@ -621,6 +628,7 @@ fn print_usage() {
         "          artifacts, inbox, signal, issue, leases, ledger, counters, evidence, diagnostics, trace"
     );
     println!("          otel-export, pause, resume, cancel, checkpoint, restore, fork, retry, recover, doctor, deploy");
+    println!("          improve, campaigns, campaign, adopt, pin, gauges");
     println!("run `whip <command> --help` or `whip help <command>` for command usage");
 }
 
@@ -628,6 +636,12 @@ fn command_usage(command: &str) -> Option<&'static str> {
     Some(match command {
         "check" => "usage: whip check [--model-search] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--package-lock <path>] <workflow.whip>...",
         "lint" => "usage: whip [--json] lint [--root <workflow>] <workflow.whip>",
+        "improve" => "usage: whip [--json] improve [<gauge>[><=<target>] ... [then ...] | <campaign>] [--program <workflow.whip>] [--sacrifice <gauge>] [--within <gauge>=<band>%] [--spend-cap $<n>] [--proposer fixture|native] [--provider <name>]\n  bare `whip improve` = repair mode (restore violated bars, touch nothing else)",
+        "campaigns" => "usage: whip [--json] campaigns",
+        "campaign" => "usage: whip [--json] campaign <id>",
+        "adopt" => "usage: whip [--json] adopt <campaign>:<candidate> [--program <workflow.whip>]",
+        "pin" => "usage: whip [--json] pin <instance> --as <name>",
+        "gauges" => "usage: whip [--json] gauges [<gauge>]",
         "lsp" => "usage: whip lsp   (Language Server over stdio; launched by an editor)",
         "compile" => "usage: whip compile [--model-search] [--root <workflow>] [--package-lock <path>] <workflow.whip>",
         "fmt" => "usage: whip fmt [--check] <workflow.whip>...",
@@ -2428,19 +2442,37 @@ fn lsp_path_to_uri(path: &Path) -> String {
 
 /// Recursively collects `.whip` files under `dir`, skipping VCS/build/hidden
 /// directories so the workspace scan stays bounded.
-fn lsp_collect_whip_files(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Recursion-depth ceiling for the LSP workspace scan: a guard against a
+/// pathologically deep tree exhausting the stack. With the symlink skip below,
+/// a crafted workspace (e.g. a `evil -> .` directory-symlink cycle, or one
+/// pointing at `/`) can neither loop the scanner nor walk outside the project.
+const LSP_MAX_SCAN_DEPTH: usize = 64;
+
+fn lsp_collect_whip_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth >= LSP_MAX_SCAN_DEPTH {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
+        // `file_type()` reports the entry WITHOUT resolving a final symlink, so
+        // a symlink is never recursed into or read — a directory-symlink cycle
+        // can't loop the scan and a symlink out of the tree can't escape it.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if path.is_dir() {
+        if file_type.is_dir() {
             if name.starts_with('.') || name == "target" || name == "node_modules" {
                 continue;
             }
-            lsp_collect_whip_files(&path, out);
+            lsp_collect_whip_files(&path, out, depth + 1);
         } else if path.extension().and_then(|ext| ext.to_str()) == Some("whip") {
             out.push(path);
         }
@@ -2458,7 +2490,7 @@ fn lsp_workspace_documents(
     let mut docs = std::collections::HashMap::new();
     for root in roots {
         let mut files = Vec::new();
-        lsp_collect_whip_files(root, &mut files);
+        lsp_collect_whip_files(root, &mut files, 0);
         for file in files {
             if let Ok(text) = std::fs::read_to_string(&file) {
                 docs.insert(lsp_path_to_uri(&file), text);
@@ -19224,6 +19256,18 @@ struct WorkerReport {
     terminal_events: Vec<String>,
 }
 
+/// One drive pass (rule step + worker) is idle when the step committed no
+/// rules and the worker neither ran effects nor admitted new source input.
+/// Shared by `dev` and the improve evaluation loop so a new admission
+/// channel added to `WorkerReport` cannot silently drift between them.
+fn drive_pass_idle(step_report: &StepReport, worker_report: &WorkerReport) -> bool {
+    step_report.committed_rules == 0
+        && worker_report.ran_effects == 0
+        && worker_report.file_lines_admitted == 0
+        && worker_report.http_items_admitted == 0
+        && worker_report.inbound_messages_admitted == 0
+}
+
 fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerReport, StoreError> {
     guard_no_stale_effect_kinds(store_path)?;
     let mut report = WorkerReport {
@@ -24755,11 +24799,7 @@ fn dev(options: &CliOptions) -> ExitCode {
         // must evaluate rules against, so an admitting pass is never idle. File
         // admission is idempotent, so this converges: the pass after admission
         // admits nothing more.
-        let idle = step_report.committed_rules == 0
-            && worker_report.ran_effects == 0
-            && worker_report.file_lines_admitted == 0
-            && worker_report.http_items_admitted == 0
-            && worker_report.inbound_messages_admitted == 0;
+        let idle = drive_pass_idle(&step_report, &worker_report);
         steps.push(step_report);
         workers.push(worker_report);
         if idle {
@@ -24778,6 +24818,9 @@ fn dev(options: &CliOptions) -> ExitCode {
             break;
         }
     }
+    // Ambient measurement (experimentation surface): gauges score every dev
+    // run; the primary evidence source has no verb at all.
+    improve::ambient_score_after_dev(&options.store_path, &started.instance_id, &ir, options.json);
     let store = match SqliteStore::open(&options.store_path) {
         Ok(store) => store,
         Err(error) => return report_store_error("failed to open store", error),
@@ -25677,11 +25720,7 @@ fn acceptance_dev_report(
         // must evaluate rules against, so an admitting pass is never idle. File
         // admission is idempotent, so this converges: the pass after admission
         // admits nothing more.
-        let idle = step_report.committed_rules == 0
-            && worker_report.ran_effects == 0
-            && worker_report.file_lines_admitted == 0
-            && worker_report.http_items_admitted == 0
-            && worker_report.inbound_messages_admitted == 0;
+        let idle = drive_pass_idle(&step_report, &worker_report);
         steps.push(step_report);
         workers.push(worker_report);
         if idle {
@@ -38681,6 +38720,60 @@ mod tests {
         assert!(path.is_absolute(), "resolved sidecar path must be absolute");
         assert!(path.ends_with("scripts/claude-agent-sdk-sidecar.mjs"));
         assert!(path.is_file(), "resolved sidecar must be a real file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_scan_skips_symlinks_and_terminates_on_cycles() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("whip-lsp-scan-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("whip-lsp-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(root.join("sub")).expect("mkdir sub");
+        std::fs::write(root.join("a.whip"), "workflow A").expect("a");
+        std::fs::write(root.join("sub/b.whip"), "workflow B").expect("b");
+        // A `.whip` outside the tree that a symlink would otherwise expose.
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        std::fs::write(outside.join("secret.whip"), "workflow Secret").expect("secret");
+        // A directory-symlink CYCLE (`loop -> .`) and an out-of-tree ESCAPE.
+        symlink(&root, root.join("loop")).expect("loop symlink");
+        symlink(&outside, root.join("escape")).expect("escape symlink");
+
+        // Must terminate (the test completing at all proves no infinite loop /
+        // stack overflow from the cycle).
+        let mut files = Vec::new();
+        lsp_collect_whip_files(&root, &mut files, 0);
+
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            names.contains(&"a.whip".to_owned()),
+            "found a.whip: {names:?}"
+        );
+        assert!(
+            names.contains(&"b.whip".to_owned()),
+            "found b.whip: {names:?}"
+        );
+        assert!(
+            !names.contains(&"secret.whip".to_owned()),
+            "must not escape the tree via a symlink: {names:?}"
+        );
+        assert_eq!(
+            files.len(),
+            2,
+            "exactly the two real files, no cycle dups: {names:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

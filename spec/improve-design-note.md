@@ -1,6 +1,10 @@
 # `whip improve` — Design Note (multi-objective system improvement)
 
-**Status: DESIGN NOTE (pre-ADR).** The full design effort behind the verb
+**Status: DESIGN NOTE — v1 BUILT (DR-0037, 2026-07-11).** The settled
+ground below is built as the v1 `whip improve` loop
+(`spec/decision-records/0037-gauge-campaign-improve-surface.md` records
+what shipped and every deliberate v1 gap); the open policies below remain
+open. The full design effort behind the verb
 reserved in `experimentation-subsystem-research-note.md` ("`whip improve` —
 reserved"). Effort opened
 2026-07-03 (Jack). Frame and several core decisions are **settled in
@@ -162,9 +166,35 @@ Lifecycle: `whip improve` starts a durable campaign (it is a whip);
 `whip campaigns` lists; `whip campaign <id>` shows candidate evidence
 cards; `whip adopt <candidate>` merges into current mainline; pause and
 self-parking exist. Tradeoffs escalate through the ask door and train the
-local utility model. **Open: campaign scope** (restrict to a
-segment/mark — "improve extraction *for subject-line cases*"); lands
-together with the grant grammar's segment carve-out vocabulary.
+local utility model.
+
+**Campaign scope — SETTLED 2026-07-11 (Jack).** "Improve extraction *for
+subject-line cases*" carries the implicit obligation *don't break it
+elsewhere* — which is the dominance invariant one level down. So scope
+attaches at the **gauge layer, never the campaign layer**: a segment is a
+**partition refinement of a gauge** (`extract_quality[subject-line]` and
+its complement), and a scoped campaign simply names the refined gauge —
+the complement is guarded automatically by unnamed-means-guarded, and
+campaign syntax, dominance checking, sealing, and evidence cards need
+nothing new (the same move that made composite objectives derived gauges
+rather than campaign weights). A campaign-layer filter was REJECTED: it
+evaluates only the segment, so out-of-segment regression is invisible —
+exactly the failure the acceptance rule exists to refuse; patching that
+rebuilds per-segment gauges with worse bookkeeping. The naming surface:
+**case-feature predicates over input/recorded facts** are the settled
+destination (statically visible, apply to ambient traffic, and draw from
+the same well as §12's backdoor adjustment covariates); **pin-time
+segment tags** (`whip pin … --segment <name>`) are the progressive-rigor
+entry rung (scenario-corpus-only segments, ambient rows unsegmented,
+honestly tagged) that may ship first; classifier-judge segments (a
+deterministic judge emitting the label) remain an available *idiom*, not
+the mechanism. The grant grammar (§9) shares the predicate **form** only
+— never the machinery or admission discipline: grants stay fail-closed
+and statically checkable, measurement scopes may be advisory; sharing the
+form keeps the audit story coherent ("the segment the canary excluded is
+the segment the campaign scoped to"). Campaign *target* (running against
+a workstream's line rather than mainline) is DECOUPLED from scope — pure
+mechanics once candidates-as-branches lands, no vocabulary of its own.
 
 ## 4. Why whip affords the multi-objective guard
 
@@ -534,12 +564,17 @@ exception. This note only records the dependency.
   over an `inputs` gauge vector; delta-kernel, Goodhart-resistant;
   subsumes weights — no weights feature ever.
 
+**Settled in the design passes with Jack (2026-07-11):**
+- **Campaign scope** (§3): segments are gauge-layer partition refinements,
+  never campaign-layer filters (complement auto-guarded via
+  unnamed-means-guarded; campaign-layer filtering rejected as a dominance
+  hole); case-feature predicates over facts as the naming destination,
+  pin-time segment tags as the progressive-rigor rung, classifier-judge
+  segments an idiom; the grant grammar shares the predicate form only;
+  campaign *target* (workstream line vs. mainline) decoupled — mechanics
+  riding the candidates-as-branches residual.
+
 **Open:**
-- **Campaign scope** — restricting a campaign to a segment/mark; lands
-  with the grant grammar's carve-out vocabulary (§3, §9). Also registered
-  2026-07-04: campaign *target* — running a campaign against a
-  workstream's line rather than mainline (versioned-workspace note, "The
-  workstream tier").
 - **Canary authorization surface** — shared with the quasi-experimental
   layer's deliberate-reversal question (experimentation note); narrowed
   2026-07-03 to the canary grant grammar (§9).

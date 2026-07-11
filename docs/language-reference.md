@@ -1406,6 +1406,62 @@ body codecs (structured `json`/`csv`/`jsonl` are the `import`/`export` surface a
 `bytes` is deferred — the parser rejects them), and `import`/`export` and the
 `files.read`/`files.write` capability grants are not yet implemented.
 
+## Gauges and campaigns (experimentation surface)
+
+A `gauge` declares a named quality dimension — a judge, optionally bound to a
+site, optionally carrying a bar. It is the stochastic sibling of `test`:
+where a test asserts a deterministic expectation once, a gauge makes *every*
+run an observation. `whip dev` scores the free deterministic judges
+ambiently after each settled run; `whip gauges` shows the accumulated
+evidence; `whip improve` optimizes against it.
+
+```whip
+gauge extract_quality on summarize.extract {
+  judge via exec "./judge.py"
+  expect P(due_date_correct) at least 0.9
+}
+```
+
+- `judge via coerce <Name> | prompt "<template>" | exec "<command>" |
+  labels "<source>"` — one judge slot, four ground-truth granularities.
+  `exec` judges are deterministic validators (the det-validation pattern:
+  run context JSON on stdin, a JSON object on stdout; governed by
+  `WHIPPLESCRIPT_EXEC_ALLOW`); `labels` reads a user-owned JSON file keyed
+  by scenario name. Exec/labels gauges are Goodhart-resistant by
+  construction — you can't sweet-talk a validator.
+- `expect` bars are chance-shaped (`P(<field>)` — the judge's boolean
+  output field, `expect P(ok) at least 0.9`) or stat-shaped over the score
+  distribution (`expect p90 at most 800`, `expect mean at least 0.7`).
+  Bars use the word forms `at least` / `at most` (declarations use words
+  where expressions use operators, like presence conditions use `is`).
+  Declared bars are hard constraints for `whip improve`.
+- `inputs a, b` declares a **derived gauge**: its `exec` judge also
+  receives the named gauges' scores, so composite/business objectives are
+  ordinary gauges — there is no weighting feature.
+- `std.spend`, `std.latency`, and `std.tokens` are built-in resource
+  gauges: deterministic observables from the run ledger, present without
+  declaration, descending-toward-better.
+
+A `campaign` declares versioned, diffable objective intent — a partition of
+the gauge vector at higher ceremony than a CLI invocation
+(`whip improve release_tuning` adopts it):
+
+```whip
+campaign release_tuning {
+  ascend    extract_quality, reply_quality
+  reach     std.latency at most 800ms
+  guard     tone within 2 percent
+  sacrifice verbosity
+}
+```
+
+Named gauges ascend toward better; `reach` sets a target that holds as a
+hard bound once met; `guard` widens a gauge's indifference band; `sacrifice`
+releases a gauge from the guard set (the evidence card says so). Unnamed
+gauges are always guarded — there are no modes. See `whip improve` in the
+[CLI Reference](api-reference.md) for the campaign loop, holdout policy,
+and adoption.
+
 ## Channels (`std.messaging`)
 
 A `channel` declares a named communication route through a provider — the

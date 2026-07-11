@@ -486,6 +486,47 @@ mod tests {
         );
     }
 
+    /// A chunk root that declares a size over the blob ceiling is refused at
+    /// import (fail-fast on the honest-oversize case, before any work).
+    #[test]
+    fn import_refuses_oversize_chunk_root() {
+        use crate::chunking::ChunkingConfig;
+        let config = ChunkingConfig {
+            whole_blob_threshold: 256,
+            min_size: 64,
+            avg_size: 256,
+            max_size: 1024,
+        };
+        let mut source = vcs("oversize-src");
+        source.init("t0").expect("init");
+        source
+            .create_branch("draft_a", None, "main", "t1")
+            .expect("create");
+        let big = "0123456789abcdef-".repeat(600);
+        let root = source
+            .content_store()
+            .put_chunked(&big, &config)
+            .expect("chunk");
+        let mut changed = BTreeMap::new();
+        changed.insert("big.dat".to_owned(), root.clone());
+        source
+            .import_diff("draft_a", &changed, &[], "cut_a1", "t2")
+            .expect("diff");
+        let mut bundle = source.export_bundle("draft_a").expect("export").expect("b");
+        // Tamper the declared size to far over the 256 MiB default ceiling.
+        for blob in &mut bundle.blobs {
+            if blob.id == root {
+                blob.byte_len = 300 * 1024 * 1024;
+            }
+        }
+        let mut target = vcs("oversize-dst");
+        target.init("t0").expect("init");
+        assert!(
+            target.import_bundle(&bundle, "t1").is_err(),
+            "an oversize chunk root must be refused at import"
+        );
+    }
+
     /// A bundle that rebinds a locally-erased content id is refused:
     /// erasure is honest and permanent, so an import must not resurrect the
     /// bytes (defeats the erasure-never-recalled invariant).

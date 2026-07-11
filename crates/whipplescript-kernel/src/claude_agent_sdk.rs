@@ -948,12 +948,14 @@ pub struct StdioClaudeAgentSdkTransport {
 
 impl StdioClaudeAgentSdkTransport {
     pub fn spawn(command: &str, args: &[&str]) -> Result<Self, ClaudeAgentSdkError> {
-        let mut child = Command::new(command)
+        let mut builder = Command::new(command);
+        builder
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        crate::harness::strip_control_plane_secrets(&mut builder);
+        let mut child = builder.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| {
             ClaudeAgentSdkError::Protocol("Claude sidecar did not expose stdin".to_owned())
         })?;

@@ -7,6 +7,7 @@ pub mod content;
 pub mod coordination;
 pub mod diff;
 pub mod files;
+pub mod improve;
 pub mod items;
 pub mod materialize;
 pub mod merge;

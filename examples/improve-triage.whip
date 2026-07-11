@@ -1,0 +1,57 @@
+@service
+workflow ImproveTriage
+
+# The experimentation surface: gauges make every run an observation, and a
+# campaign declares which dimensions `whip improve` may trade.
+#
+# whip dev examples/improve-triage.whip --input '{"ticket":{"id":"T-1","title":"Fix login"}}'
+# whip pin <instance> --as subject-line-case
+# whip improve release_tuning --program examples/improve-triage.whip
+input ticket Ticket
+
+class Ticket {
+  id string
+  title string
+}
+
+class Assessment {
+  ticket string
+  priority string
+}
+
+# A deterministic exec judge: run-context JSON on stdin, a JSON verdict on
+# stdout ({"ok": true} — the bar's P(ok) field). Goodhart-resistant by
+# construction; granted via WHIPPLESCRIPT_EXEC_ALLOW.
+gauge priority_correct {
+  judge via exec "python3 ./judge_priority.py"
+  expect P(ok) at least 0.9
+}
+
+gauge ticket_echoed {
+  judge via exec "python3 ./judge_echo.py"
+}
+
+# A derived gauge: its exec judge also receives the input gauges' scores —
+# composite objectives are ordinary gauges, never a weighting feature.
+gauge triage_cost {
+  judge via exec "python3 ./cost_model.py"
+  inputs priority_correct, std.latency
+}
+
+# Versioned objective intent: ascend the focus, hold latency, release
+# verbosity-like dimensions explicitly. `whip improve release_tuning`
+# adopts this partition.
+campaign release_tuning {
+  ascend priority_correct
+  reach std.latency at most 800ms
+  guard triage_cost within 5 percent
+}
+
+rule triage
+  when Ticket as ticket
+=> {
+  record Assessment {
+    ticket ticket.id
+    priority "normal"
+  }
+}

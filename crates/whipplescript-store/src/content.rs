@@ -27,6 +27,28 @@ use rusqlite::{params, Connection, OptionalExtension};
 #[cfg(feature = "native")]
 const MAX_REASSEMBLE_PREALLOC: usize = 8 * 1024 * 1024;
 
+/// Default ceiling on a single content blob's reassembled size (256 MiB).
+/// A chunk root's `chunk_ids` may repeat the same chunk id — legitimate for
+/// deduped repetitive content, but also the lever for an amplification bomb
+/// (a tiny bundle whose root reassembles to gigabytes from one shared chunk).
+/// There is no structural way to tell the two apart, so an absolute size
+/// ceiling is the only real defense. Content-store bodies are UTF-8 text, so
+/// this is generous for real files. Override with `WHIPPLESCRIPT_MAX_BLOB_BYTES`.
+#[cfg(feature = "native")]
+const DEFAULT_MAX_BLOB_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The active per-blob size ceiling, read from `WHIPPLESCRIPT_MAX_BLOB_BYTES`
+/// (bytes) or the 256 MiB default. A malformed/zero override falls back to the
+/// default rather than disabling the guard.
+#[cfg(feature = "native")]
+pub(crate) fn max_blob_bytes() -> u64 {
+    std::env::var("WHIPPLESCRIPT_MAX_BLOB_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|&bytes| bytes > 0)
+        .unwrap_or(DEFAULT_MAX_BLOB_BYTES)
+}
+
 /// What the store knows about a content id: alive with payload, erased
 /// under the honesty downgrade (identity + size retained, payload gone),
 /// or never seen.
@@ -193,20 +215,7 @@ impl ContentBlobs for ContentStore {
         if info.erased {
             return Ok(None);
         }
-        // `byte_len` is a stored field and, for a chunk root arriving through
-        // bundle import, is attacker-controlled and unrelated to the verified
-        // root id (which commits only to the chunk-id list). Never pre-allocate
-        // the claimed size: cap the reservation so a forged multi-GiB `byte_len`
-        // cannot OOM the process. The string still grows to hold the real chunk
-        // bytes, which are bounded by what is actually stored.
-        let mut body = String::with_capacity((info.byte_len as usize).min(MAX_REASSEMBLE_PREALLOC));
-        for chunk_id in &info.chunk_ids {
-            let Some(piece) = self.get(chunk_id)? else {
-                return Ok(None);
-            };
-            body.push_str(&piece);
-        }
-        Ok(Some(body))
+        self.reassemble_root(id, &info, max_blob_bytes())
     }
 
     fn status(&self, id: &str) -> StoreResult<BlobStatus> {
@@ -435,6 +444,37 @@ impl ContentStore {
         self.get(id)
     }
 
+    /// Reassemble a chunk root's bytes, refusing at `cap` bytes. `chunk_ids`
+    /// may repeat a shared chunk, so the reassembled size is bounded only by
+    /// the ref count, not the distinct stored bytes — a chunk-amplification
+    /// bomb. Growth is checked after every piece so a hostile root is refused
+    /// having buffered at most one chunk past the ceiling, never gigabytes.
+    fn reassemble_root(
+        &self,
+        id: &str,
+        info: &ChunkRootInfo,
+        cap: u64,
+    ) -> StoreResult<Option<String>> {
+        // Never pre-allocate the claimed `byte_len` (attacker-controlled and
+        // uncommitted by the verified root id); reserve a small window and let
+        // the string grow to the real size under the running cap.
+        let mut body = String::with_capacity((info.byte_len as usize).min(MAX_REASSEMBLE_PREALLOC));
+        for chunk_id in &info.chunk_ids {
+            let Some(piece) = self.get(chunk_id)? else {
+                return Ok(None);
+            };
+            body.push_str(&piece);
+            if body.len() as u64 > cap {
+                return Err(crate::StoreError::Conflict(format!(
+                    "content `{id}` reassembles beyond the {cap}-byte blob ceiling \
+                     (raise WHIPPLESCRIPT_MAX_BLOB_BYTES if this is a genuine large file); \
+                     refusing (possible chunk amplification)"
+                )));
+            }
+        }
+        Ok(Some(body))
+    }
+
     /// The retained identity of a chunk root, before or after erasure.
     pub fn chunk_root_info(&self, root_id: &str) -> StoreResult<Option<ChunkRootInfo>> {
         let root: Option<(i64, Option<String>)> = self
@@ -635,6 +675,45 @@ impl ContentStore {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_root_reassembly_refuses_beyond_cap() {
+        use crate::chunking::ChunkingConfig;
+        let dir = std::env::temp_dir().join(format!("whip-content-cap-{}", std::process::id()));
+        let path = dir.join("content.db");
+        let _ = std::fs::remove_file(&path);
+        let store = ContentStore::open(&path).expect("open");
+
+        // A small-threshold config forces a multi-chunk root.
+        let config = ChunkingConfig {
+            whole_blob_threshold: 8,
+            min_size: 4,
+            avg_size: 8,
+            max_size: 32,
+        };
+        let body = "the-quick-brown-fox-".repeat(16);
+        let root = store.put_chunked(&body, &config).expect("put chunked");
+        let info = store
+            .chunk_root_info(&root)
+            .expect("info")
+            .expect("root exists");
+
+        // A ceiling below the true size refuses reassembly (chunk-amplification
+        // guard) rather than building the whole blob.
+        assert!(
+            store.reassemble_root(&root, &info, 16).is_err(),
+            "reassembly past the cap must be refused"
+        );
+        // A generous ceiling reassembles the original bytes exactly.
+        assert_eq!(
+            store
+                .reassemble_root(&root, &info, 1_000_000)
+                .expect("ok")
+                .as_deref(),
+            Some(body.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn put_is_content_addressed_and_get_round_trips() {

@@ -193,6 +193,15 @@ selective-undo.maude             selective-undo stranding: a naive by-path filte
 stat-cache.maude                 import-back stat-cache soundness: a naive size+mtime
                                  fingerprint drops a racy-granule content change; the
                                  sound importer re-hashes inside the racy window only
+improve-acceptance.maude         campaign acceptance invariant: never surface a
+                                 dominated candidate -- guarded regressions beyond
+                                 band, violated bars, and focus regressions are
+                                 refused; sacrifice releases a guard; the naive
+                                 focus-only judge demonstrates the hazard
+improve-holdout.maude            holdout sealing: the proposer never reads sealed
+                                 scenarios; kmax promotion gates wear a seal out with
+                                 ambient refresh; anchor asks retire seals honestly;
+                                 below the floor the gate passes tagged unheld-out
 ```
 
 The shell script runs every Maude test file and checks the expected number of

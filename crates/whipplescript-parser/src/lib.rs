@@ -128,6 +128,8 @@ pub enum Item {
     Harness(HarnessDecl),
     Tracker(TrackerDecl),
     Channel(ChannelDecl),
+    Gauge(GaugeDecl),
+    Campaign(CampaignDecl),
     FileStore(FileStoreDecl),
     MemoryPool(MemoryPoolDecl),
     Flow(FlowDecl),
@@ -161,6 +163,8 @@ impl Item {
             Self::Harness(decl) => decl.span,
             Self::Tracker(decl) => decl.span,
             Self::Channel(decl) => decl.span,
+            Self::Gauge(decl) => decl.span,
+            Self::Campaign(decl) => decl.span,
             Self::FileStore(decl) => decl.span,
             Self::MemoryPool(decl) => decl.span,
             Self::Flow(decl) => decl.span,
@@ -274,6 +278,106 @@ pub struct ChannelDecl {
     pub provider: Ident,
     pub workspace: Option<Ident>,
     pub destination: Option<StringLiteral>,
+    pub span: SourceSpan,
+}
+
+/// `gauge <name> [on <site>] { judge via ... [expect ...] [inputs ...] }`
+/// (experimentation subsystem §4.2): a named quality dimension — a site, a
+/// judge, optionally a bar. The sibling of `test`: deterministic expectation
+/// vs. stochastic expectation, one family. Core grammar (hand-parsed): the
+/// `judge via` tagged union and the bar form are outside the declaration
+/// family's shape. Bars use the word forms `at least` / `at most` because
+/// the declaration tokenizer deliberately steps over `>=`/`<=` (the same
+/// reason field presence conditions use `is`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GaugeDecl {
+    pub name: Ident,
+    /// Optional `on <dotted.site>` designation. v1 records it (identity and
+    /// forward-compat with site-scoped judging); ambient scoring judges the
+    /// run's terminal view.
+    pub site: Option<String>,
+    pub site_span: Option<SourceSpan>,
+    pub judge: GaugeJudge,
+    pub expect: Option<GaugeBar>,
+    /// Derived gauges: other gauges whose scores feed this gauge's exec
+    /// judge (`inputs a, b`). Deterministic composition — the settled cure
+    /// for composite objectives (no weights feature, ever).
+    pub inputs: Vec<GaugeRef>,
+    pub span: SourceSpan,
+}
+
+/// The generalized judge slot: `judge via coerce <Name> | prompt "<t>" |
+/// exec "<cmd>" | labels "<source>"`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GaugeJudge {
+    Coerce(Ident),
+    Prompt(StringLiteral),
+    Exec(StringLiteral),
+    Labels(StringLiteral),
+}
+
+/// An optional bar: the default decision bar for settle/campaign gates.
+/// `expect P(<field>) at least 0.9` (chance-shaped) or
+/// `expect p10 at least 0.7` / `expect mean at most 800` (stat-shaped).
+/// Thresholds keep their exact source text (`Eq`-safe, format-exact);
+/// consumers parse.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GaugeBar {
+    pub subject: GaugeBarSubject,
+    /// `true` = `at least`, `false` = `at most`.
+    pub at_least: bool,
+    pub threshold: String,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GaugeBarSubject {
+    /// `P(<field>)`: probability the judge's boolean output field holds.
+    Chance { field: Ident },
+    /// A named statistic of the score distribution: `mean`, `p10`, `p90`, …
+    Stat { stat: Ident },
+}
+
+/// A (possibly dotted) gauge reference: user gauges are bare idents, the
+/// built-in resource gauges are namespaced (`std.spend` / `std.latency` /
+/// `std.tokens`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GaugeRef {
+    pub name: String,
+    pub span: SourceSpan,
+}
+
+/// `campaign <name> { ascend … [reach …] [guard …] [sacrifice …] }`
+/// (improve design note §3): versioned, diffable objective intent at higher
+/// ceremony than a CLI invocation — the partition of the gauge vector.
+/// Unnamed gauges are guarded by default; `guard` widens a band, `sacrifice`
+/// releases a gauge, `reach` sets a target that becomes a hard bound.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CampaignDecl {
+    pub name: Ident,
+    pub ascend: Vec<GaugeRef>,
+    pub reach: Vec<CampaignReach>,
+    pub guard: Vec<CampaignGuard>,
+    pub sacrifice: Vec<GaugeRef>,
+    pub span: SourceSpan,
+}
+
+/// `reach <gauge> at least 0.9` / `reach std.latency at most 800ms`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CampaignReach {
+    pub gauge: GaugeRef,
+    pub at_least: bool,
+    pub threshold: String,
+    /// Optional trailing unit ident (`ms`, `s`); recorded verbatim.
+    pub unit: Option<String>,
+    pub span: SourceSpan,
+}
+
+/// `guard <gauge> within 2 percent`: an indifference-band override.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CampaignGuard {
+    pub gauge: GaugeRef,
+    pub band_percent: String,
     pub span: SourceSpan,
 }
 
@@ -865,6 +969,8 @@ pub struct IrProgram {
     pub harnesses: Vec<IrHarness>,
     pub trackers: Vec<IrTracker>,
     pub channels: Vec<IrChannel>,
+    pub gauges: Vec<IrGauge>,
+    pub campaigns: Vec<IrCampaign>,
     pub file_stores: Vec<IrFileStore>,
     pub memory_pools: Vec<IrMemoryPool>,
     pub events: Vec<IrEvent>,
@@ -996,6 +1102,62 @@ pub struct IrChannel {
     pub workspace: Option<String>,
     pub destination: Option<String>,
     pub span: SourceSpan,
+}
+
+/// A lowered `gauge` declaration (experimentation subsystem): the binding of
+/// a judge to a quality dimension, versioning with the program. Lowering
+/// class is `metadata_only`; the evidence engine (`whip evidence` /
+/// `whip improve`) consumes it at runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrGauge {
+    pub name: String,
+    pub site: Option<String>,
+    /// `coerce` | `prompt` | `exec` | `labels`.
+    pub judge_kind: String,
+    /// The judge target: coerce name, prompt template, exec command, or
+    /// labels source path.
+    pub judge_target: String,
+    pub expect: Option<IrGaugeBar>,
+    pub inputs: Vec<String>,
+    pub span: SourceSpan,
+}
+
+/// A lowered gauge bar. `form` is `chance` (`P(field)`) or `stat`
+/// (`p10`/`mean`/…); `op` is `>=` (`at least`) or `<=` (`at most`);
+/// `threshold` keeps its exact source text — consumers parse.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrGaugeBar {
+    pub form: String,
+    pub subject: String,
+    pub op: String,
+    pub threshold: String,
+}
+
+/// A lowered `campaign` declaration (improve design note §3): the named,
+/// versioned partition of the gauge vector. `metadata_only`; consumed by
+/// `whip improve <name>`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrCampaign {
+    pub name: String,
+    pub ascend: Vec<String>,
+    pub reach: Vec<IrCampaignReach>,
+    pub guard: Vec<IrCampaignGuard>,
+    pub sacrifice: Vec<String>,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrCampaignReach {
+    pub gauge: String,
+    pub op: String,
+    pub threshold: String,
+    pub unit: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrCampaignGuard {
+    pub gauge: String,
+    pub band_percent: String,
 }
 
 /// A lowered `file store` declaration (std.files): the store identity + its
@@ -2003,6 +2165,8 @@ pub fn document_symbols(source: &str) -> Vec<DeclSymbol> {
             Item::MemoryPool(decl) => ("memory pool", decl.name.name.clone(), decl.span),
             Item::Event(decl) => ("signal", decl.name.clone(), decl.span),
             Item::Table(decl) => ("table", decl.name.name.clone(), decl.span),
+            Item::Gauge(decl) => ("gauge", decl.name.name.clone(), decl.span),
+            Item::Campaign(decl) => ("campaign", decl.name.name.clone(), decl.span),
             _ => continue,
         };
         symbols.push(DeclSymbol {
@@ -2636,6 +2800,8 @@ fn referenced_decl_name(item: &Item) -> Option<(String, SourceSpan)> {
         Item::MemoryPool(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::Event(decl) => Some((decl.name.clone(), decl.span)),
         Item::Table(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::Gauge(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::Campaign(decl) => Some((decl.name.name.clone(), decl.span)),
         _ => None,
     }
 }
@@ -3036,6 +3202,58 @@ impl IrProgram {
                 }
                 if let Some(destination) = &channel.destination {
                     line.push_str(&format!(" destination={destination:?}"));
+                }
+                push_line(&mut snapshot, line);
+            }
+        }
+
+        if !self.gauges.is_empty() {
+            push_line(&mut snapshot, "gauges");
+            for gauge in &self.gauges {
+                let mut line = format!(
+                    "  gauge {} judge={}:{}",
+                    gauge.name, gauge.judge_kind, gauge.judge_target
+                );
+                if let Some(site) = &gauge.site {
+                    line.push_str(&format!(" site={site}"));
+                }
+                if let Some(bar) = &gauge.expect {
+                    line.push_str(&format!(
+                        " expect={}:{}{}{}",
+                        bar.form, bar.subject, bar.op, bar.threshold
+                    ));
+                }
+                if !gauge.inputs.is_empty() {
+                    line.push_str(&format!(" inputs={}", gauge.inputs.join(",")));
+                }
+                push_line(&mut snapshot, line);
+            }
+        }
+
+        if !self.campaigns.is_empty() {
+            push_line(&mut snapshot, "campaigns");
+            for campaign in &self.campaigns {
+                let mut line = format!("  campaign {}", campaign.name);
+                if !campaign.ascend.is_empty() {
+                    line.push_str(&format!(" ascend={}", campaign.ascend.join(",")));
+                }
+                for reach in &campaign.reach {
+                    line.push_str(&format!(
+                        " reach={}{}{}{}",
+                        reach.gauge,
+                        reach.op,
+                        reach.threshold,
+                        reach.unit.as_deref().unwrap_or("")
+                    ));
+                }
+                for guard in &campaign.guard {
+                    line.push_str(&format!(
+                        " guard={}:within:{}%",
+                        guard.gauge, guard.band_percent
+                    ));
+                }
+                if !campaign.sacrifice.is_empty() {
+                    line.push_str(&format!(" sacrifice={}", campaign.sacrifice.join(",")));
                 }
                 push_line(&mut snapshot, line);
             }
@@ -3859,6 +4077,8 @@ fn lower_program(
         harnesses: Vec::new(),
         trackers: Vec::new(),
         channels: Vec::new(),
+        gauges: Vec::new(),
+        campaigns: Vec::new(),
         file_stores: Vec::new(),
         memory_pools: Vec::new(),
         events: Vec::new(),
@@ -3945,6 +4165,8 @@ fn lower_program(
             Item::Harness(harness) => lower_harness(harness, &mut ir, &mut diagnostics),
             Item::Tracker(queue) => lower_tracker(queue, &mut ir, &mut diagnostics),
             Item::Channel(channel) => lower_channel(channel, &mut ir, &mut diagnostics),
+            Item::Gauge(gauge) => lower_gauge(gauge, &mut ir, &mut diagnostics),
+            Item::Campaign(campaign) => lower_campaign(campaign, &mut ir, &mut diagnostics),
             // The `file store` declaration (capability-scoped store identity)
             // lowers to its name + literal root; the runtime file provider reads
             // `<root>/<path>` for `read` effects against this store.
@@ -4109,6 +4331,7 @@ fn lower_program(
     ir.rule_dependencies = build_rule_dependencies(&ir.rules);
     validate_turn_access_grant_file_operations(&ir, &mut diagnostics);
     validate_turn_access_grant_memory_operations(&ir, &mut diagnostics);
+    validate_improve_declarations(&ir, &mut diagnostics);
 
     CompileOutput {
         ir: diagnostics.is_empty().then_some(ir),
@@ -4752,6 +4975,21 @@ fn pattern_body_admission(
                 "apply patterns from workflow bodies only in this implementation slice".to_owned(),
             ),
         }),
+        // Objective intent is top-level: a gauge binds a judge to this
+        // program's sites and a campaign partitions this program's gauge
+        // vector — neither is a reusable template fragment.
+        Item::Gauge(gauge) => Some(Diagnostic {
+            related: Vec::new(),
+            span: gauge.span,
+            message: "gauge declarations are not allowed in pattern bodies".to_owned(),
+            suggestion: Some("declare gauges at source top level".to_owned()),
+        }),
+        Item::Campaign(campaign) => Some(Diagnostic {
+            related: Vec::new(),
+            span: campaign.span,
+            message: "campaign declarations are not allowed in pattern bodies".to_owned(),
+            suggestion: Some("declare campaigns at source top level".to_owned()),
+        }),
         Item::Rule(rule) => pattern_rule_terminal_span(rule).map(|span| Diagnostic {
             related: Vec::new(),
             span,
@@ -4821,6 +5059,10 @@ fn expand_pattern_item(
             format!("channel:{}", channel.name.name),
             Item::Channel(channel),
         )),
+        // Gauges and campaigns are rejected from pattern bodies by
+        // `pattern_body_admission` (objective intent is top-level); there is
+        // deliberately no expansion path for them.
+        Item::Gauge(_) | Item::Campaign(_) => None,
         Item::FileStore(file_store) => Some((
             format!("file-store:{}", file_store.name.name),
             Item::FileStore(file_store),
@@ -6174,6 +6416,208 @@ fn lower_channel(channel: ChannelDecl, ir: &mut IrProgram, diagnostics: &mut Vec
         destination: channel.destination.map(|destination| destination.value),
         span: channel.span,
     });
+}
+
+/// The built-in resource gauges: deterministic observables already in the
+/// effect ledger, present without declaration (improve design note §3).
+pub const BUILTIN_GAUGES: &[&str] = &["std.spend", "std.latency", "std.tokens"];
+
+fn lower_gauge(gauge: GaugeDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    if let Some(existing) = ir.gauges.iter().find(|other| other.name == gauge.name.name) {
+        diagnostics.push(
+            Diagnostic {
+                related: Vec::new(),
+                span: gauge.name.span,
+                message: format!("gauge `{}` is declared more than once", gauge.name.name),
+                suggestion: Some("give each gauge a unique name".to_owned()),
+            }
+            .with_related(existing.span, "first declared here"),
+        );
+        return;
+    }
+    let (judge_kind, judge_target) = match &gauge.judge {
+        GaugeJudge::Coerce(target) => ("coerce", target.name.clone()),
+        GaugeJudge::Prompt(template) => ("prompt", template.value.clone()),
+        GaugeJudge::Exec(command) => ("exec", command.value.clone()),
+        GaugeJudge::Labels(source) => ("labels", source.value.clone()),
+    };
+    let expect = gauge.expect.as_ref().map(|bar| IrGaugeBar {
+        form: match &bar.subject {
+            GaugeBarSubject::Chance { .. } => "chance".to_owned(),
+            GaugeBarSubject::Stat { .. } => "stat".to_owned(),
+        },
+        subject: match &bar.subject {
+            GaugeBarSubject::Chance { field } => field.name.clone(),
+            GaugeBarSubject::Stat { stat } => stat.name.clone(),
+        },
+        op: if bar.at_least { ">=" } else { "<=" }.to_owned(),
+        threshold: bar.threshold.clone(),
+    });
+    ir.gauges.push(IrGauge {
+        name: gauge.name.name,
+        site: gauge.site,
+        judge_kind: judge_kind.to_owned(),
+        judge_target,
+        expect,
+        inputs: gauge.inputs.into_iter().map(|input| input.name).collect(),
+        span: gauge.span,
+    });
+}
+
+fn lower_campaign(campaign: CampaignDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    if let Some(existing) = ir
+        .campaigns
+        .iter()
+        .find(|other| other.name == campaign.name.name)
+    {
+        diagnostics.push(
+            Diagnostic {
+                related: Vec::new(),
+                span: campaign.name.span,
+                message: format!(
+                    "campaign `{}` is declared more than once",
+                    campaign.name.name
+                ),
+                suggestion: Some("give each campaign a unique name".to_owned()),
+            }
+            .with_related(existing.span, "first declared here"),
+        );
+        return;
+    }
+    ir.campaigns.push(IrCampaign {
+        name: campaign.name.name,
+        ascend: campaign
+            .ascend
+            .into_iter()
+            .map(|gauge| gauge.name)
+            .collect(),
+        reach: campaign
+            .reach
+            .into_iter()
+            .map(|reach| IrCampaignReach {
+                gauge: reach.gauge.name,
+                op: if reach.at_least { ">=" } else { "<=" }.to_owned(),
+                threshold: reach.threshold,
+                unit: reach.unit,
+            })
+            .collect(),
+        guard: campaign
+            .guard
+            .into_iter()
+            .map(|guard| IrCampaignGuard {
+                gauge: guard.gauge.name,
+                band_percent: guard.band_percent,
+            })
+            .collect(),
+        sacrifice: campaign
+            .sacrifice
+            .into_iter()
+            .map(|gauge| gauge.name)
+            .collect(),
+        span: campaign.span,
+    });
+}
+
+/// Cross-reference validation for the improve surface, run after the item
+/// loop so declaration order never matters: judge `coerce` targets must
+/// resolve, derived-gauge inputs and campaign gauge references must name a
+/// declared gauge or a built-in resource gauge, and a campaign's partition
+/// must be disjoint (a gauge cannot be both ascended and sacrificed).
+fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    let gauge_names: BTreeSet<&str> = ir.gauges.iter().map(|gauge| gauge.name.as_str()).collect();
+    let resolves = |name: &str| gauge_names.contains(name) || BUILTIN_GAUGES.contains(&name);
+    let unknown = |name: &str, span: SourceSpan, diagnostics: &mut Vec<Diagnostic>| {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span,
+            message: format!("unknown gauge `{name}`"),
+            suggestion: Some(format!(
+                "declare `gauge {name} {{ ... }}` or use a built-in gauge ({})",
+                BUILTIN_GAUGES.join(", ")
+            )),
+        });
+    };
+    for gauge in &ir.gauges {
+        if gauge.judge_kind == "coerce"
+            && !ir
+                .coerces
+                .iter()
+                .any(|coerce| coerce.name == gauge.judge_target)
+        {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: gauge.span,
+                message: format!(
+                    "gauge `{}` judges via undeclared coerce `{}`",
+                    gauge.name, gauge.judge_target
+                ),
+                suggestion: Some("declare the coerce this gauge judges with".to_owned()),
+            });
+        }
+        if !gauge.inputs.is_empty() && gauge.judge_kind != "exec" {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: gauge.span,
+                message: format!(
+                    "derived gauge `{}` must judge via exec (its judge receives the input score vector)",
+                    gauge.name
+                ),
+                suggestion: Some("use `judge via exec \"<validator>\"`".to_owned()),
+            });
+        }
+        for input in &gauge.inputs {
+            if input == &gauge.name {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: gauge.span,
+                    message: format!("derived gauge `{}` cannot input itself", gauge.name),
+                    suggestion: None,
+                });
+            } else if !resolves(input) {
+                unknown(input, gauge.span, diagnostics);
+            }
+        }
+    }
+    for campaign in &ir.campaigns {
+        let mut named: Vec<(&str, &'static str)> = Vec::new();
+        for name in &campaign.ascend {
+            named.push((name, "ascend"));
+        }
+        for reach in &campaign.reach {
+            named.push((&reach.gauge, "reach"));
+        }
+        for guard in &campaign.guard {
+            named.push((&guard.gauge, "guard"));
+        }
+        for name in &campaign.sacrifice {
+            named.push((name, "sacrifice"));
+        }
+        let mut seen: BTreeMap<&str, &'static str> = BTreeMap::new();
+        for (name, role) in named {
+            if !resolves(name) {
+                unknown(name, campaign.span, diagnostics);
+            }
+            if let Some(previous) = seen.insert(name, role) {
+                let message = if previous == role {
+                    format!(
+                        "campaign `{}` names gauge `{name}` twice in {role}",
+                        campaign.name
+                    )
+                } else {
+                    format!(
+                        "campaign `{}` names gauge `{name}` as both {previous} and {role}",
+                        campaign.name
+                    )
+                };
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: campaign.span,
+                    message,
+                    suggestion: Some("name each gauge once, in at most one clause".to_owned()),
+                });
+            }
+        }
+    }
 }
 
 fn lower_harness(harness: HarnessDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
@@ -16771,6 +17215,88 @@ fn format_item(item: Item, formatted: &mut String) {
             push_line(formatted, format!("  provider {}", queue.provider.name));
             push_line(formatted, "}");
         }
+        Item::Gauge(gauge) => {
+            let mut header = format!("gauge {}", gauge.name.name);
+            if let Some(site) = &gauge.site {
+                header.push_str(&format!(" on {site}"));
+            }
+            header.push_str(" {");
+            push_line(formatted, header);
+            let judge = match &gauge.judge {
+                GaugeJudge::Coerce(target) => format!("coerce {}", target.name),
+                GaugeJudge::Prompt(template) => format!("prompt {:?}", template.value),
+                GaugeJudge::Exec(command) => format!("exec {:?}", command.value),
+                GaugeJudge::Labels(source) => format!("labels {:?}", source.value),
+            };
+            push_line(formatted, format!("  judge via {judge}"));
+            if let Some(bar) = &gauge.expect {
+                let subject = match &bar.subject {
+                    GaugeBarSubject::Chance { field } => format!("P({})", field.name),
+                    GaugeBarSubject::Stat { stat } => stat.name.clone(),
+                };
+                let direction = if bar.at_least { "at least" } else { "at most" };
+                push_line(
+                    formatted,
+                    format!("  expect {subject} {direction} {}", bar.threshold),
+                );
+            }
+            if !gauge.inputs.is_empty() {
+                let names = gauge
+                    .inputs
+                    .iter()
+                    .map(|input| input.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                push_line(formatted, format!("  inputs {names}"));
+            }
+            push_line(formatted, "}");
+        }
+        Item::Campaign(campaign) => {
+            push_line(formatted, format!("campaign {} {{", campaign.name.name));
+            if !campaign.ascend.is_empty() {
+                let names = campaign
+                    .ascend
+                    .iter()
+                    .map(|gauge| gauge.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                push_line(formatted, format!("  ascend {names}"));
+            }
+            for reach in &campaign.reach {
+                let direction = if reach.at_least {
+                    "at least"
+                } else {
+                    "at most"
+                };
+                let unit = reach.unit.as_deref().unwrap_or("");
+                push_line(
+                    formatted,
+                    format!(
+                        "  reach {} {direction} {}{unit}",
+                        reach.gauge.name, reach.threshold
+                    ),
+                );
+            }
+            for guard in &campaign.guard {
+                push_line(
+                    formatted,
+                    format!(
+                        "  guard {} within {} percent",
+                        guard.gauge.name, guard.band_percent
+                    ),
+                );
+            }
+            if !campaign.sacrifice.is_empty() {
+                let names = campaign
+                    .sacrifice
+                    .iter()
+                    .map(|gauge| gauge.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                push_line(formatted, format!("  sacrifice {names}"));
+            }
+            push_line(formatted, "}");
+        }
         Item::Channel(channel) => {
             push_line(formatted, format!("channel {} {{", channel.name.name));
             push_line(formatted, format!("  provider {}", channel.provider.name));
@@ -18437,6 +18963,14 @@ impl Parser<'_> {
             self.reject_pending_tags(pending_tags, "signal");
             self.reject_pending_description(pending_description, "signal");
             self.parse_event().map(Item::Event)
+        } else if self.at_ident("gauge") {
+            self.reject_pending_tags(pending_tags, "gauge");
+            self.reject_pending_description(pending_description, "gauge");
+            self.parse_gauge().map(Item::Gauge)
+        } else if self.at_ident("campaign") {
+            self.reject_pending_tags(pending_tags, "campaign");
+            self.reject_pending_description(pending_description, "campaign");
+            self.parse_campaign().map(Item::Campaign)
         } else if self.at_ident("source") {
             self.reject_pending_tags(pending_tags, "source");
             self.reject_pending_description(pending_description, "source");
@@ -19248,6 +19782,405 @@ impl Parser<'_> {
             name,
             name_span,
             fields,
+            span: SourceSpan { start, end },
+        })
+    }
+
+    /// A dotted name (`summarize.extract`, `std.spend`) as one string + span.
+    fn parse_dotted_name_spanned(&mut self, label: &str) -> Option<(String, SourceSpan)> {
+        let first = self.expect_ident(label)?;
+        let mut name = first.name.clone();
+        let mut span = first.span;
+        while self.at_symbol('.') {
+            self.expect_symbol('.');
+            let segment = self.expect_ident(label)?;
+            name.push('.');
+            name.push_str(&segment.name);
+            span = span.join(segment.span);
+        }
+        Some((name, span))
+    }
+
+    fn parse_gauge_ref(&mut self, label: &str) -> Option<GaugeRef> {
+        let (name, span) = self.parse_dotted_name_spanned(label)?;
+        Some(GaugeRef { name, span })
+    }
+
+    /// A comma-separated gauge-reference list (`ascend a, std.spend`).
+    fn parse_gauge_ref_list(&mut self, label: &str, into: &mut Vec<GaugeRef>) -> Option<()> {
+        into.push(self.parse_gauge_ref(label)?);
+        while self.at_symbol(',') {
+            self.expect_symbol(',');
+            into.push(self.parse_gauge_ref(label)?);
+        }
+        Some(())
+    }
+
+    /// A numeric literal as exact source text: `800` or `0.9`. The
+    /// declaration lexer emits digits-only Number tokens, so a fraction is
+    /// Number `.` Number.
+    fn parse_decl_number_text(&mut self, label: &str) -> Option<(String, SourceSpan)> {
+        let token = self.peek()?;
+        let TokenKind::Number(whole) = token.kind.clone() else {
+            self.expected(label);
+            return None;
+        };
+        let mut span = token.span;
+        let mut text = whole;
+        self.advance();
+        if self.at_symbol('.') {
+            self.expect_symbol('.');
+            let token = self.peek()?;
+            let TokenKind::Number(fraction) = token.kind.clone() else {
+                self.expected(format!("{label} fraction digits"));
+                return None;
+            };
+            text.push('.');
+            text.push_str(&fraction);
+            span = span.join(token.span);
+            self.advance();
+        }
+        Some((text, span))
+    }
+
+    /// Bar direction: `at least` (true) / `at most` (false). The declaration
+    /// tokenizer steps over `>=`/`<=` silently (the `is` precedent), so a
+    /// user writing an operator gets a targeted diagnostic instead of a
+    /// direction-less bar: the raw source gap before the next token is
+    /// inspected for the dropped operator.
+    fn parse_bar_direction(&mut self, label: &str) -> Option<bool> {
+        if self.consume_ident("at") {
+            if self.consume_ident("least") {
+                return Some(true);
+            }
+            if self.consume_ident("most") {
+                return Some(false);
+            }
+            self.expected(format!("`least` or `most` after `at` in {label}"));
+            return None;
+        }
+        let gap_start = self.last_span_end();
+        let gap_end = self
+            .peek()
+            .map(|token| token.span.start)
+            .unwrap_or(gap_start);
+        let gap = &self.source[gap_start..gap_end.max(gap_start)];
+        let suggestion = if gap.contains(">=") {
+            Some("write `at least` (the declaration grammar uses words, not `>=`)".to_owned())
+        } else if gap.contains("<=") {
+            Some("write `at most` (the declaration grammar uses words, not `<=`)".to_owned())
+        } else {
+            Some("write `at least <n>` or `at most <n>`".to_owned())
+        };
+        self.diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: SourceSpan {
+                start: gap_start,
+                end: gap_end.max(gap_start),
+            },
+            message: format!("expected `at least` or `at most` in {label}"),
+            suggestion,
+        });
+        None
+    }
+
+    /// `gauge <name> [on <site>] { judge via <form> [expect <bar>]
+    /// [inputs <gauges>] }`.
+    fn parse_gauge(&mut self) -> Option<GaugeDecl> {
+        let start = self.expect_keyword("gauge")?.span.start;
+        let name = self.expect_ident("gauge name")?;
+        let (site, site_span) = if self.consume_ident("on") {
+            let (site, span) = self.parse_dotted_name_spanned("gauge site")?;
+            (Some(site), Some(span))
+        } else {
+            (None, None)
+        };
+        let open = self.expect_symbol('{')?;
+        let mut judge: Option<GaugeJudge> = None;
+        let mut expect: Option<GaugeBar> = None;
+        let mut inputs: Vec<GaugeRef> = Vec::new();
+        while !self.is_at_end() && !self.at_symbol('}') {
+            if self.at_ident("judge") {
+                let keyword = self.advance().clone();
+                if !self.consume_ident("via") {
+                    self.expected("`via` after `judge`");
+                    self.synchronize_to_block_item();
+                    continue;
+                }
+                let form = if self.consume_ident("coerce") {
+                    self.expect_ident("coerce judge name")
+                        .map(GaugeJudge::Coerce)
+                } else if self.consume_ident("prompt") {
+                    self.expect_string("prompt judge template")
+                        .map(GaugeJudge::Prompt)
+                } else if self.consume_ident("exec") {
+                    self.expect_string("exec judge command")
+                        .map(GaugeJudge::Exec)
+                } else if self.consume_ident("labels") {
+                    self.expect_string("labels source").map(GaugeJudge::Labels)
+                } else {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: keyword.span,
+                        message: "unknown judge form".to_owned(),
+                        suggestion: Some(
+                            "judge forms are `coerce <Name>`, `prompt \"<template>\"`, \
+                             `exec \"<command>\"`, and `labels \"<source>\"`"
+                                .to_owned(),
+                        ),
+                    });
+                    None
+                };
+                let Some(form) = form else {
+                    self.synchronize_to_block_item();
+                    continue;
+                };
+                if judge.is_some() {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: keyword.span,
+                        message: "gauge declares more than one judge".to_owned(),
+                        suggestion: Some("a gauge has exactly one judge".to_owned()),
+                    });
+                } else {
+                    judge = Some(form);
+                }
+            } else if self.at_ident("expect") {
+                let keyword = self.advance().clone();
+                let subject_ident = match self.expect_ident("bar subject") {
+                    Some(ident) => ident,
+                    None => {
+                        self.synchronize_to_block_item();
+                        continue;
+                    }
+                };
+                let subject = if subject_ident.name == "P" && self.at_symbol('(') {
+                    self.expect_symbol('(');
+                    let Some(field) = self.expect_ident("chance bar field") else {
+                        self.synchronize_to_block_item();
+                        continue;
+                    };
+                    if self.expect_symbol(')').is_none() {
+                        self.synchronize_to_block_item();
+                        continue;
+                    }
+                    GaugeBarSubject::Chance { field }
+                } else {
+                    let stat = &subject_ident.name;
+                    let is_quantile = stat.len() > 1
+                        && stat.starts_with('p')
+                        && stat[1..].chars().all(|ch| ch.is_ascii_digit());
+                    if stat != "mean" && !is_quantile {
+                        self.diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: subject_ident.span,
+                            message: format!("unknown bar statistic `{stat}`"),
+                            suggestion: Some(
+                                "bars are chance-shaped (`P(<field>)`) or stat-shaped \
+                                 (`mean`, `p10`, `p90`, ...)"
+                                    .to_owned(),
+                            ),
+                        });
+                    }
+                    GaugeBarSubject::Stat {
+                        stat: subject_ident,
+                    }
+                };
+                let Some(at_least) = self.parse_bar_direction("the gauge bar") else {
+                    self.synchronize_to_block_item();
+                    continue;
+                };
+                let Some((threshold, threshold_span)) =
+                    self.parse_decl_number_text("bar threshold")
+                else {
+                    self.synchronize_to_block_item();
+                    continue;
+                };
+                if expect.is_some() {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: keyword.span,
+                        message: "gauge declares more than one bar".to_owned(),
+                        suggestion: Some("a gauge has at most one `expect` bar".to_owned()),
+                    });
+                } else {
+                    expect = Some(GaugeBar {
+                        subject,
+                        at_least,
+                        threshold,
+                        span: keyword.span.join(threshold_span),
+                    });
+                }
+            } else if self.at_ident("inputs") {
+                self.advance();
+                if self
+                    .parse_gauge_ref_list("input gauge name", &mut inputs)
+                    .is_none()
+                {
+                    self.synchronize_to_block_item();
+                }
+            } else {
+                let span = self.peek().map(|token| token.span).unwrap_or(open.span);
+                self.diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span,
+                    message: "unknown gauge clause".to_owned(),
+                    suggestion: Some(
+                        "gauge clauses are `judge via`, `expect`, and `inputs`".to_owned(),
+                    ),
+                });
+                self.synchronize_to_block_item();
+            }
+        }
+        let end = self
+            .expect_symbol('}')
+            .map(|token| token.span.end)
+            .unwrap_or(open.span.end);
+        let Some(judge) = judge else {
+            self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: name.span,
+                message: format!("gauge `{}` declares no judge", name.name),
+                suggestion: Some(
+                    "add `judge via coerce <Name>`, `judge via prompt \"<template>\"`, \
+                     `judge via exec \"<command>\"`, or `judge via labels \"<source>\"`"
+                        .to_owned(),
+                ),
+            });
+            return None;
+        };
+        Some(GaugeDecl {
+            name,
+            site,
+            site_span,
+            judge,
+            expect,
+            inputs,
+            span: SourceSpan { start, end },
+        })
+    }
+
+    /// `campaign <name> { ascend … [reach …] [guard …] [sacrifice …] }`.
+    fn parse_campaign(&mut self) -> Option<CampaignDecl> {
+        let start = self.expect_keyword("campaign")?.span.start;
+        let name = self.expect_ident("campaign name")?;
+        let open = self.expect_symbol('{')?;
+        let mut ascend: Vec<GaugeRef> = Vec::new();
+        let mut reach: Vec<CampaignReach> = Vec::new();
+        let mut guard: Vec<CampaignGuard> = Vec::new();
+        let mut sacrifice: Vec<GaugeRef> = Vec::new();
+        while !self.is_at_end() && !self.at_symbol('}') {
+            if self.at_ident("ascend") {
+                self.advance();
+                if self
+                    .parse_gauge_ref_list("ascend gauge name", &mut ascend)
+                    .is_none()
+                {
+                    self.synchronize_to_block_item();
+                }
+            } else if self.at_ident("reach") {
+                let keyword = self.advance().clone();
+                let Some(gauge) = self.parse_gauge_ref("reach gauge name") else {
+                    self.synchronize_to_block_item();
+                    continue;
+                };
+                let Some(at_least) = self.parse_bar_direction("the reach target") else {
+                    self.synchronize_to_block_item();
+                    continue;
+                };
+                let Some((threshold, threshold_span)) =
+                    self.parse_decl_number_text("reach threshold")
+                else {
+                    self.synchronize_to_block_item();
+                    continue;
+                };
+                // A trailing duration unit (`800ms`) lexes as a separate
+                // ident; a clause keyword never collides with the unit set.
+                let unit = if self
+                    .peek()
+                    .map(|token| {
+                        matches!(&token.kind, TokenKind::Ident(name)
+                            if matches!(name.as_str(), "ms" | "s" | "m" | "h" | "d"))
+                    })
+                    .unwrap_or(false)
+                {
+                    self.expect_ident("unit").map(|ident| ident.name)
+                } else {
+                    None
+                };
+                reach.push(CampaignReach {
+                    gauge,
+                    at_least,
+                    threshold,
+                    unit,
+                    span: keyword.span.join(threshold_span),
+                });
+            } else if self.at_ident("guard") {
+                let keyword = self.advance().clone();
+                let Some(gauge) = self.parse_gauge_ref("guard gauge name") else {
+                    self.synchronize_to_block_item();
+                    continue;
+                };
+                if !self.consume_ident("within") {
+                    self.expected("`within` after the guarded gauge");
+                    self.synchronize_to_block_item();
+                    continue;
+                }
+                let Some((band_percent, band_span)) = self.parse_decl_number_text("guard band")
+                else {
+                    self.synchronize_to_block_item();
+                    continue;
+                };
+                if !self.consume_ident("percent") {
+                    self.expected("`percent` after the guard band");
+                    self.synchronize_to_block_item();
+                    continue;
+                }
+                guard.push(CampaignGuard {
+                    gauge,
+                    band_percent,
+                    span: keyword.span.join(band_span),
+                });
+            } else if self.at_ident("sacrifice") {
+                self.advance();
+                if self
+                    .parse_gauge_ref_list("sacrifice gauge name", &mut sacrifice)
+                    .is_none()
+                {
+                    self.synchronize_to_block_item();
+                }
+            } else {
+                let span = self.peek().map(|token| token.span).unwrap_or(open.span);
+                self.diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span,
+                    message: "unknown campaign clause".to_owned(),
+                    suggestion: Some(
+                        "campaign clauses are `ascend`, `reach`, `guard`, and `sacrifice`"
+                            .to_owned(),
+                    ),
+                });
+                self.synchronize_to_block_item();
+            }
+        }
+        let end = self
+            .expect_symbol('}')
+            .map(|token| token.span.end)
+            .unwrap_or(open.span.end);
+        if ascend.is_empty() && reach.is_empty() {
+            self.diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: name.span,
+                message: format!("campaign `{}` names nothing to improve", name.name),
+                suggestion: Some("add an `ascend` or `reach` clause".to_owned()),
+            });
+        }
+        Some(CampaignDecl {
+            name,
+            ascend,
+            reach,
+            guard,
+            sacrifice,
             span: SourceSpan { start, end },
         })
     }
@@ -29514,6 +30447,239 @@ source clock as daily_triage {
             }
             other => panic!("expected calendar recurrence, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn gauge_and_campaign_declarations_parse_and_lower() {
+        let source = r##"
+@service
+workflow Improve
+
+output result R
+class R { v string }
+signal go.now { x string }
+
+coerce DueDateJudge(v string) -> R {
+  prompt """markdown
+  Judge {{ v }}.
+
+  {{ ctx.output_format }}
+  """
+}
+
+gauge extract_quality on j.result {
+  judge via coerce DueDateJudge
+  expect P(due_date_correct) at least 0.9
+}
+
+gauge tail_latency {
+  judge via exec "./latency_check.py"
+  expect p90 at most 800
+}
+
+gauge fulfillment_cost {
+  judge via exec "./cost_model.py"
+  inputs extract_quality, std.spend
+}
+
+campaign release_tuning {
+  ascend extract_quality
+  reach std.latency at most 800ms
+  guard tail_latency within 2 percent
+  sacrifice fulfillment_cost
+}
+
+rule j
+  when go.now as g
+=> {
+  complete result {
+    v "ok"
+  }
+}
+"##;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("program compiles");
+        assert_eq!(ir.gauges.len(), 3);
+        let extract = &ir.gauges[0];
+        assert_eq!(extract.name, "extract_quality");
+        assert_eq!(extract.site.as_deref(), Some("j.result"));
+        assert_eq!(extract.judge_kind, "coerce");
+        assert_eq!(extract.judge_target, "DueDateJudge");
+        let bar = extract.expect.as_ref().expect("bar declared");
+        assert_eq!(
+            (
+                bar.form.as_str(),
+                bar.subject.as_str(),
+                bar.op.as_str(),
+                bar.threshold.as_str()
+            ),
+            ("chance", "due_date_correct", ">=", "0.9")
+        );
+        let tail = &ir.gauges[1];
+        let tail_bar = tail.expect.as_ref().expect("stat bar declared");
+        assert_eq!(
+            (
+                tail_bar.form.as_str(),
+                tail_bar.subject.as_str(),
+                tail_bar.op.as_str()
+            ),
+            ("stat", "p90", "<=")
+        );
+        let derived = &ir.gauges[2];
+        assert_eq!(derived.judge_kind, "exec");
+        assert_eq!(derived.inputs, vec!["extract_quality", "std.spend"]);
+        assert_eq!(ir.campaigns.len(), 1);
+        let campaign = &ir.campaigns[0];
+        assert_eq!(campaign.ascend, vec!["extract_quality"]);
+        assert_eq!(campaign.reach.len(), 1);
+        assert_eq!(campaign.reach[0].gauge, "std.latency");
+        assert_eq!(campaign.reach[0].op, "<=");
+        assert_eq!(campaign.reach[0].threshold, "800");
+        assert_eq!(campaign.reach[0].unit.as_deref(), Some("ms"));
+        assert_eq!(campaign.guard[0].gauge, "tail_latency");
+        assert_eq!(campaign.guard[0].band_percent, "2");
+        assert_eq!(campaign.sacrifice, vec!["fulfillment_cost"]);
+        let snapshot = ir.to_snapshot();
+        assert!(snapshot.contains("gauge extract_quality judge=coerce:DueDateJudge site=j.result expect=chance:due_date_correct>=0.9"));
+        assert!(snapshot.contains(
+            "campaign release_tuning ascend=extract_quality reach=std.latency<=800ms guard=tail_latency:within:2% sacrifice=fulfillment_cost"
+        ));
+    }
+
+    #[test]
+    fn gauge_and_campaign_cross_reference_validation() {
+        let source = r##"
+@service
+workflow Improve
+
+output result R
+class R { v string }
+signal go.now { x string }
+
+gauge broken_judge {
+  judge via coerce MissingJudge
+}
+
+gauge broken_inputs {
+  judge via prompt "score this"
+  inputs nowhere
+}
+
+campaign confused {
+  ascend broken_judge
+  sacrifice broken_judge
+}
+
+campaign unknown_ref {
+  ascend nowhere_else
+}
+
+rule j
+  when go.now as g
+=> {
+  complete result {
+    v "ok"
+  }
+}
+"##;
+        let compiled = compile_program(source);
+        let messages: Vec<String> = compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect();
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("judges via undeclared coerce `MissingJudge`")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("derived gauge `broken_inputs` must judge via exec")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("unknown gauge `nowhere`")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("unknown gauge `nowhere_else`")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("names gauge `broken_judge` as both ascend and sacrifice")));
+    }
+
+    #[test]
+    fn campaign_naming_nothing_is_rejected_at_parse() {
+        let source = r##"
+@service
+workflow Improve
+
+output result R
+class R { v string }
+signal go.now { x string }
+
+campaign nothing_named {
+  guard std.spend within 5 percent
+}
+
+rule j
+  when go.now as g
+=> {
+  complete result {
+    v "ok"
+  }
+}
+"##;
+        let compiled = compile_program(source);
+        assert!(compiled.diagnostics.iter().any(|d| d
+            .message
+            .contains("campaign `nothing_named` names nothing to improve")));
+    }
+
+    #[test]
+    fn gauge_bar_operator_gets_word_form_diagnostic() {
+        let source = r##"
+@service
+workflow Improve
+
+output result R
+class R { v string }
+signal go.now { x string }
+
+gauge extract_quality {
+  judge via exec "./judge.py"
+  expect P(ok) >= 0.9
+}
+
+rule j
+  when go.now as g
+=> {
+  complete result {
+    v "ok"
+  }
+}
+"##;
+        let compiled = compile_program(source);
+        assert!(compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .suggestion
+                .as_deref()
+                .is_some_and(|s| s.contains("write `at least`"))
+        }));
+    }
+
+    #[test]
+    fn formats_gauge_and_campaign_declarations() {
+        let source = "workflow Improve\n\n\ngauge extract_quality on j.result {\n  judge via exec \"./judge.py\"\n  expect P(ok) at least 0.9\n}\n\ncampaign release_tuning {\n  ascend extract_quality\n  reach std.latency at most 800ms\n  guard std.tokens within 2 percent\n  sacrifice std.spend\n}\n";
+        let formatted = format_program(source);
+        assert_eq!(formatted.diagnostics, Vec::new());
+        let once = formatted.formatted.expect("formats");
+        assert!(once.contains("gauge extract_quality on j.result {"));
+        assert!(once.contains("  judge via exec \"./judge.py\""));
+        assert!(once.contains("  expect P(ok) at least 0.9"));
+        assert!(once.contains("campaign release_tuning {"));
+        assert!(once.contains("  reach std.latency at most 800ms"));
+        assert!(once.contains("  guard std.tokens within 2 percent"));
+        let twice = format_program(&once).formatted.expect("reformats");
+        assert_eq!(once, twice, "gauge/campaign formatting is idempotent");
     }
 
     #[test]
