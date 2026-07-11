@@ -32684,6 +32684,10 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 Ok(VcsMergeOutcome::Adopted {
                     merge_cut_id,
                     into_branch_id,
+                })
+                | Ok(VcsMergeOutcome::Landed {
+                    merge_cut_id,
+                    into_branch_id,
                 }) => emit_json(json!({
                     "adopted": branch_id,
                     "into": into_branch_id,

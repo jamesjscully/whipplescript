@@ -245,6 +245,10 @@ pub fn apply<B: Branches, C: ContentBlobs>(
             VcsMergeOutcome::Adopted {
                 merge_cut_id,
                 into_branch_id,
+            }
+            | VcsMergeOutcome::Landed {
+                merge_cut_id,
+                into_branch_id,
             } => WorkspaceOpOutcome::Merged {
                 merge_cut_id,
                 into_branch_id,

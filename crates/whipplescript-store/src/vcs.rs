@@ -101,6 +101,14 @@ pub enum VcsMergeOutcome {
         merge_cut_id: String,
         into_branch_id: String,
     },
+    /// Keep-open merge landed (`merge_keeping`): the parent adopted the
+    /// CONTENT and the branch rebased onto the merge cut — empty delta,
+    /// still active. A long-lived member line promoting its work, not a
+    /// proposal closing.
+    Landed {
+        merge_cut_id: String,
+        into_branch_id: String,
+    },
     Conflicted {
         conflicts: Vec<PathConflict>,
     },
@@ -1378,6 +1386,30 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         merge_cut_id: &str,
         at: &str,
     ) -> StoreResult<VcsMergeOutcome> {
+        self.merge_with_mode(branch_id, merge_cut_id, at, false)
+    }
+
+    /// `merge` for a LONG-LIVED member line (a chat, a workstream): the
+    /// parent adopts the content exactly as in `merge`, but instead of
+    /// closing, the branch rebases onto the merge cut — branch point and
+    /// head both at the parent's new head, an empty delta, still active.
+    /// The next turn diverges from what just landed.
+    pub fn merge_keeping(
+        &mut self,
+        branch_id: &str,
+        merge_cut_id: &str,
+        at: &str,
+    ) -> StoreResult<VcsMergeOutcome> {
+        self.merge_with_mode(branch_id, merge_cut_id, at, true)
+    }
+
+    fn merge_with_mode(
+        &mut self,
+        branch_id: &str,
+        merge_cut_id: &str,
+        at: &str,
+        keep_open: bool,
+    ) -> StoreResult<VcsMergeOutcome> {
         let Some(mut branch) = self.branches.get_branch(branch_id)? else {
             return Ok(VcsMergeOutcome::BranchMissing);
         };
@@ -1479,6 +1511,43 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                         return Ok(VcsMergeOutcome::NoParent)
                     }
                 };
+                if keep_open {
+                    // The member line continues: rebase point AND head to
+                    // the merge cut (the parent's new head) — an empty
+                    // delta over what just landed, same shape a fresh
+                    // fork at the merge cut would have.
+                    return match self.branches.rebase_branch(
+                        branch_id,
+                        branch.head_cut_id.as_deref(),
+                        merge_cut_id,
+                        &merged_hash,
+                        merge_cut_id,
+                        &merged_hash,
+                        at,
+                    )? {
+                        AdvanceOutcome::Advanced(rebased) => {
+                            self.log_op(
+                                &format!("op-{merge_cut_id}"),
+                                "merge-keep",
+                                vec![
+                                    Self::op_delta(Some(&parent), &parent_advanced),
+                                    Self::op_delta(Some(&branch), &rebased),
+                                ],
+                                Some(&origin),
+                                at,
+                            )?;
+                            Ok(VcsMergeOutcome::Landed {
+                                merge_cut_id: merge_cut_id.to_owned(),
+                                into_branch_id: parent_id,
+                            })
+                        }
+                        AdvanceOutcome::Stale { .. } => Err(StoreError::Conflict(
+                            "branch head moved during the merge; retry".to_owned(),
+                        )),
+                        AdvanceOutcome::NotActive { .. } => Ok(VcsMergeOutcome::BranchNotActive),
+                        AdvanceOutcome::NotFound => Ok(VcsMergeOutcome::BranchMissing),
+                    };
+                }
                 match self.branches.adopt_branch(branch_id, merge_cut_id, at)? {
                     StatusOutcome::Done(adopted) => {
                         self.log_op(
@@ -3132,6 +3201,77 @@ mod tests {
             vcs.write("draft_a", "x.md", Some("nope"), "cut_x", "t5")
                 .expect("write"),
             VcsWriteOutcome::BranchNotActive
+        );
+    }
+
+    /// A LONG-LIVED member line merges with `merge_keeping`: the parent
+    /// adopts the content, the branch stays ACTIVE with an empty delta at
+    /// the merge cut, and the next divergence merges again — repeatedly,
+    /// which is the shape `merge`'s adopt-terminal refuses on the second
+    /// round.
+    #[test]
+    fn merge_keeping_lands_content_and_line_lives_on() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        assert!(matches!(
+            vcs.create_branch("chat", None, MAINLINE_BRANCH_ID, "t1")
+                .expect("create"),
+            CreateBranchOutcome::Created(_)
+        ));
+        assert!(matches!(
+            vcs.write("chat", "a.md", Some("first turn"), "cut_c1", "t2")
+                .expect("write"),
+            VcsWriteOutcome::Written { .. }
+        ));
+        assert_eq!(
+            vcs.merge_keeping("chat", "cut_keep1", "t3").expect("merge"),
+            VcsMergeOutcome::Landed {
+                merge_cut_id: "cut_keep1".to_owned(),
+                into_branch_id: MAINLINE_BRANCH_ID.to_owned(),
+            }
+        );
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "a.md").expect("read"),
+            Some("first turn".to_owned())
+        );
+        // Still active, empty delta, based at the merge cut.
+        let row = vcs.get_branch("chat").expect("get").expect("row");
+        assert_eq!(row.status, BranchStatus::Active);
+        assert_eq!(row.branch_point_cut_id.as_deref(), Some("cut_keep1"));
+        assert_eq!(row.head_cut_id.as_deref(), Some("cut_keep1"));
+        // A second round writes and lands again — including a rebase-down
+        // past mainline movement in between.
+        assert!(matches!(
+            vcs.write(
+                MAINLINE_BRANCH_ID,
+                "b.md",
+                Some("elsewhere"),
+                "cut_m2",
+                "t4"
+            )
+            .expect("write"),
+            VcsWriteOutcome::Written { .. }
+        ));
+        assert!(matches!(
+            vcs.write("chat", "a.md", Some("second turn"), "cut_c2", "t5")
+                .expect("write"),
+            VcsWriteOutcome::Written { .. }
+        ));
+        assert_eq!(
+            vcs.merge_keeping("chat", "cut_keep2", "t6").expect("merge"),
+            VcsMergeOutcome::Landed {
+                merge_cut_id: "cut_keep2".to_owned(),
+                into_branch_id: MAINLINE_BRANCH_ID.to_owned(),
+            }
+        );
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "a.md").expect("read"),
+            Some("second turn".to_owned())
+        );
+        assert_eq!(
+            vcs.read("chat", "b.md").expect("read"),
+            Some("elsewhere".to_owned()),
+            "the rebase-down folded mainline's move into the live line"
         );
     }
 
