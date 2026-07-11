@@ -700,6 +700,15 @@ impl Envelope {
         base_url: &str,
         placement_handle: &str,
     ) -> bool {
+        // An envelope with no typed provider/placement policy (the DSL surface,
+        // or one signed before SUB-4) has not constrained providers: the check
+        // engages once the authority declares any binding or placement, and
+        // only then refuses unmatched tuples (progressive rigor, not a
+        // precondition — clearance/principal admission still gates the model
+        // regardless).
+        if self.provider_bindings.is_empty() && self.placements.is_empty() {
+            return true;
+        }
         let Some(binding) = self.provider_bindings.get(binding_handle) else {
             return false;
         };
