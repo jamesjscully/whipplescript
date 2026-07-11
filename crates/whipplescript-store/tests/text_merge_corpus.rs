@@ -188,6 +188,61 @@ fn registry() -> Vec<Case> {
             theirs: "one two three FOUR five",
             expect: Expect::Escalates,
         },
+        // -- paragraph-boundary adjacency (MINED 2026-07-11, rust-book:
+        //    3 of 341 human merges): edits with zero Word tokens between
+        //    them but a blank line separating them — the last sentence of
+        //    one paragraph and the first of the next. Git composes these
+        //    (different lines); the word-count dial alone escalated them.
+        //    Ratcheted: a paragraph break IS semantic distance, so this
+        //    composes. The single-newline variant below still asks.
+        Case {
+            mode: "paragraph-boundary-adjacency",
+            name: "adjacent edits across a blank line compose",
+            base: "The vector holds the values one, two, and three.\n\nNow let us change what the vector holds next.",
+            ours: "The vector holds the values one, two, and three by default.\n\nNow let us change what the vector holds next.",
+            theirs: "The vector holds the values one, two, and three.\n\nNEXT let us change what the vector holds next.",
+            expect: Expect::Composes(
+                "The vector holds the values one, two, and three by default.\n\nNEXT let us change what the vector holds next.",
+            ),
+        },
+        Case {
+            mode: "paragraph-boundary-adjacency",
+            name: "the same adjacency inside one paragraph still asks",
+            base: "The vector holds the values one, two, and three.\nNow let us change what the vector holds next.",
+            ours: "The vector holds the values one, two, and three by default.\nNow let us change what the vector holds next.",
+            theirs: "The vector holds the values one, two, and three.\nNEXT let us change what the vector holds next.",
+            expect: Expect::Escalates,
+        },
+        // -- red-team on the §7.3 paragraph-break exception: when one
+        //    side DELETES the blank line (joining the paragraphs), the
+        //    break no longer lies in the gap between the ops, so the
+        //    relaxation must not reach through it — adjacent cross-side
+        //    edits around a deleted boundary still ask.
+        Case {
+            mode: "paragraph-boundary-adjacency",
+            name: "a deleted blank line is not distance",
+            base: "The first paragraph ends here.\n\nThe second paragraph starts now.",
+            ours: "The first paragraph ends here; the second paragraph starts now.",
+            theirs: "The first paragraph ends here.\n\nTHE second paragraph starts now.",
+            expect: Expect::Escalates,
+        },
+        // -- convergent fix coalesced with a one-side insertion (MINED
+        //    2026-07-11, rust-book ce8b88f1ed7d): both sides make the
+        //    IDENTICAL typo fix, but one side also inserts a sentence
+        //    nearby, so its diff coalesces insertion+fix into one op and
+        //    the convergent-Both detection (exact span + bytes) misses.
+        //    Over-escalation only — never a wrong compose — and the fix
+        //    is aligner-tier (finer run splitting or fuzzy convergence).
+        Case {
+            mode: "convergent-fix-near-insertion",
+            name: "identical fix beside one side's insertion",
+            base: "First paragraph explains the setup carefully. We destructure the reference from the value, which we can do can by specifying a pattern.",
+            ours: "First paragraph explains the setup carefully. A brand new sentence appears here with plenty of extra words to say. We destructure the reference from the value, which we can do by specifying a pattern.",
+            theirs: "First paragraph explains the setup carefully. We destructure the reference from the value, which we can do by specifying a pattern.",
+            expect: Expect::EscalatesCandidateFix(
+                "both sides carry the identical fix; one side's nearby insertion coalesces into the same edit run, hiding the convergence — finer run splitting should compose this to insertion + Both-fix",
+            ),
+        },
     ]
 }
 

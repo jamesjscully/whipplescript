@@ -224,12 +224,26 @@ Per-heading `· vN` tags below restate this at each phase.
       verb with transient conflicts, `merge_preview`, region-level
       resolution memory — exact triple both orientations, live-only,
       auto-apply, `resolved` provenance; partial-memory-never-fakes-
-      clean pinned in the model's memory tier). STILL OPEN, deferred
-      by design: move detection (needs its own design pass — weakens
-      never-fabricate to atom level; corpus-gated), corpus mining +
-      agent red-team (candidate gauge/mark campaign; dials ratchet
-      only on corpus evidence), and the gaugedesk fold UI consumer
-      (SUB-6 there, gated on the whip pin repoint). CONVERGENCE PORT
+      clean pinned in the model's memory tier). CORPUS MINING RUN 1 +
+      RED-TEAM COMPLETE 2026-07-11: scripts/mine-merge-corpus.py +
+      examples/text_merge_eval.rs scored 341 real human-admitted .md
+      merges (Jack's repos + rust-lang/book) — ZERO bad merges (all 8
+      clean-but-divergent cases hand-verified as human editorial
+      choices or pure re-wrap), 246 composed byte-identical to the
+      human result, and vs git line-merge: composes 13 of git's 99
+      conflicts (7 byte-identical to the human's hand resolution)
+      while over-escalating exactly 1 case git handled. Evidence
+      ratcheted the proximity dial (spec §7.3): a paragraph break in
+      the gap is semantic distance (spurious escalations 5→1; every
+      freed case composes byte-identical to the human), guarded by a
+      red-team pin (a DELETED blank line is not distance). Two mined
+      modes joined the registry: paragraph-boundary-adjacency
+      (Composes) and convergent-fix-near-insertion
+      (EscalatesCandidateFix, aligner-tier). MOVE DETECTION CLOSED BY
+      EVIDENCE (spec §11): interior-edit shape already composes via
+      §7.2; zero genuine boundary-shape escalations in the corpus —
+      the design pass stays unwritten until larger-scale mining
+      surfaces real demand. CONVERGENCE PORT
       LANDED 2026-07-11: gaugedesk dropped its standalone
       whipplescript-workspace mirror crate and rides WorkspaceVcs
       end-to-end (worktrees via materialize/import-back with persisted

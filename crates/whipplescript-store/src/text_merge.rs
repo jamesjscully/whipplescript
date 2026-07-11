@@ -554,15 +554,31 @@ pub fn text_merge(
     let theirs_script = build_script(base, &base_tokens, theirs, &theirs_tokens, config);
 
     // Word-token prefix counts for the proximity gap (Space/Other tokens
-    // provide no separation — spec §7.3).
+    // provide no separation — spec §7.3) and paragraph-break prefix
+    // counts: a blank line IS semantic separation. Ratcheted on corpus
+    // evidence (2026-07-11, 341 mined human merges): edits on adjacent
+    // lines across a paragraph/code-fence boundary carry zero Word tokens
+    // between them and escalated spuriously (3 of the 5 escalations git
+    // composed cleanly); a gap containing a paragraph break now satisfies
+    // the dial outright. Relaxation-only and inside the certified layer's
+    // envelope: overlap/point/double-insertion rules are untouched.
     let mut word_prefix = Vec::with_capacity(base_tokens.len() + 1);
+    let mut paragraph_prefix = Vec::with_capacity(base_tokens.len() + 1);
     word_prefix.push(0usize);
+    paragraph_prefix.push(0usize);
     for token in &base_tokens {
         let last = *word_prefix.last().expect("non-empty");
         word_prefix.push(last + usize::from(token.class == TokenClass::Word));
+        let breaks = *paragraph_prefix.last().expect("non-empty");
+        let is_break = token.class == TokenClass::Space
+            && base[token.start..token.end].matches('\n').count() >= 2;
+        paragraph_prefix.push(breaks + usize::from(is_break));
     }
     let gap_words = |left_end: usize, right_start: usize| -> usize {
         word_prefix[right_start.max(left_end)] - word_prefix[left_end]
+    };
+    let gap_has_paragraph_break = |left_end: usize, right_start: usize| -> bool {
+        paragraph_prefix[right_start.max(left_end)] > paragraph_prefix[left_end]
     };
 
     // Convergent pairs collapse to Both items; the rest stay one-sided.
@@ -635,6 +651,9 @@ pub fn text_merge(
             return true;
         }
         if second.base_start >= first.base_end {
+            if gap_has_paragraph_break(first.base_end, second.base_start) {
+                return false; // a blank line is semantic distance
+            }
             return gap_words(first.base_end, second.base_start) < config.proximity_gap;
         }
         false
@@ -968,6 +987,34 @@ mod tests {
             },
         );
         assert_eq!(merged_text(&loose), "ALPHA beta GAMMA delta");
+    }
+
+    /// A paragraph break is semantic distance (corpus ratchet 2026-07-11):
+    /// cross-side edits with zero words between them COMPOSE when a blank
+    /// line separates them, and still escalate when only a single newline
+    /// does.
+    #[test]
+    fn paragraph_break_satisfies_the_proximity_dial() {
+        let base = "alpha beta gamma.\n\ndelta epsilon zeta.";
+        let ours = "alpha beta GAMMA.\n\ndelta epsilon zeta.";
+        let theirs = "alpha beta gamma.\n\nDELTA epsilon zeta.";
+        let across = merge(base, ours, theirs);
+        assert_eq!(
+            merged_text(&across),
+            "alpha beta GAMMA.\n\nDELTA epsilon zeta.",
+            "adjacent edits across a blank line compose: {across:?}"
+        );
+        // The same adjacency inside ONE paragraph still asks.
+        let single = "alpha beta gamma.\ndelta epsilon zeta.";
+        let near = merge(
+            single,
+            "alpha beta GAMMA.\ndelta epsilon zeta.",
+            "alpha beta gamma.\nDELTA epsilon zeta.",
+        );
+        assert!(
+            matches!(near, TextMergeOutcome::Conflicted { .. }),
+            "a single newline is not semantic distance: {near:?}"
+        );
     }
 
     /// Convergent edits are one change (spec §7.1), tagged Both.

@@ -190,9 +190,20 @@ same-point insertion pairs keep their conflict rules unchanged.
 Two ops from opposite sides conflict if their base ranges overlap, OR
 if the base tokens strictly between them contain fewer than `d` **Word**
 tokens (Space/Other tokens provide no separation). Default `d = 2`,
-override `WHIPPLESCRIPT_TEXT_MERGE_GAP`. Exception: pure insertion
-pairs at distinct points (§7.2) — atomicity makes them interleave-safe
-at any distance.
+override `WHIPPLESCRIPT_TEXT_MERGE_GAP`. Two exceptions:
+
+- pure insertion pairs at distinct points (§7.2) — atomicity makes them
+  interleave-safe at any distance;
+- a **paragraph break** in the gap (a Space token carrying two or more
+  newlines) satisfies the dial outright — a blank line is semantic
+  distance even when zero words separate the edits. *(Ratcheted
+  2026-07-11 on mined evidence: 341 human-admitted `.md` merges from
+  real git histories; the last-sentence-of-one-paragraph vs
+  first-sentence-of-the-next shape accounted for 3 of the 5 escalations
+  git composed cleanly, and every case freed by this rule composes
+  byte-identical to the human's admitted result. Relaxation-only:
+  overlap/point/double-insertion rules are untouched, so the certified
+  layer's envelope holds.)*
 
 This is the guard against the word-atom hazard: two rewrites of the
 same sentence that happen to slice into technically-disjoint ranges by
@@ -292,6 +303,32 @@ replayable fixture. Candidate first campaign for gauge/mark when it
 exists. The proximity dial `d` and anchor parameters are the tunables;
 loosening them requires corpus evidence.
 
+**First mining run (2026-07-11).** Harness: `scripts/mine-merge-corpus.py`
+(three-way `.md`/`.txt` cases from real git merge commits, scored
+against the HUMAN-ADMITTED merge result) +
+`examples/text_merge_eval.rs` (whipplescript-store). Corpus: 341
+modify/modify cases — 11 from Jack's own repos (whipplescript,
+gaugedesk, Descender), 330 from rust-lang/book. Results after the
+paragraph-break ratchet (§7.3):
+
+- **composed-exact 246 (72%)** — byte-identical to what the human
+  admitted;
+- **composed-divergent 8 (2.3%)** — every one hand-inspected, **zero
+  bad merges**: in each the engine preserved BOTH sides' edits and the
+  human made an editorial choice beyond the merge (dropped one side's
+  addition, rewrote during hand-resolution, or carried extra edits in
+  the merge commit) or differed only in line-wrap;
+- **escalated 87 (26%)** — vs git line-merge: the engine composes 13 of
+  git's 99 conflicts (7 byte-identical to the human's eventual hand
+  resolution) while escalating only 1 case git handled cleanly
+  (interleaved edits inside one section — asking there is defensible).
+
+Two mined modes joined the registry: `paragraph-boundary-adjacency`
+(now Composes, the §7.3 ratchet) and `convergent-fix-near-insertion`
+(EscalatesCandidateFix: an identical both-sides fix hidden by one
+side's nearby insertion coalescing into the same edit run — aligner-
+tier, over-escalation only).
+
 ## 11. v1 scope and deferrals
 
 In: everything above. Out (deferred, compatible by construction):
@@ -304,7 +341,15 @@ In: everything above. Out (deferred, compatible by construction):
   piece/provenance structure, so it takes its own design pass + model
   extension (move-vs-move, move-vs-delete, edit-straddling-a-move
   semantics) before any code. The evaluation corpus (§10) is its
-  acceptance gate.
+  acceptance gate. **CLOSED BY EVIDENCE 2026-07-11:** the corpus gate
+  ran and found no demand — the interior-edit move shape already
+  composes to the ideal result via the §7.2 insertion exemption
+  (registry: move-and-edit), and the first mining run (341 real human
+  merges, §10) contains ZERO escalations with a genuinely
+  moved-and-edited block (the one move-shaped hit was a whole-chapter
+  rewrite where escalating was plainly right). The design pass stays
+  unwritten until mining at larger scale surfaces real boundary-shape
+  cases; the never-fabricate weakening is not paid for speculatively.
 - **Deeper anchor trees** for very large documents (two-level covers
   the 8 MiB cap comfortably).
 - **Region-level resolution memory + editor save flow** — whip half
