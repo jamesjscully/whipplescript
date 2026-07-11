@@ -767,7 +767,22 @@ pub(crate) const CONTROL_PLANE_SECRET_ENV: &[&str] = &[
 /// Remove whip's control-plane secrets from a child command's inherited
 /// environment. Applied to every provider subprocess spawn.
 pub(crate) fn strip_control_plane_secrets(command: &mut Command) {
-    for name in CONTROL_PLANE_SECRET_ENV {
+    strip_env_vars(command, CONTROL_PLANE_SECRET_ENV);
+}
+
+/// Provider API-credential env vars, grouped by family. A provider sidecar
+/// only needs its OWN family's credentials, so — least privilege — each spawn
+/// strips the OTHER families' keys: the Claude sidecar has no business seeing
+/// an OpenAI key, nor the codex app-server an Anthropic key. (The child's own
+/// family is left inherited; it may read it directly.)
+#[cfg(feature = "codex")]
+pub(crate) const ANTHROPIC_CREDENTIAL_ENV: &[&str] = &["ANTHROPIC_API_KEY"];
+#[cfg(feature = "claude")]
+pub(crate) const OPENAI_CREDENTIAL_ENV: &[&str] = &["OPENAI_API_KEY"];
+
+/// Remove the named env vars from a child command's inherited environment.
+pub(crate) fn strip_env_vars(command: &mut Command, names: &[&str]) {
+    for name in names {
         command.env_remove(name);
     }
 }
@@ -900,6 +915,32 @@ mod tests {
         );
         std::env::remove_var("WHIPPLESCRIPT_GOV_ADMIN");
         std::env::remove_var("WHIP_KEEP_PROBE_ENVVAR");
+    }
+
+    #[test]
+    fn strip_env_vars_removes_only_named_keys() {
+        // Per-provider scoping: a spawn strips the OTHER family's key while
+        // leaving unrelated env intact. Uses test-unique names (race-safe).
+        std::env::set_var("WHIP_PROBE_FOREIGN_KEY", "foreign");
+        std::env::set_var("WHIP_PROBE_OWN_KEY", "own");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo FOREIGN=${WHIP_PROBE_FOREIGN_KEY:-absent} OWN=${WHIP_PROBE_OWN_KEY:-absent}")
+            .stdout(Stdio::piped());
+        strip_env_vars(&mut command, &["WHIP_PROBE_FOREIGN_KEY"]);
+        let output = command.output().expect("child runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("FOREIGN=absent"),
+            "the named key must be stripped: {stdout}"
+        );
+        assert!(
+            stdout.contains("OWN=own"),
+            "an unnamed key must be retained: {stdout}"
+        );
+        std::env::remove_var("WHIP_PROBE_FOREIGN_KEY");
+        std::env::remove_var("WHIP_PROBE_OWN_KEY");
     }
 
     #[test]

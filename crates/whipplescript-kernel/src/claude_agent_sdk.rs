@@ -955,6 +955,8 @@ impl StdioClaudeAgentSdkTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         crate::harness::strip_control_plane_secrets(&mut builder);
+        // The Claude sidecar is the Anthropic-family backend; strip OpenAI keys.
+        crate::harness::strip_env_vars(&mut builder, crate::harness::OPENAI_CREDENTIAL_ENV);
         let mut child = builder.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| {
             ClaudeAgentSdkError::Protocol("Claude sidecar did not expose stdin".to_owned())

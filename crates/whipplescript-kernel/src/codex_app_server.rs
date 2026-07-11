@@ -222,6 +222,8 @@ impl StdioCodexAppServerTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         crate::harness::strip_control_plane_secrets(&mut builder);
+        // Codex is the OpenAI-family backend; it never needs an Anthropic key.
+        crate::harness::strip_env_vars(&mut builder, crate::harness::ANTHROPIC_CREDENTIAL_ENV);
         let mut child = builder.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| {
             CodexAppServerError::Protocol("app-server process did not expose stdin".to_owned())

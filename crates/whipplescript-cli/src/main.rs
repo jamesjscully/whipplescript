@@ -19884,6 +19884,29 @@ fn private_or_local_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// A ureq resolver that screens DNS at CONNECTION time: it resolves `netloc`
+/// and returns the addresses only if every one is public, else errors. Because
+/// this is the same resolution ureq then connects to, it closes the DNS-rebind
+/// gap a separate up-front check leaves open (a name that passed validation but
+/// re-resolves to an internal address at connect time). Used for HTTP-source
+/// ingress; the up-front `http_source_url_policy_error` stays as a fast reject.
+fn screen_public_addrs(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let addresses: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
+    if addresses.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "`{netloc}` did not resolve to any address"
+        )));
+    }
+    if let Some(internal) = addresses.iter().find(|addr| private_or_local_ip(addr.ip())) {
+        return Err(std::io::Error::other(format!(
+            "`{netloc}` resolves to a non-public address ({})",
+            internal.ip()
+        )));
+    }
+    Ok(addresses)
+}
+
 fn private_or_local_ipv4(ip: Ipv4Addr) -> bool {
     let [a, b, _, _] = ip.octets();
     a == 0
@@ -19942,6 +19965,9 @@ fn resolve_due_http_sources(
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(5))
             .user_agent("whipplescript-ingress")
+            // Screen at connection time so a rebinding DNS name cannot swing to
+            // an internal address between the policy check and the connect.
+            .resolver(screen_public_addrs)
             .build();
         let body = match agent.get(url).call() {
             Ok(response) => match response.into_string() {
@@ -38713,6 +38739,19 @@ mod tests {
             http_source_url_policy_error("http://nonexistent-host.invalid/x").is_some(),
             "an unresolvable DNS name must be refused, not passed through"
         );
+    }
+
+    #[test]
+    fn screen_public_addrs_rejects_internal_resolutions() {
+        // Literal addresses parse without DNS, so this is deterministic. The
+        // connection-time resolver refuses any netloc that resolves to an
+        // internal target, closing the DNS-rebind gap for HTTP-source ingress.
+        assert!(screen_public_addrs("127.0.0.1:80").is_err());
+        assert!(screen_public_addrs("169.254.169.254:80").is_err());
+        assert!(screen_public_addrs("10.0.0.5:443").is_err());
+        assert!(screen_public_addrs("[::1]:80").is_err());
+        // A public literal address resolves through.
+        assert!(screen_public_addrs("1.1.1.1:443").is_ok());
     }
 
     #[cfg(feature = "claude")]
