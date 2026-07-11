@@ -231,15 +231,17 @@ of even the *merged* spans). JSON serialization is part of the surface
 
 ## 8. Wire-in
 
-At the `MergeOutcome::Conflicted` consumers (vcs.rs merge paths), each
-eligible (§3) `PathConflict` is refined: fetch the three bodies, run
-`text_merge`. `Clean` folds the merged body into the manifest (new
-content id minted; provenance recorded on the cut alongside the
-manifest change). `Conflicted` keeps the path in the conflict list,
-now carrying the region detail for the conflict surface / resolution
-memory. The refinement is a pure function per path; the plan/apply
-split in `reconcile.rs` is preserved (planning stays pure over
-manifests + a body-fetch callback).
+Text merge is the third stage of the existing conflict-refinement
+pipeline (`refine_source_conflicts` in vcs.rs, shared by rebase-down
+and merge-up): resolution memory first (a human resolution beats the
+algorithm), certified `.whip` declaration merge second, token-level
+text merge last, for eligible (§3) paths. `Clean` folds the merged
+body into the manifest (new content id minted). `Conflicted` keeps the
+path escalating exactly as today — and because the merge is a
+deterministic pure function of the content-addressed (base, ours,
+theirs) triple the conflict row already carries, the region detail is
+recomputable on demand by any consumer (editor fold, merge preview)
+with no conflict-schema change.
 
 ## 9. Formal model
 

@@ -617,17 +617,25 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         }
     }
 
-    /// Conflict refinement, two stages. First the RESOLUTION MEMORY
+    /// Conflict refinement, three stages. First the RESOLUTION MEMORY
     /// (resolution-memory.maude): a conflict whose content-addressed
     /// triple was resolved before applies the stored resolution — the
     /// daemon's auto-propagation to descendants; rerere as ordinary
     /// workspace-plane knowledge, exact triple match only. Then
     /// source-aware refinement: for each conflicted `.whip` path with
     /// both sides present, ask the installed merger for a certified
-    /// declaration-granularity merge. Remembered/certified content is
-    /// stored and folded, everything else stays an honest conflict
-    /// (fail closed: no merger, delete-vs-modify, or non-source paths
-    /// never refine).
+    /// declaration-granularity merge. Last the token-level TEXT MERGE
+    /// (spec/text-merge-spec.md; text-merge-compose.maude) for
+    /// modify/modify on non-source text paths — word-atom composition
+    /// under the certified never-fabricate/proximity rules; a clean
+    /// composition folds, anything conflicted stays escalated (the
+    /// region detail is deterministically recomputable from the
+    /// content-addressed triple, so the conflict row needs no new
+    /// fields). Remembered/certified/composed content is stored and
+    /// folded, everything else stays an honest conflict (fail closed:
+    /// delete-vs-modify, add/add, oversized, or erased bodies never
+    /// refine; `.whip` sources never reach the text tier — the
+    /// merge-slice bite is untouched).
     fn refine_source_conflicts(
         &self,
         conflicts: Vec<PathConflict>,
@@ -653,40 +661,80 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             }
             unremembered.push(conflict);
         }
-        let Some(merger) = self.source_merger.as_deref() else {
-            return Ok((resolved, unremembered));
-        };
         let mut remaining = Vec::new();
-        for conflict in unremembered {
-            let refinable = conflict.path.ends_with(".whip")
+        if let Some(merger) = self.source_merger.as_deref() {
+            for conflict in unremembered {
+                let refinable = conflict.path.ends_with(".whip")
+                    && conflict.ours.is_some()
+                    && conflict.theirs.is_some();
+                if !refinable {
+                    remaining.push(conflict);
+                    continue;
+                }
+                let base_body = match conflict.base.as_deref() {
+                    Some(hash) => self.content.get(hash)?,
+                    None => None,
+                };
+                let (Some(ours_body), Some(theirs_body)) = (
+                    self.content
+                        .get(conflict.ours.as_deref().expect("present"))?,
+                    self.content
+                        .get(conflict.theirs.as_deref().expect("present"))?,
+                ) else {
+                    remaining.push(conflict);
+                    continue;
+                };
+                match merger.merge_source(base_body.as_deref(), &ours_body, &theirs_body) {
+                    SourceMergeVerdict::Certified { merged } => {
+                        let hash = self.content.put(&merged)?;
+                        resolved.insert(conflict.path.clone(), hash);
+                    }
+                    SourceMergeVerdict::Conflict => remaining.push(conflict),
+                }
+            }
+        } else {
+            remaining = unremembered;
+        }
+        let text_config = crate::text_merge::TextMergeConfig::from_env();
+        let mut still_conflicted = Vec::new();
+        for conflict in remaining {
+            // Eligibility (spec section 3): modify/modify with a present
+            // base, non-source path; deletes and add/add stay escalated.
+            let refinable = !conflict.path.ends_with(".whip")
+                && conflict.base.is_some()
                 && conflict.ours.is_some()
                 && conflict.theirs.is_some();
             if !refinable {
-                remaining.push(conflict);
+                still_conflicted.push(conflict);
                 continue;
             }
-            let base_body = match conflict.base.as_deref() {
-                Some(hash) => self.content.get(hash)?,
-                None => None,
-            };
-            let (Some(ours_body), Some(theirs_body)) = (
+            let (Some(base_body), Some(ours_body), Some(theirs_body)) = (
+                self.content
+                    .get(conflict.base.as_deref().expect("present"))?,
                 self.content
                     .get(conflict.ours.as_deref().expect("present"))?,
                 self.content
                     .get(conflict.theirs.as_deref().expect("present"))?,
             ) else {
-                remaining.push(conflict);
+                still_conflicted.push(conflict);
                 continue;
             };
-            match merger.merge_source(base_body.as_deref(), &ours_body, &theirs_body) {
-                SourceMergeVerdict::Certified { merged } => {
+            if !text_config.within_size(&base_body, &ours_body, &theirs_body) {
+                still_conflicted.push(conflict);
+                continue;
+            }
+            match crate::text_merge::text_merge(&base_body, &ours_body, &theirs_body, &text_config)
+            {
+                crate::text_merge::TextMergeOutcome::Clean { merged, .. } => {
                     let hash = self.content.put(&merged)?;
                     resolved.insert(conflict.path.clone(), hash);
                 }
-                SourceMergeVerdict::Conflict => remaining.push(conflict),
+                crate::text_merge::TextMergeOutcome::Conflicted { .. } => {
+                    still_conflicted.push(conflict)
+                }
             }
         }
-        Ok((resolved, remaining))
+        Ok((resolved, still_conflicted))
     }
 
     /// Record the CURRENT three-way's residue as the branch's open
@@ -2782,6 +2830,125 @@ mod tests {
         assert_eq!(
             vcs.read(MAINLINE_BRANCH_ID, "b.md").expect("read"),
             Some("B1".to_owned())
+        );
+    }
+
+    /// Token-level text merge (spec/text-merge-spec.md): disjoint word
+    /// edits to the SAME file — even the same sentence — compose during
+    /// the merge instead of escalating; both sides' words land on
+    /// mainline. The case the path-level merge could never grant.
+    #[test]
+    fn disjoint_text_edits_to_one_file_compose_on_merge() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        let base = "The quick brown fox jumps over the lazy dog tonight.";
+        vcs.write(MAINLINE_BRANCH_ID, "notes/a.md", Some(base), "cut_m1", "t1")
+            .expect("write");
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("create");
+        vcs.write(
+            "draft_a",
+            "notes/a.md",
+            Some("The swift brown fox jumps over the lazy dog tonight."),
+            "cut_d1",
+            "t3",
+        )
+        .expect("write");
+        // Mainline advances on the SAME path after the branch point.
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "notes/a.md",
+            Some("The quick brown fox jumps over the lazy cat tonight."),
+            "cut_m2",
+            "t4",
+        )
+        .expect("write");
+        assert!(matches!(
+            vcs.merge("draft_a", "cut_merge_1", "t5").expect("merge"),
+            VcsMergeOutcome::Adopted { .. }
+        ));
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "notes/a.md").expect("read"),
+            Some("The swift brown fox jumps over the lazy cat tonight.".to_owned())
+        );
+    }
+
+    /// The text tier stays honest: overlapping rewrites of the same words
+    /// still escalate, and `.whip` sources never reach it (fail closed
+    /// without a source merger installed) — the merge-slice bite is
+    /// untouched.
+    #[test]
+    fn overlapping_text_edits_and_whip_sources_still_escalate() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        let prose = "The quick brown fox jumps over the lazy dog.";
+        // Would text-compose cleanly, but lives in a .whip source path.
+        let source = "agent triage does classify tickets by urgency every hour.";
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "notes/a.md",
+            Some(prose),
+            "cut_m1",
+            "t1",
+        )
+        .expect("write");
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "prog.whip",
+            Some(source),
+            "cut_m2",
+            "t2",
+        )
+        .expect("write");
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t3")
+            .expect("create");
+        vcs.write(
+            "draft_a",
+            "notes/a.md",
+            Some("The nimble crimson fox jumps over the lazy dog."),
+            "cut_d1",
+            "t4",
+        )
+        .expect("write");
+        vcs.write(
+            "draft_a",
+            "prog.whip",
+            Some("agent sorting does classify tickets by urgency every hour."),
+            "cut_d2",
+            "t5",
+        )
+        .expect("write");
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "notes/a.md",
+            Some("The slow grey fox jumps over the lazy dog."),
+            "cut_m3",
+            "t6",
+        )
+        .expect("write");
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "prog.whip",
+            Some("agent triage does classify tickets by severity every hour."),
+            "cut_m4",
+            "t7",
+        )
+        .expect("write");
+        let outcome = vcs.merge("draft_a", "cut_merge_1", "t8").expect("merge");
+        let VcsMergeOutcome::Conflicted { conflicts } = outcome else {
+            panic!("expected escalation, got {outcome:?}");
+        };
+        let paths: Vec<&str> = conflicts
+            .iter()
+            .map(|conflict| conflict.path.as_str())
+            .collect();
+        assert!(
+            paths.contains(&"notes/a.md"),
+            "overlap escalates: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"prog.whip"),
+            ".whip never text-merges: {paths:?}"
         );
     }
 
