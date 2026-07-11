@@ -1935,8 +1935,47 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 bundle.format
             )));
         }
+        // A bundle is a fully external, serde-deserialized document
+        // (`whip branch import`). Before persisting ANY of its state,
+        // reject manifest keys that would escape the workspace root when
+        // later materialized, and verify that every blob's content id is
+        // the true content-address of the bytes it carries — otherwise a
+        // hostile bundle could bind a content id (a hash callers trust to
+        // commit to its bytes) to attacker-chosen content, forging
+        // content-addressed data or resurrecting an erased blob.
+        for key in bundle.manifest.keys() {
+            crate::materialize::validate_manifest_key(key)?;
+        }
         for blob in &bundle.blobs {
             if let Some(chunk_ids) = &blob.chunk_ids {
+                // A chunk ROOT id is the content hash over the ordered
+                // child chunk ids (their hex bytes concatenated); verify
+                // the claimed root id re-derives from the chunk list so an
+                // import cannot bind an arbitrary id to a forged structure.
+                let mut id_bytes: Vec<u8> = Vec::new();
+                for chunk_id in chunk_ids {
+                    id_bytes.extend_from_slice(chunk_id.as_bytes());
+                }
+                let derived = crate::chunking::content_hash_hex(&id_bytes);
+                if derived != blob.id {
+                    return Err(StoreError::Conflict(format!(
+                        "bundle chunk-root id `{}` does not match its chunk list \
+                         (derived `{derived}`); refusing forged content address",
+                        blob.id
+                    )));
+                }
+                // A chunk root must never resurrect an id the local store
+                // has erased (tombstone honesty): the payload is gone by
+                // decision and an import must not silently rebind it.
+                if matches!(
+                    self.content.status(&blob.id)?,
+                    crate::content::BlobStatus::Erased { .. }
+                ) {
+                    return Err(StoreError::Conflict(format!(
+                        "bundle re-binds erased content `{}`; refusing resurrection",
+                        blob.id
+                    )));
+                }
                 // A chunk root: re-link the structure without
                 // re-chunking; an erased root lands as the tombstone it
                 // is (identity, no payload).
@@ -1948,7 +1987,25 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 continue;
             }
             if let Some(body) = &blob.body {
-                self.content.put(body)?;
+                if matches!(
+                    self.content.status(&blob.id)?,
+                    crate::content::BlobStatus::Erased { .. }
+                ) {
+                    return Err(StoreError::Conflict(format!(
+                        "bundle re-binds erased content `{}`; refusing resurrection",
+                        blob.id
+                    )));
+                }
+                // `put` stores under the true content hash of `body`;
+                // assert the bundle's claimed id equals it so a mismatched
+                // (forged) id is refused rather than silently ignored.
+                let stored = self.content.put(body)?;
+                if stored != blob.id {
+                    return Err(StoreError::Conflict(format!(
+                        "bundle blob id `{}` does not match its content (hashes to `{stored}`)",
+                        blob.id
+                    )));
+                }
             } else if blob.omitted {
                 // The sender skipped this unit because we declared we
                 // have it — verify, fail honest if the negotiation lied.

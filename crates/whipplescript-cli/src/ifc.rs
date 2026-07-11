@@ -1810,7 +1810,45 @@ pub fn check_with_envelope_imports(
             };
             for tool_name in &agent.tools {
                 if let Some(tool) = imports.iter().find(|t| &t.workflow == tool_name) {
-                    tool_result_reads.extend(result_dependency_reads(tool));
+                    let reads = result_dependency_reads(tool);
+                    // DR-0027 provider-as-principal: an imported tool's
+                    // result is streamed back to the model at runtime
+                    // (host_runtime `ChatMessage::ToolResults` re-enters the
+                    // turn), so a tool that reads confidential data, called
+                    // by an agent whose provider is not cleared for it,
+                    // egresses that data to the uncleared model exactly like
+                    // the tell's own read grants. The provider-egress check
+                    // in the effects loop only inspects `effect.access_grants`
+                    // and never sees these tool result reads, so check them
+                    // against the provider here.
+                    if let Some(provider) = agent.provider.as_deref() {
+                        for resource in &reads {
+                            if envelope.leaks(resource, provider) {
+                                diagnostics.push(Diagnostic {
+                                    span: effect.span,
+                                    message: format!(
+                                        "provider-egress violation in rule `{rule}`: agent \
+                                         `{agent}` may call tool `{tool}` which reads `{resource}` \
+                                         (readable by {rr}), but the agent's provider `{provider}` \
+                                         (clearance {pr}) is not cleared, so the tool result \
+                                         egresses to an uncleared model",
+                                        rule = rule.name,
+                                        agent = agent_name,
+                                        tool = tool_name,
+                                        rr = envelope.reader_label(resource),
+                                        pr = envelope.reader_label(provider),
+                                    ),
+                                    suggestion: Some(format!(
+                                        "bind `{agent_name}` to a provider cleared for \
+                                         `{resource}`, or declassify before the tool result \
+                                         reaches the turn"
+                                    )),
+                                    related: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                    tool_result_reads.extend(reads);
                 }
             }
         }
@@ -3480,6 +3518,98 @@ rule use
         assert!(!check_with_envelope_imports(&consumer, &verified, &[])
             .iter()
             .any(|d| d.message.contains("secret")));
+    }
+
+    #[test]
+    fn imported_tool_result_egress_to_uncleared_provider_is_flagged() {
+        // DR-0027 provider-as-principal: a tool that reads confidential data
+        // is called by an agent whose model provider is NOT cleared for it.
+        // The tool's result streams back to the model at runtime, so the
+        // confidential data egresses to the uncleared provider. The turn
+        // itself completes only a literal, so the earlier access_grants-based
+        // provider check never sees the tool read — this new check must.
+        let tool = compile_program(
+            r#"@tool
+workflow Fetcher {
+  input request Req
+  output result R
+  class Req { id string }
+  class R { data string }
+  file store secret { root "./secret"  allow read ["**"] }
+  rule fetch
+    when Req as request
+  => {
+    read text from secret at "in.txt" as loaded
+    after loaded succeeds as v {
+      complete result { data v.content }
+    }
+  }
+}
+"#,
+        )
+        .ir
+        .expect("tool compiles");
+        let consumer = compile_program(
+            r#"@service
+workflow Consumer
+
+output result R2
+class R2 { ok bool }
+class Req { id string  status "open" }
+
+agent worker { provider fixture  profile "p"  capacity 1  tools [Fetcher] }
+
+table seed as Req [ { id "T1"  status "open" } ]
+
+rule use
+  when Req as request where request.status == "open"
+  when worker is available
+=> {
+  tell worker as turn "go"
+  after turn succeeds as outcome {
+    complete result { ok true }
+  }
+}
+"#,
+        )
+        .ir
+        .expect("consumer compiles");
+
+        // Provider UNCLEARED (public) for the Operator-labeled secret: the
+        // tool-result egress to the model must be flagged by the new check.
+        let uncleared = VerifiedEnvelope::for_test(
+            Envelope::from_dsl(
+                "grant file_store secret -> file:/srv/secret readable by Operator\n\
+                 grant provider fixture -> selfhost:llama readable by public\n",
+            )
+            .expect("valid"),
+        );
+        let flagged =
+            check_with_envelope_imports(&consumer, &uncleared, std::slice::from_ref(&tool));
+        assert!(
+            flagged
+                .iter()
+                .any(|d| d.message.contains("may call tool `Fetcher`")
+                    && d.message.contains("uncleared model")),
+            "an uncleared provider receiving a confidential tool result must be flagged: {:?}",
+            flagged.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // Provider CLEARED (Operator): the tool-result egress is legitimate,
+        // so the new check must stay silent (no false positive).
+        let cleared = VerifiedEnvelope::for_test(
+            Envelope::from_dsl(
+                "grant file_store secret -> file:/srv/secret readable by Operator\n\
+                 grant provider fixture -> selfhost:llama readable by Operator\n",
+            )
+            .expect("valid"),
+        );
+        assert!(
+            !check_with_envelope_imports(&consumer, &cleared, std::slice::from_ref(&tool))
+                .iter()
+                .any(|d| d.message.contains("may call tool")),
+            "a cleared provider must not raise the tool-result egress diagnostic"
+        );
     }
 
     #[test]

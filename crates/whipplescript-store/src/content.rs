@@ -19,6 +19,14 @@ use std::path::Path;
 #[cfg(feature = "native")]
 use rusqlite::{params, Connection, OptionalExtension};
 
+/// Upper bound on the buffer pre-allocated when reassembling a chunk root.
+/// A root's stored `byte_len` is attacker-controlled through bundle import
+/// and is not committed to by the verified root id, so it is never trusted
+/// as an allocation size — the reassembled string still grows to fit the
+/// real (stored, hence bounded) chunk bytes.
+#[cfg(feature = "native")]
+const MAX_REASSEMBLE_PREALLOC: usize = 8 * 1024 * 1024;
+
 /// What the store knows about a content id: alive with payload, erased
 /// under the honesty downgrade (identity + size retained, payload gone),
 /// or never seen.
@@ -162,6 +170,21 @@ impl ContentBlobs for ContentStore {
         if let Some(body) = self.read_packed(id)? {
             return Ok(Some(body));
         }
+        // Erasure honesty: an id tombstoned in `content_erasures` is gone
+        // by decision. `status` short-circuits on this table, so `get`
+        // must too — otherwise a (forged) chunk root sharing the id would
+        // resurrect erased bytes here while `status` still reports Erased.
+        let tombstoned: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT byte_len FROM content_erasures WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if tombstoned.is_some() {
+            return Ok(None);
+        }
         // Chunk-root reassembly (each piece resolves through rows or
         // packs; chunks are never themselves roots, so this is depth 1).
         let Some(info) = self.chunk_root_info(id)? else {
@@ -170,7 +193,13 @@ impl ContentBlobs for ContentStore {
         if info.erased {
             return Ok(None);
         }
-        let mut body = String::with_capacity(info.byte_len as usize);
+        // `byte_len` is a stored field and, for a chunk root arriving through
+        // bundle import, is attacker-controlled and unrelated to the verified
+        // root id (which commits only to the chunk-id list). Never pre-allocate
+        // the claimed size: cap the reservation so a forged multi-GiB `byte_len`
+        // cannot OOM the process. The string still grows to hold the real chunk
+        // bytes, which are bounded by what is actually stored.
+        let mut body = String::with_capacity((info.byte_len as usize).min(MAX_REASSEMBLE_PREALLOC));
         for chunk_id in &info.chunk_ids {
             let Some(piece) = self.get(chunk_id)? else {
                 return Ok(None);

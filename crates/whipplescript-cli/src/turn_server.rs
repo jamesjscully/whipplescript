@@ -256,6 +256,31 @@ fn pump_frames(mut stream: TcpStream, receiver: Receiver<String>) -> std::io::Re
 
 /// Execute the turn synchronously on this thread (the container's whole
 /// reason to exist), publishing progress after each checkpoint.
+/// Map a client-supplied `turn_id` (arrives over the wire) to a SAFE,
+/// single-segment scratch directory name. Using the raw id verbatim as a
+/// path lets a value like `../../etc/cron.d/x` escape `temp_dir` and give a
+/// turn arbitrary read/write outside its sandbox. Keep only characters that
+/// cannot form a path separator or a `..` traversal; replace everything else
+/// with `_`, and append a deterministic digest of the raw id so distinct
+/// turns never collide onto one scratch after sanitization.
+fn scratch_dir_name(turn_id: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let safe: String = turn_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // `DefaultHasher::new()` uses fixed keys, so this is stable across runs.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    turn_id.hash(&mut hasher);
+    format!("whip-turn-{safe}-{:016x}", hasher.finish())
+}
+
 fn run_turn(turn_id: &str, request: &Value) -> BrokeredTurnOutcome {
     let system = request
         .get("system")
@@ -273,7 +298,7 @@ fn run_turn(turn_id: &str, request: &Value) -> BrokeredTurnOutcome {
         .unwrap_or(30) as usize;
     let use_file_tools = request.get("tools").and_then(Value::as_str) != Some("none");
 
-    let scratch = std::env::temp_dir().join(format!("whip-turn-{turn_id}"));
+    let scratch = std::env::temp_dir().join(scratch_dir_name(turn_id));
     let _ = std::fs::create_dir_all(&scratch);
     let executor = FileToolExecutor::new(&scratch);
     let tools = if use_file_tools {
@@ -448,6 +473,36 @@ fn write_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> std::io::R
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    // A client-supplied turn_id cannot escape temp_dir: the scratch dir name
+    // is a single safe segment (no `/`, `\`, or `..`), and distinct ids never
+    // collide onto one scratch.
+    #[test]
+    fn scratch_dir_name_is_a_safe_single_segment() {
+        for evil in [
+            "../../etc/cron.d/x",
+            "..\\..\\windows",
+            "a/b/c",
+            "/absolute/path",
+            "..",
+            "",
+        ] {
+            let name = scratch_dir_name(evil);
+            assert!(name.starts_with("whip-turn-"), "prefix kept: {name}");
+            assert!(!name.contains('/'), "no path separator: {name}");
+            assert!(!name.contains('\\'), "no backslash: {name}");
+            assert!(!name.contains(".."), "no traversal: {name}");
+            // The joined path stays directly under temp_dir (single segment).
+            let joined = std::env::temp_dir().join(&name);
+            assert_eq!(
+                joined.parent(),
+                Some(std::env::temp_dir().as_path()),
+                "scratch stays directly under temp_dir: {name}"
+            );
+        }
+        // Distinct ids that sanitize to the same safe chars still differ.
+        assert_ne!(scratch_dir_name("a/b"), scratch_dir_name("a_b"));
+    }
 
     /// A minimal masked-frame WS client for the tests.
     fn client_send_text(stream: &mut TcpStream, text: &str) -> std::io::Result<()> {

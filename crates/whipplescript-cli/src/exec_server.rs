@@ -33,6 +33,23 @@ use whipplescript_kernel::exec_http::{base64_decode, sha256_hex};
 const STREAM_CAP_BYTES: usize = 512 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
+/// Cap on concurrently-handled connections. Each connection parses its
+/// request line + headers BEFORE authentication, so without a bound an
+/// unauthenticated peer could open connections faster than they complete
+/// and pin unbounded OS threads / FDs / memory (slowloris-class
+/// thread-exhaustion DoS). Accept blocks when the cap is reached.
+const MAX_CONNECTIONS: usize = 256;
+
+/// Wall-clock budget for the pre-auth read of the request line + headers.
+/// A peer that opens a connection and never completes the header block —
+/// or dribbles it a byte at a time — is dropped rather than holding a
+/// thread forever. The turn WebSocket clears this before streaming.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Cap on total header bytes accepted before the blank-line terminator,
+/// so an endless header stream cannot grow the buffer without bound.
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+
 /// Default and ceiling for the per-exec timeout.
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
@@ -116,6 +133,49 @@ fn exec_gate() -> &'static AdmissionGate {
     GATE.get_or_init(|| AdmissionGate::new(EXEC_SLOTS))
 }
 
+/// A minimal counting semaphore bounding the number of connection-handler
+/// threads alive at once (the pre-auth DoS backstop; see [MAX_CONNECTIONS]).
+/// A permit is held for the whole connection and released on drop.
+struct ConnLimiter {
+    available: std::sync::Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+impl ConnLimiter {
+    fn new(permits: usize) -> Self {
+        Self {
+            available: std::sync::Mutex::new(permits),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Block until a permit is free, then take one. The returned guard
+    /// returns the permit when dropped.
+    fn acquire(self: &std::sync::Arc<Self>) -> ConnPermit {
+        let mut available = self.available.lock().expect("conn limiter lock");
+        while *available == 0 {
+            available = self.freed.wait(available).expect("conn limiter wait");
+        }
+        *available -= 1;
+        ConnPermit {
+            limiter: std::sync::Arc::clone(self),
+        }
+    }
+}
+
+struct ConnPermit {
+    limiter: std::sync::Arc<ConnLimiter>,
+}
+
+impl Drop for ConnPermit {
+    fn drop(&mut self) {
+        let mut available = self.limiter.available.lock().expect("conn limiter lock");
+        *available += 1;
+        drop(available);
+        self.limiter.freed.notify_one();
+    }
+}
+
 /// Serve forever on `bind` (e.g. `127.0.0.1:8080`).
 pub fn serve(bind: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind)?;
@@ -128,10 +188,16 @@ pub fn serve_on(listener: TcpListener) -> std::io::Result<()> {
         "whip executor listening on {} ({EXECUTOR_PROTOCOL})",
         listener.local_addr()?
     );
+    let limiter = std::sync::Arc::new(ConnLimiter::new(MAX_CONNECTIONS));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                // Acquire BEFORE spawning: at the cap the accept loop blocks
+                // (new peers queue in the OS backlog) instead of spawning an
+                // unbounded number of handler threads.
+                let permit = limiter.acquire();
                 std::thread::spawn(move || {
+                    let _permit = permit; // released when the handler returns
                     let _ = handle_connection(stream);
                 });
             }
@@ -143,6 +209,11 @@ pub fn serve_on(listener: TcpListener) -> std::io::Result<()> {
 
 fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
     let local_addr = stream.local_addr().ok();
+    // Bound the PRE-AUTH header read: a peer that opens a connection and
+    // never finishes (or dribbles) the header block is dropped when the
+    // timeout fires instead of pinning this thread forever. The socket
+    // option is shared with the try_clone below.
+    stream.set_read_timeout(Some(HEADER_READ_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
@@ -155,9 +226,14 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
     let mut wants_upgrade = false;
     let mut authorization = None;
     let mut executor_token_header = None;
+    let mut header_bytes = request_line.len();
     loop {
         let mut line = String::new();
         reader.read_line(&mut line)?;
+        header_bytes = header_bytes.saturating_add(line.len());
+        if header_bytes > MAX_HEADER_BYTES {
+            return write_json_response(stream, 431, json!({"error": "request headers too large"}));
+        }
         let line = line.trim_end();
         if line.is_empty() {
             break;
@@ -197,6 +273,10 @@ fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
         }
         if let Some(key) = websocket_key {
             drop(reader);
+            // The turn channel is long-lived and client-paced; clear the
+            // header-phase read timeout so streaming frames don't expire
+            // mid-turn.
+            stream.set_read_timeout(None)?;
             return crate::turn_server::handle_turn_websocket(stream, &key);
         }
     }
@@ -264,6 +344,8 @@ fn write_json_response(
             200 => "OK",
             400 => "Bad Request",
             404 => "Not Found",
+            413 => "Payload Too Large",
+            431 => "Request Header Fields Too Large",
             _ => "Internal Server Error",
         },
         payload.len(),
@@ -715,5 +797,63 @@ mod tests {
             ureq::Error::Status(status, _) => assert_eq!(status, 400),
             other => panic!("unexpected transport error: {other}"),
         }
+    }
+
+    // The connection limiter bounds concurrent handler threads: at the cap a
+    // further acquire blocks until a permit is released, so an unauthenticated
+    // peer cannot spawn unbounded threads (pre-auth DoS backstop).
+    #[test]
+    fn conn_limiter_blocks_at_cap_and_frees_on_drop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let limiter = Arc::new(ConnLimiter::new(1));
+        let held = limiter.acquire();
+        let done = Arc::new(AtomicBool::new(false));
+        let (l2, d2) = (Arc::clone(&limiter), Arc::clone(&done));
+        let waiter = std::thread::spawn(move || {
+            let _permit = l2.acquire(); // cannot proceed while `held` lives
+            d2.store(true, Ordering::SeqCst);
+        });
+        // The only permit is held, so the waiter cannot have acquired one no
+        // matter how the threads interleave.
+        assert!(!done.load(Ordering::SeqCst), "waiter must block at the cap");
+        drop(held);
+        waiter.join().expect("waiter acquires after release");
+        assert!(done.load(Ordering::SeqCst));
+    }
+
+    // A header block larger than MAX_HEADER_BYTES is rejected with 431 rather
+    // than buffered unboundedly — the slowloris/oversized-header DoS guard.
+    #[test]
+    fn oversized_header_block_is_rejected() {
+        use std::io::{Read, Write};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let address = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            let _ = serve_on(listener);
+        });
+
+        let mut stream = std::net::TcpStream::connect(address).expect("connect");
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\n")
+            .expect("request line");
+        // One header line past the cap, then the terminator.
+        let mut headers = b"X-Pad: ".to_vec();
+        headers.resize(headers.len() + MAX_HEADER_BYTES + 64, b'a');
+        headers.extend_from_slice(b"\r\n\r\n");
+        stream.write_all(&headers).expect("oversized headers");
+        stream.flush().ok();
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        assert!(
+            response.contains(" 431 "),
+            "oversized headers must be rejected with 431: {response:?}"
+        );
     }
 }

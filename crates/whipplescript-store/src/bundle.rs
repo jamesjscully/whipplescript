@@ -424,6 +424,104 @@ mod tests {
         vcs("elsewhere")
     }
 
+    /// A bundle whose blob body does not hash to its claimed content id is
+    /// refused: content ids commit to their bytes, so import verifies each
+    /// blob rather than trusting the attacker-supplied id
+    /// (content-addressing forgery).
+    #[test]
+    fn import_refuses_forged_plain_blob_id() {
+        let mut source = vcs("forge-src");
+        source.init("t0").expect("init");
+        source
+            .create_branch("draft_a", None, "main", "t1")
+            .expect("create");
+        source
+            .write("draft_a", "a.md", Some("honest bytes"), "cut_a1", "t2")
+            .expect("write");
+        let bundle = source.export_bundle("draft_a").expect("export").expect("b");
+
+        let mut tampered = bundle.clone();
+        let blob = tampered
+            .blobs
+            .iter_mut()
+            .find(|b| b.body.is_some())
+            .expect("a carried body");
+        blob.body = Some("attacker-substituted bytes".to_owned());
+
+        let mut target = vcs("forge-dst");
+        target.init("t0").expect("init");
+        let err = target.import_bundle(&tampered, "t1");
+        assert!(
+            err.is_err(),
+            "a blob whose body does not match its id must be refused"
+        );
+    }
+
+    /// A manifest key that would escape the workspace root on materialize
+    /// (`..` traversal) is refused at import, before any state is stored —
+    /// closing the arbitrary-file-write path through materialize-on-exec.
+    #[test]
+    fn import_refuses_traversal_manifest_key() {
+        let mut source = vcs("trav-src");
+        source.init("t0").expect("init");
+        source
+            .create_branch("draft_a", None, "main", "t1")
+            .expect("create");
+        source
+            .write("draft_a", "a.md", Some("bytes"), "cut_a1", "t2")
+            .expect("write");
+        let bundle = source.export_bundle("draft_a").expect("export").expect("b");
+
+        let mut tampered = bundle.clone();
+        let id = tampered.manifest.values().next().cloned().expect("an id");
+        tampered
+            .manifest
+            .insert("../../../etc/whip-escape".to_owned(), id);
+
+        let mut target = vcs("trav-dst");
+        target.init("t0").expect("init");
+        assert!(
+            target.import_bundle(&tampered, "t1").is_err(),
+            "a `..` manifest key must be refused at import"
+        );
+    }
+
+    /// A bundle that rebinds a locally-erased content id is refused:
+    /// erasure is honest and permanent, so an import must not resurrect the
+    /// bytes (defeats the erasure-never-recalled invariant).
+    #[test]
+    fn import_refuses_erased_blob_resurrection() {
+        // Source still holds the payload and exports it.
+        let mut source = vcs("resurrect-src");
+        source.init("t0").expect("init");
+        source
+            .create_branch("draft_a", None, "main", "t1")
+            .expect("create");
+        source
+            .write("draft_a", "secret.md", Some("the payload"), "cut_a1", "t2")
+            .expect("write");
+        let bundle = source.export_bundle("draft_a").expect("export").expect("b");
+
+        // Target once held the same bytes and has ERASED them.
+        let mut target = vcs("resurrect-dst");
+        target.init("t0").expect("init");
+        target
+            .create_branch("local", None, "main", "t1")
+            .expect("create");
+        target
+            .write("local", "secret.md", Some("the payload"), "cut_l1", "t2")
+            .expect("write");
+        target
+            .erase_path("local", "secret.md", "t3")
+            .expect("erase")
+            .expect("path exists");
+
+        assert!(
+            target.import_bundle(&bundle, "t4").is_err(),
+            "importing a bundle that rebinds the erased id must be refused"
+        );
+    }
+
     /// Chunk-granular transfer: a chunk-rooted file travels as
     /// structure-plus-chunks; a delta export against the receiver's
     /// have-set moves ONLY the missing chunks (rsync-class incremental);

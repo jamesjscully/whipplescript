@@ -19782,6 +19782,35 @@ fn http_source_url_policy_error(url: &str) -> Option<String> {
         if private_or_local_ip(ip) {
             return Some(format!("host `{host}` is not a public routable address"));
         }
+        return None;
+    }
+    // Not a literal IP: a DNS name can still point at an internal target
+    // (169.254.169.254, 127.0.0.1, RFC1918), which the literal-IP screen
+    // above would miss. Resolve it and refuse if ANY resolved address is
+    // private/local. (Residual: the eventual fetch re-resolves, so a
+    // rebinding DNS server could still swing to an internal address between
+    // this check and the connect — pinning the vetted IP through the HTTP
+    // client is the airtight follow-on.)
+    use std::net::ToSocketAddrs;
+    match (host.as_str(), 0u16).to_socket_addrs() {
+        Ok(addresses) => {
+            let mut resolved_any = false;
+            for address in addresses {
+                resolved_any = true;
+                if private_or_local_ip(address.ip()) {
+                    return Some(format!(
+                        "host `{host}` resolves to a non-public address ({})",
+                        address.ip()
+                    ));
+                }
+            }
+            if !resolved_any {
+                return Some(format!("host `{host}` did not resolve to any address"));
+            }
+        }
+        Err(_) => {
+            return Some(format!("host `{host}` could not be resolved"));
+        }
     }
     None
 }
@@ -21103,16 +21132,52 @@ fn codex_native_turn_request(
     })
 }
 
+/// Locate the bundled Claude Agent SDK sidecar relative to the whip
+/// executable (a trusted install location), never the current working
+/// directory. Walks up from the binary's directory looking for
+/// `scripts/claude-agent-sdk-sidecar.mjs` so both the dev repo layout
+/// (`target/<profile>/whip` → repo root) and a packaged layout resolve,
+/// while a hostile CWD can never inject the path.
+#[cfg(feature = "claude")]
+fn default_claude_sidecar_path() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent();
+    while let Some(base) = dir {
+        let candidate = base.join("scripts/claude-agent-sdk-sidecar.mjs");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        dir = base.parent();
+    }
+    None
+}
+
 #[cfg(feature = "claude")]
 fn claude_agent_sdk_adapter(
     provider: &str,
 ) -> Result<ClaudeAgentSdkAdapter<StdioClaudeAgentSdkTransport>, StoreError> {
-    let sidecar = env::var("WHIPPLESCRIPT_CLAUDE_AGENT_SDK_SIDECAR")
-        .unwrap_or_else(|_| "scripts/claude-agent-sdk-sidecar.mjs".to_owned());
+    // The default sidecar must NOT be resolved against the current working
+    // directory: running whip inside a hostile repo that ships its own
+    // `scripts/claude-agent-sdk-sidecar.mjs` would otherwise execute that
+    // attacker file under `node` with whip's full inherited environment
+    // (provider API keys, WHIP_* tokens) — arbitrary code execution. When the
+    // operator hasn't pinned an explicit path, resolve it relative to the whip
+    // EXECUTABLE (a trusted install location), failing closed if not found.
+    let sidecar = match env::var("WHIPPLESCRIPT_CLAUDE_AGENT_SDK_SIDECAR") {
+        Ok(path) => std::path::PathBuf::from(path),
+        Err(_) => default_claude_sidecar_path().ok_or_else(|| {
+            StoreError::Conflict(
+                "Claude Agent SDK sidecar not found relative to the whip executable; set \
+                 WHIPPLESCRIPT_CLAUDE_AGENT_SDK_SIDECAR to its absolute path"
+                    .to_owned(),
+            )
+        })?,
+    };
     let command =
         env::var("WHIPPLESCRIPT_CLAUDE_AGENT_SDK_COMMAND").unwrap_or_else(|_| "node".to_owned());
-    let transport =
-        StdioClaudeAgentSdkTransport::spawn(&command, &[sidecar.as_str()]).map_err(|error| {
+    let sidecar_arg = sidecar.to_string_lossy().into_owned();
+    let transport = StdioClaudeAgentSdkTransport::spawn(&command, &[sidecar_arg.as_str()])
+        .map_err(|error| {
             StoreError::Conflict(format!(
                 "failed to launch Claude Agent SDK sidecar: {error:?}"
             ))
@@ -38571,6 +38636,52 @@ mod tests {
     use whipplescript_store::{NewEffect, RuleCommit};
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn http_source_guard_refuses_internal_targets_and_screens_dns() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("WHIPPLESCRIPT_HTTP_SOURCE_ALLOW_PRIVATE");
+        std::env::remove_var("WHIPPLESCRIPT_HTTP_SOURCE_ALLOW");
+
+        // Literal internal / link-local / RFC1918 addresses are refused.
+        for url in [
+            "http://127.0.0.1/x",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/x",
+            "http://192.168.1.1/x",
+            "https://[::1]/x",
+        ] {
+            assert!(
+                http_source_url_policy_error(url).is_some(),
+                "internal target must be refused: {url}"
+            );
+        }
+        // Local namespaces are refused before any lookup.
+        assert!(http_source_url_policy_error("http://localhost/x").is_some());
+        assert!(http_source_url_policy_error("http://svc.local/x").is_some());
+        // Non-http schemes and hostless URLs are refused.
+        assert!(http_source_url_policy_error("file:///etc/passwd").is_some());
+        // A public literal address is allowed when no allowlist is configured.
+        assert!(http_source_url_policy_error("http://1.1.1.1/x").is_none());
+        // A DNS NAME is now screened (not just literal IPs): a name that does
+        // not resolve is refused fail-closed rather than passing through — the
+        // branch that also refuses names resolving to internal addresses.
+        assert!(
+            http_source_url_policy_error("http://nonexistent-host.invalid/x").is_some(),
+            "an unresolvable DNS name must be refused, not passed through"
+        );
+    }
+
+    #[cfg(feature = "claude")]
+    #[test]
+    fn claude_sidecar_default_resolves_from_executable_not_cwd() {
+        // Resolved relative to the test binary, walking up to the repo's
+        // `scripts/` — never the current working directory.
+        let path = default_claude_sidecar_path().expect("bundled sidecar found from exe dir");
+        assert!(path.is_absolute(), "resolved sidecar path must be absolute");
+        assert!(path.ends_with("scripts/claude-agent-sdk-sidecar.mjs"));
+        assert!(path.is_file(), "resolved sidecar must be a real file");
+    }
 
     #[test]
     fn retired_effect_kinds_are_flagged_but_current_kinds_are_not() {

@@ -29,7 +29,7 @@
 #[cfg(feature = "native")]
 use std::collections::BTreeMap;
 #[cfg(feature = "native")]
-use std::path::Path;
+use std::path::{Component, Path};
 
 #[cfg(feature = "native")]
 use crate::content::ContentBlobs;
@@ -60,9 +60,48 @@ pub struct ScratchImport {
     pub rehashed: usize,
 }
 
+/// Reject any manifest key that would escape a scratch/workspace root
+/// when used as a filesystem path. Manifest keys may legitimately be
+/// absolute (file effects record resolved full paths), so a leading `/`
+/// is re-rooted under the scratch; but a `..` (ParentDir) component — or
+/// any embedded root/prefix component — is an escape attempt. Manifest
+/// keys are attacker-controllable through an imported handoff bundle
+/// (`whip branch import`), so this validation is the choke point that
+/// keeps a hostile bundle from writing outside the scratch on
+/// materialize-on-exec. Returns the re-rooted, scratch-relative form.
 #[cfg(feature = "native")]
-fn scratch_relative(key: &str) -> String {
-    key.trim_start_matches('/').to_owned()
+pub(crate) fn safe_scratch_relative(key: &str) -> StoreResult<String> {
+    let trimmed = key.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Err(StoreError::Conflict(format!(
+            "manifest key `{key}` is empty after normalization"
+        )));
+    }
+    for component in Path::new(trimmed).components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(StoreError::Conflict(format!(
+                    "manifest key `{key}` escapes the scratch root: \
+                     `..` / absolute / prefix path components are not allowed"
+                )));
+            }
+        }
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Validate a manifest key without materializing it — the import-time
+/// choke point (`import_bundle`) so a bundle carrying a traversal key is
+/// refused before any of its state is persisted.
+#[cfg(feature = "native")]
+pub(crate) fn validate_manifest_key(key: &str) -> StoreResult<()> {
+    safe_scratch_relative(key).map(|_| ())
+}
+
+#[cfg(feature = "native")]
+fn scratch_relative(key: &str) -> StoreResult<String> {
+    safe_scratch_relative(key)
 }
 
 /// Bounds for a partial materialization (Class-B sidecar disks are
@@ -139,18 +178,35 @@ pub fn materialize_manifest_subset(
     }
     std::fs::create_dir_all(root)
         .map_err(|error| StoreError::Conflict(format!("scratch {}: {error}", root.display())))?;
+    // Canonical root for the post-join containment assertion below: even
+    // with `..` rejected lexically, a symlink already present in a
+    // persistent scratch could redirect a write outside the root, so we
+    // re-check the real resolved parent against it before every write.
+    let canonical_root = std::fs::canonicalize(root).map_err(|error| {
+        StoreError::Conflict(format!("canonicalize scratch {}: {error}", root.display()))
+    })?;
     let mut cache = StatCache {
         stamp_unix_nanos: now_unix_nanos,
         entries: BTreeMap::new(),
     };
     let mut key_of = BTreeMap::new();
     for (key, hash, body) in bodies {
-        let relative = scratch_relative(&key);
+        let relative = scratch_relative(&key)?;
         let target = root.join(&relative);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
                 StoreError::Conflict(format!("scratch parent for {relative}: {error}"))
             })?;
+            let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
+                StoreError::Conflict(format!(
+                    "canonicalize scratch parent for {relative}: {error}"
+                ))
+            })?;
+            if !canonical_parent.starts_with(&canonical_root) {
+                return Err(StoreError::Conflict(format!(
+                    "manifest key `{key}` resolves outside the scratch root (symlink escape)"
+                )));
+            }
         }
         std::fs::write(&target, body.as_bytes())
             .map_err(|error| StoreError::Conflict(format!("materialize {relative}: {error}")))?;
@@ -390,6 +446,43 @@ mod tests {
         assert!(
             import.removed.is_empty(),
             "un-materialized manifest paths are not phantom removals"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A manifest key with a `..` component escapes the scratch root:
+    /// materialize refuses it before any write, so a hostile imported
+    /// bundle cannot use materialize-on-exec as an arbitrary-file-write
+    /// primitive. An absolute key stays re-rooted safely under the scratch.
+    #[test]
+    fn materialize_refuses_traversal_keys() {
+        let content = content("traversal");
+        let root = scratch_root("traversal-dir");
+        let payload = content.put("pwned").expect("put");
+
+        // `..` traversal is refused, nothing written outside the root.
+        let mut evil = BTreeMap::new();
+        evil.insert("../../escape.txt".to_owned(), payload.clone());
+        let refused = materialize_manifest(&evil, &content, &root, now_nanos());
+        assert!(refused.is_err(), "`..` traversal key must be refused");
+        assert!(
+            !root
+                .parent()
+                .expect("scratch has a parent")
+                .join("escape.txt")
+                .exists(),
+            "nothing is written outside the scratch root"
+        );
+
+        // A leading-slash absolute key is re-rooted UNDER the scratch, not
+        // at the filesystem root.
+        let mut absolute = BTreeMap::new();
+        absolute.insert("/etc/whip-test.conf".to_owned(), payload);
+        materialize_manifest(&absolute, &content, &root, now_nanos())
+            .expect("absolute key re-roots under the scratch");
+        assert!(
+            root.join("etc/whip-test.conf").exists(),
+            "the absolute key lands under the scratch, not at /etc"
         );
         let _ = std::fs::remove_dir_all(root);
     }
