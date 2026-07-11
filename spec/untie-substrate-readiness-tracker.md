@@ -194,6 +194,30 @@ Per-heading `· vN` tags below restate this at each phase.
       result must re-compile. E2E: disjoint rule edits to ONE file
       certify through `whip branch merge`; a cross-declaration write∩read
       pair stays an honest conflict.)*
+- [x] Text-merge tier: recursive token-level three-way merge for
+      non-source text blobs in the both-modified path (word atoms;
+      efficiency-only content-defined anchors; certified compose).
+      *(2026-07-11 built, design settled with Jack same day — flat line
+      diff rejected for prose, sentence atoms rejected for semantic
+      dependence; SSOT spec/text-merge-spec.md. Certified layer modeled
+      in text-merge-compose.maude (never-fabricate + overlap/proximity
+      escalation; 5 solutions + 3 no-solutions in the gate). Impl =
+      pure `whipplescript-store/src/text_merge.rs` (char-class
+      tokenizer, ephemeral CDC anchor segments over token hashes —
+      NOT identity-bearing, unlike chunking.rs — two-tier patience
+      diff, compose with proximity dial WHIPPLESCRIPT_TEXT_MERGE_GAP
+      default 2 words, provenance-tagged pieces, three-slice conflict
+      regions). Wired as stage 3 of `refine_source_conflicts` after
+      resolution memory and certified .whip merge; fail-closed:
+      deletes, add/add, oversized (8 MiB dial), erased bodies, and
+      .whip paths never text-merge (merge-slice bite untouched).
+      Conflict rows carry no new fields: region detail is
+      deterministically recomputable from the content-addressed
+      triple. STILL OPEN, deferred by design: move detection,
+      region-level resolution memory, the §10 evaluation corpus +
+      red-team failure-mode registry (candidate gauge/mark campaign;
+      proximity/anchor dials ratchet only on corpus evidence), and
+      the gaugedesk merge-preview consumer (SUB-6 there).)*
 - [x] Reconciliation daemon v1: silent rebase-down of slice-disjoint
       mainline deltas; quiescence points (terminals, marks, task
       completion); staleness bound; merge-up serialized by the adoption

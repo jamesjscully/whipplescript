@@ -81,6 +81,7 @@ subworkflow-attestation.maude	SSNSN
 subworkflow-convergence.maude	SSSSNNN
 subworkflow-lease.maude	SSSN
 terminal-payload-shape.maude	SSSSSSNN
+text-merge-compose.maude	SSSSSNNN
 trace-lifecycle-conformance.maude	SSSNNSSSSSNSS
 tracker-claim-turn.maude	NSNS
 tracker-lease.maude	SSSSNNN
