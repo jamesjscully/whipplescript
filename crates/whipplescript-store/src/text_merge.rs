@@ -355,27 +355,42 @@ fn patience_diff(a: &[u32], b: &[u32]) -> Vec<RawOp> {
             });
             continue;
         }
-        // Unique-common anchors between the trimmed ranges.
-        let mut count_a: HashMap<u32, (usize, usize)> = HashMap::new();
+        // Lowest-multiplicity common anchors between the trimmed ranges:
+        // patience proper (unique-common, k = 1) first; when the run's
+        // vocabulary repeats too much for uniqueness, relax to the
+        // histogram rule — the rarest ids with EQUAL occurrence counts on
+        // both sides anchor, paired occurrence-by-occurrence in order,
+        // and the LIS below drops any inconsistent pairings. This is what
+        // splits a one-side insertion from a nearby edit inside a
+        // repetitive run, so an identical both-sides fix stays visible as
+        // convergent (corpus mode convergent-fix-near-insertion). The
+        // multiplicity cap keeps genuinely self-similar text (the
+        // near-duplicate hazard) on the honest fat-op path.
+        const MAX_ANCHOR_MULTIPLICITY: usize = 8;
+        let mut positions_a: HashMap<u32, Vec<usize>> = HashMap::new();
         for (index, &id) in a.iter().enumerate().take(a1).skip(a0) {
-            let entry = count_a.entry(id).or_insert((0, index));
-            entry.0 += 1;
-            entry.1 = index;
+            positions_a.entry(id).or_default().push(index);
         }
-        let mut count_b: HashMap<u32, (usize, usize)> = HashMap::new();
+        let mut positions_b: HashMap<u32, Vec<usize>> = HashMap::new();
         for (index, &id) in b.iter().enumerate().take(b1).skip(b0) {
-            let entry = count_b.entry(id).or_insert((0, index));
-            entry.0 += 1;
-            entry.1 = index;
+            positions_b.entry(id).or_default().push(index);
         }
-        let mut pairs: Vec<(usize, usize)> = count_a
-            .iter()
-            .filter(|(_, (count, _))| *count == 1)
-            .filter_map(|(id, (_, a_pos))| match count_b.get(id) {
-                Some((1, b_pos)) => Some((*a_pos, *b_pos)),
-                _ => None,
-            })
-            .collect();
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for multiplicity in 1..=MAX_ANCHOR_MULTIPLICITY {
+            for (id, a_positions) in &positions_a {
+                if a_positions.len() != multiplicity {
+                    continue;
+                }
+                if let Some(b_positions) = positions_b.get(id) {
+                    if b_positions.len() == multiplicity {
+                        pairs.extend(a_positions.iter().copied().zip(b_positions.iter().copied()));
+                    }
+                }
+            }
+            if !pairs.is_empty() {
+                break;
+            }
+        }
         if pairs.is_empty() {
             ops.push(RawOp {
                 a_start: a0,
@@ -829,14 +844,28 @@ pub fn text_merge(
                 span_end,
                 ..
             } => {
-                conflicted = true;
                 let ours_range = side_span(&ours_script, *span_start, *span_end);
                 let theirs_range = side_span(&theirs_script, *span_start, *span_end);
-                pieces.push(MergePiece::Conflict {
-                    base_text: token_text(base, &base_tokens, (*span_start, *span_end)).to_owned(),
-                    ours_text: token_text(ours, &ours_tokens, ours_range).to_owned(),
-                    theirs_text: token_text(theirs, &theirs_tokens, theirs_range).to_owned(),
-                });
+                let ours_text = token_text(ours, &ours_tokens, ours_range);
+                let theirs_text = token_text(theirs, &theirs_tokens, theirs_range);
+                // Region-level convergence (op-level §7.1 generalized):
+                // both sides reconstruct this span to the SAME bytes, so
+                // there is nothing to ask — equivalent edits that aligned
+                // differently (deleting a different occurrence of a
+                // repeated word yields identical text with disjoint ops)
+                // are one agreed change. Provably safe: the emitted text
+                // is exactly what each side independently produced here.
+                if ours_text == theirs_text {
+                    push_merged(&mut pieces, ours_text, Provenance::Both);
+                } else {
+                    conflicted = true;
+                    pieces.push(MergePiece::Conflict {
+                        base_text: token_text(base, &base_tokens, (*span_start, *span_end))
+                            .to_owned(),
+                        ours_text: ours_text.to_owned(),
+                        theirs_text: theirs_text.to_owned(),
+                    });
+                }
             }
         }
         cursor = end.max(cursor);

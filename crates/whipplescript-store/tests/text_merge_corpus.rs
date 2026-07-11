@@ -228,19 +228,20 @@ fn registry() -> Vec<Case> {
         },
         // -- convergent fix coalesced with a one-side insertion (MINED
         //    2026-07-11, rust-book ce8b88f1ed7d): both sides make the
-        //    IDENTICAL typo fix, but one side also inserts a sentence
-        //    nearby, so its diff coalesces insertion+fix into one op and
-        //    the convergent-Both detection (exact span + bytes) misses.
-        //    Over-escalation only — never a wrong compose — and the fix
-        //    is aligner-tier (finer run splitting or fuzzy convergence).
+        //    IDENTICAL typo fix ("do can by" → "do by"), but "can"
+        //    appears twice and each side's diff deleted a DIFFERENT
+        //    occurrence — equivalent edits, disjoint ops, op-level
+        //    convergence missed. WON BACK same day by region-level
+        //    convergence: a conflict region whose two sides reconstruct
+        //    to the same bytes is one agreed change (Both), never an ask.
         Case {
             mode: "convergent-fix-near-insertion",
             name: "identical fix beside one side's insertion",
             base: "First paragraph explains the setup carefully. We destructure the reference from the value, which we can do can by specifying a pattern.",
             ours: "First paragraph explains the setup carefully. A brand new sentence appears here with plenty of extra words to say. We destructure the reference from the value, which we can do by specifying a pattern.",
             theirs: "First paragraph explains the setup carefully. We destructure the reference from the value, which we can do by specifying a pattern.",
-            expect: Expect::EscalatesCandidateFix(
-                "both sides carry the identical fix; one side's nearby insertion coalesces into the same edit run, hiding the convergence — finer run splitting should compose this to insertion + Both-fix",
+            expect: Expect::Composes(
+                "First paragraph explains the setup carefully. A brand new sentence appears here with plenty of extra words to say. We destructure the reference from the value, which we can do by specifying a pattern.",
             ),
         },
     ]

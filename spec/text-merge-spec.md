@@ -227,6 +227,16 @@ emits as
 envelope) both sides' provenance, never `<<<<<<<` markers, never a
 picked winner.
 
+**Region-level convergence** (2026-07-11, §7.1 generalized): a region
+whose two sides reconstruct to the SAME bytes is one agreed change —
+emitted as a single `Both` piece, never an ask. This catches equivalent
+edits that aligned differently: deleting a different occurrence of a
+repeated word yields identical text through disjoint ops, so op-level
+convergence (same span + same bytes) misses it. Provably safe: the
+emitted text is exactly what each side independently produced for the
+span. (Mined mode `convergent-fix-near-insertion`, won back the same
+day it was pinned.)
+
 ### 7.5 Outcome surface
 
     TextMergeOutcome =
@@ -324,10 +334,17 @@ paragraph-break ratchet (§7.3):
   (interleaved edits inside one section — asking there is defensible).
 
 Two mined modes joined the registry: `paragraph-boundary-adjacency`
-(now Composes, the §7.3 ratchet) and `convergent-fix-near-insertion`
-(EscalatesCandidateFix: an identical both-sides fix hidden by one
-side's nearby insertion coalescing into the same edit run — aligner-
-tier, over-escalation only).
+(now Composes, the §7.3 ratchet) and `convergent-fix-near-insertion` —
+pinned EscalatesCandidateFix, then WON BACK the same day by
+region-level convergence (§7.4): the true cause was not coalescing but
+equivalent edits aligned onto different occurrences of a repeated word.
+Post-fix corpus: composed-exact 247, escalated 86, divergent 8 (all
+verified benign) — the originating mined case now composes
+byte-identical to the human's hand resolution. The patience anchor
+selection also gained the histogram relaxation (lowest-multiplicity
+common anchors, cap 8, when no unique-common token exists in a run) —
+finer alignment inside repetitive runs, same fat-op honesty beyond the
+cap.
 
 ## 11. v1 scope and deferrals
 
