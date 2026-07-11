@@ -59,6 +59,14 @@ pub enum BlobStatus {
     Unknown,
 }
 
+/// Outcome of a `purge_unreachable` sweep: how many orphaned plain blob
+/// rows were reclaimed and how many rows remain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PurgeOutcome {
+    pub purged: usize,
+    pub retained: usize,
+}
+
 /// Outcome of a per-blob erasure request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EraseOutcome {
@@ -152,6 +160,45 @@ impl ContentStore {
     /// Idempotent: identical bytes dedupe to the same id and one row.
     pub fn put(&self, body: &str) -> StoreResult<String> {
         ContentBlobs::put(self, body)
+    }
+
+    /// Conservative orphan sweep: delete plain blob rows unreachable from
+    /// `roots`. Deliberately narrow so a wrong root set can only RETAIN
+    /// too much, never break a readable id: erasure tombstones are a
+    /// different honesty plane (never touched), and the whole chunk tier
+    /// — chunk payloads, roots, refs, pack payloads — is left to its own
+    /// erasure discipline.
+    pub fn purge_unreachable(
+        &self,
+        roots: &std::collections::BTreeSet<String>,
+    ) -> StoreResult<PurgeOutcome> {
+        self.connection.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS gc_roots (id TEXT PRIMARY KEY); \
+             DELETE FROM gc_roots;",
+        )?;
+        {
+            let mut insert = self
+                .connection
+                .prepare("INSERT OR IGNORE INTO gc_roots (id) VALUES (?1)")?;
+            for id in roots {
+                insert.execute(params![id])?;
+            }
+        }
+        let purged = self.connection.execute(
+            "DELETE FROM content_blobs WHERE id NOT IN (SELECT id FROM gc_roots) \
+             AND id NOT IN (SELECT chunk_id FROM content_chunk_refs) \
+             AND id NOT IN (SELECT pack_id FROM content_pack_entries)",
+            [],
+        )?;
+        let retained: i64 =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM content_blobs", [], |row| row.get(0))?;
+        self.connection
+            .execute_batch("DROP TABLE IF EXISTS gc_roots;")?;
+        Ok(PurgeOutcome {
+            purged,
+            retained: retained as usize,
+        })
     }
 
     /// Read the full stored bytes for a content id, or `None` if unknown.

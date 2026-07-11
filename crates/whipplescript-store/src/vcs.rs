@@ -401,6 +401,28 @@ impl NativeWorkspaceVcs {
             source_merger: None,
         })
     }
+
+    /// Reclaim orphaned content — the residue of superseded working sets,
+    /// refused imports, and raced saves. Roots = everything the branch
+    /// plane can still name (every recorded cut's manifest and its
+    /// entries, branch pointers, remembered resolutions, conflict sides);
+    /// the sweep is conservative by construction (chunk tier and erasure
+    /// tombstones untouched), so archaeology keeps everything a recorded
+    /// cut can reach and a wrong root set can only retain too much.
+    pub fn purge_unreachable(&mut self) -> StoreResult<crate::content::PurgeOutcome> {
+        let mut roots = self.branches.reachability_roots()?;
+        // A root that is a MANIFEST names content ids: expand one level.
+        // (Non-manifest roots that happen to parse as a string map add
+        // only phantom ids — retention noise, never a wrong delete.)
+        for hash in roots.clone() {
+            if let Some(body) = self.content.get(&hash)? {
+                if let Ok(manifest) = serde_json::from_str::<BTreeMap<String, String>>(&body) {
+                    roots.extend(manifest.into_values());
+                }
+            }
+        }
+        self.content.purge_unreachable(&roots)
+    }
 }
 
 impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
@@ -3202,6 +3224,112 @@ mod tests {
                 .expect("write"),
             VcsWriteOutcome::BranchNotActive
         );
+    }
+
+    /// The GC sweep reclaims only true orphans: content no recorded cut,
+    /// branch pointer, resolution memory, or conflict row can name.
+    /// Historical cut bodies, current heads, and remembered region
+    /// payloads all survive; a directly-stored stray blob does not.
+    #[test]
+    fn purge_unreachable_reclaims_orphans_and_spares_everything_nameable() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        assert!(matches!(
+            vcs.write(
+                MAINLINE_BRANCH_ID,
+                "a.md",
+                Some("first body"),
+                "cut_1",
+                "t1"
+            )
+            .expect("write"),
+            VcsWriteOutcome::Written { .. }
+        ));
+        assert!(matches!(
+            vcs.write(
+                MAINLINE_BRANCH_ID,
+                "a.md",
+                Some("second body"),
+                "cut_2",
+                "t2"
+            )
+            .expect("write"),
+            VcsWriteOutcome::Written { .. }
+        ));
+        // Remembered region resolution: its payload must survive the sweep.
+        vcs.record_region_resolutions(
+            &[RegionResolution {
+                base_text: "dog".to_owned(),
+                ours_text: "tiger".to_owned(),
+                theirs_text: "lion".to_owned(),
+                resolution_text: "liger".to_owned(),
+            }],
+            "t3",
+        )
+        .expect("record");
+        // A stray blob nothing names — the one thing the sweep may take.
+        let orphan = vcs.content_store().put("orphaned residue").expect("put");
+        let outcome = vcs.purge_unreachable().expect("purge");
+        assert!(outcome.purged >= 1, "the orphan was reclaimed: {outcome:?}");
+        assert_eq!(
+            vcs.content_store().get(&orphan).expect("get"),
+            None,
+            "orphan gone"
+        );
+        // The head reads; the SUPERSEDED body still reads through its cut.
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "a.md").expect("read"),
+            Some("second body".to_owned())
+        );
+        let old_manifest = vcs
+            .cut_manifest("cut_1")
+            .expect("cut manifest")
+            .expect("recorded");
+        let old_id = old_manifest.get("a.md").expect("entry");
+        assert_eq!(
+            vcs.content_store().get(old_id).expect("get"),
+            Some("first body".to_owned()),
+            "archaeology intact"
+        );
+        // The remembered payload still applies: the same divergence folds
+        // to the settled text instead of re-asking.
+        assert!(matches!(
+            vcs.write(
+                MAINLINE_BRANCH_ID,
+                "b.md",
+                Some("the dog sleeps"),
+                "cut_3",
+                "t4"
+            )
+            .expect("write"),
+            VcsWriteOutcome::Written { .. }
+        ));
+        assert!(matches!(
+            vcs.write(
+                MAINLINE_BRANCH_ID,
+                "b.md",
+                Some("the tiger sleeps"),
+                "cut_4",
+                "t5"
+            )
+            .expect("write"),
+            VcsWriteOutcome::Written { .. }
+        ));
+        let saved = vcs
+            .save_with_base(
+                MAINLINE_BRANCH_ID,
+                "b.md",
+                "the lion sleeps",
+                "cut_3",
+                &[],
+                "cut_5",
+                "t6",
+            )
+            .expect("save");
+        let SaveWithBaseOutcome::Merged { merged, .. } = saved else {
+            panic!("memory should fold the remembered region, got {saved:?}");
+        };
+        assert_eq!(merged, "the liger sleeps");
     }
 
     /// A LONG-LIVED member line merges with `merge_keeping`: the parent

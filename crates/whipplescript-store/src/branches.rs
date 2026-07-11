@@ -469,6 +469,45 @@ impl BranchStore {
             .optional()?;
         Ok(row)
     }
+
+    /// Every content id the branch plane can still name: cut manifests
+    /// (permanent archaeology — cuts of discarded branches included),
+    /// branch pointers, remembered resolutions (region AND path tiers),
+    /// and recorded conflict sides. This is the GC root set: anything the
+    /// content store holds beyond these (and what they transitively name)
+    /// is orphaned working residue.
+    pub fn reachability_roots(&self) -> StoreResult<std::collections::BTreeSet<String>> {
+        fn collect(
+            connection: &Connection,
+            sql: &str,
+            roots: &mut std::collections::BTreeSet<String>,
+        ) -> StoreResult<()> {
+            let mut statement = connection.prepare(sql)?;
+            let rows = statement.query_map([], |row| row.get::<_, Option<String>>(0))?;
+            for value in rows {
+                if let Some(value) = value? {
+                    if !value.is_empty() {
+                        roots.insert(value);
+                    }
+                }
+            }
+            Ok(())
+        }
+        let mut roots = std::collections::BTreeSet::new();
+        for sql in [
+            "SELECT manifest_hash FROM cuts",
+            "SELECT head_manifest_hash FROM branches",
+            "SELECT branch_point_manifest_hash FROM branches",
+            "SELECT resolution FROM resolution_memory",
+            "SELECT base FROM conflicts",
+            "SELECT ours FROM conflicts",
+            "SELECT theirs FROM conflicts",
+            "SELECT resolution FROM conflicts",
+        ] {
+            collect(&self.connection, sql, &mut roots)?;
+        }
+        Ok(roots)
+    }
 }
 
 #[cfg(feature = "native")]
