@@ -219,7 +219,8 @@ of even the *merged* spans). JSON serialization is part of the surface
 
 1. **Never-fabricate:** every piece's text is a contiguous substring of
    exactly one input (conflict regions: three substrings of their three
-   inputs).
+   inputs). Refined by §12.3 for remembered resolutions, which are
+   recorded human content under a distinct `resolved` provenance.
 2. **Both-touched ⇒ conflict:** no clean composition exists when ops
    from opposite sides overlap or violate the proximity rule.
 3. **Identity:** merge(b, b, r) = r; merge(b, l, b) = l;
@@ -281,12 +282,134 @@ In: everything above. Out (deferred, compatible by construction):
 
 - **Move detection** — a moved-and-edited block degrades to
   delete+insert (conflict or one-sided, per the scripts). Slots into
-  the alignment tier later; the certified core is untouched.
+  the alignment tier later — but NOT core-neutrally: composing side
+  B's in-place edit into side A's relocated copy weakens
+  never-fabricate from slice-level to atom-level and changes the
+  piece/provenance structure, so it takes its own design pass + model
+  extension (move-vs-move, move-vs-delete, edit-straddling-a-move
+  semantics) before any code. The evaluation corpus (§10) is its
+  acceptance gate.
 - **Deeper anchor trees** for very large documents (two-level covers
   the 8 MiB cap comfortably).
-- **Resolution-memory integration** for region-level conflicts
-  (path-level resolution memory exists; region-level keying is a
-  follow-up).
+- **Region-level resolution memory + editor save flow** — design
+  SETTLED in §12 (2026-07-11), build follows the corpus scaffold.
 - **The evaluation corpus itself** (§10) — the harness and fixtures
   land with the red-team campaign, not this slice; v1 ships the
   metamorphic property tests inline.
+
+## 12. Editor save flow + region-level resolution memory (SUB-6 co-design)
+
+Settled 2026-07-11 (Jack delegated the engineering decisions; gaugedesk
+half tracked as SUB-6 in its implementation tracker). The two features
+are one design: the editor's conflict fold is the surface that MINTS
+region resolutions, and region memory is what makes resolving pay
+forward.
+
+### 12.1 The save verb (whip side)
+
+One store-level verb, consumed by gaugedesk's
+`WhippleWorkspaceProvider`:
+
+    save_with_base(branch, path, draft, base_cut_id,
+                   resolutions: [RegionResolution], cut_id, at)
+      -> Written { cut_id }                          -- head hadn't moved
+       | Merged  { cut_id, merged, pieces }          -- composed cleanly
+       | Conflicted { head_cut_id, pieces }          -- no write; fold me
+
+Semantics: load the path's body at `base_cut_id` (the revision the
+editor's draft started from) and at the current head. Head unmoved (or
+body identical) → plain mediated write. Otherwise three-way with
+base = base-cut body, ours = head body (the line's content), theirs =
+draft (the editor's proposal), through the same region-memory-aware
+merge as branch reconciliation (§12.3) — one merge behavior whip-wide,
+same dials. Clean → write the merged body (optimistic head advance;
+stale head retries the whole verb) and return the pieces so the editor
+can render provenance. Conflicted → return the regions and write
+NOTHING.
+
+**Decision — editor-save conflicts are transient, not persisted.**
+Branch-merge conflicts stay first-class open rows (the ask surface for
+a daemon-mediated, possibly-absent resolver). An editor save has the
+resolving human present holding the draft; persisting an open-conflict
+row for a decision made in the next thirty seconds is noise, and the
+draft lives client-side if abandoned. The conflict-bearing-state
+doctrine is about branch lines, not in-flight PUTs.
+
+A read-only twin, `merge_preview(branch, path, draft, base_cut_id) ->
+pieces`, is the same compute without the write — the editor's live
+fold (gaugedesk already streams file-change events; a change to the
+open path while the draft is dirty triggers a preview).
+
+### 12.2 Region resolutions: minting
+
+When the editor submits a resolved save, `resolutions` carries one
+entry per region the user settled:
+
+    RegionResolution { base_text, ours_text, theirs_text, resolution_text }
+
+Each entry stores `resolution_text` in the content store (a content
+id — erasure honesty applies automatically) and records a memory row
+in the existing resolution-memory table, kind-tagged `region`, keyed
+by the content hashes of the three region texts. Recording rides the
+same call as the save: resolving and saving are one atomic intent.
+`resolve_conflict`'s take-ours/take-theirs/authored-body shape (vw
+note §7.3) is reused per-region in the editor fold.
+
+### 12.3 Region memory: applying
+
+A wrapper `text_merge_with_memory(base, ours, theirs, config, lookup)`
+post-processes the §7.5 outcome: each Conflict piece's triple key is
+looked up; a remembered resolution WITH LIVE PAYLOAD replaces the
+region as a Merged piece with provenance `resolved`; if every region
+resolves, the outcome upgrades to Clean. Partial memory shrinks the
+conflict set honestly — never fakes clean. The wrapper is used by BOTH
+`refine_source_conflicts` stage 3 and `save_with_base`.
+
+**Decision — auto-apply is ON, exactly like path-level memory.** Same
+doctrine (rerere as ordinary workspace-plane knowledge), exact triple
+match only, apply only while the payload is live, workspace-scoped.
+The extra safety at region level is structural: region boundaries
+depend on the alignment heuristic, so an aligner upgrade degrades
+remembered keys to MISSES — never misapplication. Fail-closed under
+drift, by construction.
+
+**Invariant restatement (amends §7.6.1):** never-fabricate governs
+ALGORITHMIC composition — every algorithmically merged piece is a
+contiguous slice of one input. A `resolved` piece is recorded human
+content applied by exact content-addressed key: the same honesty
+posture as path-level resolution memory, distinguishable in the piece
+provenance, erasure-respecting. The Maude model's never-fabricate bite
+is unchanged (it models the algorithmic layer); the memory tier's
+exact-triple/live-only semantics are already modeled in
+resolution-memory.maude, which the region tier reuses; the build adds
+a search pinning that partial region memory never yields Clean.
+
+### 12.4 Gaugedesk half (SUB-6 there)
+
+The file PUT gains `{content, base_cut, resolutions?}`; the viewer
+tracks the cut id its content came from. Responses: plain save →
+unchanged UX; `merged` → editor refreshes to the merged body with a
+quiet affordance ("merged with concurrent changes"), recorded on the
+AUDIT plane (ADR-0082 posture: rationale in audit, not conversation);
+`conflicted` (409) → inline region fold rendering base/ours/theirs
+per region with pick-or-edit, submit = second save carrying
+`resolutions`. Live fold: on a file-change event for a dirty open
+file, call `merge_preview` and offer the fold proactively.
+
+**Sequencing constraint:** gaugedesk pins whip by git rev; SUB-6's
+build needs `save_with_base` reachable from that pin. Land the merge
+cluster on v0.4, then repoint gaugedesk's pin (the SUB-3/4/5
+host-governance commits are already cherry-picked onto v0.4, so the
+protocol extensions travel); the interim dev-loop `[patch]` in
+gaugedesk's root Cargo.toml (currently aimed at whipplescript-sub3)
+gets updated or removed at that repoint.
+
+### 12.5 Build order
+
+1. Evaluation corpus scaffold (§10, in-repo) — the instrument lands
+   before any further heuristic work.
+2. Whip: `text_merge_with_memory` + region rows + `save_with_base` +
+   `merge_preview` (+ the partial-memory model search).
+3. Gaugedesk: provider + PUT contract + fold UI (after the pin
+   repoint).
+4. Move detection design pass (§11), corpus-gated.
