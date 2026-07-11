@@ -171,12 +171,28 @@ no algorithm should fake). An insertion coincident with an opposite-side
 op whose range covers or abuts that gap is within reach and escalates
 with it.
 
+**Insertion-pair exemption (settled 2026-07-11, corpus finding):** two
+pure insertions at DISTINCT points are exempt from the proximity rule.
+The hazard §7.3 guards against — slicing one rewrite into interleaved
+fragments via shared anchor words — requires base-consuming ops; a pure
+insertion is atomic in the output (its full text lands contiguously),
+so distinct-point insertion pairs cannot mechanically interleave a
+single passage. Both added texts survive whole, ordered by base
+position. This exemption is what lets the block-reorder-vs-in-place-
+edit case compose to the ideal result (the moved block carries the
+other side's edit) whenever the reorder diff expresses as insert+delete
+around the block interior — see the move-and-edit entries in the
+corpus registry. Mixed pairs (insertion vs replace/delete) and
+same-point insertion pairs keep their conflict rules unchanged.
+
 ### 7.3 The proximity rule (the tuning dial)
 
 Two ops from opposite sides conflict if their base ranges overlap, OR
 if the base tokens strictly between them contain fewer than `d` **Word**
 tokens (Space/Other tokens provide no separation). Default `d = 2`,
-override `WHIPPLESCRIPT_TEXT_MERGE_GAP`.
+override `WHIPPLESCRIPT_TEXT_MERGE_GAP`. Exception: pure insertion
+pairs at distinct points (§7.2) — atomicity makes them interleave-safe
+at any distance.
 
 This is the guard against the word-atom hazard: two rewrites of the
 same sentence that happen to slice into technically-disjoint ranges by

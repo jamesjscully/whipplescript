@@ -567,7 +567,11 @@ pub fn text_merge(
     // Pairwise cross-side conflicts (hard rules are independent of the
     // dial): strict interval overlap; an insertion point touching or inside
     // the other op's closed range; same-point double insertion; and the
-    // proximity rule for disjoint neighbours.
+    // proximity rule for disjoint neighbours. Pure insertion pairs at
+    // DISTINCT points are exempt from proximity (spec section 7.2): the
+    // interleave hazard needs base-consuming ops, an insertion is atomic
+    // in the output — this exemption is what lets a block reorder compose
+    // with an in-place edit of the moved block (corpus: move-and-edit).
     let conflicting = |a: &Item, b: &Item| -> bool {
         if a.side == ItemSide::Both || b.side == ItemSide::Both || a.side == b.side {
             return false;
