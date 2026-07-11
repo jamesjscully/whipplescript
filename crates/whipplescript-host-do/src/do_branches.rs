@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 
 use whipplescript_store::branches::{
     AdvanceOutcome, BindOutcome, BranchRow, BranchStatus, Branches, ConflictRow, CreateBranch,
-    CreateBranchOutcome, CutRecord, CutRow, OpBranchDelta, OpRow, StatusOutcome,
+    CreateBranchOutcome, CutRecord, CutRow, OpBranchDelta, OpRow, RetargetOutcome, StatusOutcome,
     MAINLINE_BRANCH_ID,
 };
 use whipplescript_store::content::ContentBlobs;
@@ -313,6 +313,55 @@ impl<S: DoSql> Branches for DoBranches<S> {
             rows.push(row);
         }
         Ok(rows)
+    }
+
+    fn retarget_branch(
+        &mut self,
+        branch_id: &str,
+        new_parent_branch_id: &str,
+        at: &str,
+    ) -> StoreResult<RetargetOutcome> {
+        let Some(row) = self.row_by_id(branch_id)? else {
+            return Ok(RetargetOutcome::BranchMissing);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(RetargetOutcome::BranchNotActive { status: row.status });
+        }
+        let Some(parent) = self.row_by_id(new_parent_branch_id)? else {
+            return Ok(RetargetOutcome::ParentMissing);
+        };
+        if parent.status != BranchStatus::Active {
+            return Ok(RetargetOutcome::ParentNotActive {
+                status: parent.status,
+            });
+        }
+        // Parent pointers must stay a tree: refuse if the new parent's
+        // lineage passes through the branch itself (self-parent is the
+        // one-step case). Visited guard bounds the walk even against a
+        // manually corrupted store.
+        let mut cursor = Some(new_parent_branch_id.to_owned());
+        let mut visited = BTreeSet::new();
+        while let Some(current) = cursor {
+            if current == branch_id {
+                return Ok(RetargetOutcome::WouldCycle);
+            }
+            if !visited.insert(current.clone()) {
+                break;
+            }
+            cursor = self
+                .row_by_id(&current)?
+                .and_then(|row| row.parent_branch_id);
+        }
+        self.sql
+            .execute(
+                "UPDATE branches SET parent_branch_id = ?2, updated_at = ?3 WHERE branch_id = ?1",
+                &[text(branch_id), text(new_parent_branch_id), text(at)],
+            )
+            .map_err(sql_err)?;
+        let row = self
+            .row_by_id(branch_id)?
+            .ok_or_else(|| StoreError::Conflict("retargeted row missing".to_owned()))?;
+        Ok(RetargetOutcome::Retargeted(Box::new(row)))
     }
 
     fn advance_head(

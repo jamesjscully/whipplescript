@@ -138,6 +138,27 @@ pub enum StatusOutcome {
     NotFound,
 }
 
+/// Outcome of retargeting a branch's lineage parent (a chat re-homed
+/// onto a workstream). Pointer-only: the recorded branch point is NOT
+/// touched — it still names where this branch's content diverged, so
+/// three-way merges stay correct; the next reconcile against the new
+/// parent folds its deltas down and advances the point.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RetargetOutcome {
+    Retargeted(Box<BranchRow>),
+    BranchMissing,
+    BranchNotActive {
+        status: BranchStatus,
+    },
+    ParentMissing,
+    ParentNotActive {
+        status: BranchStatus,
+    },
+    /// The new parent's lineage passes through the branch itself (or IS
+    /// the branch): parent pointers must stay a tree.
+    WouldCycle,
+}
+
 /// One recorded cut with its provenance — the archaeology substrate
 /// (vw note §7.3: write-attribution supersedes blame; every cut knows
 /// what produced it and which head it advanced from).
@@ -316,6 +337,14 @@ pub trait Branches {
         merge_cut_id: &str,
         at: &str,
     ) -> StoreResult<StatusOutcome>;
+    /// Move the branch's lineage parent (its upstream) to another active
+    /// branch. See `RetargetOutcome` for what deliberately does NOT move.
+    fn retarget_branch(
+        &mut self,
+        branch_id: &str,
+        new_parent_branch_id: &str,
+        at: &str,
+    ) -> StoreResult<RetargetOutcome>;
     /// Bind an instance to the branch it is born on (write-once; the
     /// dispatch seam selects the instance's file surface by this).
     fn bind_instance(
@@ -755,6 +784,51 @@ impl Branches for BranchStore {
             rows.push(row);
         }
         Ok(rows)
+    }
+
+    fn retarget_branch(
+        &mut self,
+        branch_id: &str,
+        new_parent_branch_id: &str,
+        at: &str,
+    ) -> StoreResult<RetargetOutcome> {
+        let tx = self.connection.transaction()?;
+        let Some(row) = Self::row_by_id(&tx, branch_id)? else {
+            return Ok(RetargetOutcome::BranchMissing);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(RetargetOutcome::BranchNotActive { status: row.status });
+        }
+        let Some(parent) = Self::row_by_id(&tx, new_parent_branch_id)? else {
+            return Ok(RetargetOutcome::ParentMissing);
+        };
+        if parent.status != BranchStatus::Active {
+            return Ok(RetargetOutcome::ParentNotActive {
+                status: parent.status,
+            });
+        }
+        // Parent pointers must stay a tree: refuse if the new parent's
+        // lineage passes through the branch itself (self-parent is the
+        // one-step case). Visited guard bounds the walk even against a
+        // manually corrupted store.
+        let mut cursor = Some(new_parent_branch_id.to_owned());
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(current) = cursor {
+            if current == branch_id {
+                return Ok(RetargetOutcome::WouldCycle);
+            }
+            if !visited.insert(current.clone()) {
+                break;
+            }
+            cursor = Self::row_by_id(&tx, &current)?.and_then(|row| row.parent_branch_id);
+        }
+        tx.execute(
+            "UPDATE branches SET parent_branch_id = ?2, updated_at = ?3 WHERE branch_id = ?1",
+            params![branch_id, new_parent_branch_id, at],
+        )?;
+        let row = Self::row_by_id(&tx, branch_id)?.expect("retargeted row");
+        tx.commit()?;
+        Ok(RetargetOutcome::Retargeted(Box::new(row)))
     }
 
     fn advance_head(

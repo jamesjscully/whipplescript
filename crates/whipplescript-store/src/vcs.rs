@@ -27,7 +27,8 @@ use std::path::Path;
 use crate::branches::BranchStore;
 use crate::branches::{
     AdvanceOutcome, BranchRow, BranchStatus, Branches, CreateBranch, CreateBranchOutcome,
-    CutRecord, CutRow, OpBranchDelta, OpBranchState, OpRow, StatusOutcome, MAINLINE_BRANCH_ID,
+    CutRecord, CutRow, OpBranchDelta, OpBranchState, OpRow, RetargetOutcome, StatusOutcome,
+    MAINLINE_BRANCH_ID,
 };
 use crate::content::ContentBlobs;
 #[cfg(feature = "native")]
@@ -479,6 +480,34 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
 
     pub fn list_branches(&self, status: Option<BranchStatus>) -> StoreResult<Vec<BranchRow>> {
         self.branches.list_branches(status)
+    }
+
+    /// Re-home a branch under a new lineage parent (a chat retargeted
+    /// onto a workstream). Pointer-only: the branch point stays the
+    /// recorded divergence base, so the NEXT `reconcile_branch` folds the
+    /// new parent's deltas down three-ways against it; `merge` now adopts
+    /// into the new parent. Op-logged like every lineage movement.
+    pub fn retarget(
+        &mut self,
+        branch_id: &str,
+        new_parent_branch_id: &str,
+        at: &str,
+    ) -> StoreResult<RetargetOutcome> {
+        let before = self.branches.get_branch(branch_id)?;
+        let outcome = self
+            .branches
+            .retarget_branch(branch_id, new_parent_branch_id, at)?;
+        if let RetargetOutcome::Retargeted(row) = &outcome {
+            let origin = format!("retarget:{new_parent_branch_id}");
+            self.log_op(
+                &format!("op-retarget-{branch_id}-{at}"),
+                "retarget",
+                vec![Self::op_delta(before.as_ref(), row)],
+                Some(&origin),
+                at,
+            )?;
+        }
+        Ok(outcome)
     }
 
     pub fn discard_branch(&mut self, branch_id: &str, at: &str) -> StoreResult<StatusOutcome> {
@@ -3103,6 +3132,101 @@ mod tests {
             vcs.write("draft_a", "x.md", Some("nope"), "cut_x", "t5")
                 .expect("write"),
             VcsWriteOutcome::BranchNotActive
+        );
+    }
+
+    /// Retarget moves ONLY the lineage pointer: a chat branch re-homed
+    /// onto a workstream merges into the WORKSTREAM afterwards, a
+    /// reconcile folds the new parent's deltas down, and any retarget
+    /// that would bend parent pointers into a cycle (including
+    /// self-parent) is refused.
+    #[test]
+    fn retarget_rehomes_merge_target_and_refuses_cycles() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        assert!(matches!(
+            vcs.write(MAINLINE_BRANCH_ID, "a.md", Some("base"), "cut_m1", "t1")
+                .expect("write"),
+            VcsWriteOutcome::Written { .. }
+        ));
+        assert!(matches!(
+            vcs.create_branch("ws", Some("stream"), MAINLINE_BRANCH_ID, "t2")
+                .expect("create"),
+            CreateBranchOutcome::Created(_)
+        ));
+        assert!(matches!(
+            vcs.create_branch("chat", Some("chat"), MAINLINE_BRANCH_ID, "t2")
+                .expect("create"),
+            CreateBranchOutcome::Created(_)
+        ));
+        // The workstream advances on its own file; the chat writes another.
+        assert!(matches!(
+            vcs.write("ws", "ws.md", Some("stream work"), "cut_w1", "t3")
+                .expect("write"),
+            VcsWriteOutcome::Written { .. }
+        ));
+        assert!(matches!(
+            vcs.write("chat", "chat.md", Some("chat work"), "cut_c1", "t3")
+                .expect("write"),
+            VcsWriteOutcome::Written { .. }
+        ));
+        // Re-home the chat under the workstream.
+        assert!(matches!(
+            vcs.retarget("chat", "ws", "t4").expect("retarget"),
+            RetargetOutcome::Retargeted(_)
+        ));
+        // The new parent's deltas fold DOWN on reconcile (disjoint paths
+        // compose silently)…
+        assert!(matches!(
+            vcs.reconcile_branch("chat", false, "cut_reb1", "t5")
+                .expect("reconcile"),
+            ReconcileOutcome::Rebased { .. }
+        ));
+        assert_eq!(
+            vcs.read("chat", "ws.md").expect("read"),
+            Some("stream work".to_owned())
+        );
+        // …and merge now adopts into the workstream, not mainline.
+        assert_eq!(
+            vcs.merge("chat", "cut_merge_c", "t6").expect("merge"),
+            VcsMergeOutcome::Adopted {
+                merge_cut_id: "cut_merge_c".to_owned(),
+                into_branch_id: "ws".to_owned(),
+            }
+        );
+        assert_eq!(
+            vcs.read("ws", "chat.md").expect("read"),
+            Some("chat work".to_owned())
+        );
+        // Mainline never saw either line's work.
+        assert_eq!(vcs.read(MAINLINE_BRANCH_ID, "chat.md").expect("read"), None);
+        // Guards: a retarget that bends the tree into a cycle is refused —
+        // "ws" under its (adopted) child is caught by the not-active guard
+        // first, so build a live A→B chain to prove the cycle walk bites.
+        assert!(matches!(
+            vcs.create_branch("a", None, MAINLINE_BRANCH_ID, "t7")
+                .expect("create"),
+            CreateBranchOutcome::Created(_)
+        ));
+        assert!(matches!(
+            vcs.create_branch("b", None, "a", "t7").expect("create"),
+            CreateBranchOutcome::Created(_)
+        ));
+        assert_eq!(
+            vcs.retarget("a", "b", "t8").expect("retarget"),
+            RetargetOutcome::WouldCycle
+        );
+        assert_eq!(
+            vcs.retarget("a", "a", "t8").expect("retarget"),
+            RetargetOutcome::WouldCycle
+        );
+        assert_eq!(
+            vcs.retarget("a", "ghost", "t8").expect("retarget"),
+            RetargetOutcome::ParentMissing
+        );
+        assert_eq!(
+            vcs.retarget("ghost", "a", "t8").expect("retarget"),
+            RetargetOutcome::BranchMissing
         );
     }
 
