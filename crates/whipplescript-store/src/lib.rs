@@ -16,6 +16,7 @@ pub mod reconcile;
 pub mod selection;
 pub mod skill_frontmatter;
 pub mod stat_cache;
+pub mod text_merge;
 pub mod vcs;
 pub mod working_set;
 pub mod workspace_api;
