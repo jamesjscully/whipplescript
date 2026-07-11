@@ -110,4 +110,45 @@ mod WHIPPLESCRIPT-TEXT-MERGE-COMPOSE is
       compose(P ; T2 ; M ; T1 ; S, rep(T1, R1), rep(T2, R2))
       => escalated(rep(T1, R1), rep(T2, R2))
       if T1 =/= nilA /\ T2 =/= nilA /\ wc(M) < gapD .
+
+  --- Region-memory refinement tier (spec section 12.3): remembered
+  --- resolutions fold conflict regions one at a time; ONLY a fully
+  --- covered region set reaches the clean refinement. The pinned
+  --- invariant: partial memory never fakes a clean outcome -- the
+  --- honest residue stays conflicted. Exact-key/live-only semantics of
+  --- the memory rows themselves live in resolution-memory.maude, which
+  --- the region tier reuses unchanged.
+  sorts Region RSet Mem MemSet .
+  subsort Region < RSet .
+  subsort Mem < MemSet .
+
+  ops rA rB : -> Region [ctor] .
+  op mtR : -> RSet [ctor] .
+  op _%_ : RSet RSet -> RSet [ctor assoc comm id: mtR] .
+  op mem : Region -> Mem [ctor] .
+  op mtMem : -> MemSet [ctor] .
+  op _&_ : MemSet MemSet -> MemSet [ctor assoc comm id: mtMem] .
+
+  op covered : Region MemSet -> Bool .
+  eq covered(R:Region, (mem(R:Region) & MM:MemSet)) = true .
+  eq covered(R:Region, MM:MemSet) = false [owise] .
+
+  op refineReq : RSet MemSet -> Cfg [ctor] .
+  op refinedClean : -> Cfg [ctor] .
+  op refinedConflicted : RSet -> Cfg [ctor] .
+
+  --- A remembered region folds; the memory row is knowledge, not a
+  --- consumable, so it stays available (the daemon re-applies it to
+  --- every descendant hitting the identical triple).
+  rl [mem-fold] :
+      refineReq((R:Region % RS:RSet), (mem(R:Region) & MM:MemSet))
+      => refineReq(RS:RSet, (mem(R:Region) & MM:MemSet)) .
+  rl [mem-clean] :
+      refineReq(mtR, MM:MemSet) => refinedClean .
+  --- Any uncovered region settles the whole refinement as conflicted:
+  --- the residue is honest, never absorbed.
+  crl [mem-settle] :
+      refineReq((R:Region % RS:RSet), MM:MemSet)
+      => refinedConflicted(R:Region % RS:RSet)
+      if covered(R:Region, MM:MemSet) = false .
 endm

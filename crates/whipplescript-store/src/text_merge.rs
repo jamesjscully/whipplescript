@@ -99,6 +99,12 @@ pub enum Provenance {
     Theirs,
     /// Convergent: both sides made the byte-identical change (taken once).
     Both,
+    /// A remembered region resolution (spec §12.3): recorded human content
+    /// applied by exact content-addressed triple key — NOT algorithmic
+    /// composition, and distinguishable as such. The never-fabricate
+    /// invariant governs the algorithmic pieces; this tag is the honesty
+    /// marker for the memory tier.
+    Resolved,
 }
 
 /// One span of the merged document, in base order. `Conflict` is the
@@ -119,6 +125,17 @@ pub enum MergePiece {
     },
 }
 
+/// One settled region from a resolved editor save (spec §12.2): the exact
+/// three region texts the user saw plus the text they chose or authored.
+/// The store records it into region-level resolution memory.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RegionResolution {
+    pub base_text: String,
+    pub ours_text: String,
+    pub theirs_text: String,
+    pub resolution_text: String,
+}
+
 /// The three-way outcome. `Conflicted` is a legal, tagged state to build
 /// on (conflicts don't block); `Clean.merged` is the piece concatenation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,6 +154,28 @@ impl TextMergeOutcome {
         match self {
             TextMergeOutcome::Clean { pieces, .. } => pieces,
             TextMergeOutcome::Conflicted { pieces } => pieces,
+        }
+    }
+
+    /// Rebuild an outcome from a (possibly memory-refined) piece list:
+    /// Clean iff no Conflict pieces remain, with `merged` = the piece
+    /// concatenation. Partial refinement stays honestly Conflicted —
+    /// this is the pinned invariant of the memory tier (spec §12.3).
+    pub fn from_pieces(pieces: Vec<MergePiece>) -> TextMergeOutcome {
+        let conflicted = pieces
+            .iter()
+            .any(|piece| matches!(piece, MergePiece::Conflict { .. }));
+        if conflicted {
+            TextMergeOutcome::Conflicted { pieces }
+        } else {
+            let merged: String = pieces
+                .iter()
+                .map(|piece| match piece {
+                    MergePiece::Merged { text, .. } => text.as_str(),
+                    MergePiece::Conflict { .. } => unreachable!("checked above"),
+                })
+                .collect();
+            TextMergeOutcome::Clean { pieces, merged }
         }
     }
 }
@@ -829,6 +868,9 @@ mod tests {
                         Provenance::Ours => &[ours],
                         Provenance::Theirs => &[theirs],
                         Provenance::Both => &[ours, theirs],
+                        Provenance::Resolved => {
+                            panic!("core text_merge never emits resolved pieces")
+                        }
                     };
                     assert!(
                         sources.iter().all(|source| source.contains(text.as_str())),

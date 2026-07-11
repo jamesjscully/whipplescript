@@ -307,8 +307,10 @@ In: everything above. Out (deferred, compatible by construction):
   acceptance gate.
 - **Deeper anchor trees** for very large documents (two-level covers
   the 8 MiB cap comfortably).
-- **Region-level resolution memory + editor save flow** — design
-  SETTLED in §12 (2026-07-11), build follows the corpus scaffold.
+- **Region-level resolution memory + editor save flow** — whip half
+  BUILT 2026-07-11 per §12 (`save_with_base`, `merge_preview`,
+  `record_region_resolutions`, memory-aware refinement, partial-memory
+  model searches); the gaugedesk fold UI remains (SUB-6 there).
 - **The evaluation corpus itself** (§10) — the harness and fixtures
   land with the red-team campaign, not this slice; v1 ships the
   metamorphic property tests inline.

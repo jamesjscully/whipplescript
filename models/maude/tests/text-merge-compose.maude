@@ -60,3 +60,21 @@ search in WHIPPLESCRIPT-TEXT-MERGE-COMPOSE :
   compose(w1 ; s1 ; w2 ; s2 ; w3 ; s3 ; w4 ; s4 ; w5,
           rep(w1, x1), rep(w5, y1))
   =>* composed(P:AList ; z1 ; S:AList) RESIDUAL:Cfg .
+
+--- Coverage, memory tier: full region memory refines both regions and
+--- reaches the clean outcome.
+search [1] in WHIPPLESCRIPT-TEXT-MERGE-COMPOSE :
+  refineReq((rA % rB), (mem(rA) & mem(rB)))
+  =>* refinedClean RESIDUAL:Cfg .
+
+--- Coverage, memory tier: partial memory folds what it knows and settles
+--- the honest residue as conflicted.
+search [1] in WHIPPLESCRIPT-TEXT-MERGE-COMPOSE :
+  refineReq((rA % rB), mem(rA))
+  =>* refinedConflicted(rB) RESIDUAL:Cfg .
+
+--- Bite, memory tier: partial memory can NEVER fake a clean refinement
+--- -- spec section 12.3's pinned invariant.
+search in WHIPPLESCRIPT-TEXT-MERGE-COMPOSE :
+  refineReq((rA % rB), mem(rA))
+  =>* refinedClean RESIDUAL:Cfg .

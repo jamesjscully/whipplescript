@@ -210,6 +210,9 @@ fn assert_never_fabricate(outcome: &TextMergeOutcome, base: &str, ours: &str, th
                     Provenance::Ours => &[ours],
                     Provenance::Theirs => &[theirs],
                     Provenance::Both => &[ours, theirs],
+                    Provenance::Resolved => {
+                        panic!("core text_merge never emits resolved pieces")
+                    }
                 };
                 assert!(
                     sources.iter().all(|source| source.contains(text.as_str())),

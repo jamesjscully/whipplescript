@@ -213,11 +213,23 @@ Per-heading `· vN` tags below restate this at each phase.
       .whip paths never text-merge (merge-slice bite untouched).
       Conflict rows carry no new fields: region detail is
       deterministically recomputable from the content-addressed
-      triple. STILL OPEN, deferred by design: move detection,
-      region-level resolution memory, the §10 evaluation corpus +
-      red-team failure-mode registry (candidate gauge/mark campaign;
-      proximity/anchor dials ratchet only on corpus evidence), and
-      the gaugedesk merge-preview consumer (SUB-6 there).)*
+      triple. SAME-DAY FOLLOW-ONS BUILT: the evaluation corpus v1
+      (tests/text_merge_corpus.rs — executable failure-mode registry
+      with pinned dispositions, zero-bad-merge hard gate, 500-seed
+      metamorphic sweep; corpus finding folded into spec §7.2: pure
+      insertion pairs at distinct points are exempt from proximity,
+      which composes block-reorder-vs-interior-edit to the ideal
+      moved-block-carries-the-edit result) and the §12 editor-save
+      surface (SUB-6 co-design: `save_with_base` base-carrying CAS
+      verb with transient conflicts, `merge_preview`, region-level
+      resolution memory — exact triple both orientations, live-only,
+      auto-apply, `resolved` provenance; partial-memory-never-fakes-
+      clean pinned in the model's memory tier). STILL OPEN, deferred
+      by design: move detection (needs its own design pass — weakens
+      never-fabricate to atom level; corpus-gated), corpus mining +
+      agent red-team (candidate gauge/mark campaign; dials ratchet
+      only on corpus evidence), and the gaugedesk fold UI consumer
+      (SUB-6 there, gated on the whip pin repoint).)*
 - [x] Reconciliation daemon v1: silent rebase-down of slice-disjoint
       mainline deltas; quiescence points (terminals, marks, task
       completion); staleness bound; merge-up serialized by the adoption
