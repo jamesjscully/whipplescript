@@ -38,7 +38,10 @@ pub fn model_context_window(provider: CoerceProvider, model: &str) -> u64 {
     match provider {
         // Claude models are 200k standard context.
         CoerceProvider::Anthropic => 200_000,
-        CoerceProvider::OpenAi => {
+        // A generic OpenAI-compatible endpoint serves arbitrary models whose windows
+        // we can't know; fall back to the OpenAI heuristic (conservative default for
+        // an unrecognized id).
+        CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat => {
             if model.contains("gpt-4.1") {
                 1_000_000
             } else if model.contains("gpt-4o") || model.contains("gpt-4-turbo") {
@@ -318,7 +321,149 @@ fn build_request(
         CoerceProvider::OpenAi => {
             build_openai_request(base_url, api_key, model, cache_key, messages, tools)
         }
+        CoerceProvider::OpenAiCompat => build_openai_compat_request(
+            base_url, api_key, model, max_tokens, cache_key, messages, tools,
+        ),
     }
+}
+
+/// Agent-turn request for a generic OpenAI-compatible endpoint: the Chat Completions
+/// API (`/v1/chat/completions`) — messages in the `(system|user|assistant|tool)`
+/// shape, tools as `{type:"function", function:{…}}`, tool results as `role:"tool"`
+/// messages. The near-universal OpenAI-wire surface, distinct from the Responses API
+/// the [`build_openai_request`] path targets.
+#[allow(clippy::too_many_arguments)]
+fn build_openai_compat_request(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    max_tokens: u64,
+    cache_key: Option<&str>,
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+) -> HttpRequest {
+    let msgs = openai_compat_messages(messages);
+    let tool_defs: Vec<Value> = tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                },
+            })
+        })
+        .collect();
+    let mut body = json!({
+        "model": model,
+        "messages": msgs,
+        "max_tokens": max_tokens,
+    });
+    if !tool_defs.is_empty() {
+        body["tools"] = json!(tool_defs);
+    }
+    if let Some(key) = cache_key {
+        // Honored by OpenAI and ignored by endpoints that don't cache — harmless.
+        body["prompt_cache_key"] = json!(key);
+    }
+    let mut headers = vec![
+        ("authorization".into(), format!("Bearer {api_key}")),
+        ("content-type".into(), "application/json".into()),
+    ];
+    if let Some(key) = cache_key {
+        headers.push(("Idempotency-Key".into(), key.to_owned()));
+    }
+    HttpRequest {
+        // The configured endpoint is the OpenAI-compatible base URL as provider docs
+        // give it (it already includes `/v1`), so append only `/chat/completions` —
+        // the OpenAI SDK `base_url` convention every compat endpoint follows.
+        url: format!("{}/chat/completions", base_url.trim_end_matches('/')),
+        headers,
+        body,
+    }
+}
+
+/// Serialize the conversation into the Chat Completions `messages[]` shape: assistant
+/// tool calls become `tool_calls[]` (arguments stringified) and results become one
+/// `role:"tool"` message each (correlated by `tool_call_id`).
+fn openai_compat_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for message in messages {
+        match message {
+            ChatMessage::System(text) => {
+                out.push(json!({ "role": "system", "content": text }));
+            }
+            ChatMessage::User { text, images } => {
+                if images.is_empty() {
+                    out.push(json!({ "role": "user", "content": text }));
+                } else {
+                    let mut content: Vec<Value> = vec![json!({ "type": "text", "text": text })];
+                    for image in images {
+                        content.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!(
+                                    "data:{};base64,{}",
+                                    image.media_type, image.data_base64
+                                ),
+                            },
+                        }));
+                    }
+                    out.push(json!({ "role": "user", "content": content }));
+                }
+            }
+            ChatMessage::Assistant { text, tool_calls } => {
+                let mut msg = Map::new();
+                msg.insert("role".into(), json!("assistant"));
+                // Chat Completions wants `content: null` when the turn is only tool
+                // calls; a plain string otherwise.
+                msg.insert(
+                    "content".into(),
+                    if text.is_empty() && !tool_calls.is_empty() {
+                        Value::Null
+                    } else {
+                        json!(text)
+                    },
+                );
+                if !tool_calls.is_empty() {
+                    let calls: Vec<Value> = tool_calls
+                        .iter()
+                        .map(|call| {
+                            json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": call.name,
+                                    "arguments": call.arguments.to_string(),
+                                },
+                            })
+                        })
+                        .collect();
+                    msg.insert("tool_calls".into(), json!(calls));
+                }
+                out.push(Value::Object(msg));
+            }
+            ChatMessage::ToolResults(results) => {
+                for result in results {
+                    // Chat Completions `role:"tool"` has no error flag; mark a failure
+                    // in-band so the model sees it (matches the Responses path).
+                    let content = if result.is_error {
+                        format!("error: {}", result.content)
+                    } else {
+                        result.content.clone()
+                    };
+                    out.push(json!({
+                        "role": "tool",
+                        "tool_call_id": result.tool_call_id,
+                        "content": content,
+                    }));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn build_anthropic_request(
@@ -576,6 +721,51 @@ fn parse_response(
     match provider {
         CoerceProvider::Anthropic => Ok(parse_anthropic_response(body)),
         CoerceProvider::OpenAi => Ok(parse_openai_response(body)),
+        CoerceProvider::OpenAiCompat => Ok(parse_openai_compat_response(body)),
+    }
+}
+
+/// Parse a Chat Completions reply: `choices[0].message` → free text (`content`) plus
+/// `tool_calls[]` (function name + JSON-string arguments).
+fn parse_openai_compat_response(body: &Value) -> ModelReply {
+    let mut text = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let message = body
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"));
+    if let Some(message) = message {
+        if let Some(content) = message.get("content").and_then(Value::as_str) {
+            text.push_str(content);
+        }
+        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                let function = call.get("function");
+                tool_calls.push(ToolCall {
+                    id: call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    name: function
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    arguments: function
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(Value::as_str)
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .unwrap_or(Value::Null),
+                });
+            }
+        }
+    }
+    ModelReply {
+        text,
+        tool_calls,
+        usage: body.get("usage").cloned().unwrap_or(Value::Null),
     }
 }
 
@@ -714,6 +904,11 @@ mod tests {
             model_context_window(CoerceProvider::OpenAi, "some-future-model"),
             128_000
         );
+        // A generic OpenAI-compatible endpoint reuses the OpenAI heuristic.
+        assert_eq!(
+            model_context_window(CoerceProvider::OpenAiCompat, "llama-3.3-70b"),
+            128_000
+        );
     }
 
     struct FakeTransport {
@@ -830,6 +1025,87 @@ mod tests {
                     && i["call_id"] == json!("call_1"))
         );
         assert_eq!(req.body["tools"][0]["type"], json!("function"));
+    }
+
+    #[test]
+    fn openai_compat_request_uses_chat_completions_with_tools_and_roles() {
+        let req = build_openai_compat_request(
+            "https://api.together.xyz/v1",
+            "sk-key",
+            "llama-3.3-70b",
+            8192,
+            None,
+            &convo(),
+            &tool_specs(),
+        );
+        // Chat Completions endpoint (not the Responses API).
+        assert_eq!(req.url, "https://api.together.xyz/v1/chat/completions");
+        assert!(req
+            .headers
+            .iter()
+            .any(|(k, v)| k == "authorization" && v == "Bearer sk-key"));
+        assert_eq!(req.body["max_tokens"], json!(8192));
+        let msgs = req.body["messages"].as_array().expect("messages");
+        // system, user, assistant(tool_calls), tool(result)
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["role"], json!("system"));
+        assert_eq!(msgs[1]["role"], json!("user"));
+        // Assistant with only tool calls: content is null, tool_calls carry
+        // stringified arguments in the chat-completions shape.
+        assert_eq!(msgs[2]["role"], json!("assistant"));
+        assert_eq!(msgs[2]["content"], Value::Null);
+        assert_eq!(msgs[2]["tool_calls"][0]["type"], json!("function"));
+        assert_eq!(msgs[2]["tool_calls"][0]["id"], json!("call_1"));
+        assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], json!("read"));
+        assert_eq!(
+            msgs[2]["tool_calls"][0]["function"]["arguments"],
+            json!("{\"path\":\"a.txt\"}")
+        );
+        // Tool result becomes a role:"tool" message correlated by id.
+        assert_eq!(msgs[3]["role"], json!("tool"));
+        assert_eq!(msgs[3]["tool_call_id"], json!("call_1"));
+        assert_eq!(msgs[3]["content"], json!("hello"));
+        // Tools are the chat-completions {type:function, function:{…}} shape.
+        assert_eq!(req.body["tools"][0]["type"], json!("function"));
+        assert_eq!(req.body["tools"][0]["function"]["name"], json!("read"));
+    }
+
+    #[test]
+    fn openai_compat_response_parses_content_and_tool_calls() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "let me look",
+                    "tool_calls": [{
+                        "id": "call_9",
+                        "type": "function",
+                        "function": { "name": "read", "arguments": "{\"path\":\"x\"}" }
+                    }]
+                }
+            }],
+            "usage": { "completion_tokens": 7 }
+        });
+        let reply = parse_openai_compat_response(&body);
+        assert_eq!(reply.text, "let me look");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].id, "call_9");
+        assert_eq!(reply.tool_calls[0].name, "read");
+        assert_eq!(reply.tool_calls[0].arguments, json!({ "path": "x" }));
+        assert!(!reply.is_final());
+    }
+
+    #[test]
+    fn openai_compat_tool_result_error_is_marked_in_band() {
+        let messages = vec![ChatMessage::ToolResults(vec![ToolResultMsg {
+            tool_call_id: "call_err".into(),
+            tool_name: "read".into(),
+            content: "read of `x` failed".into(),
+            is_error: true,
+        }])];
+        let msgs = openai_compat_messages(&messages);
+        assert_eq!(msgs[0]["role"], json!("tool"));
+        assert_eq!(msgs[0]["content"], json!("error: read of `x` failed"));
     }
 
     #[test]

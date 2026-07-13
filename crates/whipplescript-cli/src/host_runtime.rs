@@ -408,7 +408,8 @@ pub trait PackageResolver {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelProvider {
     OpenAi,
-    /// A generic OpenAI-compatible Chat Completions endpoint.
+    /// A generic OpenAI-compatible endpoint (Chat Completions API) at a caller-supplied
+    /// base URL — OpenRouter, Together, Groq, vLLM, Ollama, LM Studio, etc.
     OpenAiCompat,
     Anthropic,
     Codex,

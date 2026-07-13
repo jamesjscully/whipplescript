@@ -149,7 +149,7 @@ fn missing_credential_message(provider: CoerceProvider) -> String {
              `whip auth set anthropic <key>`"
                 .to_owned()
         }
-        CoerceProvider::OpenAi => {
+        CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat => {
             "coerce provider `openai` needs a credential: set OPENAI_API_KEY, run \
              `whip auth set openai <key>`, or sign in with `codex login`"
                 .to_owned()
@@ -171,9 +171,11 @@ fn codex_account_id() -> Option<String> {
 fn parse_provider(name: &str) -> Result<CoerceProvider, String> {
     match name {
         "openai" => Ok(CoerceProvider::OpenAi),
+        "openai-generic" => Ok(CoerceProvider::OpenAiCompat),
         "anthropic" => Ok(CoerceProvider::Anthropic),
         other => Err(format!(
-            "unknown WHIPPLESCRIPT_COERCE_PROVIDER `{other}` (expected `openai` or `anthropic`)"
+            "unknown WHIPPLESCRIPT_COERCE_PROVIDER `{other}` \
+             (expected `openai`, `openai-generic`, or `anthropic`)"
         )),
     }
 }
@@ -212,7 +214,7 @@ pub fn resolve_credential_with_source(
                 crate::auth::stored_credential("anthropic")
                     .map(|key| (key, CredentialSource::Stored))
             }),
-        CoerceProvider::OpenAi => env_nonempty("OPENAI_API_KEY")
+        CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat => env_nonempty("OPENAI_API_KEY")
             .map(|key| (key, CredentialSource::Env("OPENAI_API_KEY")))
             .or_else(|| {
                 crate::auth::stored_credential("openai").map(|key| (key, CredentialSource::Stored))

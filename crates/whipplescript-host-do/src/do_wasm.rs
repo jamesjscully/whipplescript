@@ -354,6 +354,7 @@ fn parse_coerce_config(json: &str) -> Result<CoerceProviderConfig, String> {
     let provider = match value.get("provider").and_then(serde_json::Value::as_str) {
         Some("anthropic") => CoerceProvider::Anthropic,
         Some("openai") => CoerceProvider::OpenAi,
+        Some("openai-generic") => CoerceProvider::OpenAiCompat,
         other => return Err(format!("unknown coerce provider: {other:?}")),
     };
     let field = |name: &str| {
@@ -384,6 +385,7 @@ fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
     let provider = match value.get("provider").and_then(serde_json::Value::as_str) {
         Some("anthropic") => CoerceProvider::Anthropic,
         Some("openai") => CoerceProvider::OpenAi,
+        Some("openai-generic") => CoerceProvider::OpenAiCompat,
         other => return Err(format!("unknown agent provider: {other:?}")),
     };
     let field = |name: &str| {
