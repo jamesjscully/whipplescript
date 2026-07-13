@@ -264,30 +264,26 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                         revision_epoch: active_revision_epoch,
                     },
                 );
-                match event {
-                    Ok(committed) => {
-                        report.committed_rules += 1;
-                        report.facts_created += new_facts.len();
-                        report.facts_consumed += consumed_fact_ids.len();
-                        report.effects_created += new_effects.len();
-                        // Holder-lifetime bound (spec/coordination.md): an
-                        // instance reaching a workflow terminal auto-releases
-                        // every lease it held.
-                        if lowering.terminal.is_some() {
-                            release_holder_resources_on_terminal(kernel.store_mut(), instance_id);
-                        }
-                        apply_rule_cancels(
-                            kernel,
-                            instance_id,
-                            &rule.name,
-                            &lowering.cancels,
-                            &committed.event_id,
-                        )?;
-                        made_progress = true;
-                        break 'rules;
-                    }
-                    Err(error) => return Err(error),
+                let committed = event?;
+                report.committed_rules += 1;
+                report.facts_created += new_facts.len();
+                report.facts_consumed += consumed_fact_ids.len();
+                report.effects_created += new_effects.len();
+                // Holder-lifetime bound (spec/coordination.md): an
+                // instance reaching a workflow terminal auto-releases
+                // every lease it held.
+                if lowering.terminal.is_some() {
+                    release_holder_resources_on_terminal(kernel.store_mut(), instance_id);
                 }
+                apply_rule_cancels(
+                    kernel,
+                    instance_id,
+                    &rule.name,
+                    &lowering.cancels,
+                    &committed.event_id,
+                )?;
+                made_progress = true;
+                break 'rules;
             }
         }
     }
