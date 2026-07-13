@@ -1755,17 +1755,11 @@ impl<'a> BodyParser<'a> {
             let operation = self.ident_text("operation in the access-grant block")?;
             let mut target = None;
             if self.consume_ident("for") {
-                match self.ident_text("target after `for`") {
-                    Some(name) => target = Some(name),
-                    None => return None,
-                }
+                target = Some(self.ident_text("target after `for`")?);
             }
             let mut globs = Vec::new();
             if self.at_sym('[') {
-                match self.parse_string_array() {
-                    Some(values) => globs = values,
-                    None => return None,
-                }
+                globs = self.parse_string_array()?;
             }
             operations.push(AccessGrantOp {
                 operation,
