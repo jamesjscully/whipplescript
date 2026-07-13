@@ -861,7 +861,6 @@ pub(crate) fn redact_sensitive_metadata(value: &str) -> String {
     if value.contains("sk-")
         || value.contains("ANTHROPIC_API_KEY")
         || value.contains("OPENAI_API_KEY")
-        || value.contains("PI_API_KEY")
         || value.contains("token")
         || value.contains("secret")
     {

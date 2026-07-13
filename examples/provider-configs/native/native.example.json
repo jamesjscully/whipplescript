@@ -25,19 +25,6 @@
       "cancellation_depth": "cooperative_request",
       "artifact_policy": "required",
       "health_checks": ["claude_sdk", "api_key", "tool_policy"]
-    },
-    {
-      "provider_id": "pi-main",
-      "provider_kind": "pi",
-      "surface": "pi_rpc",
-      "credentials_ref": "env:PI_API_KEY",
-      "profile_ids": ["repo-reader", "repo-writer"],
-      "default_model": "provider/default",
-      "workspace_policy": "read_only",
-      "timeout_ms": 60000,
-      "cancellation_depth": "native_stop",
-      "artifact_policy": "required",
-      "health_checks": ["pi_cli", "rpc_mode", "provider_model", "extensions"]
     }
   ]
 }

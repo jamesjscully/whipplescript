@@ -2462,7 +2462,6 @@ fn doctor_providers_reports_deterministic_health_posture() {
     assert!(!doctor_json.contains("sk-test-secret"), "{doctor_json}");
     assert!(!doctor_json.contains("ANTHROPIC_API_KEY="), "{doctor_json}");
     assert!(!doctor_json.contains("OPENAI_API_KEY="), "{doctor_json}");
-    assert!(!doctor_json.contains("PI_API_KEY="), "{doctor_json}");
 
     let _ = fs::remove_file(store_path);
 }

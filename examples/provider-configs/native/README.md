@@ -1,6 +1,6 @@
 # Native Provider Config Examples
 
-These files are release-package examples for native Codex, Claude, and Pi
+These files are release-package examples for native Codex and Claude
 bindings. They are safe to publish because credential fields are references,
 not secret values.
 
