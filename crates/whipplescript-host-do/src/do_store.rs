@@ -5529,55 +5529,6 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         Ok(evidence_id)
     }
 
-    fn record_pi_rpc_evidence(&self, evidence: PiRpcEvidence<'_>) -> StoreResult<String> {
-        let inner = serde_json::from_str::<Value>(evidence.metadata_json)?;
-        let metadata = serde_json::json!({
-            "provider_id": evidence.provider_id,
-            "session_id": evidence.session_id,
-            "run_id": evidence.run_id,
-            "evidence": inner,
-        })
-        .to_string();
-        let summary = format!(
-            "Pi RPC evidence for provider `{}` session `{}`",
-            evidence.provider_id, evidence.session_id
-        );
-        let evidence_id = do_insert_evidence(
-            &self.sql,
-            EvidenceRecord {
-                instance_id: evidence.instance_id,
-                kind: "pi.rpc.evidence",
-                subject_type: "provider_session",
-                subject_id: evidence.session_id,
-                causation_id: Some(evidence.run_id),
-                correlation_id: evidence.correlation_id,
-                summary: Some(&summary),
-                metadata_json: &metadata,
-            },
-        )?;
-        do_insert_evidence_link(
-            &self.sql,
-            EvidenceLink {
-                evidence_id: &evidence_id,
-                instance_id: evidence.instance_id,
-                target_type: "provider",
-                target_id: evidence.provider_id,
-                relation: "observes",
-            },
-        )?;
-        do_insert_evidence_link(
-            &self.sql,
-            EvidenceLink {
-                evidence_id: &evidence_id,
-                instance_id: evidence.instance_id,
-                target_type: "provider_run",
-                target_id: evidence.run_id,
-                relation: "observes",
-            },
-        )?;
-        Ok(evidence_id)
-    }
-
     fn link_evidence(&self, link: EvidenceLink<'_>) -> StoreResult<()> {
         do_insert_evidence_link(&self.sql, link)
     }

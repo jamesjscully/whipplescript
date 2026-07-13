@@ -18,7 +18,6 @@ pub mod instance_machine;
 pub mod lowering;
 pub mod native_lifecycle;
 pub mod package_registry;
-pub mod pi_rpc;
 pub mod provider;
 pub mod rule_lowering;
 pub mod rule_pass;
@@ -4301,11 +4300,8 @@ pub fn kernel_stage() -> &'static str {
 mod tests {
     use super::*;
     use coerce::{CoerceRequest, FakeCoerceClient};
-    use harness::{
-        ClaudeCodeAgentHarness, CodexAgentHarness, CommandLaunchPlan, MockAgentHarness,
-        PiStyleAgentHarness,
-    };
-    use native_lifecycle::{normalize_pi_rpc_event, AgentTurnLifecycleKind};
+    use harness::{ClaudeCodeAgentHarness, CodexAgentHarness, CommandLaunchPlan, MockAgentHarness};
+    use native_lifecycle::AgentTurnLifecycleKind;
     use provider::{
         builtin_provider_capabilities, AdapterSurface, CancellationDepth,
         NativeProviderBoundaryError, NativeProviderCancellation, ProviderCapability, ProviderKind,
@@ -6011,6 +6007,7 @@ rule wait
         assert_eq!(replayed_artifacts[0].artifact_id, artifacts[0].artifact_id);
     }
 
+    #[cfg(feature = "codex")]
     #[test]
     fn native_provider_lifecycle_observation_records_event_and_fact() {
         let store = SqliteStore::open_in_memory().expect("store opens");
@@ -6026,15 +6023,19 @@ rule wait
         let instance_id = kernel
             .create_instance(&version, "{}")
             .expect("instance creates");
-        let observation = normalize_pi_rpc_event(&json!({
-            "type": "turn_end",
-            "message": {
-                "role": "assistant",
-                "stopReason": "aborted",
-                "content": [{"type": "text", "text": "secret"}],
+        let observation = native_lifecycle::normalize_codex_app_server_event(&json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "session-1",
+                "turnId": "turn-1",
+                "status": "cancelled",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "secret"}],
+                },
             },
         }))
-        .expect("Pi event normalizes");
+        .expect("codex event normalizes");
         assert_eq!(observation.kind, AgentTurnLifecycleKind::Cancelled);
 
         kernel
@@ -6043,7 +6044,7 @@ rule wait
                     instance_id: &instance_id,
                     effect_id: "tell",
                     run_id: "run-tell",
-                    provider: "pi-main",
+                    provider: "codex-main",
                     worker_id: "worker-1",
                     lease_id: "lease-tell",
                     lease_expires_at: "2030-01-01T00:00:00Z",
@@ -6053,7 +6054,7 @@ rule wait
                     skill_names: &[],
                 },
                 &observation,
-                "pi-turn-end-1",
+                "codex-turn-completed-1",
             )
             .expect("native lifecycle records");
 
@@ -6066,7 +6067,7 @@ rule wait
         let payload = serde_json::from_str::<Value>(&event.payload_json).expect("payload json");
         assert_eq!(
             payload.get("provider_event_type").and_then(Value::as_str),
-            Some("turn_end")
+            Some("turn/completed")
         );
         assert_eq!(payload.get("terminal").and_then(Value::as_bool), Some(true));
         let evidence_id = payload
@@ -7784,17 +7785,17 @@ rule wait
     }
 
     #[test]
-    fn restart_recovers_running_pi_native_run_from_terminal_evidence() {
+    fn restart_recovers_running_codex_native_run_from_terminal_evidence() {
         let store_path = std::env::temp_dir().join(format!(
-            "whip-kernel-pi-native-recovery-{}.sqlite",
-            idempotency_key(&["pi-native-provider-recovery", "store"])
+            "whip-kernel-codex-native-recovery-{}.sqlite",
+            idempotency_key(&["codex-native-provider-recovery", "store"])
         ));
         let _ = fs::remove_file(&store_path);
         let store = SqliteStore::open(&store_path).expect("store opens");
         let mut kernel = RuntimeKernel::new(store);
         let version = kernel
             .create_program_version(ProgramVersionInput {
-                program_name: "RestartPiNativeRecovery",
+                program_name: "RestartCodexNativeRecovery",
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
@@ -7814,7 +7815,7 @@ rule wait
                     timeout_seconds: None,
                     effect_id: "tell",
                     kind: "agent.tell",
-                    target: Some("pi"),
+                    target: Some("codex"),
                     input_json: r#"{"prompt":"go"}"#,
                     status: "queued",
                     idempotency_key: "rule=start;effect=tell",
@@ -7825,7 +7826,7 @@ rule wait
                 }],
                 dependencies: &[],
                 terminal: None,
-                idempotency_key: Some("commit-start-pi-native-recovery"),
+                idempotency_key: Some("commit-start-codex-native-recovery"),
             })
             .expect("rule commits");
         kernel
@@ -7833,7 +7834,7 @@ rule wait
                 instance_id: &instance_id,
                 effect_id: "tell",
                 run_id: "run-tell",
-                provider: "pi",
+                provider: "codex",
                 worker_id: "worker-1",
                 lease_id: "lease-tell",
                 lease_expires_at: "2030-01-01T00:00:00Z",
@@ -7842,17 +7843,17 @@ rule wait
             .expect("run starts");
         let native_metadata = json!({
             "effect_id": "tell",
-            "agent": "pi",
+            "agent": "codex",
             "profile": "repo-reader",
-            "provider": "pi",
+            "provider": "codex",
             "native_event": {
-                "provider_id": "pi",
+                "provider_id": "codex",
                 "run_id": "run-tell",
                 "event_kind": "completed",
                 "terminal": true,
-                "provider_event_type": "turn_end",
-                "provider_session_id": "pi-session-1",
-                "provider_turn_id": "pi-turn-1",
+                "provider_event_type": "turn/completed",
+                "provider_session_id": "codex-session-1",
+                "provider_turn_id": "codex-turn-1",
                 "sequence": 4,
                 "evidence_shape": {"type": "object", "keys": 2},
                 "artifacts": []
@@ -7868,8 +7869,8 @@ rule wait
                 subject_type: "run",
                 subject_id: "run-tell",
                 causation_id: Some("tell"),
-                correlation_id: Some("native-pi-terminal-gap"),
-                summary: Some("completed native provider event from turn_end"),
+                correlation_id: Some("native-codex-terminal-gap"),
+                summary: Some("completed native provider event from turn/completed"),
                 metadata_json: &native_metadata,
             })
             .expect("native provider evidence records");
@@ -7904,8 +7905,8 @@ rule wait
             .expect("terminal event exists");
         assert!(terminal
             .payload_json
-            .contains("\"provider_event_type\":\"turn_end\""));
-        assert!(terminal.payload_json.contains("pi-session-1"));
+            .contains("\"provider_event_type\":\"turn/completed\""));
+        assert!(terminal.payload_json.contains("codex-session-1"));
 
         let _ = fs::remove_file(store_path);
     }
@@ -7944,23 +7945,6 @@ rule wait
             "claude",
             &harness,
             "unknown option",
-        );
-    }
-
-    #[test]
-    fn real_pi_failure_reaches_event_stream() {
-        if !command_exists("pi") {
-            eprintln!("skipping real Pi failure smoke: pi not found on PATH");
-            return;
-        }
-        let harness = PiStyleAgentHarness::new(
-            CommandLaunchPlan::new("pi", "pi").arg("--definitely-not-a-real-flag"),
-        );
-        assert_real_provider_failure_reaches_event_stream(
-            "RealPiFailure",
-            "pi",
-            &harness,
-            "Unknown option",
         );
     }
 

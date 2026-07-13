@@ -368,10 +368,6 @@ impl RuntimeStore for NativeStores {
         self.runtime.record_claude_agent_sdk_evidence(evidence)
     }
 
-    fn record_pi_rpc_evidence(&self, evidence: PiRpcEvidence<'_>) -> StoreResult<String> {
-        self.runtime.record_pi_rpc_evidence(evidence)
-    }
-
     fn link_evidence(&self, link: EvidenceLink<'_>) -> StoreResult<()> {
         self.runtime.link_evidence(link)
     }

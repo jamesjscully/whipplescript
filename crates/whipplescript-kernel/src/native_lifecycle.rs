@@ -238,61 +238,6 @@ pub fn normalize_claude_agent_sdk_event(
     )
 }
 
-pub fn normalize_pi_rpc_event(message: &Value) -> Option<NativeAgentTurnObservation> {
-    let event_type = message.get("type").and_then(Value::as_str)?;
-    let kind = match event_type {
-        "turn_start" => AgentTurnLifecycleKind::Started,
-        "message_start" | "message_end" => AgentTurnLifecycleKind::Streamed,
-        "tool_call" | "tool_result" => AgentTurnLifecycleKind::ToolRequested,
-        "artifact" | "artifact_captured" => AgentTurnLifecycleKind::ArtifactCaptured,
-        "turn_end" => pi_terminal_kind(message),
-        "agent_start" | "agent_end" => AgentTurnLifecycleKind::Streamed,
-        _ => return None,
-    };
-    Some(
-        NativeAgentTurnObservation::new(kind, event_type)
-            .session_id(
-                message
-                    .get("sessionId")
-                    .or_else(|| message.pointer("/message/sessionId"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            )
-            .turn_id(
-                message
-                    .get("turnId")
-                    .or_else(|| message.pointer("/message/turnId"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            )
-            .payload_shape(message)
-            .provider_error(pi_terminal_error(message)),
-    )
-}
-
-/// Pi reports a terminal failure reason under `/message/errorMessage`.
-fn pi_terminal_error(message: &Value) -> Option<String> {
-    message
-        .pointer("/message/errorMessage")
-        .or_else(|| message.get("errorMessage"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-fn pi_terminal_kind(message: &Value) -> AgentTurnLifecycleKind {
-    match message
-        .pointer("/message/stopReason")
-        .or_else(|| message.get("stopReason"))
-        .and_then(Value::as_str)
-    {
-        Some("aborted" | "cancelled" | "canceled") => AgentTurnLifecycleKind::Cancelled,
-        Some("error" | "failed") => AgentTurnLifecycleKind::Failed,
-        Some("timeout" | "timed_out") => AgentTurnLifecycleKind::TimedOut,
-        _ if message.pointer("/message/errorMessage").is_some() => AgentTurnLifecycleKind::Failed,
-        _ => AgentTurnLifecycleKind::Completed,
-    }
-}
-
 fn json_shape(value: &Value) -> Value {
     match value {
         Value::Null => json!({"type":"null"}),
@@ -369,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_claude_and_pi_artifact_events() {
+    fn normalizes_claude_artifact_events() {
         let claude = normalize_claude_agent_sdk_event(&ClaudeSidecarEvent {
             event_type: "claude.artifact.captured".to_owned(),
             run_id: "run-1".to_owned(),
@@ -378,39 +323,5 @@ mod tests {
         .expect("claude artifact normalizes");
         assert_eq!(claude.kind, AgentTurnLifecycleKind::ArtifactCaptured);
         assert!(!claude.provider_payload_shape.to_string().contains("secret"));
-
-        let pi = normalize_pi_rpc_event(&json!({
-            "type": "artifact",
-            "message": {
-                "sessionId": "session-1",
-                "turnId": "turn-1",
-                "content": "secret",
-            },
-        }))
-        .expect("pi artifact normalizes");
-        assert_eq!(pi.kind, AgentTurnLifecycleKind::ArtifactCaptured);
-        assert_eq!(pi.provider_session_id.as_deref(), Some("session-1"));
-        assert_eq!(pi.provider_turn_id.as_deref(), Some("turn-1"));
-        assert!(!pi.provider_payload_shape.to_string().contains("secret"));
-    }
-
-    #[test]
-    fn normalizes_pi_aborted_turn_end() {
-        let observation = normalize_pi_rpc_event(&json!({
-            "type": "turn_end",
-            "message": {
-                "role": "assistant",
-                "stopReason": "aborted",
-                "content": [{"type": "text", "text": "secret"}],
-            },
-        }))
-        .expect("event normalizes");
-
-        assert_eq!(observation.kind, AgentTurnLifecycleKind::Cancelled);
-        assert!(observation.terminal);
-        assert!(!observation
-            .provider_payload_shape
-            .to_string()
-            .contains("secret"));
     }
 }

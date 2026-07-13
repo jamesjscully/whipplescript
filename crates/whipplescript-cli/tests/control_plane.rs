@@ -2440,7 +2440,7 @@ fn doctor_providers_reports_deterministic_health_posture() {
         .get("provider_health_checks")
         .and_then(Value::as_array)
         .expect("provider health checks");
-    for provider in ["codex", "claude", "pi"] {
+    for provider in ["codex", "claude"] {
         assert!(
             checks
                 .iter()
@@ -4151,10 +4151,6 @@ fn running_cancel_supported_provider_acknowledges_cancellation() {
     running_cancel_supported_provider_acknowledges_cancellation_case(
         "fixture-cancellable",
         "before_terminal",
-    );
-    running_cancel_supported_provider_acknowledges_cancellation_case(
-        "pi-main",
-        "after_terminal_allowed",
     );
 }
 
@@ -5995,7 +5991,7 @@ rule start_delegated_work
 #[test]
 fn dev_native_provider_unavailable_blocks_effect_recoverably() {
     // DR-0020: a native agent effect whose provider binding is unavailable
-    // (here: the `pi` sidecar cannot launch) is BLOCKED before provider execution
+    // (here: the `codex` sidecar cannot launch) is BLOCKED before provider execution
     // with a categorized reason — recoverable, not a terminal failure. The effect
     // never runs (no failed run, no agent.turn.failed event).
     let bin = env!("CARGO_BIN_EXE_whip");
@@ -6007,7 +6003,7 @@ fn dev_native_provider_unavailable_blocks_effect_recoverably() {
 workflow NativeProviderUnavailable
 
 agent worker {
-  provider pi
+  provider codex
   profile "repo-reader"
   capacity 1
 }
@@ -6025,8 +6021,8 @@ rule start_native_work
     let store_str = store_path.to_str().expect("utf-8 temp path");
     let output = Command::new(bin)
         .env(
-            "WHIPPLESCRIPT_PI_RPC_COMMAND",
-            "__whipplescript_missing_pi_rpc_command__",
+            "WHIPPLESCRIPT_CODEX_APP_SERVER_COMMAND",
+            "__whipplescript_missing_codex_command__",
         )
         .args([
             "--store",
@@ -6035,7 +6031,7 @@ rule start_native_work
             "dev",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
-            "pi",
+            "codex",
             "--until",
             "idle",
         ])
@@ -6089,8 +6085,8 @@ rule start_native_work
             .as_array()
             .expect("runs array")
             .iter()
-            .any(|run| run.get("provider").and_then(Value::as_str) == Some("pi")),
-        "no pi run should start: {runs}"
+            .any(|run| run.get("provider").and_then(Value::as_str) == Some("codex")),
+        "no codex run should start: {runs}"
     );
     let log = run_json(bin, &["--store", store_str, "--json", "log", instance_id]);
     let events = log.as_array().expect("event array");
@@ -14841,7 +14837,7 @@ fn dev_provider_language_rehydrates_after_bound_coerce_arguments() {
                 .and_then(Value::as_u64)
                 .unwrap_or(0))
             .collect::<Vec<_>>(),
-        vec![6, 6, 0, 0]
+        vec![4, 4, 0, 0]
     );
     let instance_id = dev
         .get("instance_id")
@@ -14940,13 +14936,13 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
                 .and_then(Value::as_u64)
                 .unwrap_or(0))
             .collect::<Vec<_>>(),
-        vec![6, 6, 0, 0]
+        vec![4, 4, 0, 0]
     );
     let assertions = dev
         .get("assertions")
         .and_then(Value::as_array)
         .expect("assertions");
-    assert_eq!(assertions.len(), 6);
+    assert_eq!(assertions.len(), 5);
     assert!(assertions
         .iter()
         .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));
@@ -14972,12 +14968,12 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
         .is_some_and(|reads| reads.iter().any(|read| {
             read.get("kind").and_then(Value::as_str) == Some("effect")
                 && read.get("head").and_then(Value::as_str) == Some("kind agent.tell")
-                && read.get("match_count").and_then(Value::as_u64) == Some(6)
+                && read.get("match_count").and_then(Value::as_u64) == Some(4)
                 && read
                     .get("matches")
                     .and_then(Value::as_array)
                     .is_some_and(|matches| {
-                        matches.len() == 6
+                        matches.len() == 4
                             && matches.iter().all(|matched| {
                                 matched.get("prompt_content_type").and_then(Value::as_str)
                                     == Some("markdown")
@@ -15010,14 +15006,14 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
             .get("summary")
             .and_then(|summary| summary.get("total"))
             .and_then(Value::as_u64),
-        Some(6)
+        Some(5)
     );
     assert_eq!(
         executable_spec
             .get("summary")
             .and_then(|summary| summary.get("passed"))
             .and_then(Value::as_u64),
-        Some(6)
+        Some(5)
     );
     let acceptance_group = executable_spec
         .get("tags")
@@ -15031,14 +15027,14 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
             .get("summary")
             .and_then(|summary| summary.get("total"))
             .and_then(Value::as_u64),
-        Some(6)
+        Some(5)
     );
     assert_eq!(
         acceptance_group
             .get("assertions")
             .and_then(Value::as_array)
             .map(Vec::len),
-        Some(6)
+        Some(5)
     );
     assert!(acceptance_group
         .get("assertions")
@@ -15093,7 +15089,7 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
             .iter()
             .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("agent.turn.completed"))
             .count(),
-        6
+        4
     );
     assert_eq!(
         facts
@@ -15102,7 +15098,7 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
                 |fact| fact.get("name").and_then(Value::as_str) == Some("schema.coerce.succeeded")
             )
             .count(),
-        6
+        4
     );
     let result_languages = facts
         .iter()
@@ -15117,7 +15113,7 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         result_languages,
-        ["Arabic", "French", "German", "Hindi", "Japanese", "Spanish"]
+        ["Arabic", "French", "Hindi", "Spanish"]
             .into_iter()
             .map(str::to_owned)
             .collect::<std::collections::BTreeSet<_>>()
@@ -15147,13 +15143,6 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
             .count(),
         2
     );
-    assert_eq!(
-        result_providers
-            .iter()
-            .filter(|provider| provider.as_str() == "pi")
-            .count(),
-        2
-    );
 
     let _ = fs::remove_file(store_path);
 }
@@ -15161,7 +15150,7 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
 #[test]
 fn dev_native_provider_records_policy_denial_from_source_required_capabilities() {
     let bin = env!("CARGO_BIN_EXE_whip");
-    for provider in ["codex", "claude", "pi"] {
+    for provider in ["codex", "claude"] {
         let source_path = temp_workflow_path(&format!("native-policy-denial-e2e-{provider}"));
         fs::write(
             &source_path,
@@ -15313,7 +15302,7 @@ fn dev_incident_router_routes_with_agentref_metadata() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         providers,
-        ["codex", "pi"]
+        ["codex", "claude"]
             .into_iter()
             .map(str::to_owned)
             .collect::<std::collections::BTreeSet<_>>()
@@ -15703,7 +15692,7 @@ fn dev_evaluates_shared_expression_kernel_for_guards_and_assertions() {
 workflow ExpressionKernelE2E
 
 class ExprTask {
-  provider "codex" | "claude" | "pi"
+  provider "codex" | "claude" | "gpt5"
   priority int
   status "queued" | "blocked"
 }
@@ -15716,9 +15705,9 @@ class ExprResult {
 
 assert count(ExprResult) == 1
 assert exists(ExprResult where provider == codex && priority >= 3)
-assert count(ExprResult where provider == pi) == 0
+assert count(ExprResult where provider == gpt5) == 0
 assert count(ExprResult where priority > 1 && provider in ["codex", "claude"]) == 1
-assert ("codex" in ["codex", "claude"]) && !("pi" in ["codex"])
+assert ("codex" in ["codex", "claude"]) && !("gpt5" in ["codex"])
 assert count([]) == 0
 
 rule seed
@@ -15731,7 +15720,7 @@ rule seed
   }
 
   record ExprTask {
-    provider "pi"
+    provider "gpt5"
     priority 1
     status "blocked"
   }
@@ -16095,7 +16084,7 @@ fn check_rejects_bad_finite_domain_expressions() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("finite-domain value to unknown `pi`"),
+        stderr.contains("finite-domain value to unknown `gpt5`"),
         "stderr:\n{stderr}"
     );
     assert!(
@@ -16829,7 +16818,7 @@ rule seed
 
 #[test]
 fn dev_stream_emits_pending_asks_for_the_workbench() {
-    // Workbench projection (pi-conformance / un-tie Phase 3): a pending human
+    // Workbench projection (un-tie Phase 3): a pending human
     // ask surfaces as a `dev.asks` stream event an external UI renders as an
     // inbox; the pending set is re-emitted only when it changes.
     let bin = env!("CARGO_BIN_EXE_whip");

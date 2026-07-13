@@ -8,7 +8,6 @@ use serde_json::{json, Value};
 pub enum ProviderKind {
     Codex,
     Claude,
-    Pi,
     Fixture,
     Command,
     SchemaCoerce,
@@ -19,7 +18,6 @@ impl ProviderKind {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
-            Self::Pi => "pi",
             Self::Fixture => "fixture",
             Self::Command => "command",
             Self::SchemaCoerce => "schema_coercer",
@@ -30,7 +28,6 @@ impl ProviderKind {
         match value {
             "codex" => Some(Self::Codex),
             "claude" => Some(Self::Claude),
-            "pi" => Some(Self::Pi),
             "fixture" => Some(Self::Fixture),
             "command" => Some(Self::Command),
             "schema_coercer" => Some(Self::SchemaCoerce),
@@ -43,8 +40,6 @@ impl ProviderKind {
 pub enum AdapterSurface {
     CodexAppServer,
     ClaudeAgentSdk,
-    PiSdk,
-    PiRpc,
     Fixture,
     Command,
     CoerceHttp,
@@ -55,8 +50,6 @@ impl AdapterSurface {
         match self {
             Self::CodexAppServer => "codex_app_server",
             Self::ClaudeAgentSdk => "claude_agent_sdk",
-            Self::PiSdk => "pi_sdk",
-            Self::PiRpc => "pi_rpc",
             Self::Fixture => "fixture",
             Self::Command => "command",
             Self::CoerceHttp => "coerce_http",
@@ -67,8 +60,6 @@ impl AdapterSurface {
         match value {
             "codex_app_server" => Some(Self::CodexAppServer),
             "claude_agent_sdk" => Some(Self::ClaudeAgentSdk),
-            "pi_sdk" => Some(Self::PiSdk),
-            "pi_rpc" => Some(Self::PiRpc),
             "fixture" => Some(Self::Fixture),
             "command" => Some(Self::Command),
             "coerce_http" => Some(Self::CoerceHttp),
@@ -708,7 +699,7 @@ fn native_boundary_error(
 
 pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
     // Codex/Claude are optional providers (DR-0024): their capability entries are
-    // present only when the corresponding feature is built. Pi, Fixture, Command,
+    // present only when the corresponding feature is built. Fixture, Command,
     // and the owned harness are always available.
     let mut caps: Vec<ProviderCapability> = Vec::new();
     #[cfg(feature = "codex")]
@@ -743,25 +734,6 @@ pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
         auth_requirements: strings(&["anthropic_api_key_or_provider_config_ref"]),
     });
     caps.extend([
-        ProviderCapability {
-            provider_kind: ProviderKind::Pi,
-            surface: AdapterSurface::PiRpc,
-            protocol_version: Some("pi-rpc-0.73.0".to_owned()),
-            session_identity_fields: strings(&["session_id", "parent_session_id"]),
-            stream_event_kinds: strings(&[
-                "agent_start",
-                "turn_start",
-                "message_start",
-                "message_end",
-                "turn_end",
-                "agent_end",
-            ]),
-            tool_policy: "pi_tools_extensions_resources".to_owned(),
-            cancellation_depths: vec![CancellationDepth::NativeStop],
-            artifact_manifest: true,
-            health_checks: strings(&["pi_cli", "rpc_mode", "provider_model", "extensions"]),
-            auth_requirements: strings(&["pi_provider_api_key_or_auth_storage"]),
-        },
         ProviderCapability {
             provider_kind: ProviderKind::Fixture,
             surface: AdapterSurface::Fixture,
@@ -1056,13 +1028,6 @@ mod tests {
                 && capability.tool_policy == "claude_tools_permissions_hooks"
         }));
         assert!(capabilities.iter().any(|capability| {
-            capability.provider_kind == ProviderKind::Pi
-                && capability.surface == AdapterSurface::PiRpc
-                && capability
-                    .session_identity_fields
-                    .contains(&"session_id".to_owned())
-        }));
-        assert!(capabilities.iter().any(|capability| {
             capability.provider_kind == ProviderKind::Command
                 && capability.surface == AdapterSurface::Command
                 && capability.cancellation_depths == vec![CancellationDepth::None]
@@ -1141,27 +1106,6 @@ mod tests {
     }
 
     #[test]
-    fn accepts_validated_pi_native_stop_cancellation_depth() {
-        let config = ProviderBindingConfig::from_json_str(
-            r#"{
-              "provider_id": "pi-main",
-              "provider_kind": "pi",
-              "surface": "pi_rpc",
-              "credentials_ref": "secret:pi",
-              "cancellation_depth": "native_stop"
-            }"#,
-        )
-        .expect("config shape parses");
-
-        let results = validate_provider_binding(&config, &builtin_provider_capabilities());
-
-        assert!(results.iter().any(|result| {
-            result.status == ProviderValidationStatus::Pass
-                && result.code == "cancellation_supported"
-        }));
-    }
-
-    #[test]
     fn reports_missing_credentials_without_secret_values() {
         let results = validate_provider_binding_json(
             r#"{
@@ -1236,7 +1180,7 @@ mod tests {
     #[test]
     fn native_provider_event_preserves_shape_without_raw_payload() {
         let event = NativeProviderEvent {
-            provider_id: "pi-main".to_owned(),
+            provider_id: "codex-main".to_owned(),
             run_id: "run-1".to_owned(),
             event_kind: NativeProviderEventKind::Cancelled,
             provider_event_type: "turn_end".to_owned(),
@@ -1251,7 +1195,7 @@ mod tests {
             artifacts: vec![NativeProviderArtifactRef {
                 artifact_id: Some("artifact-1".to_owned()),
                 kind: "transcript".to_owned(),
-                uri: "provider://pi/runs/run-1/secret/transcript".to_owned(),
+                uri: "provider://codex/runs/run-1/secret/transcript".to_owned(),
                 content_hash: Some("sha256:secret-token".to_owned()),
                 mime_type: Some("text/plain".to_owned()),
                 required: true,
@@ -1318,7 +1262,7 @@ mod tests {
 
         impl NativeProviderAdapter for FakeNativeAdapter {
             fn provider_id(&self) -> &str {
-                "fake-pi"
+                "fake-codex"
             }
 
             fn capability(&self) -> &ProviderCapability {
@@ -1338,7 +1282,7 @@ mod tests {
                     provider_session_id: Some("session-1".to_owned()),
                     provider_turn_id: None,
                     sequence: Some(1),
-                    evidence: json!({"pi_shape": "turn_start"}),
+                    evidence: json!({"codex_shape": "turn_start"}),
                     artifacts: Vec::new(),
                 })
             }
@@ -1349,14 +1293,14 @@ mod tests {
             ) -> Result<Option<NativeProviderEvent>, NativeProviderBoundaryError> {
                 assert!(self.started);
                 Ok(Some(NativeProviderEvent {
-                    provider_id: "fake-pi".to_owned(),
+                    provider_id: "fake-codex".to_owned(),
                     run_id: run_id.to_owned(),
                     event_kind: NativeProviderEventKind::Streamed,
                     provider_event_type: "message_end".to_owned(),
                     provider_session_id: Some("session-1".to_owned()),
                     provider_turn_id: None,
                     sequence: Some(2),
-                    evidence: json!({"pi_shape": "message_end"}),
+                    evidence: json!({"codex_shape": "message_end"}),
                     artifacts: Vec::new(),
                 }))
             }
@@ -1366,7 +1310,7 @@ mod tests {
                 cancellation: NativeProviderCancellation,
             ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
                 Ok(NativeProviderEvent {
-                    provider_id: "fake-pi".to_owned(),
+                    provider_id: "fake-codex".to_owned(),
                     run_id: cancellation.run_id,
                     event_kind: NativeProviderEventKind::Cancelled,
                     provider_event_type: "turn_end".to_owned(),
@@ -1381,16 +1325,16 @@ mod tests {
 
         let capability = builtin_provider_capabilities()
             .into_iter()
-            .find(|capability| capability.provider_kind == ProviderKind::Pi)
-            .expect("pi capability exists");
+            .find(|capability| capability.provider_kind == ProviderKind::Codex)
+            .expect("codex capability exists");
         let mut adapter = FakeNativeAdapter {
             capability,
             started: false,
         };
         let request = NativeProviderTurnRequest {
-            provider_id: "fake-pi".to_owned(),
-            provider_kind: ProviderKind::Pi,
-            surface: AdapterSurface::PiRpc,
+            provider_id: "fake-codex".to_owned(),
+            provider_kind: ProviderKind::Codex,
+            surface: AdapterSurface::CodexAppServer,
             run_id: "run-1".to_owned(),
             effect_id: "tell".to_owned(),
             agent: "worker".to_owned(),
@@ -1400,7 +1344,7 @@ mod tests {
             required_capabilities: vec!["repo.read".to_owned()],
             cancellation_depth: CancellationDepth::NativeStop,
             artifact_policy: "optional".to_owned(),
-            credential_ref: Some("secret:pi".to_owned()),
+            credential_ref: Some("secret:codex".to_owned()),
             provider_options: BTreeMap::new(),
         };
 
@@ -1419,8 +1363,8 @@ mod tests {
             })
             .expect("cancel event");
 
-        assert_eq!(adapter.provider_id(), "fake-pi");
-        assert_eq!(adapter.capability().surface, AdapterSurface::PiRpc);
+        assert_eq!(adapter.provider_id(), "fake-codex");
+        assert_eq!(adapter.capability().surface, AdapterSurface::CodexAppServer);
         assert_eq!(started.event_kind, NativeProviderEventKind::Started);
         assert_eq!(streamed.provider_event_type, "message_end");
         assert_eq!(cancelled.event_kind, NativeProviderEventKind::Cancelled);
@@ -1431,10 +1375,10 @@ mod tests {
     fn cancellation_depth_guard_allows_requests_within_configured_depth() {
         let config = ProviderBindingConfig::from_json_str(
             r#"{
-              "provider_id": "pi-main",
-              "provider_kind": "pi",
-              "surface": "pi_rpc",
-              "credentials_ref": "secret:pi",
+              "provider_id": "codex-main",
+              "provider_kind": "codex",
+              "surface": "codex_app_server",
+              "credentials_ref": "secret:codex",
               "cancellation_depth": "native_stop"
             }"#,
         )

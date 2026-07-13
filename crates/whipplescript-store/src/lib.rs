@@ -607,16 +607,6 @@ pub struct ClaudeAgentSdkEvidence<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PiRpcEvidence<'a> {
-    pub instance_id: &'a str,
-    pub provider_id: &'a str,
-    pub session_id: &'a str,
-    pub run_id: &'a str,
-    pub metadata_json: &'a str,
-    pub correlation_id: Option<&'a str>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactRecord<'a> {
     pub run_id: &'a str,
     pub kind: &'a str,
@@ -3502,55 +3492,6 @@ impl SqliteStore {
         Ok(evidence_id)
     }
 
-    pub fn record_pi_rpc_evidence(&self, evidence: PiRpcEvidence<'_>) -> StoreResult<String> {
-        let metadata = serde_json::from_str::<Value>(evidence.metadata_json)?;
-        let metadata = json!({
-            "provider_id": evidence.provider_id,
-            "session_id": evidence.session_id,
-            "run_id": evidence.run_id,
-            "evidence": metadata,
-        })
-        .to_string();
-        let summary = format!(
-            "Pi RPC evidence for provider `{}` session `{}`",
-            evidence.provider_id, evidence.session_id
-        );
-        let evidence_id = insert_evidence_on(
-            &self.connection,
-            EvidenceRecord {
-                instance_id: evidence.instance_id,
-                kind: "pi.rpc.evidence",
-                subject_type: "provider_session",
-                subject_id: evidence.session_id,
-                causation_id: Some(evidence.run_id),
-                correlation_id: evidence.correlation_id,
-                summary: Some(&summary),
-                metadata_json: &metadata,
-            },
-        )?;
-        insert_evidence_link_on(
-            &self.connection,
-            EvidenceLink {
-                evidence_id: &evidence_id,
-                instance_id: evidence.instance_id,
-                target_type: "provider",
-                target_id: evidence.provider_id,
-                relation: "observes",
-            },
-        )?;
-        insert_evidence_link_on(
-            &self.connection,
-            EvidenceLink {
-                evidence_id: &evidence_id,
-                instance_id: evidence.instance_id,
-                target_type: "provider_run",
-                target_id: evidence.run_id,
-                relation: "observes",
-            },
-        )?;
-        Ok(evidence_id)
-    }
-
     pub fn link_evidence(&self, link: EvidenceLink<'_>) -> StoreResult<()> {
         insert_evidence_link_on(&self.connection, link)
     }
@@ -6051,7 +5992,6 @@ pub trait RuntimeStore {
         &self,
         evidence: ClaudeAgentSdkEvidence<'_>,
     ) -> StoreResult<String>;
-    fn record_pi_rpc_evidence(&self, evidence: PiRpcEvidence<'_>) -> StoreResult<String>;
     fn link_evidence(&self, link: EvidenceLink<'_>) -> StoreResult<()>;
     fn record_artifact(&self, artifact: ArtifactRecord<'_>) -> StoreResult<String>;
     fn list_artifacts_for_run(&self, run_id: &str) -> StoreResult<Vec<ArtifactView>>;
@@ -6400,9 +6340,6 @@ impl RuntimeStore for SqliteStore {
         evidence: ClaudeAgentSdkEvidence<'_>,
     ) -> StoreResult<String> {
         self.record_claude_agent_sdk_evidence(evidence)
-    }
-    fn record_pi_rpc_evidence(&self, evidence: PiRpcEvidence<'_>) -> StoreResult<String> {
-        self.record_pi_rpc_evidence(evidence)
     }
     fn link_evidence(&self, link: EvidenceLink<'_>) -> StoreResult<()> {
         self.link_evidence(link)
@@ -16353,93 +16290,6 @@ mod tests {
             );
         }
         fs::remove_file(path).expect("claude evidence db removes");
-    }
-
-    #[test]
-    fn pi_rpc_evidence_records_refs_and_reopens() {
-        let path = std::env::temp_dir().join(format!(
-            "whipplescript-pi-rpc-evidence-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time after epoch")
-                .as_nanos()
-        ));
-        {
-            let mut store = SqliteStore::open(&path).expect("store opens");
-            let version = store
-                .create_program_version(test_program_version("PiEvidence", "source", "ir"))
-                .expect("program version creates");
-            let instance = store
-                .create_instance(NewInstance {
-                    program_id: &version.program_id,
-                    version_id: &version.version_id,
-                    input_json: "{}",
-                })
-                .expect("instance creates");
-            let evidence_id = store
-                .record_pi_rpc_evidence(PiRpcEvidence {
-                    instance_id: &instance.instance_id,
-                    provider_id: "pi-main",
-                    session_id: "session-1",
-                    run_id: "run-1",
-                    metadata_json: r#"{"session_id":"session-1","model_provider":"openai-codex","model_id":"gpt-5.5","event_counts":{"message":2,"tool_call":1},"terminal_type":"completed","terminal_payload":{"result_shape":{"type":"string","chars":12}}}"#,
-                    correlation_id: Some("pi-rpc:run-1"),
-                })
-                .expect("pi evidence records");
-            assert!(evidence_id.starts_with("evd_"));
-            let evidence = store
-                .list_evidence(&instance.instance_id)
-                .expect("evidence lists");
-            assert_eq!(evidence.len(), 1);
-            assert_eq!(evidence[0].kind, "pi.rpc.evidence");
-            assert_eq!(evidence[0].subject_type, "provider_session");
-            assert_eq!(evidence[0].subject_id, "session-1");
-            assert_eq!(evidence[0].causation_id.as_deref(), Some("run-1"));
-            let metadata =
-                serde_json::from_str::<Value>(&evidence[0].metadata_json).expect("metadata json");
-            assert_eq!(
-                metadata.get("provider_id").and_then(Value::as_str),
-                Some("pi-main")
-            );
-            assert_eq!(
-                metadata
-                    .pointer("/evidence/event_counts/tool_call")
-                    .and_then(Value::as_i64),
-                Some(1)
-            );
-            assert_eq!(
-                metadata
-                    .pointer("/evidence/model_provider")
-                    .and_then(Value::as_str),
-                Some("openai-codex")
-            );
-            let links = store
-                .list_evidence_links(&instance.instance_id)
-                .expect("evidence links list");
-            assert!(links.iter().any(|link| {
-                link.evidence_id == evidence_id
-                    && link.target_type == "provider"
-                    && link.target_id == "pi-main"
-                    && link.relation == "observes"
-            }));
-            assert!(links.iter().any(|link| {
-                link.evidence_id == evidence_id
-                    && link.target_type == "provider_run"
-                    && link.target_id == "run-1"
-                    && link.relation == "observes"
-            }));
-        }
-        {
-            let store = SqliteStore::open(&path).expect("store reopens");
-            let evidence = store
-                .list_evidence_for_subject("provider_session", "session-1")
-                .expect("subject evidence lists");
-            assert_eq!(evidence.len(), 1);
-            assert_eq!(evidence[0].kind, "pi.rpc.evidence");
-            assert_eq!(evidence[0].correlation_id.as_deref(), Some("pi-rpc:run-1"));
-        }
-        fs::remove_file(path).expect("pi evidence db removes");
     }
 
     fn new_event<'a>(

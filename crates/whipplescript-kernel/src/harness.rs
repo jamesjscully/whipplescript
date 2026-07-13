@@ -521,25 +521,6 @@ impl AgentHarness for ClaudeCodeAgentHarness {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PiStyleAgentHarness {
-    inner: CommandAgentHarness,
-}
-
-impl PiStyleAgentHarness {
-    pub fn new(plan: CommandLaunchPlan) -> Self {
-        Self {
-            inner: CommandAgentHarness::new(plan),
-        }
-    }
-}
-
-impl AgentHarness for PiStyleAgentHarness {
-    fn run(&self, request: AgentTurnRequest) -> ProviderRunResult {
-        self.inner.run(request)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MockAgentHarness {
     result: ProviderRunResult,
 }
@@ -1241,21 +1222,12 @@ mod tests {
                 .arg("-c")
                 .arg("cat >/dev/null"),
         );
-        let pi = PiStyleAgentHarness::new(
-            CommandLaunchPlan::new("pi", "sh")
-                .arg("-c")
-                .arg("cat >/dev/null"),
-        );
 
         assert_eq!(
             codex.run(request.clone()).status,
             ProviderRunStatus::Completed
         );
-        assert_eq!(
-            claude.run(request.clone()).status,
-            ProviderRunStatus::Completed
-        );
-        assert_eq!(pi.run(request).status, ProviderRunStatus::Completed);
+        assert_eq!(claude.run(request).status, ProviderRunStatus::Completed);
     }
 
     fn test_request() -> AgentTurnRequest {

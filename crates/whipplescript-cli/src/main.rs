@@ -43,7 +43,6 @@ use whipplescript_kernel::{
     idempotency_key,
     instance_machine::{EffectStep, InstanceDriver},
     lowering::{BranchReport, BranchStatus},
-    pi_rpc::{PiRpcAdapter, PiRpcClient, StdioPiRpcTransport},
     program_analysis_summary_json,
     provider::{
         builtin_provider_capabilities, validate_provider_binding, validate_provider_binding_json,
@@ -928,7 +927,7 @@ fn doctor_provider_health_checks(
 ) -> Vec<DoctorProviderHealthCheck> {
     capabilities
         .iter()
-        .filter(|capability| matches!(capability.provider_kind.as_str(), "codex" | "claude" | "pi"))
+        .filter(|capability| matches!(capability.provider_kind.as_str(), "codex" | "claude"))
         .flat_map(|capability| {
             let mut checks = Vec::new();
             let provider = capability.provider_kind.as_str().to_owned();
@@ -989,7 +988,6 @@ fn auth_health_check(
     let env_name = match provider {
         "codex" => Some("OPENAI_API_KEY"),
         "claude" => Some("ANTHROPIC_API_KEY"),
-        "pi" => Some("PI_API_KEY"),
         _ => None,
     };
     let env_set = env_name.is_some_and(|name| env::var_os(name).is_some());
@@ -1270,13 +1268,6 @@ fn doctor_tool_checks() -> Vec<ToolCheck> {
             &["claude"][..],
             false,
             "needed for Claude Code agent harness provider runs",
-        ),
-        (
-            "pi",
-            "provider",
-            &["pi"][..],
-            false,
-            "needed for Pi RPC provider runs",
         ),
     ]
     .into_iter()
@@ -20209,14 +20200,12 @@ enum ProviderCancellationPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CancellationAcknowledgementOrder {
     BeforeTerminal,
-    AfterTerminalAllowed,
 }
 
 impl CancellationAcknowledgementOrder {
     fn as_str(self) -> &'static str {
         match self {
             Self::BeforeTerminal => "before_terminal",
-            Self::AfterTerminalAllowed => "after_terminal_allowed",
         }
     }
 }
@@ -20324,11 +20313,6 @@ fn provider_cancellation_policy(provider: &str) -> ProviderCancellationPolicy {
     {
         return ProviderCancellationPolicy::NativeStop {
             acknowledgement_order: CancellationAcknowledgementOrder::BeforeTerminal,
-        };
-    }
-    if normalized == "pi" || normalized.starts_with("pi-") {
-        return ProviderCancellationPolicy::NativeStop {
-            acknowledgement_order: CancellationAcknowledgementOrder::AfterTerminalAllowed,
         };
     }
     ProviderCancellationPolicy::Unsupported
@@ -20446,7 +20430,7 @@ fn run_agent_effect(
     // no config launches with defaults; a sidecar that cannot launch is caught as
     // `provider_health` in the per-kind arms below.) Recoverable — a later worker
     // pass runs the effect once the binding is supplied.
-    if matches!(provider_selection.kind.as_str(), "codex" | "claude" | "pi") {
+    if matches!(provider_selection.kind.as_str(), "codex" | "claude") {
         if let Some(config) = provider_selection.provider_config.as_ref() {
             let validation = validate_provider_binding(config, &builtin_provider_capabilities());
             if validation
@@ -20593,33 +20577,6 @@ fn run_agent_effect(
             "provider `claude` is not built into this whip (the `claude` feature is disabled)"
                 .to_owned(),
         ));
-    }
-    if provider_selection.kind == "pi" {
-        let request = pi_native_turn_request(
-            execution,
-            effect,
-            &input_json,
-            provider_selection.provider_config.as_ref(),
-        )?;
-        let mut adapter = match pi_rpc_adapter(&provider_selection.provider_id) {
-            Ok(healthy_adapter) => healthy_adapter,
-            Err(error) => {
-                return kernel.block_effect_binding(
-                    instance_id,
-                    &effect.effect_id,
-                    "provider_health",
-                    &binding_failure_detail(&error),
-                );
-            }
-        };
-        let metadata_json = agent_provider_selection_metadata_json(&provider_selection);
-        return kernel.run_native_agent_turn_with_metadata(
-            execution,
-            request,
-            &mut adapter,
-            native_provider_max_events(),
-            &metadata_json,
-        );
     }
     if provider_selection.kind == "command" {
         let Some(plan) = provider_selection.command_plan.clone() else {
@@ -21017,8 +20974,6 @@ fn fallback_provider_kind(provider: &str) -> &'static str {
         "codex"
     } else if is_claude_native_provider(provider) {
         "claude"
-    } else if is_pi_native_provider(provider) {
-        "pi"
     } else if provider == "owned" || provider == "owned-fixture" {
         "owned"
     } else {
@@ -21130,11 +21085,6 @@ fn is_codex_native_provider(provider: &str) -> bool {
 fn is_claude_native_provider(provider: &str) -> bool {
     let normalized = provider.to_ascii_lowercase();
     normalized == "claude" || normalized.starts_with("claude-")
-}
-
-fn is_pi_native_provider(provider: &str) -> bool {
-    let normalized = provider.to_ascii_lowercase();
-    normalized == "pi" || normalized.starts_with("pi-")
 }
 
 #[cfg(feature = "codex")]
@@ -21338,73 +21288,6 @@ fn claude_native_turn_request(
             config,
             CancellationDepth::CooperativeRequest,
         ),
-        artifact_policy: provider_artifact_policy(config, "metadata"),
-        credential_ref: provider_credential_ref(config),
-        provider_options,
-    })
-}
-
-fn pi_rpc_adapter(provider: &str) -> Result<PiRpcAdapter<StdioPiRpcTransport>, StoreError> {
-    let args = ["--mode", "rpc", "--no-session"];
-    let command = env::var("WHIPPLESCRIPT_PI_RPC_COMMAND").unwrap_or_else(|_| "pi".to_owned());
-    let transport = StdioPiRpcTransport::spawn(&command, &args)
-        .map_err(|error| StoreError::Conflict(format!("failed to launch Pi RPC: {error:?}")))?;
-    let capability = builtin_provider_capabilities()
-        .into_iter()
-        .find(|capability| {
-            capability.provider_kind == ProviderKind::Pi
-                && capability.surface == AdapterSurface::PiRpc
-        })
-        .ok_or_else(|| StoreError::Conflict("missing built-in Pi capability".to_owned()))?;
-    Ok(
-        PiRpcAdapter::new(provider, capability, PiRpcClient::new(transport))
-            .with_inactivity_budget(native_provider_inactivity_budget()),
-    )
-}
-
-fn pi_native_turn_request(
-    execution: AgentTurnExecution<'_>,
-    effect: &ClaimableEffect,
-    input_json: &str,
-    config: Option<&ProviderBindingConfig>,
-) -> Result<NativeProviderTurnRequest, StoreError> {
-    let input = serde_json::from_str::<Value>(input_json)?;
-    let prompt_json = input
-        .get("prompt")
-        .and_then(Value::as_str)
-        .map(|prompt| Value::String(prompt.to_owned()))
-        .unwrap_or(input);
-    let mut provider_options = BTreeMap::new();
-    if let Ok(provider) = env::var("WHIPPLESCRIPT_PI_RPC_PROVIDER") {
-        provider_options.insert("provider".to_owned(), Value::String(provider));
-    }
-    if let Ok(model) = env::var("WHIPPLESCRIPT_PI_RPC_MODEL") {
-        provider_options.insert("model".to_owned(), Value::String(model));
-    }
-    if let Some(model) = config.and_then(|config| config.default_model.clone()) {
-        provider_options.insert("model".to_owned(), Value::String(model));
-    }
-    if let Some(config) = config {
-        if let Some(provider) = optional_extra_string(config, "model_provider")? {
-            provider_options.insert("provider".to_owned(), Value::String(provider));
-        }
-    }
-    apply_provider_config_options(&mut provider_options, config);
-    Ok(NativeProviderTurnRequest {
-        provider_id: execution.provider.to_owned(),
-        provider_kind: ProviderKind::Pi,
-        surface: AdapterSurface::PiRpc,
-        run_id: execution.run_id.to_owned(),
-        effect_id: execution.effect_id.to_owned(),
-        agent: execution.agent.to_owned(),
-        profile: execution
-            .profile
-            .map(str::to_owned)
-            .or_else(|| Some("repo-reader".to_owned())),
-        prompt_json,
-        workspace_policy: provider_workspace_policy(config, "read_only"),
-        required_capabilities: native_required_capabilities(effect)?,
-        cancellation_depth: provider_cancellation_depth(config, CancellationDepth::NativeStop),
         artifact_policy: provider_artifact_policy(config, "metadata"),
         credential_ref: provider_credential_ref(config),
         provider_options,
@@ -51037,11 +50920,11 @@ rule finish_batch
                   "api_key": "sk-should-not-appear"
                 },
                 {
-                  "provider_id": "pi-main",
-                  "provider_kind": "pi",
-                  "surface": "pi_rpc",
-                  "credentials_ref": "secret:pi",
-                  "cancellation_depth": "native_stop"
+                  "provider_id": "reviewer",
+                  "provider_kind": "claude",
+                  "surface": "claude_agent_sdk",
+                  "credentials_ref": "secret:claude",
+                  "cancellation_depth": "cooperative_request"
                 }
               ]
             }"#,
@@ -51054,7 +50937,7 @@ rule finish_batch
         }));
         assert!(results.iter().any(|result| {
             result.status == whipplescript_kernel::provider::ProviderValidationStatus::Pass
-                && result.provider == "pi-main"
+                && result.provider == "reviewer"
                 && result.code == "cancellation_supported"
         }));
         assert!(!json!(results
@@ -51101,10 +50984,10 @@ rule finish_batch
                 json!({
                     "run_id": "run-1",
                     "effect_id": "tell",
-                    "provider": "pi-main",
+                    "provider": "codex-main",
                     "status": "streamed",
                     "terminal": false,
-                    "provider_event_type": "message_end",
+                    "provider_event_type": "item/completed",
                     "provider_payload_shape": {"type":"object","keys":2},
                     "evidence_id": "evd_stream",
                 }),
@@ -51115,10 +50998,10 @@ rule finish_batch
                 json!({
                     "run_id": "run-1",
                     "effect_id": "tell",
-                    "provider": "pi-main",
+                    "provider": "codex-main",
                     "status": "cancelled",
                     "terminal": true,
-                    "provider_event_type": "turn_end",
+                    "provider_event_type": "turn/completed",
                     "provider_payload_shape": {"type":"object","keys":3},
                     "evidence_id": "evd_cancel",
                 }),
@@ -51131,7 +51014,7 @@ rule finish_batch
             lifecycle
                 .pointer("/1/provider_event_type")
                 .and_then(Value::as_str),
-            Some("turn_end")
+            Some("turn/completed")
         );
         assert!(lifecycle.to_string().contains("evd_cancel"));
         assert!(!lifecycle.to_string().contains("provider_payload_shape"));
@@ -51139,16 +51022,16 @@ rule finish_batch
         let run = RunView {
             run_id: "run-1".to_owned(),
             effect_id: "tell".to_owned(),
-            provider: "pi-main".to_owned(),
+            provider: "codex-main".to_owned(),
             worker_id: "worker-1".to_owned(),
             status: "running".to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             completed_at: None,
             metadata_json: json!({
                 "native_provider": {
-                    "provider_id": "pi-main",
-                    "provider_kind": "pi",
-                    "surface": "pi_rpc"
+                    "provider_id": "codex-main",
+                    "provider_kind": "codex",
+                    "surface": "codex_app_server"
                 }
             })
             .to_string(),
@@ -51171,7 +51054,7 @@ rule finish_batch
             run_json
                 .pointer("/provider_selection/surface")
                 .and_then(Value::as_str),
-            Some("pi_rpc")
+            Some("codex_app_server")
         );
     }
 
@@ -51181,12 +51064,6 @@ rule finish_batch
             provider_cancellation_policy("codex-main"),
             ProviderCancellationPolicy::NativeStop {
                 acknowledgement_order: CancellationAcknowledgementOrder::BeforeTerminal,
-            }
-        );
-        assert_eq!(
-            provider_cancellation_policy("pi-main"),
-            ProviderCancellationPolicy::NativeStop {
-                acknowledgement_order: CancellationAcknowledgementOrder::AfterTerminalAllowed,
             }
         );
         assert_eq!(
@@ -51728,52 +51605,6 @@ rule finish_batch
                 .get("settings")
                 .and_then(Value::as_str),
             Some("project")
-        );
-
-        let pi_config_json = json!({
-            "provider_id": "pi-main",
-            "provider_kind": "pi",
-            "surface": "pi_rpc",
-            "credentials_ref": "env:PI_API_KEY",
-            "default_model": "pi-model",
-            "workspace_policy": "shared",
-            "cancellation_depth": "native_stop",
-            "artifact_policy": "required",
-            "model_provider": "openai-compatible"
-        });
-        let pi_config =
-            ProviderBindingConfig::from_value(&pi_config_json).expect("pi config parses");
-        let pi_request = pi_native_turn_request(
-            AgentTurnExecution {
-                provider: "pi-main",
-                agent: "planner",
-                profile: None,
-                ..execution
-            },
-            &effect,
-            r#"{"prompt":"plan"}"#,
-            Some(&pi_config),
-        )
-        .expect("pi request builds");
-
-        assert_eq!(pi_request.provider_id, "pi-main");
-        assert_eq!(pi_request.workspace_policy, "shared");
-        assert_eq!(pi_request.cancellation_depth, CancellationDepth::NativeStop);
-        assert_eq!(pi_request.artifact_policy, "required");
-        assert_eq!(pi_request.credential_ref.as_deref(), Some("env:PI_API_KEY"));
-        assert_eq!(
-            pi_request
-                .provider_options
-                .get("model")
-                .and_then(Value::as_str),
-            Some("pi-model")
-        );
-        assert_eq!(
-            pi_request
-                .provider_options
-                .get("provider")
-                .and_then(Value::as_str),
-            Some("openai-compatible")
         );
     }
 

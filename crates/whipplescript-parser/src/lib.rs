@@ -473,7 +473,7 @@ pub enum AgentField {
     /// `none`.
     Compaction(Ident),
     /// `thread <mode>`: owned-harness conversation continuation across tells
-    /// (pi-conformance §4, the chat-shaped instance v1). `continue` seeds each
+    /// (the chat-shaped instance v1). `continue` seeds each
     /// new tell from the agent's latest completed-turn transcript in this
     /// instance; `fresh` (the default) starts every tell from scratch.
     Thread(Ident),
@@ -1359,7 +1359,7 @@ pub struct IrAgent {
     /// `summarize` (default), `hard_reset`, `tool_results`, or `none`. `None` uses
     /// the harness default.
     pub compaction: Option<String>,
-    /// Owned-harness thread continuation across tells (pi-conformance §4):
+    /// Owned-harness thread continuation across tells:
     /// `continue` or `fresh`. `None` = `fresh` (every tell starts from scratch).
     pub thread: Option<String>,
     /// Ambient-config sources a Delegated harness may read (DR-0034 Decision 4):
@@ -6640,7 +6640,7 @@ fn lower_harness(harness: HarnessDecl, ir: &mut IrProgram, diagnostics: &mut Vec
                 harness.name.name, harness.kind.name
             ),
             suggestion: Some(
-                "supported harness kinds are `codex`, `claude`, `pi`, `fixture`, and `command`"
+                "supported harness kinds are `codex`, `claude`, `fixture`, and `command`"
                     .to_owned(),
             ),
         });
@@ -6656,7 +6656,7 @@ fn lower_harness(harness: HarnessDecl, ir: &mut IrProgram, diagnostics: &mut Vec
 fn is_supported_harness_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "codex" | "claude" | "pi" | "fixture" | "native-fixture" | "command" | "owned"
+        "codex" | "claude" | "fixture" | "native-fixture" | "command" | "owned"
     )
 }
 
@@ -6744,7 +6744,7 @@ fn lower_agent(
                     agent.name.name, delegate.name
                 ),
                 suggestion: Some(
-                    "supported delegate providers are `codex`, `claude`, `pi`, `native-fixture`, and `command`"
+                    "supported delegate providers are `codex`, `claude`, `native-fixture`, and `command`"
                         .to_owned(),
                 ),
             });
@@ -6820,7 +6820,7 @@ fn lower_agent(
                             agent.name.name, provider.name
                         ),
                         suggestion: Some(
-                            "supported providers are `owned`, `codex`, `claude`, `pi`, `fixture`, `native-fixture`, and `command`"
+                            "supported providers are `owned`, `codex`, `claude`, `fixture`, `native-fixture`, and `command`"
                                 .to_owned(),
                         ),
                     });
@@ -24783,7 +24783,7 @@ agent codex {
 }
 
 class LanguageTask {
-  provider AgentRef<codex | pi>
+  provider AgentRef<codex | ghost>
 }
 
 rule seed
@@ -24799,7 +24799,7 @@ rule seed
         assert!(compiled.ir.is_none());
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
-            .contains("AgentRef references unknown agent `pi`")));
+            .contains("AgentRef references unknown agent `ghost`")));
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("field `LanguageTask.provider` cannot reference agent `claude`")));
@@ -25254,7 +25254,7 @@ workflow UnsatisfiableFiniteDomains
 
 class Task {
   provider "codex" | "claude"
-  route "pi" | "coerce"
+  route "cache" | "coerce"
 }
 
 rule disjoint_equality
@@ -26954,7 +26954,7 @@ enum ReviewStatus {
 
 class Review {
   status ReviewStatus
-  provider "codex" | "claude" | "pi"
+  provider "codex" | "claude"
   owner string?
 }
 
@@ -26972,8 +26972,6 @@ rule route
 
   case review.provider {
     "codex" => {
-    }
-    "claude" => {
     }
   }
 
@@ -26993,7 +26991,7 @@ rule route
             .contains("non-exhaustive case; missing Blocked")));
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
-            .contains("non-exhaustive case; missing pi")));
+            .contains("non-exhaustive case; missing claude")));
         assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("non-exhaustive case; missing None")));

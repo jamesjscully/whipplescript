@@ -5,24 +5,22 @@ source_tags
 @service workflow ProviderLanguageE2E
 @acceptance assertion a219774c2ee6f69f
 @acceptance assertion 5e025ac90573be72
-@acceptance assertion c85987961124ce71
 @acceptance assertion 78aac8e288a30964
-@acceptance assertion 680e3adc36120f16
-@acceptance assertion 6d151ce022887cf8
+@acceptance assertion 680e38dc36120bb0
+@acceptance assertion 6d151ee02288805e
 @fixture table language_tasks
 source_descriptions
 "Fixture-backed provider x language acceptance workflow" workflow ProviderLanguageE2E
 "Codex completes both assigned language tasks" assertion a219774c2ee6f69f
 "Claude completes both assigned language tasks" assertion 5e025ac90573be72
-"Pi completes both assigned language tasks" assertion c85987961124ce71
 "All seeded language tasks are consumed" assertion 78aac8e288a30964
-"All agent turns complete" assertion 680e3adc36120f16
-"All language reviews complete" assertion 6d151ce022887cf8
+"All agent turns complete" assertion 680e38dc36120bb0
+"All language reviews complete" assertion 6d151ee02288805e
 "Static provider x language task rows" table language_tasks
 "Route one queued language task to its selected provider" rule run_language_task
 schemas
   class LanguageTask
-    provider agentref<codex | claude | pi>
+    provider agentref<codex | claude>
     language string
     expectedScript string
     prompt string
@@ -44,7 +42,6 @@ schemas
 agents
   agent codex harness=<fallback> provider=codex profile=repo-writer capacity=2 skills=[] capabilities=[] tools=[] class=delegated
   agent claude harness=<fallback> provider=claude profile=repo-writer capacity=2 skills=[] capabilities=[] tools=[] class=delegated
-  agent pi harness=<fallback> provider=pi profile=repo-writer capacity=2 skills=[] capabilities=[] tools=[] class=delegated
 coerces
   coerce reviewLanguageArtifact(language string, expectedScript string, artifactPath string, turnSummary string) -> ref<LanguageQualityReview>
 assertions
@@ -54,16 +51,13 @@ assertions
   assert count(LanguageE2EResult where provider == "claude") == 2
     reads
       fact:LanguageE2EResult where provider == "claude"
-  assert count(LanguageE2EResult where provider == "pi") == 2
-    reads
-      fact:LanguageE2EResult where provider == "pi"
   assert count(LanguageTask where status == "queued") == 0
     reads
       fact:LanguageTask where status == "queued"
-  assert count(effect kind agent.tell where status == completed) == 6
+  assert count(effect kind agent.tell where status == completed) == 4
     reads
       effect:kind agent.tell where status == completed
-  assert count(effect kind schema.coerce where status == completed) == 6
+  assert count(effect kind schema.coerce where status == completed) == 4
     reads
       effect:kind schema.coerce where status == completed
 rules
@@ -74,13 +68,11 @@ rules
     writes
       schema:LanguageTask
     record_sources
-      schema:LanguageTask construct=table_row span=2191..2422
-      schema:LanguageTask construct=table_row span=2426..2649
-      schema:LanguageTask construct=table_row span=2653..2879
-      schema:LanguageTask construct=table_row span=2883..3108
-      schema:LanguageTask construct=table_row span=3112..3346
-      schema:LanguageTask construct=table_row span=3350..3566
-    body_hash c7caf87da16ccacc
+      schema:LanguageTask construct=table_row span=1993..2224
+      schema:LanguageTask construct=table_row span=2228..2451
+      schema:LanguageTask construct=table_row span=2455..2681
+      schema:LanguageTask construct=table_row span=2685..2910
+    body_hash 762318eb56dea822
   rule run_language_task
     when LanguageTask as task where task.status == "queued"
     when task.provider is available
