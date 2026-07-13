@@ -176,7 +176,7 @@ pub trait HarnessModelClient {
 /// provider `fetch`.
 ///
 /// Non-HTTP model clients (fixtures, scripted tests, and the native-only stdio
-/// sidecars — codex/claude/pi, DR-0033 Decision 7) implement [`HarnessModelClient`]
+/// sidecars — codex/claude, DR-0033 Decision 7) implement [`HarnessModelClient`]
 /// directly and are never put on the step machine.
 pub trait HttpModelClient {
     fn build_request(&self, messages: &[ChatMessage], tools: &[ToolSpec]) -> HttpRequest;
