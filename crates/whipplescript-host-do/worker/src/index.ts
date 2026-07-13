@@ -416,7 +416,7 @@ interface HostTurnAdmission {
 
 interface HostProviderBinding {
   credential_id: string;
-  provider: "openai" | "anthropic" | "openai-codex";
+  provider: "openai" | "openai-generic" | "anthropic" | "openai-codex";
   model: string;
   base_url: string;
   secret: "OPENAI_API_KEY" | "ANTHROPIC_API_KEY";
