@@ -23,7 +23,12 @@ use whipplescript_parser::{IrClassField, IrPrimitiveType, IrProgram, IrSchema, I
 /// Which provider API the native client targets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoerceProvider {
+    /// OpenAI's Responses API (`/v1/responses`).
     OpenAi,
+    /// A generic OpenAI-**compatible** endpoint speaking the Chat Completions API
+    /// (`/v1/chat/completions`) — OpenRouter, Together, Groq, vLLM, Ollama, LM Studio,
+    /// etc. Same wire family as OpenAi but the older, near-universally-implemented API.
+    OpenAiCompat,
     Anthropic,
 }
 
@@ -31,7 +36,7 @@ impl CoerceProvider {
     /// Default API base URL (overridable for the Codex backend or a mock).
     pub fn default_base_url(self) -> &'static str {
         match self {
-            CoerceProvider::OpenAi => "https://api.openai.com",
+            CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat => "https://api.openai.com",
             CoerceProvider::Anthropic => "https://api.anthropic.com",
         }
     }
@@ -300,7 +305,44 @@ pub fn build_request(call: &CoerceCall<'_>) -> HttpRequest {
             Some(codex) => build_codex_request(call, codex),
             None => build_openai_request(call),
         },
+        CoerceProvider::OpenAiCompat => build_openai_compat_request(call),
         CoerceProvider::Anthropic => build_anthropic_request(call),
+    }
+}
+
+/// Structured-output request for a generic OpenAI-compatible endpoint: the Chat
+/// Completions API with a `response_format` json-schema constraint (the widely
+/// implemented equivalent of the Responses API's `text.format`). The base URL is
+/// always the caller's configured endpoint.
+fn build_openai_compat_request(call: &CoerceCall<'_>) -> HttpRequest {
+    let body = json!({
+        "model": call.model,
+        "messages": [{ "role": "user", "content": call.prompt }],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": sanitize_name(call.schema_name),
+                "schema": call.output_schema,
+                "strict": is_strict_compatible(call.output_schema),
+            }
+        },
+    });
+    HttpRequest {
+        // The configured endpoint is the OpenAI-compatible base URL as provider docs
+        // give it (it already includes `/v1`), so append only `/chat/completions` —
+        // matching the OpenAI SDK `base_url` convention every compat endpoint follows.
+        url: format!("{}/chat/completions", call.base_url.trim_end_matches('/')),
+        headers: with_idempotency_key(
+            call,
+            vec![
+                (
+                    "authorization".to_owned(),
+                    format!("Bearer {}", call.api_key),
+                ),
+                ("content-type".to_owned(), "application/json".to_owned()),
+            ],
+        ),
+        body,
     }
 }
 
@@ -503,7 +545,37 @@ pub fn parse_response(
     }
     match provider {
         CoerceProvider::OpenAi => parse_openai_response(response, wrapped),
+        CoerceProvider::OpenAiCompat => parse_openai_compat_response(response, wrapped),
         CoerceProvider::Anthropic => parse_anthropic_response(response, wrapped),
+    }
+}
+
+fn parse_openai_compat_response(response: &HttpResponse, wrapped: bool) -> CoerceResult {
+    // Chat Completions returns the structured payload as a JSON string in
+    // `choices[0].message.content`.
+    let text = openai_compat_message_content(&response.body);
+    let Some(text) = text else {
+        return failed_result(
+            "provider response contained no message content".to_owned(),
+            provider_error_excerpt(&response.body),
+        );
+    };
+    finalize_structured(&text_to_value(&text), wrapped, openai_usage(&response.body))
+}
+
+/// The assistant message text of the first Chat Completions choice, if non-empty.
+fn openai_compat_message_content(body: &Value) -> Option<String> {
+    let content = body
+        .get("choices")?
+        .as_array()?
+        .first()?
+        .get("message")?
+        .get("content")?
+        .as_str()?;
+    if content.is_empty() {
+        None
+    } else {
+        Some(content.to_owned())
     }
 }
 
@@ -1044,6 +1116,54 @@ mod tests {
     }
 
     #[test]
+    fn openai_compat_request_uses_chat_completions_with_response_format() {
+        let schema = json!({ "type": "object" });
+        let call = CoerceCall {
+            provider: CoerceProvider::OpenAiCompat,
+            base_url: "https://api.together.xyz/v1",
+            api_key: "sk-test",
+            model: "llama-3.3-70b",
+            prompt: "Classify this",
+            output_schema: &schema,
+            schema_name: "WorkReview",
+            max_tokens: 1024,
+            codex: None,
+            idempotency_key: "key_compat_effect",
+        };
+        let request = build_request(&call);
+        // Chat Completions endpoint + `response_format` json-schema (not the
+        // Responses API's `text.format`).
+        assert_eq!(request.url, "https://api.together.xyz/v1/chat/completions");
+        assert_eq!(
+            request.body["response_format"]["type"],
+            json!("json_schema")
+        );
+        assert_eq!(
+            request.body["response_format"]["json_schema"]["name"],
+            json!("WorkReview")
+        );
+        assert_eq!(request.body["messages"][0]["role"], json!("user"));
+        assert!(request
+            .headers
+            .iter()
+            .any(|(k, v)| k == "authorization" && v == "Bearer sk-test"));
+    }
+
+    #[test]
+    fn openai_compat_response_reads_message_content_as_structured_value() {
+        let response = HttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{ "message": { "content": "{\"ok\":true}" } }],
+                "usage": { "completion_tokens": 3 }
+            }),
+        };
+        let result = parse_response(CoerceProvider::OpenAiCompat, &response, false);
+        assert_eq!(result.status, CoerceStatus::Succeeded);
+        assert_eq!(result.value_json.as_deref(), Some("{\"ok\":true}"));
+    }
+
+    #[test]
     fn empty_idempotency_key_emits_no_header_on_every_builder() {
         // The fixture/no-key path must stay byte-identical to before: an empty
         // key produces no `Idempotency-Key` header on any of the three builders.
@@ -1362,7 +1482,9 @@ mod tests {
                 provider,
                 base_url: match provider {
                     CoerceProvider::Anthropic => "https://api.anthropic.com",
-                    CoerceProvider::OpenAi => "https://api.openai.com",
+                    CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat => {
+                        "https://api.openai.com"
+                    }
                 },
                 api_key: "key",
                 model: "m",
