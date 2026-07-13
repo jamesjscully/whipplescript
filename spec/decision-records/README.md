@@ -198,6 +198,10 @@ others are active workshop material.
   epoch-bump refires tagged), `whip suppose` as the what-if verb, and
   campaign evaluation paired at the cut. Witness model
   `prefix-replay.maude`. *Accepted + built.*
+- [0039-bashkit-default-bash.md](0039-bashkit-default-bash.md): Bashkit becomes
+  WhippleScript's default governed `bash` implementation on native and Durable
+  Object placements; non-bash external capabilities remain typed brokered
+  effects. *Accepted; implementation in progress.*
 
 ## Historical Decision Trackers
 

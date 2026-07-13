@@ -2,9 +2,10 @@
 
 This is the **live-deployment shell** for the sans-IO runtime. The Rust core
 (`crate whipplescript-host-do`) is compiled to wasm and exposes
-`WasmDurableInstance` (`create` / `step` / `status`); this shell adds only the JS
-glue — a `DoSqlBridge` over `state.storage.sql`, the `fetch` for each suspended
-round, and step-protocol JSON marshalling. **No scheduling logic lives here.**
+`WasmDurableInstance` (`create` / `attach_host` / `step` / `status`). The shell
+also exposes the authenticated `whipplescript.host.v1` placement API: signed
+policy bootstrap, package/instance open, workspace sync and projection,
+turn/cancel/result, evidence/events, and checkpoint/restore.
 
 ## What is done vs. what needs a deployment
 
@@ -42,7 +43,9 @@ reference:
    wrangler secret put OPENAI_API_KEY
    ```
 4. **Deploy**: `npm run deploy` (`wrangler deploy`).
-5. **Validate**: `POST /start { program, input, principal }` and confirm the
+5. **Validate**: use the canonical managed route
+   `/v1/tenants/:tenant/placements/:placement/host/...` (Bearer
+   `WHIP_CONTROL_TOKEN`), or `POST /start` for the legacy workflow surface, and confirm the
    instance drives to `completed` — an effect-free workflow in one `step`, a coerce/
    agent workflow across `needs_http` rounds.
 

@@ -4,9 +4,5 @@
 //! boundary. Keeping these modules in the package library prevents a host from
 //! reimplementing envelope parsing, attestation verification, or IFC semantics.
 
-pub mod gov;
-pub mod host_policy;
-pub mod host_protocol;
+pub use whipplescript_kernel::{gov, host_policy, host_protocol, ifc, principal};
 pub mod host_runtime;
-pub mod ifc;
-pub mod principal;

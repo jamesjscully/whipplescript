@@ -19,6 +19,14 @@ serde_json = "1"
 # Pure-Rust, wasm-clean: script-pin verification + delta-kernel content keys
 # for the exec-over-HTTP path (compute plane P8).
 sha2 = "0.10"
+# Placement-neutral governed bash. Default features are disabled so the kernel
+# does not acquire Bashkit's separate LLM-tool wrapper; WhippleScript owns the
+# model-facing contract through `WhipShell`.
+bashkit = { version = "=0.13.0", default-features = false, features = ["jq"] }
+futures = { version = "0.3", default-features = false, features = ["executor"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { version = "1", features = ["rt", "time"] }
 
 [features]
 # `native` pulls in the rusqlite-backed store (whipplescript-store/native); the
@@ -31,6 +39,9 @@ default = ["native", "codex", "claude"]
 native = ["whipplescript-store/native"]
 codex = []
 claude = []
+# Exposes deterministic legacy-envelope construction only to downstream test
+# targets. Production embeddings must use an external governance signature.
+test-support = []
 
 [lib]
 path = "src/lib.rs"

@@ -40,6 +40,173 @@ pub mod do_tools;
 #[cfg(target_arch = "wasm32")]
 pub mod do_wasm;
 pub mod do_worker;
+/// GaugeDesk-compatible governance verification for hosted placements.
+pub mod governance;
+
+#[cfg(test)]
+mod governed_host_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use p256::ecdsa::signature::Signer;
+    use p256::ecdsa::{Signature, SigningKey};
+    use serde_json::json;
+    use whipplescript_kernel::gov::{external_signing_bytes, SignedEnvelope};
+    use whipplescript_kernel::host_facade::{GovernedHostFacade, ProviderRealization};
+    use whipplescript_kernel::host_package::{AuthoredAgentPackage, AGENT_PACKAGE_SCHEMA};
+    use whipplescript_kernel::host_policy::{
+        HostGovernancePolicy, PlacementPolicy, ProviderBindingPolicy, ResourcePolicy,
+    };
+    use whipplescript_kernel::host_protocol::{
+        CredentialRef, OpenInstanceCommand, ProviderBindingRef, StartTurnCommand, TurnInput,
+        HOST_PROTOCOL,
+    };
+    use whipplescript_store::RuntimeStore;
+
+    use crate::do_store::test_support;
+    use crate::governance::{GaugeDeskGovernanceRoot, GAUGEDESK_ATTESTATION_ALGORITHM};
+
+    fn package() -> AuthoredAgentPackage {
+        AuthoredAgentPackage::from_documents(
+            json!({
+                "schema": AGENT_PACKAGE_SCHEMA,
+                "source": "method.whip",
+                "workflow": "Method",
+                "agent": "assistant",
+                "system_prompt": "persona.md",
+                "capabilities": [],
+                "max_steps": 4,
+            })
+            .to_string(),
+            r#"
+workflow Method {
+  agent assistant {
+    provider owned
+    profile "plain"
+    capacity 1
+    capabilities []
+  }
+  rule converse when started => { tell assistant "Answer without tools." }
+}
+"#,
+            "Be helpful.",
+        )
+        .expect("package")
+    }
+
+    fn signed_policy() -> (GaugeDeskGovernanceRoot, String) {
+        let principal = ResourcePolicy {
+            principal: true,
+            ..ResourcePolicy::default()
+        };
+        let policy = HostGovernancePolicy {
+            resources: BTreeMap::from([
+                ("provider:openai".to_owned(), principal.clone()),
+                ("placement:do".to_owned(), principal),
+            ]),
+            bindings: BTreeMap::from([
+                ("model".to_owned(), "provider:openai".to_owned()),
+                ("do".to_owned(), "placement:do".to_owned()),
+            ]),
+            parties: BTreeMap::from([("operator".to_owned(), "public".to_owned())]),
+            provider_bindings: BTreeMap::from([(
+                "model".to_owned(),
+                ProviderBindingPolicy {
+                    provider: "openai".to_owned(),
+                    model: "gpt-test".to_owned(),
+                    base_url: "https://provider.invalid".to_owned(),
+                    credential_ref: "credential:model".to_owned(),
+                },
+            )]),
+            placements: BTreeMap::from([(
+                "do".to_owned(),
+                PlacementPolicy {
+                    kind: "durable_object".to_owned(),
+                    provider_bindings: BTreeSet::from(["model".to_owned()]),
+                    command_network: false,
+                },
+            )]),
+            ..HostGovernancePolicy::default()
+        };
+        let signer = "authority:gaugedesk";
+        let key = SigningKey::from_slice(&[7u8; 32]).expect("test key");
+        let public_key = hex::encode(key.verifying_key().to_encoded_point(true).as_bytes());
+        let unsigned = policy.to_json().expect("policy");
+        let signing_bytes = external_signing_bytes(
+            &unsigned,
+            signer,
+            GAUGEDESK_ATTESTATION_ALGORITHM,
+            &public_key,
+        )
+        .expect("bytes");
+        let signature: Signature = key.sign(&signing_bytes);
+        let signed = SignedEnvelope::from_external_signature(
+            &unsigned,
+            signer,
+            GAUGEDESK_ATTESTATION_ALGORITHM,
+            &public_key,
+            &hex::encode(signature.to_bytes()),
+        )
+        .expect("signed")
+        .to_json();
+        (GaugeDeskGovernanceRoot::new(signer, public_key), signed)
+    }
+
+    #[test]
+    fn gaugedesk_host_protocol_admits_the_same_package_on_the_do_store() {
+        let (root, signed) = signed_policy();
+        let verified = root.verify_epoch(7, &signed).expect("verified");
+        let mut host =
+            GovernedHostFacade::from_verified_store(test_support::store(), 7, verified.envelope)
+                .expect("host");
+        let package = package();
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-do-1".to_owned(),
+            package_version_ref: package.version_ref().to_owned(),
+            policy: host.policy_ref().clone(),
+        };
+        let opened = host.open_instance(&open, &package).expect("opened");
+        let turn = StartTurnCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            command_id: "turn-do-1".to_owned(),
+            run_ref: "gaugedesk:run:do:1".to_owned(),
+            instance_ref: opened.instance_ref,
+            package_version_ref: package.version_ref().to_owned(),
+            policy: host.policy_ref().clone(),
+            actor_ref: "operator".to_owned(),
+            input: TurnInput {
+                text: "hello from GaugeDesk".to_owned(),
+                images: Vec::new(),
+            },
+            resources: Vec::new(),
+            provider_binding: ProviderBindingRef {
+                binding_id: "model".to_owned(),
+                credential: CredentialRef {
+                    credential_id: "credential:model".to_owned(),
+                },
+            },
+            placement_ceiling_ref: "do".to_owned(),
+        };
+        assert!(host
+            .begin_turn(
+                &turn,
+                &package,
+                ProviderRealization {
+                    provider: "openai",
+                    model: "gpt-test",
+                    base_url: "https://provider.invalid",
+                },
+            )
+            .expect("admitted"));
+        let effects = host
+            .kernel()
+            .store()
+            .list_effects(&turn.instance_ref)
+            .expect("effects");
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].effect_id, turn.command_id);
+    }
+}
 
 // -- HTTP: the fetch host driver ------------------------------------------
 

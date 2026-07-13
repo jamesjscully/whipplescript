@@ -26,6 +26,7 @@ use whipplescript_kernel::harness_loop::{
 };
 use whipplescript_kernel::harness_model::RealHarnessModelClient;
 use whipplescript_kernel::sansio::{HostDriver, IoRequest, IoResult};
+use whipplescript_kernel::whip_shell::{ShellFile, ShellRequest, WhipShell};
 use whipplescript_kernel::{BrokeredTurnContext, RuntimeKernel};
 use whipplescript_parser::IrWorkflowContractKind;
 use whipplescript_store::content::ContentStore;
@@ -1389,7 +1390,7 @@ impl FileToolExecutor {
     }
 
     fn bash(&self, args: &Value) -> Result<String, String> {
-        let command = str_arg(args, "command")?;
+        let command = str_arg(args, "command")?.trim();
         if !self.profile_policy.bash {
             return Err(format!(
                 "bash is not permitted by profile `{}`",
@@ -1402,30 +1403,116 @@ impl FileToolExecutor {
                     .to_owned(),
             );
         }
-        if !self.command_allowed(command) {
-            return Err(format!(
-                "command refused: `{command}` is not permitted by WHIPPLESCRIPT_HARNESS_BASH_ALLOW"
-            ));
+        if command.is_empty() {
+            return Err("bash command must not be empty".to_owned());
         }
-        self.enforce_command_read_boundary(command)?;
-        self.enforce_command_write_boundary(command)?;
-        if let Some(reason) = command_argument_policy_violation(command) {
-            return Err(format!("command refused: {reason}"));
-        }
-        self.enforce_command_path_argument_boundary(command)?;
         let timeout = std::time::Duration::from_secs(
             args.get("timeout")
                 .and_then(Value::as_u64)
                 .unwrap_or(BASH_DEFAULT_TIMEOUT_SECS),
         );
-        let output = run_bounded_command(command, &self.root, timeout)?;
+        if timeout.is_zero() || timeout > Duration::from_secs(BASH_DEFAULT_TIMEOUT_SECS) {
+            return Err(format!(
+                "bash timeout must be between 1 and {BASH_DEFAULT_TIMEOUT_SECS} seconds"
+            ));
+        }
+
+        let mut before = std::collections::BTreeMap::new();
+        let mut files = Vec::new();
+        let mut pending = vec![self.root.clone()];
+        while let Some(directory) = pending.pop() {
+            let mut entries = std::fs::read_dir(&directory)
+                .map_err(|error| format!("cannot enumerate bash workspace: {error}"))?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let kind = entry
+                    .file_type()
+                    .map_err(|error| format!("cannot inspect bash workspace: {error}"))?;
+                if kind.is_symlink() {
+                    continue;
+                }
+                if kind.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if !kind.is_file() {
+                    continue;
+                }
+                if files.len() >= MAX_FILES_WALKED {
+                    return Err(format!(
+                        "bash workspace contains more than {MAX_FILES_WALKED} files"
+                    ));
+                }
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .map_err(|_| "bash workspace traversal escaped its root".to_owned())?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if self.policy(&relative, "read").is_some() {
+                    continue;
+                }
+                let content = std::fs::read(&path)
+                    .map_err(|error| format!("cannot load bash file `{relative}`: {error}"))?;
+                before.insert(relative.clone(), content.clone());
+                files.push(ShellFile {
+                    writable: self.policy(&relative, "write").is_none(),
+                    path: relative,
+                    content,
+                });
+            }
+        }
+
+        let output = WhipShell::default().execute(ShellRequest {
+            command: command.to_owned(),
+            files,
+            timeout,
+        })?;
+        // Validate the complete delta before importing it into the governed
+        // native workspace.
+        for (path, content) in &output.files {
+            if before.get(path) != Some(content) {
+                if let Some(reason) = self.policy(path, "write") {
+                    return Err(format!("bash write to `{path}` refused: {reason}"));
+                }
+            }
+        }
+        let after_paths = output
+            .files
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        for removed in before.keys().filter(|path| !after_paths.contains(*path)) {
+            if let Some(reason) = self.policy(removed, "write") {
+                return Err(format!("bash delete of `{removed}` refused: {reason}"));
+            }
+        }
+        for removed in before.keys().filter(|path| !after_paths.contains(*path)) {
+            std::fs::remove_file(self.root.join(removed))
+                .map_err(|error| format!("cannot delete bash file `{removed}`: {error}"))?;
+        }
+        for (path, content) in &output.files {
+            if before.get(path) == Some(content) {
+                continue;
+            }
+            let full = self.root.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("cannot create parent for `{path}`: {error}"))?;
+            }
+            std::fs::write(&full, content)
+                .map_err(|error| format!("cannot write bash file `{path}`: {error}"))?;
+        }
+
         // Full (source-bounded) output; `execute` applies the single capture-time cap
         // on success so the pre-truncation bytes can be captured for `recall`.
-        let combined = output.combined;
+        let mut combined = output.stdout;
+        combined.push_str(&output.stderr);
         match output.exit_code {
-            Some(0) => Ok(combined),
-            Some(code) => Err(format!("command exited with status {code}\n{combined}")),
-            None => Err(format!("command terminated by signal\n{combined}")),
+            0 => Ok(combined),
+            code => Err(format!("command exited with status {code}\n{combined}")),
         }
     }
 
@@ -5408,17 +5495,17 @@ mod tests {
     }
 
     #[test]
-    fn bash_default_deny_refuses_without_allow_list() {
+    fn bash_is_available_without_a_native_allow_list() {
         let root = temp_root();
         let exec = FileToolExecutor::new(&root).with_bash_allow(vec![]);
         let r = exec.execute(&call(TOOL_BASH, json!({ "command": "echo hi" })));
-        assert_eq!(r.status, ToolStatus::Error);
-        assert!(r.content.contains("refused"));
+        assert_eq!(r.status, ToolStatus::Ok);
+        assert_eq!(r.content, "hi\n");
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn bash_runs_an_allowed_command() {
+    fn bash_runs_a_virtual_builtin() {
         let root = temp_root();
         let exec = FileToolExecutor::new(&root).with_bash_allow(vec!["echo".into()]);
         let r = exec.execute(&call(TOOL_BASH, json!({ "command": "echo hello" })));
@@ -5457,7 +5544,7 @@ mod tests {
     }
 
     #[test]
-    fn bash_runs_when_profile_turn_grant_and_allow_list_all_permit() {
+    fn bash_runs_when_profile_and_turn_grant_permit() {
         let root = temp_root();
         let command_only = turn_tool_access_from_input(
             &json!({
@@ -5546,26 +5633,22 @@ mod tests {
 
         assert_eq!(denied.status, ToolStatus::Error);
         assert!(denied.content.contains("input.txt"));
-        assert!(denied.content.contains("file read is not granted"));
+        assert!(!denied.content.contains("hello"));
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn bash_refuses_shell_control_operators_before_execution() {
+    fn bash_supports_shell_control_operators_in_the_virtual_interpreter() {
         let root = temp_root();
         let exec = FileToolExecutor::new(&root).with_bash_allow(vec!["echo".into()]);
 
-        for command in [
-            "echo ok; touch owned.txt",
-            "echo ok && touch owned.txt",
-            "echo ok | touch owned.txt",
-            "echo ok\n touch owned.txt",
-        ] {
-            let denied = exec.execute(&call(TOOL_BASH, json!({ "command": command })));
-            assert_eq!(denied.status, ToolStatus::Error, "command: {command}");
-            assert!(denied.content.contains("command refused"));
-        }
-        assert!(!root.join("owned.txt").exists());
+        let result = exec.execute(&call(
+            TOOL_BASH,
+            json!({ "command": "echo ok | tr a-z A-Z; touch owned.txt" }),
+        ));
+        assert_eq!(result.status, ToolStatus::Ok);
+        assert!(result.content.contains("OK"));
+        assert!(root.join("owned.txt").exists());
 
         let quoted = exec.execute(&call(
             TOOL_BASH,
@@ -5577,7 +5660,7 @@ mod tests {
     }
 
     #[test]
-    fn bash_refuses_command_substitution_before_execution() {
+    fn bash_supports_command_substitution_in_the_virtual_interpreter() {
         let root = temp_root();
         let exec = FileToolExecutor::new(&root).with_bash_allow(vec!["echo".into()]);
 
@@ -5590,12 +5673,10 @@ mod tests {
             json!({ "command": "echo `touch backtick-owned.txt`" }),
         ));
 
-        assert_eq!(dollar.status, ToolStatus::Error);
-        assert!(dollar.content.contains("command substitution"));
-        assert_eq!(backticks.status, ToolStatus::Error);
-        assert!(backticks.content.contains("command substitution"));
-        assert!(!root.join("owned.txt").exists());
-        assert!(!root.join("backtick-owned.txt").exists());
+        assert_eq!(dollar.status, ToolStatus::Ok);
+        assert_eq!(backticks.status, ToolStatus::Ok);
+        assert!(root.join("owned.txt").exists());
+        assert!(root.join("backtick-owned.txt").exists());
 
         let literal = exec.execute(&call(
             TOOL_BASH,
@@ -5608,47 +5689,46 @@ mod tests {
     }
 
     #[test]
-    fn bash_refuses_dynamic_shell_expansion_before_execution() {
+    fn bash_supports_dynamic_shell_expansion_without_ambient_host_access() {
         let root = temp_root();
         let exec = FileToolExecutor::new(&root).with_bash_allow(vec!["echo".into()]);
 
-        for command in ["echo $HOME", "echo *.rs", "echo {a,b}", "echo ~/secret"] {
-            let denied = exec.execute(&call(TOOL_BASH, json!({ "command": command })));
-            assert_eq!(denied.status, ToolStatus::Error, "command: {command}");
-            assert!(denied.content.contains("command refused"));
-        }
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").expect("fixture");
+        let expanded = exec.execute(&call(
+            TOOL_BASH,
+            json!({ "command": "echo $HOME; echo *.rs; echo {a,b}" }),
+        ));
+        assert_eq!(expanded.status, ToolStatus::Ok);
+        assert!(expanded.content.contains("/workspace"));
+        assert!(expanded.content.contains("main.rs"));
+        assert!(expanded.content.contains("a b"));
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn bash_refuses_out_of_workspace_path_arguments() {
+    fn bash_paths_cannot_reach_the_ambient_host_filesystem() {
         let root = temp_root();
         let exec = FileToolExecutor::new(&root).with_bash_allow(vec!["echo".into()]);
 
-        for command in [
-            "echo ../secret",
-            "echo /tmp/secret",
-            "echo --input=../secret",
-        ] {
-            let denied = exec.execute(&call(TOOL_BASH, json!({ "command": command })));
-            assert_eq!(denied.status, ToolStatus::Error, "command: {command}");
-            assert!(denied.content.contains("must stay within the workspace"));
-        }
+        let ambient_secret = root.parent().expect("parent").join("secret");
+        std::fs::write(&ambient_secret, "ambient-secret").expect("ambient fixture");
+        let denied = exec.execute(&call(TOOL_BASH, json!({ "command": "cat ../secret" })));
+        assert_eq!(denied.status, ToolStatus::Error);
+        assert!(!denied.content.contains("ambient-secret"));
+        std::fs::remove_file(ambient_secret).ok();
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn bash_refuses_command_outside_the_allow_list() {
+    fn bashkit_unsupported_commands_fail_honestly_without_native_escalation() {
         let root = temp_root();
         let exec = FileToolExecutor::new(&root).with_bash_allow(vec!["echo".into()]);
-        // A dangerous command that does NOT match the `echo` prefix is refused
-        // before any execution.
-        let r = exec.execute(&call(TOOL_BASH, json!({ "command": "rm -rf /" })));
+        let r = exec.execute(&call(
+            TOOL_BASH,
+            json!({ "command": "definitely-not-a-bashkit-command" }),
+        ));
         assert_eq!(r.status, ToolStatus::Error);
-        assert!(r.content.contains("refused"));
-        // And a near-miss that only shares a prefix substring is also refused.
-        let r2 = exec.execute(&call(TOOL_BASH, json!({ "command": "echofoo bar" })));
-        assert_eq!(r2.status, ToolStatus::Error);
+        assert!(r.content.contains("command not found"));
         std::fs::remove_dir_all(&root).ok();
     }
 }

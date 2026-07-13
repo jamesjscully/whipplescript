@@ -28,6 +28,195 @@ use crate::do_store::DoSql;
 use crate::do_worker::{
     DurableEffectPorts, DurableInstance, DurableStepOutcome, ScriptCapabilityInput,
 };
+use crate::governance::GaugeDeskGovernanceRoot;
+use whipplescript_kernel::host_facade::{GovernedHostFacade, ProviderRealization};
+use whipplescript_kernel::host_package::AuthoredAgentPackage;
+use whipplescript_kernel::host_protocol::{OpenInstanceCommand, StartTurnCommand};
+use whipplescript_store::{EffectCancellationRequest, RuntimeStore};
+
+/// Verify and normalize one GaugeDesk-signed hosted policy epoch. This is a
+/// direct wasm export so the Worker shell can fail closed before persisting a
+/// placement bootstrap. The signer and key come from Worker bindings, never
+/// from the request body.
+#[wasm_bindgen]
+pub fn verify_host_policy(
+    epoch: u64,
+    signed_envelope: &str,
+    expected_signer: &str,
+    public_key_hex: &str,
+) -> Result<String, JsValue> {
+    let verified = GaugeDeskGovernanceRoot::new(expected_signer, public_key_hex)
+        .verify_epoch(epoch, signed_envelope)
+        .map_err(|error| JsValue::from_str(&error))?;
+    serde_json::to_string(&verified.policy).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+fn hosted_facade(
+    bridge: DoSqlBridge,
+    epoch: u64,
+    signed_envelope: &str,
+    expected_signer: &str,
+    public_key_hex: &str,
+) -> Result<GovernedHostFacade<crate::do_store::DoSqliteStore<JsDoSql>>, JsValue> {
+    let verified = GaugeDeskGovernanceRoot::new(expected_signer, public_key_hex)
+        .verify_epoch(epoch, signed_envelope)
+        .map_err(|error| JsValue::from_str(&error))?;
+    GovernedHostFacade::from_verified_store(
+        crate::do_store::DoSqliteStore::new(JsDoSql { bridge }),
+        epoch,
+        verified.envelope,
+    )
+    .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+fn authored_package(
+    manifest: &str,
+    source: &str,
+    system_prompt: &str,
+) -> Result<AuthoredAgentPackage, JsValue> {
+    AuthoredAgentPackage::from_documents(manifest, source, system_prompt)
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+/// Execute `OpenInstanceCommand` against the DO store through the common
+/// governed facade and placement-neutral authored package implementation.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn host_open_instance(
+    bridge: DoSqlBridge,
+    epoch: u64,
+    signed_envelope: &str,
+    expected_signer: &str,
+    public_key_hex: &str,
+    command_json: &str,
+    package_manifest: &str,
+    package_source: &str,
+    system_prompt: &str,
+) -> Result<String, JsValue> {
+    let mut facade = hosted_facade(
+        bridge,
+        epoch,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+    )?;
+    let command: OpenInstanceCommand = serde_json::from_str(command_json)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    let opened = facade
+        .open_instance(&command, &package)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    serde_json::to_string(&opened).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Phase one of a hosted turn: validate the signed epoch, instance, package,
+/// IFC, actor, and opaque references. The Worker may resolve only the returned
+/// capability ids after this function succeeds.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn host_validate_turn(
+    bridge: DoSqlBridge,
+    epoch: u64,
+    signed_envelope: &str,
+    expected_signer: &str,
+    public_key_hex: &str,
+    command_json: &str,
+    package_manifest: &str,
+    package_source: &str,
+    system_prompt: &str,
+) -> Result<String, JsValue> {
+    let facade = hosted_facade(
+        bridge,
+        epoch,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+    )?;
+    let command: StartTurnCommand = serde_json::from_str(command_json)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    let admission = facade
+        .validate_turn(&command, &package)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    serde_json::to_string(&admission).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Phase two of a hosted turn: after the Worker resolves the admitted opaque
+/// capability, verify its credential-free provider identity and enqueue the
+/// exact command idempotently.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn host_begin_turn(
+    bridge: DoSqlBridge,
+    epoch: u64,
+    signed_envelope: &str,
+    expected_signer: &str,
+    public_key_hex: &str,
+    command_json: &str,
+    package_manifest: &str,
+    package_source: &str,
+    system_prompt: &str,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+) -> Result<bool, JsValue> {
+    let mut facade = hosted_facade(
+        bridge,
+        epoch,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+    )?;
+    let command: StartTurnCommand = serde_json::from_str(command_json)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    facade
+        .begin_turn(
+            &command,
+            &package,
+            ProviderRealization {
+                provider,
+                model,
+                base_url,
+            },
+        )
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Request cooperative cancellation of one admitted hosted turn. The public
+/// Worker fixes `requested_by`; callers cannot forge runtime evidence fields.
+#[wasm_bindgen]
+pub fn host_cancel_turn(
+    bridge: DoSqlBridge,
+    instance_id: &str,
+    command_id: &str,
+    requested_by: &str,
+) -> Result<String, JsValue> {
+    let mut store = crate::do_store::DoSqliteStore::new(std::rc::Rc::new(JsDoSql { bridge }));
+    let idempotency = whipplescript_kernel::idempotency_key(&[
+        instance_id,
+        command_id,
+        "host-cancellation-request",
+    ]);
+    let request = store
+        .request_effect_cancellation(EffectCancellationRequest {
+            instance_id,
+            effect_id: command_id,
+            revision_id: None,
+            reason: Some("GaugeDesk requested cancellation"),
+            requested_by,
+            causation_event_id: None,
+            idempotency_key: Some(&idempotency),
+        })
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    Ok(serde_json::json!({
+        "request_id": request.request_id,
+        "instance_ref": request.instance_id,
+        "command_id": request.effect_id,
+        "status": request.status,
+    })
+    .to_string())
+}
 
 #[wasm_bindgen]
 extern "C" {
@@ -320,6 +509,42 @@ pub struct WasmDurableInstance {
 
 #[wasm_bindgen]
 impl WasmDurableInstance {
+    /// Attach to an instance already opened through `host_open_instance` and
+    /// drive its queued governed turns. Package bytes are resolved through the
+    /// same placement-neutral package implementation used during admission.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_host(
+        bridge: DoSqlBridge,
+        instance_id: &str,
+        package_manifest: &str,
+        package_source: &str,
+        system_prompt: &str,
+        agent_config_json: Option<String>,
+    ) -> Result<WasmDurableInstance, JsValue> {
+        let package = authored_package(package_manifest, package_source, system_prompt)?;
+        let resolved = package
+            .resolve(package.version_ref())
+            .map_err(|error| JsValue::from_str(&error))?;
+        let agent_model: Option<Box<dyn whipplescript_kernel::harness_loop::HttpModelClient>> =
+            match agent_config_json {
+                Some(config) => Some(Box::new(
+                    parse_agent_config(&config).map_err(|error| JsValue::from_str(&error))?,
+                )),
+                None => None,
+            };
+        let inner = DurableInstance::attach(
+            JsDoSql { bridge },
+            resolved.program,
+            instance_id,
+            DurableEffectPorts {
+                agent_model,
+                ..DurableEffectPorts::default()
+            },
+        )
+        .map_err(|error| JsValue::from_str(&error))?;
+        Ok(Self { inner })
+    }
+
     /// Compile `program` and create + start a fresh instance over the JS-backed DO
     /// SQLite. Called once when the object is first addressed. Both config args are
     /// optional and carry provider creds from DO secrets, same JSON shape

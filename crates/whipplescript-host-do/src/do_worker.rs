@@ -127,6 +127,55 @@ pub struct DurableInstance<Sql: DoSql> {
 // as `Box<dyn FileStore>` (both real handles — `JsDoSql`, `RusqliteDoSql` — own
 // their storage and are `'static`).
 impl<Sql: DoSql + 'static> DurableInstance<Sql> {
+    /// Attach the step machine to an instance and program already admitted and
+    /// registered by the governed host facade. This is the hosted-placement
+    /// counterpart to `create`: it never creates a second instance or ingests
+    /// an ungoverned start event.
+    pub fn attach(
+        sql: Sql,
+        ir: IrProgram,
+        instance_id: &str,
+        ports: DurableEffectPorts,
+    ) -> Result<Self, String> {
+        let sql = Rc::new(sql);
+        let kernel = RuntimeKernel::new(DoSqliteStore {
+            sql: Rc::clone(&sql),
+        });
+        let exists = kernel
+            .store()
+            .list_instances()
+            .map_err(|error| format!("{error:?}"))?
+            .into_iter()
+            .any(|instance| instance.instance_id == instance_id);
+        if !exists {
+            return Err(format!("no governed host instance `{instance_id}`"));
+        }
+        let default_files: Box<dyn FileStore> =
+            Box::new(DoFileStore::new(DoSqlStorage::for_instance(
+                Rc::clone(&sql),
+                instance_id,
+            )));
+        Ok(Self {
+            kernel: Some(kernel),
+            ir,
+            instance_id: instance_id.to_owned(),
+            in_flight: None,
+            files: ports.files.unwrap_or(default_files),
+            coerce: ports.coerce,
+            agent_model: ports.agent_model,
+            agent_tools: ports
+                .agent_tools
+                .unwrap_or_else(|| {
+                    Box::new(crate::do_tools::DoToolExecutor::for_instance(
+                        Rc::clone(&sql),
+                        instance_id,
+                    ))
+                }),
+            exec: ports.exec,
+            turn: ports.turn,
+        })
+    }
+
     /// Compile `program_source`, then get-or-create THE instance in the DO
     /// store (a Durable Object holds exactly one workflow instance). The first
     /// call creates + starts it; any later call — an alarm wake-up, a poke, an

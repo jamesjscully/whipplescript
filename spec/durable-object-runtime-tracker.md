@@ -15,12 +15,11 @@ Registered in `spec/TRACKERS.md` (status: active).
 ## DO feature-parity sweep — COMPLETE 2026-07-09
 
 Jack directed: bring the DO backend to full feature parity with native, **including
-the agent-turn tool executor**. DONE except bash (a separate initiative — see
-P5/P6 note). The DO now runs `file.*` effects, exposes `checkpoint`/`restore`
+the agent-turn tool executor**. DONE, including Bashkit under DR-0039. The DO
+now runs `file.*` effects, exposes `checkpoint`/`restore`
 operator commands, and runs a real in-isolate agent tool set — all proven
 end-to-end through the real wasm boundary (validate.cjs 8 cases). Remaining DO
-asymmetries are intentional (below): `exec.command` (native-only by design, →
-Class-A executor HTTP effect on the DO), bash (bashkit initiative), and the
+asymmetries are intentional (below): explicitly brokered non-bash execution and the
 coordination-state checkpoint snapshot (deferred on both hosts).
 
 **Residuals re-scoped to v0.4 (Jack 2026-07-09):** with the parity sweep done and
@@ -50,7 +49,7 @@ turn now advertises a real in-isolate tool set instead of `tools: Vec::new()`.
       all synchronous SQLite rounds against the flat `files` table / `content_blobs`
       / work-item store; schemas mirror native; wired as the default `agent_tools`.
       validate.cjs case: an agent turn calls `write` in-isolate through real wasm.
-      bash excluded (bashkit initiative).
+      plus Bashkit over the same instance-scoped store-backed file plane.
 
 **P5/P6 DROPPED (2026-07-09).** The old plan — reshape the tool seam into a
 nested `ToolCallMachine` yielding `NeedsIo(Http)` and broker `bash` to a
@@ -61,11 +60,11 @@ every other tool — no fetch-suspend, no sidecar, no seam reshape. Only *real*
 exec (cargo/builds) escalates to the existing Class-A `whip-executor/1` sidecar.
 The synchronous `ToolExecutor` trait stays.
 
-**bash-via-bashkit = a SEPARATE initiative, not this sweep** (Jack 2026-07-09):
-it is pre-ADR (the note's §9 requirements pass is unrun) and spans native too (it
-un-cripples the crippled v0 native `bash`, giving native + DO the same bash
-semantics). Picked up after its requirements pass; tracked by
-`spec/in-isolate-bash-design-note.md`, not here.
+**bash-via-bashkit is accepted and implemented in the GaugeDesk DO placement sprint**
+(DR-0039, Jack 2026-07-13): Bashkit becomes the default governed `bash` on
+native and DO; non-bash external capabilities remain explicit brokered effects.
+The same wrapper and script semantics run in the native owned harness, native
+governed host, and DO governed host. Tracked by the design note and DR-0039.
 
 Out of scope (intentional asymmetries): `exec.command` is native-only by design
 (DR-0033 Decision 7, re-expressed as the Class-A executor HTTP effect); the

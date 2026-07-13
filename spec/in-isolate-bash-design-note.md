@@ -1,10 +1,11 @@
 # The in-isolate bash tool — Design Note (virtual interpreter tier)
 
-**Status: DRAFT DESIGN NOTE (pre-ADR; needs research + refinement passes).**
+**Status: research record; direction accepted by
+[DR-0039](decision-records/0039-bashkit-default-bash.md).**
 Opened by Jack 2026-07-05: whip needs a bash tool that is safe and
 compatible with execution in a Durable Object. This note captures the
-design shape and the validation spike run the same day; the requirements
-pass has **not** happened yet — §9 lists what it must settle. Cites the
+design shape, the validation spike run the same day, and the implementation
+landed with DR-0039. Cites the
 "virtual bash for agents" initiative class (bashkit, just-bash) that
 emerged in 2026.
 
@@ -12,7 +13,7 @@ emerged in 2026.
 
 Two independent pressures point at the same design:
 
-- **The v0 owned-harness `bash` tool is deliberately crippled** (see
+- **Before DR-0039 the v0 owned-harness `bash` tool was deliberately crippled** (see
   `owned-harness-tool-surface.md`): single simple command only; control
   operators, pipes, command substitution, and expansion are refused;
   redirection targets are checked literally. All of this because *real*
@@ -20,7 +21,7 @@ Two independent pressures point at the same design:
   cannot parse conservatively it must refuse. The argv-classifier rollback
   (workflow-encapsulation course correction) is the recorded lesson:
   classifying bash *text* from outside is a losing game.
-- **The DO runtime has no bash at all.** The compute plane
+- **Before DR-0039 the DO runtime had no bash at all.** The compute plane
   (`compute-plane-design-note.md`) routes real exec to container sidecars
   (Class A/B). But the majority of agent tool calls are `grep`/`ls`/
   `cat`/`sed`-class file inspection; waking a container (1–3s cold start,
@@ -52,7 +53,8 @@ just means most bash tool calls never emit a container effect at all.
 
 ## 3. Spike results (2026-07-05) — bashkit validated, one fixable gap
 
-Candidate: **bashkit** (everruns, MIT, Rust, crates.io v0.12.0; ~164
+Candidate: **bashkit** (everruns, MIT, Rust; validated at v0.12.0 and integrated
+at pinned v0.13.0; ~164
 builtins, pluggable VFS, resource caps, published threat model with
 stable threat IDs). Spike evidence:
 
@@ -72,11 +74,10 @@ stable threat IDs). Spike evidence:
 - **Governance seams exist**: `before_exec`/`after_exec` hooks (per-
   command interception with cancel), custom `Builtin` trait (async
   execute + one-line LLM prompt hints), `NetworkAllowlist`.
-- **wasm32-unknown-unknown** (our DO target): compiles (1.97 MB raw /
-  633 KB gz) but **panics at runtime on `SystemTime::now()`** — 64 time
-  call sites, no clock abstraction. Upstream's "WASM" claims are
-  emscripten (Python wheels) and a NAPI wasip1 build currently commented
-  out in their CI ("needs architectural fix to gate tokio features").
+- **wasm32-unknown-unknown** (our DO target): v0.12.0 exposed a clock/tokio
+  incompatibility. Bashkit v0.13.0 added the web-time/gated-runtime support;
+  the combined WhippleScript DO host now builds for the target and executes
+  the shared conformance scripts without a fork or vendored patch.
 - **wasm32-wasip1**: after a 2-line cfg patch (a genuine bug —
   `std::os::unix` under `cfg(target_os = "wasi")`), the full interpreter
   **runs correctly under node:wasi**: pipes, loops, VFS writes, awk, sed,
@@ -112,12 +113,10 @@ with an endless compat tail).
   Preload is the simpler v1; demand-fetch is the fork to revisit for
   large manifests (ties to slicer input closures,
   versioned-workspace §10.1).
-- **Policy at the hooks**: `before_exec` receives each simple command
-  *post-parse, pre-execute* — the operator allow-list
-  (`WHIPPLESCRIPT_HARNESS_BASH_ALLOW` analog) enforces per-command inside
-  compound structures, which the v0 text-level surface could never do.
-  Labels/IFC ride the store adapter (every read/write goes through our
-  store API), not the interpreter.
+- **Policy at the boundary**: package `command.run` admission determines whether
+  `bash` is available. The interpreter receives only the admitted workspace
+  snapshot and imports a fully validated delta. There is no second ambient
+  command allowlist and no OS-exec fallback hidden inside `bash`.
 - **The escalation contract** (§5) — entirely ours.
 
 ## 5. The fidelity trap and the escalation contract
@@ -134,11 +133,9 @@ stated as invariant:
 > stub may masquerade as the real tool.
 
 bashkit's exit-127 + explicit sandbox message is the raw material. Open
-design: **auto-escalation policy** — does an out-of-tier command
-transparently re-run as a Class A/B effect (cost: a container wake the
-model didn't ask for), or does the model see the boundary and choose
-(cost: prompt-level complexity)? Leaning: surface the boundary in v1
-(honest, cheap), revisit auto-escalation with usage data. Also open:
+design was settled by DR-0039: the model sees the boundary and a real non-bash
+operation must request an explicitly brokered capability. There is no automatic
+real-exec escalation. Still open:
 audit bashkit's builtin set for *quiet* divergences from real tools
 (their threat-model exclusion list is the starting point) — divergence
 that exits 0 is exactly the trap.
@@ -160,14 +157,13 @@ re-observe wall clock.)
 ## 7. Where it runs — not just the DO
 
 The same tier slots into the **native** owned harness: replace the
-crippled v0 `bash` surface with the virtual interpreter + real-exec
-escalation. That gives native and DO the *same* bash semantics and the
+crippled v0 `bash` surface with the virtual interpreter. That gives native and DO the *same* bash semantics and the
 same governance story, and un-cripples pipes/substitution on native
 today. The v0 restrictions (single simple command, no pipes) then apply
-only to the *escalation* path (real exec), where they belong. This
-supersedes the "command side-effect boundary" open item's premise for the
-in-isolate tier — classification is unnecessary where whip executes the
-structure itself; the item survives only for escalated real exec.
+no longer define a second path. This supersedes the "command side-effect
+boundary" open item's premise for the in-isolate tier — classification is
+unnecessary where whip executes the structure itself. Real toolchains are
+separate named brokered capabilities.
 
 ## 8. Sessions and durability (new option the interpreter opens)
 
@@ -179,43 +175,39 @@ per turn** — snapshot into the store at effect boundaries, replayable
 under DR-0033 — becomes cheap. Not v1 scope; recorded as the natural
 follow-on that the DR-0024 deferral anticipated.
 
-## 9. What the requirements pass must settle
+## 9. Implementation choices under DR-0039
 
-1. **Consumers**: agent `bash` tool only, or also `exec` lowering for
-   hermetic script sites (an `exec` that never leaves the isolate)?
-2. **Escalation contract** (§5): signal shape, tier surfacing vs
-   auto-escalate, the builtin divergence audit.
-3. **VFS integration**: preload-closure v1 confirmation; demand-fetch
-   trigger conditions.
-4. **Determinism posture** (§6): hermeticity bit vs virtual clock.
-5. **Caps mapping**: bashkit `ExecutionLimits`/`FsLimits` values under DO
-   isolate CPU/memory budgets; who sets them (workspace config with
-   progressive-rigor defaults).
+1. **Consumers**: implemented for the native owned harness, native governed
+   host, and DO governed host. Other `exec` lowering remains separate.
+2. **Unsupported-command signal** (§5): surface the Bashkit boundary honestly;
+   DR-0039 rejects automatic real-exec escalation. Audit builtin divergences.
+3. **VFS integration**: preload-closure v1 is implemented; demand-fetch remains
+   a future large-workspace optimization.
+4. **Determinism posture** (§6): v1 uses a fixed Unix epoch and no ambient
+   randomness or network.
+5. **Caps mapping**: v1 fixes 32 MiB workspace, 8 MiB per file, 5,000 files,
+   1 MiB output, and a caller-bounded timeout. Configuration remains open.
 6. **Network posture**: v1 = no network in the interpreter (`curl` →
    not-found/escalation); later fork: a custom `curl` builtin over the
    `NeedsHttp` effect (would make in-isolate curl governed, recorded, and
    cache-keyed).
-7. **Feature set**: which bashkit features on (`jq` likely yes; `python`/
-   `typescript`/`sqlite`/`ssh` off in v1 — each is its own authority
-   discussion).
-8. **Dependency posture**: upstream engagement (clock abstraction PR +
-   wasi cfg fix + tokio gating — they clearly want wasm to work; active
-   project, 1,545 commits) vs temporary vendored patch; `WhipShell` trait
-   boundary in either case.
+7. **Feature set**: `jq` is on; `python`/`typescript`/`sqlite`/`ssh` are off.
+8. **Dependency posture**: pinned upstream v0.13.0 behind WhippleScript's
+   `WhipShell` wrapper; no vendored patch.
 9. **Naming/tool schema**: stays `bash` (familiar shape) — the tier is an
    implementation property, not a tool the model picks.
 
 ## 10. Settled vs. open
 
-**Settled in principle (Jack, 2026-07-05):** the need (a DO-safe bash
-tool); validation approach ran and passed; bashkit is the lead candidate
-(dep-vs-scratch resolved *against* from-scratch by spike evidence, dep
-choice pending the requirements pass).
+**Settled by DR-0039 (Jack, 2026-07-13):** Bashkit is the default governed
+`bash` for both native and DO managed harnesses; non-bash capabilities are
+brokered explicitly; unsupported Bashkit behavior surfaces honestly rather than
+auto-escalating.
 
-**Open (requirements pass / ADR):** everything in §9; the
-wasm32-unknown-unknown clock fix landing (upstream or fork); Class-A
-cache integration timing (v1 or follow-on); durable sessions (§8,
-explicitly later).
+**Implemented 2026-07-13:** the shared `WhipShell` wrapper, preloaded VFS,
+fixed clock, limits, `jq`, honest unsupported-command failure, and native/DO
+adapters. **Still open:** configurable caps, Class-A cache integration, builtin
+fidelity auditing, and durable sessions (§8, explicitly later).
 
 ## 11. Relationships
 

@@ -35,6 +35,11 @@ default = ["codex", "claude"]
 codex = ["whipplescript-kernel/codex"]
 claude = ["whipplescript-kernel/claude"]
 
+[dev-dependencies]
+# Enables the private legacy-envelope fixture constructor only while compiling
+# this crate's tests; normal library/binary builds do not expose it.
+whipplescript-kernel = { version = "0.4.0", path = "../whipplescript-kernel", features = ["test-support"] }
+
 [[bin]]
 name = "whip"
 path = "src/main.rs"

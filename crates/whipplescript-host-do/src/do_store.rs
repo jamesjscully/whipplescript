@@ -75,11 +75,29 @@ impl<T: DoSql + ?Sized> DoSql for std::rc::Rc<T> {
 /// counterpart to the test-only in-memory `MemStorage`.
 pub struct DoSqlStorage<S: DoSql> {
     sql: S,
+    key_prefix: String,
 }
 
 impl<S: DoSql> DoSqlStorage<S> {
     pub fn new(sql: S) -> Self {
-        Self { sql }
+        Self {
+            sql,
+            key_prefix: String::new(),
+        }
+    }
+
+    /// Scope the flat DO file plane to one governed host instance. The NUL
+    /// delimiter cannot occur in a portable workspace path and prevents two
+    /// chat instances inside the same placement DO from sharing file keys.
+    pub fn for_instance(sql: S, instance_id: &str) -> Self {
+        Self {
+            sql,
+            key_prefix: format!("{instance_id}\0"),
+        }
+    }
+
+    fn key(&self, key: &str) -> String {
+        format!("{}{key}", self.key_prefix)
     }
 }
 
@@ -89,45 +107,50 @@ fn io_err(message: String) -> std::io::Error {
 
 impl<S: DoSql> crate::DoStorage for DoSqlStorage<S> {
     fn read_file(&self, key: &str) -> std::io::Result<Option<String>> {
+        let key = self.key(key);
         let rows = self
             .sql
-            .query("SELECT content FROM files WHERE key = ?1", &[text(key)])
+            .query("SELECT content FROM files WHERE key = ?1", &[text(&key)])
             .map_err(io_err)?;
         Ok(rows.first().map(|row| as_text(&row[0])))
     }
 
     fn write_file(&self, key: &str, content: &str) -> std::io::Result<()> {
+        let key = self.key(key);
         self.sql
             .execute(
                 "INSERT INTO files (key, content) VALUES (?1, ?2) \
                  ON CONFLICT(key) DO UPDATE SET content = excluded.content",
-                &[text(key), text(content)],
+                &[text(&key), text(content)],
             )
             .map_err(io_err)?;
         Ok(())
     }
 
     fn append_file(&self, key: &str, content: &str) -> std::io::Result<()> {
+        let key = self.key(key);
         self.sql
             .execute(
                 "INSERT INTO files (key, content) VALUES (?1, ?2) \
                  ON CONFLICT(key) DO UPDATE SET content = content || excluded.content",
-                &[text(key), text(content)],
+                &[text(&key), text(content)],
             )
             .map_err(io_err)?;
         Ok(())
     }
 
     fn file_exists(&self, key: &str) -> bool {
+        let key = self.key(key);
         self.sql
-            .query("SELECT 1 FROM files WHERE key = ?1", &[text(key)])
+            .query("SELECT 1 FROM files WHERE key = ?1", &[text(&key)])
             .map(|rows| !rows.is_empty())
             .unwrap_or(false)
     }
 
     fn delete_file(&self, key: &str) -> std::io::Result<()> {
+        let key = self.key(key);
         self.sql
-            .execute("DELETE FROM files WHERE key = ?1", &[text(key)])
+            .execute("DELETE FROM files WHERE key = ?1", &[text(&key)])
             .map_err(io_err)?;
         Ok(())
     }

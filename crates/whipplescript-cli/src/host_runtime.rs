@@ -5,6 +5,7 @@
 //! provide only opaque-reference resolvers. Secrets and resource bodies are
 //! resolved after admission and never enter the host command or receipt.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -21,10 +22,10 @@ use whipplescript_kernel::harness_loop::{
 };
 use whipplescript_kernel::harness_model::MessagesApiClient;
 use whipplescript_kernel::sansio::{HostDriver, HttpResponse, IoRequest, IoResult, TransportError};
+use whipplescript_kernel::whip_shell::{ShellFile, ShellRequest, WhipShell};
 use whipplescript_kernel::{
     idempotency_key, AgentThreadSeed, BrokeredTurnContext, ProgramVersionInput, RuntimeKernel,
 };
-use whipplescript_parser::IrProgram;
 use whipplescript_store::{
     EffectCancellationRequest, EvidenceRecord, NewEffect, NewEvent, RuleCommit, SqliteStore,
     StoreError,
@@ -37,7 +38,19 @@ use crate::host_protocol::{
     TurnReceipt, TurnStatus, HOST_PROTOCOL,
 };
 use crate::ifc::VerifiedEnvelope;
+pub use whipplescript_kernel::host_package::{
+    AuthoredAgentPackage, PackageResolver, ResolvedPackage, AGENT_PACKAGE_MANIFEST,
+    AGENT_PACKAGE_SCHEMA,
+};
 
+// Retained temporarily in source history while downstream code moves to the
+// placement-neutral kernel package implementation above. This block is never
+// compiled; keeping it isolated makes the extraction reviewable without
+// changing the native facade and DO vertical in separate semantic steps.
+#[cfg(any())]
+#[rustfmt::skip]
+mod retired_native_package_implementation {
+use super::*;
 /// Canonical manifest name for an authored agent package consumed by the
 /// persistent host facade.
 pub const AGENT_PACKAGE_MANIFEST: &str = "package.json";
@@ -390,6 +403,7 @@ impl ResolvedPackage {
 pub trait PackageResolver {
     fn resolve_package(&self, version_ref: &str) -> Result<ResolvedPackage, String>;
 }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelProvider {
@@ -537,7 +551,7 @@ pub struct ResolvedImage {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WitnessedWrite {
     pub path: String,
-    /// `"add"` (path did not exist before) or `"modify"`.
+    /// `"add"`, `"modify"`, or `"delete"`.
     pub kind: String,
     pub content_hash: String,
     pub bytes: u64,
@@ -683,13 +697,23 @@ struct WitnessState {
 }
 
 impl NativeWorkspaceResolver {
-    fn witness_write(&self, path: &str, existed: bool, content: &str) {
+    fn witness_write(&self, path: &str, existed: bool, content: &[u8]) {
         let mut state = self.witness.lock().expect("witness lock");
         state.writes.push(WitnessedWrite {
             path: path.to_owned(),
             kind: if existed { "modify" } else { "add" }.to_owned(),
-            content_hash: sha256_hex(content.as_bytes()),
+            content_hash: sha256_hex(content),
             bytes: content.len() as u64,
+        });
+    }
+
+    fn witness_delete(&self, path: &str) {
+        let mut state = self.witness.lock().expect("witness lock");
+        state.writes.push(WitnessedWrite {
+            path: path.to_owned(),
+            kind: "delete".to_owned(),
+            content_hash: sha256_hex(&[]),
+            bytes: 0,
         });
     }
 
@@ -818,7 +842,7 @@ impl NativeWorkspaceResolver {
         let existed = resolved.exists();
         fs::write(&resolved, content)
             .map_err(|error| format!("cannot write workspace path `{path}`: {error}"))?;
-        self.witness_write(path, existed, content);
+        self.witness_write(path, existed, content.as_bytes());
         Ok(format!("wrote {} bytes to {path}", content.len()))
     }
 
@@ -844,7 +868,7 @@ impl NativeWorkspaceResolver {
         }
         fs::write(&resolved, &text)
             .map_err(|error| format!("cannot edit workspace path `{path}`: {error}"))?;
-        self.witness_write(path, true, &text);
+        self.witness_write(path, true, text.as_bytes());
         Ok(format!("applied {} edit(s) to {path}", edits.len()))
     }
 
@@ -912,53 +936,101 @@ impl NativeWorkspaceResolver {
     }
 
     fn bash(&self, arguments: &Value) -> Result<String, String> {
-        let (policy, executor) = self
-            .command
-            .as_ref()
-            .ok_or_else(|| "command execution is not configured for this workspace".to_owned())?;
         let command = string_argument(arguments, "command")?.trim();
         if command.is_empty() {
             return Err("command must not be empty".to_owned());
         }
-        if !policy.admits(command) {
-            return Err(format!(
-                "command refused by the admitted allow-list: `{command}`"
-            ));
-        }
-        validate_simple_command(command, &self.read_only)?;
         let requested = Duration::from_secs(
             arguments
                 .get("timeout")
                 .and_then(Value::as_u64)
                 .unwrap_or(30),
         );
-        if requested.is_zero() || requested > policy.max_timeout {
-            return Err(format!(
-                "command timeout must be between 1 and {} seconds",
-                policy.max_timeout.as_secs()
-            ));
+        if requested.is_zero() || requested > Duration::from_secs(30) {
+            return Err("command timeout must be between 1 and 30 seconds".to_owned());
         }
-        // The command mutates the workspace outside the mediated tool surface:
-        // the turn's workspace cut can no longer be claimed as complete
-        // (turn-witness.maude's taint) — the receipt will decline honestly.
-        self.witness_taint("a native command ran outside the mediated tool surface");
-        let output = executor.execute(&AdmittedCommand {
-            command: command.to_owned(),
-            workspace_root: self.root.clone(),
-            read_only_paths: self
-                .read_only
-                .iter()
-                .map(|path| self.root.join(path))
-                .collect(),
-            timeout: requested,
+
+        let mut before = BTreeMap::new();
+        let mut files = Vec::new();
+        let mut load_error = None;
+        walk_workspace(&self.root, &self.root, &mut |relative, absolute| {
+            if files.len() >= 5_000 {
+                load_error = Some("bash workspace contains more than 5000 files".to_owned());
+                return false;
+            }
+            match fs::read(absolute) {
+                Ok(content) => {
+                    let relative = relative.replace('\\', "/");
+                    let path = Path::new(&relative);
+                    let writable = !self
+                        .read_only
+                        .iter()
+                        .any(|protected| path.starts_with(protected));
+                    before.insert(relative.clone(), content.clone());
+                    files.push(ShellFile {
+                        path: relative,
+                        content,
+                        writable,
+                    });
+                    true
+                }
+                Err(error) => {
+                    load_error = Some(format!(
+                        "cannot load bash workspace file `{relative}`: {error}"
+                    ));
+                    false
+                }
+            }
         })?;
+        if let Some(error) = load_error {
+            return Err(error);
+        }
+
+        let output = WhipShell::default().execute(ShellRequest {
+            command: command.to_owned(),
+            timeout: requested,
+            files,
+        })?;
+        // Validate every result path and mutation before changing the real
+        // workspace. This preserves the same capability and read-only ceilings
+        // as the first-class file tools.
+        for (path, content) in &output.files {
+            let resolved = self.resolve(path, true)?;
+            if let Some(parent) = resolved.parent() {
+                reject_symlinks_between(&self.root, parent, path)?;
+            }
+            let _ = content;
+        }
+        let after_paths = output.files.keys().cloned().collect::<BTreeSet<_>>();
+        for removed in before.keys().filter(|path| !after_paths.contains(*path)) {
+            let resolved = self.resolve(removed, true)?;
+            fs::remove_file(&resolved).map_err(|error| {
+                format!("cannot delete bash workspace path `{removed}`: {error}")
+            })?;
+            self.witness_delete(removed);
+        }
+        for (path, content) in &output.files {
+            if before.get(path) == Some(content) {
+                continue;
+            }
+            let resolved = self.resolve(path, true)?;
+            if let Some(parent) = resolved.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("cannot create parent for `{path}`: {error}"))?;
+                reject_symlinks_between(&self.root, parent, path)?;
+            }
+            let existed = before.contains_key(path);
+            fs::write(&resolved, content)
+                .map_err(|error| format!("cannot write bash workspace path `{path}`: {error}"))?;
+            self.witness_write(path, existed, content);
+        }
+
         let mut combined = output.stdout;
         combined.push_str(&output.stderr);
         let combined = self.cap(combined);
         match output.exit_code {
-            Some(0) => Ok(combined),
-            Some(code) => Err(format!("command exited with status {code}\n{combined}")),
-            None => Err(format!("command terminated by signal\n{combined}")),
+            0 => Ok(combined),
+            code => Err(format!("command exited with status {code}\n{combined}")),
         }
     }
 }
@@ -1089,6 +1161,10 @@ impl ResourceResolver for NativeWorkspaceResolver {
     }
 }
 
+#[cfg(any())]
+#[rustfmt::skip]
+mod retired_native_tool_schema_implementation {
+use super::*;
 /// The model-facing workspace tools owned by WhippleScript. An embedding host
 /// selects whether mutation is present; it cannot redefine their schemas or
 /// execution semantics.
@@ -1222,6 +1298,16 @@ fn tool_spec(name: &str, description: &str, input_schema: Value) -> ToolSpec {
         input_schema,
     }
 }
+}
+
+/// Compatibility names for existing native embedding consumers. The schemas
+/// now come from the placement-neutral kernel module used by the DO host too.
+pub use whipplescript_kernel::host_package::{
+    workspace_tool_specs as native_workspace_tool_specs,
+    workspace_tool_specs_from_registry as native_workspace_tool_specs_from_registry,
+    workspace_tool_specs_with_capabilities as native_workspace_tool_specs_with_capabilities,
+    workspace_tool_specs_with_command as native_workspace_tool_specs_with_command,
+};
 
 fn string_argument<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
     arguments
@@ -4584,7 +4670,7 @@ workflow HumanHostChat {
     }
 
     #[test]
-    fn native_command_tool_requires_governance_and_rejects_shell_bypasses() {
+    fn native_command_tool_is_governed_virtual_bash() {
         struct StubExecutor {
             calls: std::sync::Mutex<Vec<AdmittedCommand>>,
         }
@@ -4592,7 +4678,7 @@ workflow HumanHostChat {
             fn execute(&self, command: &AdmittedCommand) -> Result<CommandExecutionOutput, String> {
                 self.calls.lock().expect("calls").push(command.clone());
                 Ok(CommandExecutionOutput {
-                    stdout: "clean\n".to_owned(),
+                    stdout: "native executor must not run\n".to_owned(),
                     stderr: String::new(),
                     exit_code: Some(0),
                 })
@@ -4616,7 +4702,7 @@ workflow HumanHostChat {
             .read_only([PathBuf::from(".pi")])
             .expect("read-only")
             .command_execution(
-                NativeCommandPolicy::allow_prefixes(["git".to_owned()], Duration::from_secs(60)),
+                NativeCommandPolicy::allow_any(Duration::from_secs(60)),
                 executor.clone(),
             );
         let project_only = [ResourceRef {
@@ -4639,32 +4725,32 @@ workflow HumanHostChat {
         };
 
         assert!(resolver
-            .execute_tool(&project_only, &call("git status"))
+            .execute_tool(&project_only, &call("date +%s"))
             .is_err());
         assert_eq!(
             resolver
-                .execute_tool(&admitted, &call("git status"))
+                .execute_tool(&admitted, &call("date +%s"))
                 .expect("admitted command"),
-            "clean\n"
+            "0\n"
         );
-        for refused in [
-            "cargo test",
-            "git status; rm -rf .",
-            "git status | cat",
-            "git status $(touch bad)",
-            "sh -c 'git status'",
-            "git status .pi/SYSTEM.md",
-            "git status ../outside",
-        ] {
-            assert!(
-                resolver.execute_tool(&admitted, &call(refused)).is_err(),
-                "refused {refused}"
-            );
-        }
+        resolver
+            .execute_tool(&admitted, &call("printf hello | tr a-z A-Z > output.txt"))
+            .expect("pipeline");
+        assert_eq!(
+            fs::read_to_string(root.join("output.txt")).expect("virtual bash delta"),
+            "HELLO"
+        );
+        assert!(resolver
+            .execute_tool(&admitted, &call("echo tampered > .pi/SYSTEM.md"))
+            .is_err());
+        assert!(resolver
+            .execute_tool(&admitted, &call("definitely-not-a-bashkit-command"))
+            .is_err());
         let calls = executor.calls.lock().expect("calls");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].workspace_root, root.canonicalize().expect("root"));
-        assert_eq!(calls[0].timeout, Duration::from_secs(30));
+        assert!(
+            calls.is_empty(),
+            "virtual bash never invokes the OS executor"
+        );
         assert!(native_workspace_tool_specs_with_command(true, true)
             .iter()
             .any(|tool| tool.name == "bash"));
@@ -4998,9 +5084,9 @@ workflow HostChat {
             Some(0)
         );
 
-        // Turn 4: a native command mutates outside the mediated surface, so
-        // the receipt declines the cut (turn-witness.maude) and scope
-        // guarantees report not-evaluated instead of fabricating.
+        // Turn 4: bash remains inside the same witnessed virtual workspace.
+        // Unsupported real-git behavior fails honestly as a tool result, but
+        // it does not create an unmediated mutation channel or taint the cut.
         let mut command4 = turn(&instance.instance_ref, &open.policy, 4);
         command4.resources.push(ResourceRef {
             handle: "command".to_owned(),
@@ -5030,15 +5116,14 @@ workflow HostChat {
                 ]),
             )
             .expect("turn 4");
-        assert_eq!(
-            turn4.receipt.expect("terminal").workspace_cut_ref,
-            None,
-            "an unmediated mutation channel declines the cut"
+        assert!(
+            turn4.receipt.expect("terminal").workspace_cut_ref.is_some(),
+            "virtual bash preserves the complete workspace witness"
         );
         let guarantee4 = guarantee_metadata(&runtime, &command4);
         assert_eq!(
             dynamic_outcome(&guarantee4, "writes_within:src").0,
-            "not_evaluated"
+            "held"
         );
 
         drop(runtime);
@@ -5159,15 +5244,15 @@ workflow Method {
 
     #[test]
     fn authored_agent_package_rejects_manifest_source_capability_drift() {
-        let manifest = AuthoredAgentPackageManifest {
-            schema: AGENT_PACKAGE_SCHEMA.to_owned(),
-            source: "method.whip".to_owned(),
-            workflow: "Method".to_owned(),
-            agent: "assistant".to_owned(),
-            system_prompt: "persona.md".to_owned(),
-            capabilities: vec!["workspace.read".to_owned()],
-            max_steps: 8,
-        };
+        let manifest = json!({
+            "schema": AGENT_PACKAGE_SCHEMA,
+            "source": "method.whip",
+            "workflow": "Method",
+            "agent": "assistant",
+            "system_prompt": "persona.md",
+            "capabilities": ["workspace.read"],
+            "max_steps": 8,
+        });
         let source = r#"
 workflow Method {
   agent assistant {
@@ -5178,13 +5263,8 @@ workflow Method {
   }
 }
 "#;
-        let error = AuthoredAgentPackage::from_parts(
-            "{}".to_owned(),
-            manifest,
-            source.to_owned(),
-            "persona".to_owned(),
-        )
-        .expect_err("registry drift must fail");
+        let error = AuthoredAgentPackage::from_documents(manifest.to_string(), source, "persona")
+            .expect_err("registry drift must fail");
         assert!(error.contains("capabilities do not match"));
     }
 

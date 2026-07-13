@@ -11,13 +11,20 @@ pub mod context_assembly;
 pub mod effect_config;
 pub mod effect_handlers;
 pub mod exec_http;
+pub mod gov;
 pub mod harness;
 pub mod harness_loop;
 pub mod harness_model;
+pub mod host_facade;
+pub mod host_package;
+pub mod host_policy;
+pub mod host_protocol;
+pub mod ifc;
 pub mod instance_machine;
 pub mod lowering;
 pub mod native_lifecycle;
 pub mod package_registry;
+pub mod principal;
 pub mod provider;
 pub mod rule_lowering;
 pub mod rule_pass;
@@ -25,6 +32,7 @@ pub mod sansio;
 pub mod source_merge;
 pub mod time_pass;
 pub mod trace;
+pub mod whip_shell;
 
 use artifact_manifest::{
     artifact_capture_failed_payload, provider_artifact_manifest, validate_artifact_manifest,

@@ -22,7 +22,10 @@
 // module's single import namespace is the generated `_bg.js` glue itself.
 import wasmModule from "../pkg/whipplescript_host_do_bg.wasm";
 import * as bindings from "../pkg/whipplescript_host_do_bg.js";
-import { WasmDurableInstance, __wbg_set_wasm } from "../pkg/whipplescript_host_do_bg.js";
+import {
+  WasmDurableInstance,
+  __wbg_set_wasm,
+} from "../pkg/whipplescript_host_do_bg.js";
 import { Container, getRandom } from "@cloudflare/containers";
 
 const wasmInstance = new WebAssembly.Instance(wasmModule, {
@@ -30,6 +33,63 @@ const wasmInstance = new WebAssembly.Instance(wasmModule, {
 });
 __wbg_set_wasm(wasmInstance.exports);
 (wasmInstance.exports as { __wbindgen_start?: () => void }).__wbindgen_start?.();
+// wasm-bindgen's bundler `_bg.d.ts` currently omits free-function exports even
+// though `_bg.js` carries them. Keep the manual Workers instantiation and type
+// the generated function at this one boundary.
+const verifyHostPolicy = (
+  bindings as unknown as {
+    verify_host_policy: (
+      epoch: bigint,
+      signedEnvelope: string,
+      expectedSigner: string,
+      publicKeyHex: string,
+    ) => string;
+  }
+).verify_host_policy;
+const hostFunctions = bindings as unknown as {
+  host_open_instance: (
+    bridge: unknown,
+    epoch: bigint,
+    signedEnvelope: string,
+    expectedSigner: string,
+    publicKeyHex: string,
+    commandJson: string,
+    packageManifest: string,
+    packageSource: string,
+    systemPrompt: string,
+  ) => string;
+  host_validate_turn: (
+    bridge: unknown,
+    epoch: bigint,
+    signedEnvelope: string,
+    expectedSigner: string,
+    publicKeyHex: string,
+    commandJson: string,
+    packageManifest: string,
+    packageSource: string,
+    systemPrompt: string,
+  ) => string;
+  host_begin_turn: (
+    bridge: unknown,
+    epoch: bigint,
+    signedEnvelope: string,
+    expectedSigner: string,
+    publicKeyHex: string,
+    commandJson: string,
+    packageManifest: string,
+    packageSource: string,
+    systemPrompt: string,
+    provider: string,
+    model: string,
+    baseUrl: string,
+  ) => boolean;
+  host_cancel_turn: (
+    bridge: unknown,
+    instanceId: string,
+    commandId: string,
+    requestedBy: string,
+  ) => string;
+};
 
 export interface Env {
   WORKFLOW_INSTANCE: DurableObjectNamespace;
@@ -45,6 +105,14 @@ export interface Env {
   // carry `Authorization: Bearer <token>` (or `x-whip-control-token` for local
   // clients that cannot set auth headers).
   WHIP_CONTROL_TOKEN?: string;
+  // Pinned GaugeDesk governance authority for `whipplescript.host.v1` policy
+  // epochs. Both are deployment configuration; a request may supply neither.
+  GAUGEDESK_GOVERNANCE_SIGNER?: string;
+  GAUGEDESK_GOVERNANCE_KEY?: string;
+  // Credential-free provider identities keyed by policy binding handle. Each
+  // entry also names the Worker secret that holds its bytes; the bytes are
+  // resolved only after `host_validate_turn` returns the admitted capability.
+  WHIP_HOST_PROVIDER_BINDINGS_JSON?: string;
   // Secret shared with the executor/turn container sidecar. The DO sends it as
   // a bearer token on in-cluster calls; the sidecar rejects non-loopback calls
   // without it.
@@ -318,6 +386,42 @@ interface Bootstrap {
   principal: string;
 }
 
+interface HostPolicyBootstrap {
+  epoch: number;
+  signed_envelope: string;
+  policy: {
+    epoch: number;
+    envelope_hash: string;
+    signer: string;
+    signer_key_id?: string;
+  };
+}
+
+interface HostPackageDocuments {
+  manifest: string;
+  source: string;
+  system_prompt: string;
+}
+
+interface HostCommandRequest {
+  command: Record<string, unknown>;
+  package: HostPackageDocuments;
+}
+
+interface HostTurnAdmission {
+  provider_binding_id: string;
+  credential_id: string;
+  placement_ceiling_ref: string;
+}
+
+interface HostProviderBinding {
+  credential_id: string;
+  provider: "openai" | "anthropic" | "openai-codex";
+  model: string;
+  base_url: string;
+  secret: "OPENAI_API_KEY" | "ANTHROPIC_API_KEY";
+}
+
 export class WorkflowInstance implements DurableObject {
   constructor(
     private ctx: DurableObjectState,
@@ -328,16 +432,59 @@ export class WorkflowInstance implements DurableObject {
   // suspension or terminal. Subsequent external events / alarms re-enter and drive
   // further; the durable state is entirely in DO SQLite.
   async fetch(request: Request): Promise<Response> {
-    if (request.method !== "POST") {
-      return Response.json({ error: "method not allowed" }, { status: 405 });
-    }
     const authError = controlAuthError(request, this.env);
     if (authError) {
       return authError;
     }
+    const url = new URL(request.url);
+    if (request.method === "GET") {
+      return this.hostProjection(url);
+    }
+    if (request.method !== "POST") {
+      return Response.json({ error: "method not allowed" }, { status: 405 });
+    }
     const parsed = await readJsonBody(request);
     if (parsed instanceof Response) {
       return parsed;
+    }
+    const cancel = url.pathname.match(/^\/host\/instances\/([^/]+)\/turns\/([^/]+)\/cancel$/);
+    if (cancel) {
+      try {
+        const receipt = JSON.parse(
+          hostFunctions.host_cancel_turn(
+            makeBridge(this.ctx.storage.sql),
+            decodeURIComponent(cancel[1]),
+            decodeURIComponent(cancel[2]),
+            "gaugedesk-control-plane",
+          ),
+        );
+        return Response.json(receipt, { status: 202 });
+      } catch (error) {
+        return Response.json({ error: `cancellation rejected: ${String(error)}` }, { status: 400 });
+      }
+    }
+    const fileSync = url.pathname.match(/^\/host\/instances\/([^/]+)\/files\/sync$/);
+    if (fileSync) {
+      return this.syncHostFiles(decodeURIComponent(fileSync[1]), parsed);
+    }
+    const checkpoint = url.pathname.match(
+      /^\/host\/instances\/([^/]+)\/(checkpoint|restore)$/,
+    );
+    if (checkpoint) {
+      return this.hostCheckpoint(
+        decodeURIComponent(checkpoint[1]),
+        checkpoint[2] as "checkpoint" | "restore",
+        parsed,
+      );
+    }
+    if (url.pathname === "/host/policy") {
+      return this.bootstrapHostPolicy(parsed);
+    }
+    if (url.pathname === "/host/instances/open") {
+      return this.openHostInstance(parsed);
+    }
+    if (url.pathname === "/host/turns") {
+      return this.beginHostTurn(parsed);
     }
     const body = parsed as Partial<Bootstrap> & { command?: string; cut_id?: string };
     // Operator commands (P3): checkpoint / restore an existing instance. The
@@ -388,6 +535,536 @@ export class WorkflowInstance implements DurableObject {
     }
     const result = await this.drive(bootstrap);
     return Response.json(result);
+  }
+
+  private instanceExists(instanceId: string): boolean {
+    ensureSchema(this.ctx.storage.sql);
+    return (
+      this.ctx.storage.sql
+        .exec("SELECT 1 AS present FROM instances WHERE instance_id = ?1", instanceId)
+        .toArray().length > 0
+    );
+  }
+
+  private hostProjection(url: URL): Response {
+    ensureSchema(this.ctx.storage.sql);
+    const result = url.pathname.match(
+      /^\/host\/instances\/([^/]+)\/turns\/([^/]+)\/result$/,
+    );
+    if (result) {
+      const instanceId = decodeURIComponent(result[1]);
+      const commandId = decodeURIComponent(result[2]);
+      const turns = this.ctx.storage.sql
+        .exec(
+          `SELECT e.status, e.policy_block_reason, r.status AS run_status, r.summary
+             FROM effects e LEFT JOIN runs r ON r.effect_id = e.effect_id
+            WHERE e.instance_id = ?1 AND e.effect_id = ?2
+            ORDER BY r.started_at DESC LIMIT 1`,
+          instanceId,
+          commandId,
+        )
+        .toArray();
+      if (!turns.length) return Response.json({ error: "turn not found" }, { status: 404 });
+      const transcripts = this.ctx.storage.sql
+        .exec(
+          `SELECT sequence, payload_json FROM events
+            WHERE instance_id = ?1 AND event_type = 'agent.turn.brokered.transcript'
+              AND (correlation_id = ?2 OR causation_id = ?2)
+            ORDER BY sequence DESC LIMIT 1`,
+          instanceId,
+          commandId,
+        )
+        .toArray() as { sequence: number; payload_json: string }[];
+      const transcript = transcripts.length
+        ? JSON.parse(transcripts[0].payload_json) as { messages?: unknown[] }
+        : { messages: [] };
+      const pendingRows = this.ctx.storage.sql
+        .exec(
+          `SELECT inbox_item_id AS ask_ref, prompt AS question, choices_json,
+                  freeform_allowed, created_at
+             FROM inbox_items
+            WHERE instance_id = ?1 AND effect_id = ?2 AND status = 'pending'
+            ORDER BY created_at DESC LIMIT 1`,
+          instanceId,
+          commandId,
+        )
+        .toArray() as {
+          ask_ref: string; question: string; choices_json: string;
+          freeform_allowed: number; created_at: string;
+        }[];
+      const pending = pendingRows[0];
+      const evidence = this.ctx.storage.sql
+        .exec(
+          `SELECT evidence_id AS evidence_ref, kind, subject_type, subject_id,
+                  correlation_id AS command_id, created_at
+             FROM evidence WHERE instance_id = ?1 AND correlation_id = ?2
+            ORDER BY created_at, evidence_id`,
+          instanceId,
+          commandId,
+        )
+        .toArray();
+      return Response.json({
+        ...turns[0],
+        transcript_sequence: transcripts[0]?.sequence ?? 0,
+        messages: transcript.messages ?? [],
+        pending_human: pending
+          ? {
+              ask_ref: pending.ask_ref,
+              question: pending.question,
+              choices: JSON.parse(pending.choices_json),
+              freeform_allowed: Boolean(pending.freeform_allowed),
+            }
+          : null,
+        evidence,
+      });
+    }
+    const turn = url.pathname.match(/^\/host\/instances\/([^/]+)\/turns\/([^/]+)$/);
+    if (turn) {
+      const instanceId = decodeURIComponent(turn[1]);
+      const commandId = decodeURIComponent(turn[2]);
+      const rows = this.ctx.storage.sql
+        .exec(
+          `SELECT e.effect_id AS command_id, e.instance_id AS instance_ref,
+                  e.status, e.policy_block_reason, e.updated_at,
+                  r.run_id, r.status AS run_status, r.summary
+             FROM effects e LEFT JOIN runs r ON r.effect_id = e.effect_id
+            WHERE e.instance_id = ?1 AND e.effect_id = ?2
+            ORDER BY r.started_at DESC LIMIT 1`,
+          instanceId,
+          commandId,
+        )
+        .toArray();
+      return rows.length
+        ? Response.json(rows[0])
+        : Response.json({ error: "turn not found" }, { status: 404 });
+    }
+    const transcript = url.pathname.match(
+      /^\/host\/instances\/([^/]+)\/turns\/([^/]+)\/transcript$/,
+    );
+    if (transcript) {
+      const instanceId = decodeURIComponent(transcript[1]);
+      const commandId = decodeURIComponent(transcript[2]);
+      const rows = this.ctx.storage.sql
+        .exec(
+          `SELECT sequence, payload_json FROM events
+            WHERE instance_id = ?1
+              AND event_type = 'agent.turn.brokered.transcript'
+              AND (correlation_id = ?2 OR causation_id = ?2)
+            ORDER BY sequence DESC LIMIT 1`,
+          instanceId,
+          commandId,
+        )
+        .toArray() as { sequence: number; payload_json: string }[];
+      if (!rows.length) return Response.json({ sequence: 0, messages: [] });
+      const payload = JSON.parse(rows[0].payload_json) as { messages?: unknown[] };
+      return Response.json({ sequence: rows[0].sequence, messages: payload.messages ?? [] });
+    }
+    const events = url.pathname.match(/^\/host\/instances\/([^/]+)\/events$/);
+    if (events) {
+      const instanceId = decodeURIComponent(events[1]);
+      const after = Math.max(0, Number(url.searchParams.get("after") ?? "0") || 0);
+      const rows = this.ctx.storage.sql
+        .exec(
+          `SELECT event_id AS evidence_ref, sequence, event_type AS kind,
+                  occurred_at, correlation_id AS command_id
+             FROM events WHERE instance_id = ?1 AND sequence > ?2
+            ORDER BY sequence LIMIT 500`,
+          instanceId,
+          after,
+        )
+        .toArray();
+      return Response.json({ events: rows });
+    }
+    const evidence = url.pathname.match(/^\/host\/instances\/([^/]+)\/evidence$/);
+    if (evidence) {
+      const instanceId = decodeURIComponent(evidence[1]);
+      const commandId = url.searchParams.get("command_id");
+      const rows = this.ctx.storage.sql
+        .exec(
+          `SELECT evidence_id AS evidence_ref, kind, subject_type, subject_id,
+                  correlation_id AS command_id, summary, created_at
+             FROM evidence WHERE instance_id = ?1
+              AND (?2 IS NULL OR correlation_id = ?2)
+            ORDER BY created_at, evidence_id LIMIT 500`,
+          instanceId,
+          commandId,
+        )
+        .toArray();
+      return Response.json({ evidence: rows });
+    }
+    const files = url.pathname.match(/^\/host\/instances\/([^/]+)\/files$/);
+    if (files) {
+      const instanceId = decodeURIComponent(files[1]);
+      if (!this.instanceExists(instanceId)) {
+        return Response.json({ error: "instance not found" }, { status: 404 });
+      }
+      const prefix = `${instanceId}\0`;
+      const path = url.searchParams.get("path");
+      if (path != null) {
+        const rows = this.ctx.storage.sql
+          .exec("SELECT content FROM files WHERE key = ?1", `${prefix}${path}`)
+          .toArray() as { content: string }[];
+        return rows.length
+          ? new Response(rows[0].content, { headers: { "content-type": "text/plain; charset=utf-8" } })
+          : Response.json({ error: "file not found" }, { status: 404 });
+      }
+      const rows = this.ctx.storage.sql
+        .exec(
+          "SELECT substr(key, length(?1) + 1) AS path FROM files WHERE key LIKE ?1 || '%' ORDER BY key LIMIT 5000",
+          prefix,
+        )
+        .toArray();
+      return Response.json({ files: rows });
+    }
+    return Response.json({ error: "not found" }, { status: 404 });
+  }
+
+  private syncHostFiles(instanceId: string, parsed: Record<string, unknown>): Response {
+    ensureSchema(this.ctx.storage.sql);
+    if (!this.instanceExists(instanceId)) {
+      return Response.json({ error: "instance not found" }, { status: 404 });
+    }
+    const files = parsed.files;
+    if (!Array.isArray(files) || files.length > 5000) {
+      return Response.json({ error: "files must be an array of at most 5000 entries" }, { status: 400 });
+    }
+    const normalized = new Map<string, string>();
+    for (const value of files) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return Response.json({ error: "each file must be an object" }, { status: 400 });
+      }
+      const candidate = value as { path?: unknown; content?: unknown };
+      if (typeof candidate.path !== "string" || typeof candidate.content !== "string") {
+        return Response.json({ error: "each file requires path and content strings" }, { status: 400 });
+      }
+      const path = candidate.path.replaceAll("\\", "/");
+      if (
+        !path || path.startsWith("/") || path.includes("\0") ||
+        path.split("/").some((part) => !part || part === "." || part === "..")
+      ) {
+        return Response.json({ error: `invalid workspace path: ${candidate.path}` }, { status: 400 });
+      }
+      if (new TextEncoder().encode(candidate.content).length > 8 * 1024 * 1024) {
+        return Response.json({ error: `workspace file is too large: ${path}` }, { status: 413 });
+      }
+      normalized.set(path, candidate.content);
+    }
+    const prefix = `${instanceId}\0`;
+    const retainPaths = parsed.retain_paths;
+    if (retainPaths !== undefined) {
+      if (!Array.isArray(retainPaths) || retainPaths.some((path) => typeof path !== "string")) {
+        return Response.json({ error: "retain_paths must be an array of strings" }, { status: 400 });
+      }
+      const retained = new Set(retainPaths as string[]);
+      const current = this.ctx.storage.sql
+        .exec("SELECT key FROM files WHERE key LIKE ?1 || '%'", prefix)
+        .toArray() as { key: string }[];
+      for (const row of current) {
+        if (!retained.has(row.key.slice(prefix.length))) {
+          this.ctx.storage.sql.exec("DELETE FROM files WHERE key = ?1", row.key);
+        }
+      }
+    }
+    if (parsed.delete_missing === true) {
+      const current = this.ctx.storage.sql
+        .exec("SELECT key FROM files WHERE key LIKE ?1 || '%'", prefix)
+        .toArray() as { key: string }[];
+      for (const row of current) {
+        const path = row.key.slice(prefix.length);
+        if (!normalized.has(path)) this.ctx.storage.sql.exec("DELETE FROM files WHERE key = ?1", row.key);
+      }
+    }
+    for (const [path, content] of normalized) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO files (key, content) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET content = excluded.content`,
+        `${prefix}${path}`,
+        content,
+      );
+    }
+    return Response.json({ synced: normalized.size });
+  }
+
+  private async hostCheckpoint(
+    instanceId: string,
+    command: "checkpoint" | "restore",
+    parsed: Record<string, unknown>,
+  ): Promise<Response> {
+    const cutId = typeof parsed.cut_id === "string" ? parsed.cut_id.trim() : "";
+    if (!cutId) return Response.json({ error: `${command} requires cut_id` }, { status: 400 });
+    const packageDocs = await this.ctx.storage.get<HostPackageDocuments>(
+      `host-package:${instanceId}`,
+    );
+    if (!packageDocs) return Response.json({ error: "host package not found" }, { status: 404 });
+    try {
+      const instance = WasmDurableInstance.attach_host(
+        makeBridge(this.ctx.storage.sql),
+        instanceId,
+        packageDocs.manifest,
+        packageDocs.source,
+        packageDocs.system_prompt,
+        undefined,
+      );
+      const report = command === "checkpoint" ? instance.checkpoint(cutId) : instance.restore(cutId);
+      return new Response(report, { headers: { "content-type": "application/json" } });
+    } catch (error) {
+      return Response.json({ error: `${command} rejected: ${String(error)}` }, { status: 400 });
+    }
+  }
+
+  private pinnedGovernanceRoot(): { signer: string; key: string } | Response {
+    const signer = this.env.GAUGEDESK_GOVERNANCE_SIGNER?.trim();
+    const key = this.env.GAUGEDESK_GOVERNANCE_KEY?.trim();
+    if (!signer || !key) {
+      return Response.json(
+        { error: "hosted placement has no pinned GaugeDesk governance root" },
+        { status: 503 },
+      );
+    }
+    return { signer, key };
+  }
+
+  private async hostPolicy(command: Record<string, unknown>): Promise<HostPolicyBootstrap | Response> {
+    const cited = command.policy;
+    if (!cited || typeof cited !== "object" || Array.isArray(cited)) {
+      return Response.json({ error: "host command does not cite a policy epoch" }, { status: 400 });
+    }
+    const policyRef = cited as { epoch?: unknown; envelope_hash?: unknown };
+    if (!Number.isSafeInteger(policyRef.epoch) || typeof policyRef.envelope_hash !== "string") {
+      return Response.json({ error: "host command has an invalid policy reference" }, { status: 400 });
+    }
+    const key = `host-policy:${String(policyRef.epoch)}:${policyRef.envelope_hash}`;
+    const policy = await this.ctx.storage.get<HostPolicyBootstrap>(key);
+    return (
+      policy ??
+      Response.json(
+        { error: "placement policy has not been bootstrapped" },
+        { status: 409 },
+      )
+    );
+  }
+
+  private hostCommandRequest(
+    parsed: Record<string, unknown>,
+  ): HostCommandRequest | Response {
+    const command = parsed.command;
+    const packageValue = parsed.package;
+    if (!command || typeof command !== "object" || Array.isArray(command)) {
+      return Response.json({ error: "host request requires command" }, { status: 400 });
+    }
+    if (!packageValue || typeof packageValue !== "object" || Array.isArray(packageValue)) {
+      return Response.json({ error: "host request requires package documents" }, { status: 400 });
+    }
+    const candidate = packageValue as Partial<HostPackageDocuments>;
+    if (
+      typeof candidate.manifest !== "string" ||
+      typeof candidate.source !== "string" ||
+      typeof candidate.system_prompt !== "string"
+    ) {
+      return Response.json(
+        { error: "package requires manifest, source, and system_prompt strings" },
+        { status: 400 },
+      );
+    }
+    return {
+      command: command as Record<string, unknown>,
+      package: candidate as HostPackageDocuments,
+    };
+  }
+
+  private async openHostInstance(parsed: Record<string, unknown>): Promise<Response> {
+    const request = this.hostCommandRequest(parsed);
+    if (request instanceof Response) return request;
+    const policy = await this.hostPolicy(request.command);
+    if (policy instanceof Response) return policy;
+    const root = this.pinnedGovernanceRoot();
+    if (root instanceof Response) return root;
+    ensureSchema(this.ctx.storage.sql);
+    try {
+      const opened = JSON.parse(
+        hostFunctions.host_open_instance(
+          makeBridge(this.ctx.storage.sql),
+          BigInt(policy.epoch),
+          policy.signed_envelope,
+          root.signer,
+          root.key,
+          JSON.stringify(request.command),
+          request.package.manifest,
+          request.package.source,
+          request.package.system_prompt,
+        ),
+      );
+      await this.ctx.storage.put(
+        `host-package:${String(opened.instance_ref)}`,
+        request.package,
+      );
+      return Response.json(opened, { status: 201 });
+    } catch (error) {
+      return Response.json(
+        { error: `instance rejected: ${error instanceof Error ? error.message : String(error)}` },
+        { status: 400 },
+      );
+    }
+  }
+
+  private providerBindings(): Record<string, HostProviderBinding> | Response {
+    try {
+      const parsed = JSON.parse(this.env.WHIP_HOST_PROVIDER_BINDINGS_JSON ?? "{}") as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("binding map must be an object");
+      }
+      return parsed as Record<string, HostProviderBinding>;
+    } catch (error) {
+      return Response.json(
+        { error: `invalid WHIP_HOST_PROVIDER_BINDINGS_JSON: ${String(error)}` },
+        { status: 503 },
+      );
+    }
+  }
+
+  private resolveAdmittedProvider(
+    admission: HostTurnAdmission,
+  ): HostProviderBinding | Response {
+    const bindings = this.providerBindings();
+    if (bindings instanceof Response) return bindings;
+    const binding = bindings[admission.provider_binding_id];
+    if (
+      !binding ||
+      binding.credential_id !== admission.credential_id ||
+      !binding.provider ||
+      !binding.model ||
+      !binding.base_url ||
+      !binding.secret
+    ) {
+      return Response.json(
+        { error: "admitted provider capability has no exact hosted realization" },
+        { status: 503 },
+      );
+    }
+    const secret = this.env[binding.secret];
+    if (typeof secret !== "string" || !secret.trim()) {
+      return Response.json(
+        { error: `admitted provider credential ${binding.credential_id} is unavailable` },
+        { status: 503 },
+      );
+    }
+    if (binding.provider === "openai-codex") {
+      return Response.json(
+        { error: "openai-codex requires an explicitly brokered non-bash turn capability" },
+        { status: 503 },
+      );
+    }
+    return binding;
+  }
+
+  private async beginHostTurn(parsed: Record<string, unknown>): Promise<Response> {
+    const request = this.hostCommandRequest(parsed);
+    if (request instanceof Response) return request;
+    const policy = await this.hostPolicy(request.command);
+    if (policy instanceof Response) return policy;
+    const root = this.pinnedGovernanceRoot();
+    if (root instanceof Response) return root;
+    ensureSchema(this.ctx.storage.sql);
+    const common = [
+      BigInt(policy.epoch),
+      policy.signed_envelope,
+      root.signer,
+      root.key,
+      JSON.stringify(request.command),
+      request.package.manifest,
+      request.package.source,
+      request.package.system_prompt,
+    ] as const;
+    try {
+      // Phase 1 crosses no credential boundary. Only after WhippleScript has
+      // returned these exact opaque ids may this Worker read a provider secret.
+      const admission = JSON.parse(
+        hostFunctions.host_validate_turn(makeBridge(this.ctx.storage.sql), ...common),
+      ) as HostTurnAdmission;
+      const binding = this.resolveAdmittedProvider(admission);
+      if (binding instanceof Response) return binding;
+      const created = hostFunctions.host_begin_turn(
+        makeBridge(this.ctx.storage.sql),
+        ...common,
+        binding.provider,
+        binding.model,
+        binding.base_url,
+      );
+      const instanceId = String(request.command.instance_ref ?? "");
+      const secret = this.env[binding.secret];
+      if (!instanceId || typeof secret !== "string") {
+        return Response.json({ error: "admitted host turn is missing its runtime binding" }, { status: 503 });
+      }
+      const instance = WasmDurableInstance.attach_host(
+        makeBridge(this.ctx.storage.sql),
+        instanceId,
+        request.package.manifest,
+        request.package.source,
+        request.package.system_prompt,
+        JSON.stringify({
+          provider: binding.provider,
+          base_url: binding.base_url,
+          api_key: secret,
+          model: binding.model,
+          max_tokens: 4096,
+        }),
+      );
+      const driven = await this.driveInstance(instance);
+      return Response.json(
+        {
+          admitted: true,
+          created,
+          command_id: request.command.command_id,
+          status: driven.status,
+          outcome: driven.outcome,
+        },
+        { status: driven.outcome === "failed" ? 502 : 200 },
+      );
+    } catch (error) {
+      return Response.json(
+        { error: `turn rejected: ${error instanceof Error ? error.message : String(error)}` },
+        { status: 400 },
+      );
+    }
+  }
+
+  private async bootstrapHostPolicy(
+    parsed: Record<string, unknown>,
+  ): Promise<Response> {
+    const epoch = typeof parsed.epoch === "number" ? parsed.epoch : Number.NaN;
+    const signedEnvelope =
+      typeof parsed.signed_envelope === "string" ? parsed.signed_envelope : undefined;
+    const root = this.pinnedGovernanceRoot();
+    if (!Number.isSafeInteger(epoch) || epoch <= 0 || !signedEnvelope) {
+      return Response.json(
+        { error: "host policy requires a positive epoch and signed_envelope" },
+        { status: 400 },
+      );
+    }
+    if (root instanceof Response) return root;
+    let policy: HostPolicyBootstrap["policy"];
+    try {
+      policy = JSON.parse(
+        verifyHostPolicy(BigInt(epoch), signedEnvelope, root.signer, root.key),
+      ) as HostPolicyBootstrap["policy"];
+    } catch (error) {
+      return Response.json(
+        { error: `policy rejected: ${error instanceof Error ? error.message : String(error)}` },
+        { status: 403 },
+      );
+    }
+    const key = `host-policy:${epoch}:${policy.envelope_hash}`;
+    const existing = await this.ctx.storage.get<HostPolicyBootstrap>(key);
+    if (existing) {
+      return Response.json(existing.policy);
+    }
+    const bootstrap: HostPolicyBootstrap = {
+      epoch,
+      signed_envelope: signedEnvelope,
+      policy,
+    };
+    await this.ctx.storage.put(key, bootstrap);
+    return Response.json(policy, { status: 201 });
   }
 
   // The DO's single wake-up (DR-0033 Phase 6): a parked instance with pending
@@ -467,7 +1144,12 @@ export class WorkflowInstance implements DurableObject {
   }
 
   private async drive(bootstrap: Bootstrap): Promise<{ status: string; outcome: string }> {
-    const instance = this.makeInstance(bootstrap);
+    return this.driveInstance(this.makeInstance(bootstrap));
+  }
+
+  private async driveInstance(
+    instance: WasmDurableInstance,
+  ): Promise<{ status: string; outcome: string }> {
 
     // The sans-IO loop: step -> maybe fetch -> step, until a terminal or a park.
     // Each `fetch` is one provider round; the core parses the response and
@@ -498,18 +1180,44 @@ export default {
     if (url.pathname === "/healthz") {
       return Response.json({ ok: true });
     }
-    if (url.pathname !== "/start") {
-      return Response.json({ error: "not found" }, { status: 404 });
-    }
-    if (request.method !== "POST") {
-      return Response.json({ error: "method not allowed" }, { status: 405 });
-    }
     const authError = controlAuthError(request, env) ?? requestBodyTooLarge(request);
     if (authError) {
       return authError;
     }
-    const id = url.searchParams.get("id") ?? "default";
+    // Canonical hosted route: the authenticated tenant + placement tuple is
+    // the DO identity, giving exactly one Durable Object per placement. The
+    // inner object sees only the placement-local `/host/...` protocol surface.
+    const placement = url.pathname.match(
+      /^\/v1\/tenants\/([^/]+)\/placements\/([^/]+)(\/host(?:\/.*)?)$/,
+    );
+    let id: string;
+    let forwarded = request;
+    if (placement) {
+      const tenantId = decodeURIComponent(placement[1]);
+      const placementId = decodeURIComponent(placement[2]);
+      const validId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+      if (!validId.test(tenantId) || !validId.test(placementId)) {
+        return Response.json({ error: "invalid tenant or placement id" }, { status: 400 });
+      }
+      id = `tenant:${tenantId}:placement:${placementId}`;
+      const inner = new URL(request.url);
+      inner.pathname = placement[3];
+      forwarded = new Request(inner, request);
+    } else {
+      const legacy =
+        url.pathname === "/start" ||
+        url.pathname === "/host/policy" ||
+        url.pathname === "/host/instances/open" ||
+        url.pathname === "/host/turns" ||
+        /^\/host\/instances\/[^/]+\/(events|evidence|files|checkpoint|restore)$/.test(url.pathname) ||
+        /^\/host\/instances\/[^/]+\/files\/sync$/.test(url.pathname) ||
+        /^\/host\/instances\/[^/]+\/turns\/[^/]+(?:\/transcript|\/result|\/cancel)?$/.test(url.pathname);
+      if (!legacy) return Response.json({ error: "not found" }, { status: 404 });
+      // Kept for local conformance and migration only. Managed composition uses
+      // the tenant/placement route above.
+      id = url.searchParams.get("id") ?? "default";
+    }
     const stub = env.WORKFLOW_INSTANCE.get(env.WORKFLOW_INSTANCE.idFromName(id));
-    return stub.fetch(request);
+    return stub.fetch(forwarded);
   },
 } satisfies ExportedHandler<Env>;
