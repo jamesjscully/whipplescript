@@ -408,6 +408,8 @@ pub trait PackageResolver {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelProvider {
     OpenAi,
+    /// A generic OpenAI-compatible Chat Completions endpoint.
+    OpenAiCompat,
     Anthropic,
     Codex,
 }
@@ -416,6 +418,7 @@ impl ModelProvider {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenAi => "openai",
+            Self::OpenAiCompat => "openai-generic",
             Self::Anthropic => "anthropic",
             Self::Codex => "openai-codex",
         }
@@ -2582,6 +2585,14 @@ impl GovernedHostRuntime {
         let client = match binding.provider {
             ModelProvider::OpenAi => MessagesApiClient::new(
                 CoerceProvider::OpenAi,
+                binding.api_key,
+                binding.model,
+                binding.base_url,
+                binding.max_tokens,
+                Some(command.command_id.clone()),
+            ),
+            ModelProvider::OpenAiCompat => MessagesApiClient::new(
+                CoerceProvider::OpenAiCompat,
                 binding.api_key,
                 binding.model,
                 binding.base_url,

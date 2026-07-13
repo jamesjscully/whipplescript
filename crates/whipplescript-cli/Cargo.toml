@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 whipplescript-core = { version = "0.4.0", path = "../whipplescript-core" }
-whipplescript-kernel = { version = "0.4.0", path = "../whipplescript-kernel", default-features = false }
+whipplescript-kernel = { version = "0.4.0", path = "../whipplescript-kernel", default-features = false, features = ["native"] }
 whipplescript-parser = { version = "0.4.0", path = "../whipplescript-parser" }
 whipplescript-store = { version = "0.4.0", path = "../whipplescript-store" }
 regex = "1"
