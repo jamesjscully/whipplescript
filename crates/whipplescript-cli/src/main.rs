@@ -19898,6 +19898,15 @@ fn screen_public_addrs(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr
             "`{netloc}` did not resolve to any address"
         )));
     }
+    // The same operator override the up-front policy check honors: the
+    // connection-time screen must not refuse what the policy admitted
+    // (local feeds in dev/tests), or the override is a dead letter.
+    if env::var("WHIPPLESCRIPT_HTTP_SOURCE_ALLOW_PRIVATE")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return Ok(addresses);
+    }
     if let Some(internal) = addresses.iter().find(|addr| private_or_local_ip(addr.ip())) {
         return Err(std::io::Error::other(format!(
             "`{netloc}` resolves to a non-public address ({})",

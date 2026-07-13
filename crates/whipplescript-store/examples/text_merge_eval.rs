@@ -7,9 +7,8 @@
 //!
 //! - composed-exact      clean merge, byte-identical to the human result
 //! - composed-divergent  clean merge that DIFFERS from the human result —
-//!                       every one is inspected by hand: either a real
-//!                       failure mode (registry + fix) or a human choice
-//!                       the engine can't know (e.g. they dropped a hunk)
+//!   every one is inspected by hand: either a real failure mode (registry +
+//!   fix) or a human choice the engine can't know (e.g. they dropped a hunk)
 //! - escalated           honest conflict; the human resolved it by hand
 //!
 //! The zero-bad-merge gate lives in the inspection of composed-divergent:
@@ -67,11 +66,16 @@ fn main() {
                             case["repo"].as_str().unwrap_or("?"),
                             case["commit"].as_str().unwrap_or("?"),
                         );
-                        std::fs::write(format!("{stem}.base"), &base).unwrap();
-                        std::fs::write(format!("{stem}.ours"), &ours).unwrap();
-                        std::fs::write(format!("{stem}.theirs"), &theirs).unwrap();
-                        std::fs::write(format!("{stem}.human"), &result).unwrap();
-                        std::fs::write(format!("{stem}.engine"), &merged).unwrap();
+                        std::fs::write(format!("{stem}.base"), &base)
+                            .expect("write divergent base");
+                        std::fs::write(format!("{stem}.ours"), &ours)
+                            .expect("write divergent ours");
+                        std::fs::write(format!("{stem}.theirs"), &theirs)
+                            .expect("write divergent theirs");
+                        std::fs::write(format!("{stem}.human"), &result)
+                            .expect("write divergent human result");
+                        std::fs::write(format!("{stem}.engine"), &merged)
+                            .expect("write divergent engine result");
                     }
                     "composed-divergent"
                 }
