@@ -2,7 +2,7 @@
 description "Recall package memory before agent work and save context after each turn"
 workflow PackageMemory
 
-use memory
+use std.memory
 
 tracker backlog {
   provider builtin

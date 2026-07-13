@@ -1,0 +1,81 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.messaging",
+  "name": "std.messaging",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.messaging",
+      "version": "0.1.0",
+      "effect_contracts": [
+        {
+          "id": "messaging.send",
+          "effect_kind": "capability.call",
+          "source_forms": ["send"],
+          "input_schema": {
+            "channel": "string",
+            "text": "string"
+          },
+          "output_schema": {
+            "channel": "string",
+            "delivered": "bool",
+            "provider_message_id": "string"
+          },
+          "required_capabilities": ["messaging.send"],
+          "provider_kinds": ["messaging"],
+          "projected_facts": ["effect.output"],
+          "validation": "runtime_boundary"
+        }
+      ],
+      "constructs": [
+        {
+          "id": "messaging.send",
+          "construct_family": "effect_operation",
+          "keyword": "send",
+          "scope": "rule_body",
+          "grammar": {
+            "shape": "effect_operation",
+            "keyword": "send",
+            "slots": [
+              { "name": "channel", "kind": "identifier", "connective": "via" }
+            ],
+            "payload": {
+              "fields": [
+                { "name": "text", "kind": "expression", "required": true },
+                { "name": "markdown", "kind": "expression", "required": false },
+                { "name": "thread_id", "kind": "expression", "required": false }
+              ]
+            },
+            "binding": "required",
+            "target_capability": "messaging.send"
+          },
+          "requires": [
+            {
+              "kind": "Capability",
+              "name": "messaging.send"
+            }
+          ],
+          "provides": [
+            {
+              "kind": "EffectHandle",
+              "type": "MessageSendReceipt"
+            }
+          ],
+          "lowering_target": "capability_call",
+          "target_capability": "messaging.send"
+        }
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "messaging.send",
+      "description": "Send an outbound message via a declared channel.",
+      "schema": {
+        "input": {
+          "text": "string"
+        }
+      }
+    }
+  ]
+}

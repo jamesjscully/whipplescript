@@ -21,12 +21,11 @@ use whipplescript_store::{
 
 use crate::effect_config::EffectConfig;
 use crate::idempotency_key;
-use crate::loft::{FakeLoftClient, LoftAction, LoftEffectRequest};
 use crate::rule_lowering::{
     effect_binding_value, interpolate_prompt, json_from_str, parse_field_value, stable_hash_hex,
     RuleContext,
 };
-use crate::{HumanAskExecution, LoftEffectExecution, RuntimeKernel};
+use crate::{HumanAskExecution, RuntimeKernel};
 
 /// The local-workflow package name (matches the CLI's `LOCAL_WORKFLOW_PACKAGE`).
 const LOCAL_WORKFLOW_PACKAGE: &str = "local";
@@ -146,74 +145,6 @@ pub fn run_event_effect_generic<S: RuntimeStore>(
         ])),
     )?;
     Ok(terminal)
-}
-
-/// `loft.claim`: claim a Loft issue via the (fixture) loft client + settle.
-pub fn run_loft_effect_generic<S: RuntimeStore>(
-    kernel: &mut RuntimeKernel<S>,
-    instance_id: &str,
-    effect: &ClaimableEffect,
-    config: &EffectConfig,
-) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    let input = json_from_str(&effect.input_json);
-    let issue_id = input
-        .pointer("/issue/issue/id")
-        .and_then(Value::as_str)
-        .or_else(|| input.pointer("/issue/issue_id").and_then(Value::as_str))
-        .unwrap_or("issue-fixture")
-        .to_owned();
-    let request = LoftEffectRequest {
-        action: LoftAction::Claim,
-        issue_id: issue_id.clone(),
-        lease_id: None,
-        claim_ready: true,
-        issue_version: None,
-        actor: Some("whip-worker".to_owned()),
-        lease_duration_seconds: Some(3600),
-        command_id: idempotency_key(&[instance_id, &effect.effect_id, "loft-command"]),
-        note: None,
-        target_status: None,
-        evidence_json: None,
-        evidence_kind: None,
-        evidence_artifact: None,
-        evidence_data_path: None,
-        resource_intent_json: None,
-        release_after_failure: false,
-        expect_heads: Vec::new(),
-        metadata_json: effect.input_json.clone(),
-    };
-    let client = if config.outcome_failed {
-        FakeLoftClient::fails("fixture loft failure")
-    } else {
-        FakeLoftClient::succeeds(
-            json!({
-                "issue": {
-                    "id": issue_id,
-                    "title": "Fixture Loft issue",
-                    "body": "Fixture body"
-                },
-                "lease": {
-                    "id": idempotency_key(&[instance_id, &effect.effect_id, "loft-lease-value"])
-                }
-            })
-            .to_string(),
-        )
-    };
-    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "loft-run"]);
-    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "loft-lease"]);
-    kernel.run_loft_effect(
-        LoftEffectExecution {
-            instance_id,
-            effect_id: &effect.effect_id,
-            run_id: &run_id,
-            provider: &config.provider,
-            worker_id: "whip-worker",
-            lease_id: &lease_id,
-            lease_expires_at: "2030-01-01T00:00:00Z",
-            request: &request,
-        },
-        &client,
-    )
 }
 
 // -- store-only handler cores + helpers (batch lift, DR-0033 chunk 5b) -------
@@ -533,7 +464,9 @@ pub fn run_file_effect_generic<S: RuntimeStore>(
     // The `file store` root + `allow read` policy is the scope boundary
     // (spec/std-library/files.md), checked before any disk access.
     let allow = effect_allow_globs(&input);
-    let read_outcome = match file_path_policy_error(path, store_name, &allow, "read") {
+    let read_outcome = match file_path_policy_error(path, store_name, &allow, "read")
+        .or_else(|| files.path_policy_error(Path::new(root), Path::new(path), store_name, "read"))
+    {
         Some(reason) => Err(reason),
         None => files
             .read_to_string(&full)
@@ -668,41 +601,58 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
     let terminal_key = idempotency_key(&[instance_id, &effect.effect_id, "terminal"]);
     let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
     let allow = effect_allow_globs(&input);
-    let write_outcome: Result<(), String> =
-        if let Some(reason) = file_path_policy_error(path, store_name, &allow, "write") {
-            Err(reason)
-        } else {
-            let exists = files.exists(&full);
-            // Mode policy (spec/std-library/files.md): no silent overwrite.
-            let mode_ok = match mode.as_str() {
-                "create" if exists => Err(format!(
-                    "write mode `create` requires `{path}` to not already exist"
-                )),
-                "replace" if !exists => Err(format!(
-                    "write mode `replace` requires `{path}` to already exist"
-                )),
-                "create" | "replace" | "upsert" | "append" => Ok(()),
-                other => Err(format!("unknown write mode `{other}`")),
-            };
-            mode_ok.and_then(|()| {
-                if let Some(parent) = full.parent() {
-                    files
-                        .create_dir_all(parent)
-                        .map_err(|error| format!("create parent of `{path}`: {error}"))?;
-                }
-                let result = if mode == "append" {
-                    files.append(&full, body.as_bytes())
-                } else {
-                    files.write(&full, body.as_bytes())
-                };
-                result.map_err(|error| format!("write of `{}` failed: {error}", full.display()))
-            })
+    let write_outcome: Result<(), String> = if let Some(reason) =
+        file_path_policy_error(path, store_name, &allow, "write").or_else(|| {
+            files.path_policy_error(Path::new(root), Path::new(path), store_name, "write")
+        }) {
+        Err(reason)
+    } else {
+        let exists = files.exists(&full);
+        // Mode policy (spec/std-library/files.md): no silent overwrite.
+        let mode_ok = match mode.as_str() {
+            "create" if exists => Err(format!(
+                "write mode `create` requires `{path}` to not already exist"
+            )),
+            "replace" if !exists => Err(format!(
+                "write mode `replace` requires `{path}` to already exist"
+            )),
+            "create" | "replace" | "upsert" | "append" => Ok(()),
+            other => Err(format!("unknown write mode `{other}`")),
         };
+        mode_ok.and_then(|()| {
+            if let Some(parent) = full.parent() {
+                files
+                    .create_dir_all(parent)
+                    .map_err(|error| format!("create parent of `{path}`: {error}"))?;
+            }
+            let result = if mode == "append" {
+                files.append(&full, body.as_bytes())
+            } else {
+                files.write(&full, body.as_bytes())
+            };
+            result.map_err(|error| format!("write of `{}` failed: {error}", full.display()))
+        })
+    };
     match write_outcome {
         Ok(()) => {
+            // Restorable-context RC-1: capture the written body content-addressed
+            // into the runtime store's file-history blob table, keyed by the SAME
+            // `stable_hash_hex` the `file.write.completed` fact records below. The
+            // live path->bytes store overwrites in place; this sidecar preserves
+            // the superseded version so a later restore slice can `get_content`
+            // the bytes back. Captured BEFORE the fact commits (and, natively, in
+            // the same SQLite as the fact), so no committed manifest hash is ever
+            // referenced without its bytes present (restorable-context INV-4). A
+            // capture failure aborts before the fact, never leaving a dangling
+            // hash. Identical bytes dedupe; an overwrite keeps both versions.
+            kernel.store().put_content(&body)?;
             let value = json!({
                 "store": store_name,
                 "path": path,
+                // RC-5: the full resolved path (root-joined) so restore is
+                // self-contained and writes the body back to the exact location.
+                // `path` stays the workflow-visible relative path.
+                "full_path": full.display().to_string(),
                 "format": format,
                 "mode": mode,
                 "bytes": body.len(),
@@ -916,7 +866,11 @@ pub fn run_file_import_effect_generic<S: RuntimeStore>(
 
     // Decode + validate every row before admitting any (all-or-nothing).
     let decoded: Result<Vec<Value>, String> = (|| {
-        if let Some(reason) = file_path_policy_error(path, store_name, &allow, "read") {
+        if let Some(reason) =
+            file_path_policy_error(path, store_name, &allow, "read").or_else(|| {
+                files.path_policy_error(Path::new(root), Path::new(path), store_name, "read")
+            })
+        {
             return Err(reason);
         }
         let content = files

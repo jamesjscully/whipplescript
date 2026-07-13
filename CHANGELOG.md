@@ -3,12 +3,121 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
-> 0.2 is the language, standard packages, and native runtime. Cloud deployment +
-> the owned harness (0.3) and the experimentation/evals + versioned-workspace work
-> (0.4) are tracked separately and are **not** part of 0.2. Native provider support
-> is validated for **Codex and Claude**; the Pi native provider is deferred.
+> 0.3 adds cloud deployment (the Cloudflare Durable Object runtime) and the owned
+> harness. The experimentation/evals + versioned-workspace work (0.4) is tracked
+> separately and is **not** part of 0.3. Native provider support is validated for
+> **Codex and Claude**; the Pi native provider is deferred.
 
-## Unreleased
+## [0.4.0] — Unreleased (staged 2026-07-10; date set at cut)
+
+WhippleScript gains its own version control. The versioned workspace replaces
+the git seam for agent work: workspace-as-database with O(1) branches over a
+content-addressed store, and every instance's files, conversation, and effects
+move as one coherent, provenance-carrying line.
+
+### Versioned workspace (the git-replacement surface)
+- Branches, cuts, and virtual working sets: O(1) branch creation, per-instance
+  copy-on-write file surfaces, branch-distinct effect keys, and
+  materialize-on-exec with an O(touched) racy-window-sound import-back.
+- The mapped 13-operation workspace API (`workspace_api.rs`, refusals as
+  data), the op log as a first-class reflog with `whip branch undo-op`,
+  review-grade Myers diffs, handoff bundles (`whipplescript.bundle.v1`) with
+  chunk-granular delta transfer and pack objects, and per-blob erasure that
+  discharges `HISTORY_PRESERVED` / `EXPORTED_COPY_NOT_RECALLED` by test.
+- Selection algebra (`path()`/`by-effect()`/`since()`/`dependents-of()` with
+  `| ~ &`) behind selective `undo`/`transport`/`adopt --only` — dry-run by
+  default, stranding-checked, no destructive verbs.
+- Structured conflicts with rerere-style resolution memory the reconciliation
+  daemon auto-propagates; checkout-free `bisect`, `attribution`, and `log`.
+- `whip fork` — the chat fork: a new instance seeded from the source's
+  completed turns on a fresh branch forked at the source line's head, both
+  planes from one quiescent coordinate.
+
+### Policy plane, auth, and the store seam
+- DR-0036: turn receipts now carry a witnessed workspace cut
+  (`workspace_cut_ref`; honest decline when a native command mutated outside
+  the mediated surface) and a dynamic guarantee section
+  (`guarantee writes_within:<scope>` / `no_reads_beyond_grant` /
+  `no_tainted_reads:<class>` declared in the governance envelope) evaluated
+  per turn under the cited policy epoch.
+- Host-resolved provider profiles (`WHIPPLESCRIPT_PROVIDER_PROFILES`): the
+  policy channel hands whip resolved credentials; whip's own auth is the thin
+  standalone fallback.
+- The store seam: `whip handles` (stable pointers for external admission
+  logs), `whip checkpoint --external-positions` (the position-pair cut for
+  cross-store backup/handoff), and the seam-contract draft.
+
+### Owned-harness web tools
+- `web_search` (SearchProvider trait; Brave first-party, model-provider floor,
+  honest absent tier) and `web_fetch` (structurally GET-only behind a central
+  SSRF guard with pinned connections and redirect re-entry; HTML→markdown),
+  granted via `with access to web { search fetch }`.
+
+### Formal models
+- Six new gate-registered Maude models with verified bites: merge-slice,
+  merge-confluence, workstream, branch-effect-key, selective-undo, stat-cache
+  (P0), plus op-undo, resolution-memory, chat-fork, turn-witness, and
+  seam-crossing, and the ReconciliationDaemonLifecycle TLA+ model.
+
+## [0.3.0] — 2026-07-10
+
+WhippleScript is a small scripting language for AI to orchestrate AI. This release
+takes the language onto the edge: the same durable, replayable rule/effect kernel
+now runs unchanged in a Cloudflare Durable Object, and the owned agent harness
+gains its context layer and a restore-to-a-prior-point capability.
+
+### Cloud runtime — Cloudflare Durable Object
+- A sans-IO refactor lets the whole evaluation core (parser, kernel, rule/flow
+  engine, effect ledger) run inside a single-threaded wasm isolate, where the
+  only async primitive is `fetch`: every HTTP-bearing effect (`coerce`, agent
+  turns) is a resumable step machine that suspends on a request and resumes on
+  the response, so an instance survives isolate eviction with no lost work.
+- Durable-object host binding: the same instance scheduler runs over the DO's
+  synchronous SQLite (a full port of the runtime/coordination/work-item stores),
+  with alarms for timers/deadlines and secrets for provider credentials.
+- `whip deploy` — one-command edge deploy of a workflow to a Worker + DO.
+- **Feature parity with the native runtime**: `file.*` effects run over a
+  DO-owned file plane; `whip checkpoint` / `whip restore` work as operator
+  commands on a deployed instance; and an agent turn runs a real in-isolate tool
+  set (read/write/edit/ls/find/grep/recall + the work-tracker todos) against the
+  DO's own storage — no filesystem, no subprocess.
+- A Class-A compute plane for real toolchains (`whip executor` sidecar over a
+  `whip-executor/1` wire) and a Class-B per-turn container path are built and
+  live-proven; enabling them in production is a follow-on configuration step.
+  In-cluster sidecar calls authenticate with a constant-time-compared `Bearer`
+  token (`WHIP_EXECUTOR_TOKEN`), and the sidecars refuse non-loopback calls that
+  lack it — the production hardening the compute plane needed.
+
+### Network access
+- `http source` fetches an external URL, GET-only, behind an SSRF/egress policy:
+  http(s) schemes only, private/loopback IP addresses blocked, and a host
+  allowlist (`WHIPPLESCRIPT_HTTP_SOURCE_ALLOW`, with
+  `WHIPPLESCRIPT_HTTP_SOURCE_ALLOW_PRIVATE=1` to permit private hosts for local
+  development). Web *search* is designed but deferred to a later release.
+
+### Owned agent harness — the context layer
+- The owned harness gains a pi-mirrored context layer: a system-prompt assembler,
+  a skills control plane (discover-all + model-driven read; skill bodies stored
+  content-addressed; skills never grant authority), deploy-shipped project
+  instructions (`AGENTS.md` / `CLAUDE.md` discovery, injected verbatim), and
+  turn-scoped skill pins.
+- Cache-aware conversation compaction: a pluggable `Compactor` with three
+  strategies, designed so the assembled prefix stays append-only between
+  compactions (the model-provider prompt cache is never needlessly busted) and a
+  compaction summary is recorded once and reused on replay.
+
+### Restorable context — checkpoint / restore
+- `whip checkpoint` / `whip restore`: rewind an agent's work — its files, its
+  transcript, and the instance's event-log position — to a prior point as one
+  consistent, coherence-checked cut. File history is captured content-addressed,
+  so restore reverts to exact prior bytes; a restore refuses rather than applying
+  a partial (dangling) cut, and auto-checkpoints the current head first so the
+  undo is itself undoable.
+
+### Reliability
+- Every provider request now carries a stable per-effect `Idempotency-Key`
+  (resume-stable, not fingerprint-derived), so an at-least-once retry after an
+  eviction mid-request is de-duplicated by providers that honor it.
 
 ### Embedding and governance
 - The `whipplescript` package now publishes its governance and IFC trust boundary
@@ -101,4 +210,5 @@ privileges — with no ambient authority.
   Windows with shell and PowerShell installers and checksums, and crates.io-ready
   packaging.
 
+[0.3.0]: https://github.com/jamesjscully/whipplescript/releases/tag/v0.3.0
 [0.2.0]: https://github.com/jamesjscully/whipplescript/releases/tag/v0.2.0

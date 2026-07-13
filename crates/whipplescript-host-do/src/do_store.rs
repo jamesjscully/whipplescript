@@ -31,7 +31,7 @@ use serde_json::Value;
 use whipplescript_store::coordination::{
     AcquireOutcome, ConsumeOutcome, Coordination, CounterRow, LeaseRow, LedgerEntry,
 };
-use whipplescript_store::items::{ClaimOutcome, WorkItem, WorkItems};
+use whipplescript_store::items::{apply_overlay, ClaimOutcome, RenewOutcome, WorkItem, WorkItems};
 use whipplescript_store::{NewEvent, RuntimeStore, StoreError, StoreResult, StoredEvent};
 // The remaining ported methods reference the full set of store data types.
 #[allow(unused_imports)]
@@ -55,6 +55,84 @@ pub trait DoSql {
     fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String>;
 }
 
+/// Share ONE `DoSql` handle across the store and the file plane (P1). Both must
+/// hit the same DO SQLite; the test `RusqliteDoSql` wraps a non-`Clone`
+/// `Connection`, so we share the handle via `Rc` rather than requiring `Clone`.
+/// `DoSql` methods are `&self`, so `Rc<T>` forwards them directly.
+impl<T: DoSql + ?Sized> DoSql for std::rc::Rc<T> {
+    fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
+        (**self).execute(sql, params)
+    }
+    fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
+        (**self).query(sql, params)
+    }
+}
+
+/// The production `DoStorage` (P1): the DO file plane's byte store, over the
+/// same DO SQLite as the runtime store (shared via `Rc<DoSql>`). Small files
+/// inline in the `files` table (key = flattened workspace path -> content); the
+/// large-file spill tier is `TieredFileStore` layered on top. This is the live
+/// counterpart to the test-only in-memory `MemStorage`.
+pub struct DoSqlStorage<S: DoSql> {
+    sql: S,
+}
+
+impl<S: DoSql> DoSqlStorage<S> {
+    pub fn new(sql: S) -> Self {
+        Self { sql }
+    }
+}
+
+fn io_err(message: String) -> std::io::Error {
+    std::io::Error::other(message)
+}
+
+impl<S: DoSql> crate::DoStorage for DoSqlStorage<S> {
+    fn read_file(&self, key: &str) -> std::io::Result<Option<String>> {
+        let rows = self
+            .sql
+            .query("SELECT content FROM files WHERE key = ?1", &[text(key)])
+            .map_err(io_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+
+    fn write_file(&self, key: &str, content: &str) -> std::io::Result<()> {
+        self.sql
+            .execute(
+                "INSERT INTO files (key, content) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET content = excluded.content",
+                &[text(key), text(content)],
+            )
+            .map_err(io_err)?;
+        Ok(())
+    }
+
+    fn append_file(&self, key: &str, content: &str) -> std::io::Result<()> {
+        self.sql
+            .execute(
+                "INSERT INTO files (key, content) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET content = content || excluded.content",
+                &[text(key), text(content)],
+            )
+            .map_err(io_err)?;
+        Ok(())
+    }
+
+    fn file_exists(&self, key: &str) -> bool {
+        self.sql
+            .query("SELECT 1 FROM files WHERE key = ?1", &[text(key)])
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn delete_file(&self, key: &str) -> std::io::Result<()> {
+        self.sql
+            .execute("DELETE FROM files WHERE key = ?1", &[text(key)])
+            .map_err(io_err)?;
+        Ok(())
+    }
+}
+
 /// `RuntimeStore` over a `DoSql` backend — the durable-object store impl.
 pub struct DoSqliteStore<Sql: DoSql> {
     pub sql: Sql,
@@ -63,6 +141,36 @@ pub struct DoSqliteStore<Sql: DoSql> {
 impl<Sql: DoSql> DoSqliteStore<Sql> {
     pub fn new(sql: Sql) -> Self {
         Self { sql }
+    }
+
+    /// The earliest future due instant (unix milliseconds) across this
+    /// instance's pending timed effects — creation-anchored `timeout_seconds`
+    /// deadlines and explicit `$.deadline_at` instants (DR-0033 Phase 6). The
+    /// DO shell sets its single wake-up alarm from this when the instance
+    /// parks; `None` means nothing is scheduled.
+    pub fn next_effect_due_epoch_ms(&self, instance_id: &str) -> StoreResult<Option<i64>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT MIN(due_epoch) FROM ( \
+                   SELECT (CAST(strftime('%s', created_at) AS INTEGER) + timeout_seconds) \
+                     AS due_epoch FROM effects \
+                    WHERE instance_id = ?1 AND timeout_seconds IS NOT NULL \
+                      AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
+                   UNION ALL \
+                   SELECT CAST(strftime('%s', json_extract(input_json, '$.deadline_at')) \
+                     AS INTEGER) FROM effects \
+                    WHERE instance_id = ?1 \
+                      AND json_extract(input_json, '$.deadline_at') IS NOT NULL \
+                      AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
+                 )",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .first()
+            .and_then(|row| as_opt_i64(&row[0]))
+            .map(|epoch_seconds| epoch_seconds * 1000))
     }
 
     /// Records an effect-cancellation request (idempotent replay + open-request
@@ -503,36 +611,36 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
     }
 }
 
-fn sql_err(message: String) -> StoreError {
+pub(crate) fn sql_err(message: String) -> StoreError {
     StoreError::Io(std::io::Error::other(message))
 }
 
-fn text(value: &str) -> SqlValue {
+pub(crate) fn text(value: &str) -> SqlValue {
     SqlValue::Text(value.to_string())
 }
 
-fn opt_text(value: Option<&str>) -> SqlValue {
+pub(crate) fn opt_text(value: Option<&str>) -> SqlValue {
     match value {
         Some(v) => SqlValue::Text(v.to_string()),
         None => SqlValue::Null,
     }
 }
 
-fn as_i64(value: &SqlValue) -> i64 {
+pub(crate) fn as_i64(value: &SqlValue) -> i64 {
     match value {
         SqlValue::Int(n) => *n,
         _ => 0,
     }
 }
 
-fn as_text(value: &SqlValue) -> String {
+pub(crate) fn as_text(value: &SqlValue) -> String {
     match value {
         SqlValue::Text(s) => s.clone(),
         _ => String::new(),
     }
 }
 
-fn as_opt_text(value: &SqlValue) -> Option<String> {
+pub(crate) fn as_opt_text(value: &SqlValue) -> Option<String> {
     match value {
         SqlValue::Text(s) => Some(s.clone()),
         _ => None,
@@ -557,7 +665,7 @@ fn bool_int(value: bool) -> SqlValue {
 /// FNV-1a, byte-identical to the native store's `stable_hash_hex` — the DO must
 /// compute the same skill `content_hash` the native path does so a skill
 /// registered under either backend has a stable identity.
-fn stable_hash_hex(value: &str) -> String {
+pub(crate) fn stable_hash_hex(value: &str) -> String {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in value.as_bytes() {
         hash ^= u64::from(*byte);
@@ -1087,6 +1195,82 @@ fn do_append_event<Sql: DoSql>(sql: &Sql, event: NewEvent<'_>) -> StoreResult<St
         event_id: as_text(&row[0]),
         sequence: as_i64(&row[1]),
     })
+}
+
+/// Restorable-context RC-3: fold the file-store manifest at a cut from the
+/// sequence-ordered `fact.derived` event payloads. Mirrors the native
+/// `fold_file_manifest` verbatim (pure serde_json + `BTreeMap`): only
+/// `file.write.completed` facts contribute, the RC-1 write descriptor lives at
+/// `payload.value.value`, latest-write-wins per path, and the map serializes
+/// deterministically (sorted by path) so identical file states hash identically.
+fn do_fold_file_manifest(
+    fact_payloads: &[String],
+) -> StoreResult<(String, BTreeMap<String, String>)> {
+    let mut manifest: BTreeMap<String, String> = BTreeMap::new();
+    for payload_json in fact_payloads {
+        let payload: Value = serde_json::from_str(payload_json)?;
+        if payload.get("name").and_then(Value::as_str) != Some("file.write.completed") {
+            continue;
+        }
+        let descriptor = payload.get("value").and_then(|fact| fact.get("value"));
+        // Prefer the full resolved path (RC-5); fall back to relative `path`.
+        let path = descriptor
+            .and_then(|value| value.get("full_path").or_else(|| value.get("path")))
+            .and_then(Value::as_str);
+        let content_hash = descriptor
+            .and_then(|value| value.get("content_hash"))
+            .and_then(Value::as_str);
+        if let (Some(path), Some(content_hash)) = (path, content_hash) {
+            manifest.insert(path.to_owned(), content_hash.to_owned());
+        }
+    }
+    let manifest_json = serde_json::to_string(&manifest)?;
+    Ok((manifest_json, manifest))
+}
+
+/// RC-4c: the LIVE `fact.derived` payloads for an instance with the
+/// restore-marker fold applied (RC-4b), mirroring native `live_fact_payloads_on`.
+/// `up_to_sequence` bounds the read INCLUSIVE; `None` reads to the head.
+fn do_live_fact_payloads<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    up_to_sequence: Option<i64>,
+) -> StoreResult<Vec<String>> {
+    let bound_clause = match up_to_sequence {
+        Some(n) => format!(" AND sequence <= {n}"),
+        None => String::new(),
+    };
+    let rows = sql
+        .query(
+            &format!(
+                "SELECT event_type, payload_json, sequence FROM events \
+                 WHERE instance_id = ?1 AND event_type IN ('fact.derived', 'context.restored'){bound_clause} \
+                 ORDER BY sequence"
+            ),
+            &[text(instance_id)],
+        )
+        .map_err(sql_err)?;
+    let mut live: Vec<(String, i64)> = Vec::new();
+    for row in &rows {
+        if as_text(&row[0]) == "context.restored" {
+            if let Some(target) = do_restore_marker_target(&as_text(&row[1])) {
+                live.retain(|(_, seq)| *seq <= target);
+            }
+        } else {
+            live.push((as_text(&row[1]), as_i64(&row[2])));
+        }
+    }
+    Ok(live.into_iter().map(|(payload, _)| payload).collect())
+}
+
+/// RC-4b: the target sequence a `context.restored` marker rewinds replay to.
+/// Mirrors the native `restore_marker_target`: `None` for a malformed marker so
+/// the fold applies no rewind rather than corrupting the projection.
+fn do_restore_marker_target(payload_json: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(payload_json)
+        .ok()?
+        .get("restored_to_sequence")
+        .and_then(Value::as_i64)
 }
 
 /// The `effect.terminal` event payload, mirroring `effect_completion_payload`.
@@ -3300,8 +3484,29 @@ fn do_policy_block<Sql: DoSql>(
         return Ok(None);
     }
     if effect.kind == "exec.command" {
-        let capabilities = explicit_required_capabilities(&effect)?;
-        return do_policy_block_for_capabilities(sql, &effect, &capabilities);
+        // Script hard-off Layer 2 (spec/std-script.md "Hard-off semantics"),
+        // mirroring `policy_block_on`: EVERY exec.command effect requires a
+        // bound `script.*` capability — `script.<name>` for the capability
+        // form (carried from lowering), `script.raw` for the raw form (which
+        // carries none). Derived at the admission gate so a forged effect row
+        // that strips its requirements gains nothing.
+        let mut capabilities = explicit_required_capabilities(&effect)?;
+        if !capabilities
+            .iter()
+            .any(|capability| capability.starts_with("script."))
+        {
+            capabilities.push("script.raw".to_owned());
+        }
+        let block = do_policy_block_for_capabilities(sql, &effect, &capabilities)?;
+        // A script-capability block IS the "scripts are disabled" state:
+        // surface the hard-off diagnostic id with the blocked reason.
+        return Ok(block.map(|block| match block.status {
+            "blocked_by_capability" => PolicyBlock {
+                status: block.status,
+                reason: format!("security.script_disabled: {}", block.reason),
+            },
+            _ => block,
+        }));
     }
     if effect.kind == "capability.call" {
         let mut capabilities = explicit_required_capabilities(&effect)?;
@@ -3401,6 +3606,184 @@ const WORKFLOW_INVOCATION_SELECT: &str = "SELECT invocation_id, parent_instance_
      LEFT JOIN effects AS parent_effect \
      ON parent_effect.instance_id = workflow_invocations.parent_instance_id \
      AND parent_effect.effect_id = workflow_invocations.parent_effect_id ";
+
+impl<Sql: DoSql> DoSqliteStore<Sql> {
+    /// RC-2 Delta A (DO mirror): bounded projection replay. Reconstructs the
+    /// instance's projection tables AS OF event `up_to_sequence` — every
+    /// persisted event with `sequence <= up_to_sequence` is applied, none
+    /// after. `N` is INCLUSIVE. When `up_to_sequence` is `None` this is the
+    /// unbounded full rebuild (the `RuntimeStore::rebuild_projections` default,
+    /// byte-identical to before). `up_to_sequence` is the single cut coordinate
+    /// shared with the transcript plane and the file manifest.
+    pub fn rebuild_projections_to(
+        &mut self,
+        instance_id: &str,
+        up_to_sequence: i64,
+    ) -> StoreResult<()> {
+        self.rebuild_projections_impl(instance_id, Some(up_to_sequence))
+    }
+
+    fn rebuild_projections_impl(
+        &mut self,
+        instance_id: &str,
+        up_to_sequence: Option<i64>,
+    ) -> StoreResult<()> {
+        // Detach artifacts from the runs we're about to delete, then re-link the
+        // surviving ones after replay.
+        let artifact_rows = self
+            .sql
+            .query(
+                "SELECT artifact_id, run_id FROM artifacts \
+                 WHERE run_id IN (SELECT run_id FROM runs WHERE instance_id = ?1) \
+                 ORDER BY artifact_id",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        let artifact_run_links: Vec<(String, String)> = artifact_rows
+            .iter()
+            .map(|r| (as_text(&r[0]), as_text(&r[1])))
+            .collect();
+        for (artifact_id, _) in &artifact_run_links {
+            self.sql
+                .execute(
+                    "UPDATE artifacts SET run_id = NULL WHERE artifact_id = ?1",
+                    &[text(artifact_id)],
+                )
+                .map_err(sql_err)?;
+        }
+        for table in [
+            "effect_cancellation_requests",
+            "leases",
+            "runs",
+            "instance_revisions",
+            "effect_dependencies",
+            "effects",
+            "facts",
+        ] {
+            self.sql
+                .execute(
+                    &format!("DELETE FROM {table} WHERE instance_id = ?1"),
+                    &[text(instance_id)],
+                )
+                .map_err(sql_err)?;
+        }
+
+        // RC-2 Delta A: when a bound is present, cut the replayed event set at
+        // `sequence <= N` (INCLUSIVE). `N` is an i64 so interpolation is
+        // injection-safe; when unbounded the clause is empty, leaving the
+        // full-replay query semantically identical to before.
+        let bound_clause = match up_to_sequence {
+            Some(n) => format!(" AND sequence <= {n}"),
+            None => String::new(),
+        };
+        // RC-4b: fetch `context.restored` markers alongside state events (and
+        // select `sequence`) so the restore-marker replay fold below can honor
+        // them (models/maude/restore-replay.maude).
+        let events = self
+            .sql
+            .query(
+                &format!(
+                    "SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source, sequence \
+                     FROM events WHERE instance_id = ?1 AND event_type IN ( \
+                     'rule.committed', 'fact.derived', 'workflow.completed', 'workflow.failed', \
+                     'instance.transitioned', 'workflow.revision_activated', 'effect.run_started', \
+                     'effect.terminal', 'effect.cancelled', 'effect.cancellation_requested', \
+                     'lease.expired', 'context.restored'){bound_clause} ORDER BY sequence"
+                ),
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        // RC-4b restore-marker fold: walk ascending; a `context.restored` marker
+        // rewinds the live set to its target sequence, dropping every event a
+        // later restore orphaned. With no markers present, `live` is exactly the
+        // ordered state-event set, so the rebuild is byte-identical for instances
+        // that were never restored.
+        let mut live: Vec<usize> = Vec::new();
+        for (idx, row) in events.iter().enumerate() {
+            if as_text(&row[1]) == "context.restored" {
+                if let Some(target) = do_restore_marker_target(&as_text(&row[2])) {
+                    live.retain(|&i| as_i64(&events[i][6]) <= target);
+                }
+            } else {
+                live.push(idx);
+            }
+        }
+        for &idx in &live {
+            let row = &events[idx];
+            let event_id = as_text(&row[0]);
+            let event_type = as_text(&row[1]);
+            let payload_json = as_text(&row[2]);
+            let idempotency_key = as_opt_text(&row[3]);
+            let causation_id = as_opt_text(&row[4]);
+            let source = as_text(&row[5]);
+            match event_type.as_str() {
+                "rule.committed" => {
+                    do_replay_rule_commit(&self.sql, instance_id, &event_id, &payload_json)?
+                }
+                "fact.derived" => do_replay_fact_derived(
+                    &self.sql,
+                    instance_id,
+                    &event_id,
+                    &source,
+                    &payload_json,
+                )?,
+                "workflow.completed" | "workflow.failed" => do_replay_workflow_terminal(
+                    &self.sql,
+                    instance_id,
+                    &event_id,
+                    &event_type,
+                    &payload_json,
+                )?,
+                "instance.transitioned" => {
+                    do_replay_instance_transition(&self.sql, instance_id, &event_id, &payload_json)?
+                }
+                "workflow.revision_activated" => do_replay_revision_activation(
+                    &self.sql,
+                    instance_id,
+                    &event_id,
+                    &payload_json,
+                    idempotency_key.as_deref(),
+                )?,
+                "effect.run_started" => {
+                    do_replay_run_started(&self.sql, instance_id, &payload_json)?
+                }
+                "effect.terminal" => {
+                    do_replay_effect_terminal(&self.sql, instance_id, &event_id, &payload_json)?
+                }
+                "effect.cancelled" => {
+                    do_replay_effect_cancelled(&self.sql, instance_id, &event_id, &payload_json)?
+                }
+                "effect.cancellation_requested" => do_replay_cancellation_request(
+                    &self.sql,
+                    instance_id,
+                    &event_id,
+                    &payload_json,
+                    idempotency_key.as_deref(),
+                    causation_id.as_deref(),
+                )?,
+                "lease.expired" => do_replay_lease_expired(&self.sql, instance_id, &payload_json)?,
+                _ => {}
+            }
+        }
+
+        for (artifact_id, run_id) in artifact_run_links {
+            let run_exists = !self
+                .sql
+                .query("SELECT 1 FROM runs WHERE run_id = ?1", &[text(&run_id)])
+                .map_err(sql_err)?
+                .is_empty();
+            if run_exists {
+                self.sql
+                    .execute(
+                        "UPDATE artifacts SET run_id = ?1 WHERE artifact_id = ?2",
+                        &[text(&run_id), text(&artifact_id)],
+                    )
+                    .map_err(sql_err)?;
+            }
+        }
+        Ok(())
+    }
+}
 
 #[allow(unused_variables, clippy::todo, clippy::too_many_arguments)]
 impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
@@ -4292,7 +4675,8 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .query(
                 "SELECT candidate.effect_id, candidate.kind, candidate.target, candidate.profile, \
                  candidate.input_json, candidate.required_capabilities, \
-                 COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]') \
+                 COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'), \
+                 candidate.created_by_event_id \
                  FROM effects AS candidate \
                  LEFT JOIN instances ON instances.instance_id = candidate.instance_id \
                  LEFT JOIN program_versions AS active_versions \
@@ -4323,8 +4707,16 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
+        // RC-4b on the effects plane: orphaned-segment PENDING effects are
+        // never handed to the worker after a restore (parity with native).
+        let live = do_live_event_ids(&self.sql, instance_id)?;
         let mut claimable = Vec::new();
         for row in &rows {
+            if let (Some(live), Some(event_id)) = (&live, as_opt_text(&row[7])) {
+                if !live.contains(&event_id) {
+                    continue;
+                }
+            }
             let effect = ClaimableEffect {
                 effect_id: as_text(&row[0]),
                 kind: as_text(&row[1]),
@@ -4559,6 +4951,315 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             &[text(binding.binding_id), opt_text(binding.program_id), text(binding.capability), text(binding.provider), text(binding.config_json)],
         ).map_err(sql_err)?;
         Ok(())
+    }
+
+    fn register_project_context_doc(
+        &self,
+        position: i64,
+        path: &str,
+        body: &str,
+    ) -> StoreResult<()> {
+        // Content-addressed like skills: byte-identical hash across backends.
+        let content_hash = stable_hash_hex(body);
+        self.sql
+            .execute(
+                "INSERT OR REPLACE INTO project_context_docs (position, path, content_hash, body) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                &[int(position), text(path), text(&content_hash), text(body)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn list_project_context_docs(&self) -> StoreResult<Vec<ProjectContextDoc>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT position, path, content_hash, body FROM project_context_docs \
+                 ORDER BY position",
+                &[],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| ProjectContextDoc {
+                position: as_i64(&row[0]),
+                path: as_text(&row[1]),
+                content_hash: as_text(&row[2]),
+                body: as_text(&row[3]),
+            })
+            .collect())
+    }
+
+    fn record_compute_result(
+        &self,
+        registration: ComputeResultRegistration<'_>,
+    ) -> StoreResult<bool> {
+        let inserted = self
+            .sql
+            .execute(
+                "INSERT OR IGNORE INTO compute_result_cache \
+                 (content_key, effect_kind, result_json, source_instance_id, source_effect_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    text(registration.content_key),
+                    text(registration.effect_kind),
+                    text(registration.result_json),
+                    text(registration.source_instance_id),
+                    text(registration.source_effect_id),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(inserted > 0)
+    }
+
+    fn lookup_compute_result(&self, content_key: &str) -> StoreResult<Option<ComputeCachedResult>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT content_key, effect_kind, result_json, source_instance_id, \
+                 source_effect_id, created_at FROM compute_result_cache WHERE content_key = ?1",
+                &[text(content_key)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| ComputeCachedResult {
+            content_key: as_text(&row[0]),
+            effect_kind: as_text(&row[1]),
+            result_json: as_text(&row[2]),
+            source_instance_id: as_text(&row[3]),
+            source_effect_id: as_text(&row[4]),
+            created_at: as_text(&row[5]),
+        }))
+    }
+
+    fn put_content(&self, body: &str) -> StoreResult<String> {
+        // RC-1 file-history capture over DO SQLite: same content id + same
+        // dedup (INSERT OR IGNORE) as the native/recall content store, in the
+        // same DO SQLite as the write's fact and before that fact commits, so no
+        // manifest hash is ever referenced without its bytes (INV-4 coherence).
+        let id = stable_hash_hex(body);
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+                &[text(&id), text(body), int(body.len() as i64)],
+            )
+            .map_err(sql_err)?;
+        Ok(id)
+    }
+
+    fn get_content(&self, id: &str) -> StoreResult<Option<String>> {
+        let rows = self
+            .sql
+            .query("SELECT body FROM content_blobs WHERE id = ?1", &[text(id)])
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+
+    fn capture_checkpoint(
+        &mut self,
+        capture: CheckpointCapture<'_>,
+    ) -> StoreResult<CapturedCheckpoint> {
+        // INV-2 no-in-flight straddle: a checkpoint is a consistent cut only at
+        // a quiescent point; refuse if any effect is mid-run.
+        let running_rows = self
+            .sql
+            .query(
+                "SELECT COUNT(*) FROM effects WHERE instance_id = ?1 AND status = 'running'",
+                &[text(capture.instance_id)],
+            )
+            .map_err(sql_err)?;
+        let running = running_rows.first().map(|row| as_i64(&row[0])).unwrap_or(0);
+        if running > 0 {
+            return Err(StoreError::Conflict(format!(
+                "checkpoint requires a quiescent instance; {running} effect(s) still running"
+            )));
+        }
+        // RC-4c: fold the manifest from the LIVE fact.derived payloads (the
+        // restore-marker fold applied), so a checkpoint after a restore reflects
+        // the reconciled file plane, never an abandoned-branch write. The
+        // checkpoint event appended below is not a file write, so folding over
+        // the current head equals folding <= the checkpoint's own sequence.
+        let fact_payloads = do_live_fact_payloads(&self.sql, capture.instance_id, None)?;
+        let (manifest_json, manifest) = do_fold_file_manifest(&fact_payloads)?;
+        // INV-4 coherence: store the manifest content-addressed BEFORE the cut
+        // references its hash (same DO SQLite), so no committed cut names a
+        // manifest hash absent from the blob store.
+        let manifest_hash = stable_hash_hex(&manifest_json);
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+                &[
+                    text(&manifest_hash),
+                    text(&manifest_json),
+                    int(manifest_json.len() as i64),
+                ],
+            )
+            .map_err(sql_err)?;
+        let payload = serde_json::json!({
+            "cut_id": capture.cut_id,
+            "transcript_ref": capture.transcript_ref,
+            "manifest_hash": manifest_hash,
+            "manifest": manifest,
+            "file_count": manifest.len(),
+        })
+        .to_string();
+        let event = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id: capture.instance_id,
+                event_type: "context.checkpoint",
+                payload_json: &payload,
+                source: "restorable-context",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: capture.idempotency_key,
+            },
+        )?;
+        Ok(CapturedCheckpoint {
+            cut_id: capture.cut_id.to_owned(),
+            event_id: event.event_id,
+            sequence: event.sequence,
+            manifest_hash,
+            file_count: manifest.len(),
+        })
+    }
+
+    fn plan_restore(&self, instance_id: &str, cut_id: &str) -> StoreResult<RestoreDecision> {
+        // Resolve the checkpoint by cut id (latest first).
+        let checkpoint_rows = self
+            .sql
+            .query(
+                "SELECT payload_json, sequence FROM events \
+                 WHERE instance_id = ?1 AND event_type = 'context.checkpoint' ORDER BY sequence DESC",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        let resolved = checkpoint_rows.iter().find_map(|row| {
+            let payload_json = as_text(&row[0]);
+            let payload: Value = serde_json::from_str(&payload_json).ok()?;
+            (payload.get("cut_id").and_then(Value::as_str) == Some(cut_id))
+                .then(|| (payload, as_i64(&row[1])))
+        });
+        let Some((payload, restored_to_sequence)) = resolved else {
+            return Ok(RestoreDecision::Refused {
+                reason: format!("no checkpoint with cut id `{cut_id}`"),
+            });
+        };
+        let manifest_hash = payload
+            .get("manifest_hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let transcript_ref = payload
+            .get("transcript_ref")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let Some(manifest_body) = self.get_content(&manifest_hash)? else {
+            return Ok(RestoreDecision::Refused {
+                reason: format!("manifest blob `{manifest_hash}` missing for cut `{cut_id}`"),
+            });
+        };
+        let cut_manifest: BTreeMap<String, String> = serde_json::from_str(&manifest_body)?;
+        // INV-4 coherence: every referenced content hash present, up front.
+        let mut writes: BTreeMap<String, String> = BTreeMap::new();
+        for (path, content_hash) in &cut_manifest {
+            match self.get_content(content_hash)? {
+                Some(body) => {
+                    writes.insert(path.clone(), body);
+                }
+                None => {
+                    return Ok(RestoreDecision::Refused {
+                        reason: format!(
+                            "content `{content_hash}` for `{path}` missing (dangling manifest)"
+                        ),
+                    });
+                }
+            }
+        }
+        // Full reconcile: mediated paths live now but absent from the cut.
+        let current_payloads = do_live_fact_payloads(&self.sql, instance_id, None)?;
+        let (_, current_manifest) = do_fold_file_manifest(&current_payloads)?;
+        let removes: Vec<String> = current_manifest
+            .keys()
+            .filter(|path| !cut_manifest.contains_key(*path))
+            .cloned()
+            .collect();
+        Ok(RestoreDecision::Ready(RestorePlan {
+            cut_id: cut_id.to_owned(),
+            restored_to_sequence,
+            transcript_ref,
+            writes,
+            removes,
+        }))
+    }
+
+    fn commit_restore(
+        &mut self,
+        instance_id: &str,
+        restored_to_sequence: i64,
+        cut_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        let payload = serde_json::json!({
+            "cut_id": cut_id,
+            "restored_to_sequence": restored_to_sequence,
+        })
+        .to_string();
+        let marker = do_append_event(
+            &self.sql,
+            NewEvent {
+                instance_id,
+                event_type: "context.restored",
+                payload_json: &payload,
+                source: "restorable-context",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key,
+            },
+        )?;
+        self.rebuild_projections(instance_id)?;
+        Ok(marker)
+    }
+
+    fn register_script_capability(
+        &self,
+        registration: ScriptCapabilityRegistration<'_>,
+    ) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "INSERT OR REPLACE INTO script_capabilities \
+                 (name, argv_json, sha256, env_json, hermetic, body) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                &[
+                    text(registration.name),
+                    text(registration.argv_json),
+                    text(registration.sha256),
+                    text(registration.env_json),
+                    int(i64::from(registration.hermetic)),
+                    text(registration.body),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn get_script_capability(&self, name: &str) -> StoreResult<Option<ScriptCapabilityRecord>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT name, argv_json, sha256, env_json, hermetic, body \
+                 FROM script_capabilities WHERE name = ?1",
+                &[text(name)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| ScriptCapabilityRecord {
+            name: as_text(&row[0]),
+            argv_json: as_text(&row[1]),
+            sha256: as_text(&row[2]),
+            env_json: as_text(&row[3]),
+            hermetic: as_i64(&row[4]) != 0,
+            body: as_text(&row[5]),
+        }))
     }
 
     fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()> {
@@ -5405,7 +6106,8 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                  COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'), \
                  EXISTS (SELECT 1 FROM effect_cancellation_requests AS request \
                  WHERE request.instance_id = effects.instance_id \
-                 AND request.effect_id = effects.effect_id AND request.status = 'requested') \
+                 AND request.effect_id = effects.effect_id AND request.status = 'requested'), \
+                 effects.created_by_event_id \
                  FROM effects \
                  LEFT JOIN instances ON instances.instance_id = effects.instance_id \
                  LEFT JOIN program_versions AS active_versions \
@@ -5416,7 +6118,16 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|r| effect_view_from_row(r)).collect())
+        // RC-4b on the effects plane (parity with native list_effects).
+        let live = do_live_event_ids(&self.sql, instance_id)?;
+        Ok(rows
+            .iter()
+            .filter(|row| match (&live, &row.get(14).map(as_opt_text)) {
+                (Some(live), Some(Some(event_id))) => live.contains(event_id),
+                _ => true,
+            })
+            .map(|r| effect_view_from_row(r))
+            .collect())
     }
 
     fn list_runs(&self, instance_id: &str) -> StoreResult<Vec<RunView>> {
@@ -6158,131 +6869,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {
-        // Detach artifacts from the runs we're about to delete, then re-link the
-        // surviving ones after replay.
-        let artifact_rows = self
-            .sql
-            .query(
-                "SELECT artifact_id, run_id FROM artifacts \
-                 WHERE run_id IN (SELECT run_id FROM runs WHERE instance_id = ?1) \
-                 ORDER BY artifact_id",
-                &[text(instance_id)],
-            )
-            .map_err(sql_err)?;
-        let artifact_run_links: Vec<(String, String)> = artifact_rows
-            .iter()
-            .map(|r| (as_text(&r[0]), as_text(&r[1])))
-            .collect();
-        for (artifact_id, _) in &artifact_run_links {
-            self.sql
-                .execute(
-                    "UPDATE artifacts SET run_id = NULL WHERE artifact_id = ?1",
-                    &[text(artifact_id)],
-                )
-                .map_err(sql_err)?;
-        }
-        for table in [
-            "effect_cancellation_requests",
-            "leases",
-            "runs",
-            "instance_revisions",
-            "effect_dependencies",
-            "effects",
-            "facts",
-        ] {
-            self.sql
-                .execute(
-                    &format!("DELETE FROM {table} WHERE instance_id = ?1"),
-                    &[text(instance_id)],
-                )
-                .map_err(sql_err)?;
-        }
-
-        let events = self
-            .sql
-            .query(
-                "SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source \
-                 FROM events WHERE instance_id = ?1 AND event_type IN ( \
-                 'rule.committed', 'fact.derived', 'workflow.completed', 'workflow.failed', \
-                 'instance.transitioned', 'workflow.revision_activated', 'effect.run_started', \
-                 'effect.terminal', 'effect.cancelled', 'effect.cancellation_requested', \
-                 'lease.expired') ORDER BY sequence",
-                &[text(instance_id)],
-            )
-            .map_err(sql_err)?;
-        for row in &events {
-            let event_id = as_text(&row[0]);
-            let event_type = as_text(&row[1]);
-            let payload_json = as_text(&row[2]);
-            let idempotency_key = as_opt_text(&row[3]);
-            let causation_id = as_opt_text(&row[4]);
-            let source = as_text(&row[5]);
-            match event_type.as_str() {
-                "rule.committed" => {
-                    do_replay_rule_commit(&self.sql, instance_id, &event_id, &payload_json)?
-                }
-                "fact.derived" => do_replay_fact_derived(
-                    &self.sql,
-                    instance_id,
-                    &event_id,
-                    &source,
-                    &payload_json,
-                )?,
-                "workflow.completed" | "workflow.failed" => do_replay_workflow_terminal(
-                    &self.sql,
-                    instance_id,
-                    &event_id,
-                    &event_type,
-                    &payload_json,
-                )?,
-                "instance.transitioned" => {
-                    do_replay_instance_transition(&self.sql, instance_id, &event_id, &payload_json)?
-                }
-                "workflow.revision_activated" => do_replay_revision_activation(
-                    &self.sql,
-                    instance_id,
-                    &event_id,
-                    &payload_json,
-                    idempotency_key.as_deref(),
-                )?,
-                "effect.run_started" => {
-                    do_replay_run_started(&self.sql, instance_id, &payload_json)?
-                }
-                "effect.terminal" => {
-                    do_replay_effect_terminal(&self.sql, instance_id, &event_id, &payload_json)?
-                }
-                "effect.cancelled" => {
-                    do_replay_effect_cancelled(&self.sql, instance_id, &event_id, &payload_json)?
-                }
-                "effect.cancellation_requested" => do_replay_cancellation_request(
-                    &self.sql,
-                    instance_id,
-                    &event_id,
-                    &payload_json,
-                    idempotency_key.as_deref(),
-                    causation_id.as_deref(),
-                )?,
-                "lease.expired" => do_replay_lease_expired(&self.sql, instance_id, &payload_json)?,
-                _ => {}
-            }
-        }
-
-        for (artifact_id, run_id) in artifact_run_links {
-            let run_exists = !self
-                .sql
-                .query("SELECT 1 FROM runs WHERE run_id = ?1", &[text(&run_id)])
-                .map_err(sql_err)?
-                .is_empty();
-            if run_exists {
-                self.sql
-                    .execute(
-                        "UPDATE artifacts SET run_id = ?1 WHERE artifact_id = ?2",
-                        &[text(&run_id), text(&artifact_id)],
-                    )
-                    .map_err(sql_err)?;
-            }
-        }
-        Ok(())
+        self.rebuild_projections_impl(instance_id, None)
     }
 
     fn table_exists(&self, table: &str) -> StoreResult<bool> {
@@ -6297,23 +6884,33 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 }
 
-// -- WorkItems over DoSql (DR-0033 chunk 5a) --------------------------------
+// -- WorkItems over DoSql (event-sourced; ADR-0002 v1) ----------------------
 //
-// The builtin work-item tracker (`spec/work-queues.md`) ported to the DO's one
-// SQLite, so the DO backs the `WorkItems` surface the rule pass reaches
-// (`project_tracker_issues` / holder-release) the same way it backs `RuntimeStore`.
-// Natively this is a separate `.whipplescript/items.sqlite`; on the DO it is the
-// `items` + `item_counter` tables in the single durable store. The native SQL used
-// a rusqlite transaction for the file/claim atomic pairs; the DO's single-writer
-// per-invocation model supplies that atomicity (these methods never yield
-// mid-sequence), so no explicit transaction is needed — the same argument as the
+// The builtin work-item tracker (`spec/work-queues.md`) rebuilt as an
+// event-sourced provider on the DO's one SQLite, so the DO backs the
+// `WorkItems` surface the rule pass reaches (`project_tracker_issues` /
+// holder-release) the same way it backs `RuntimeStore`. This is the exact same
+// event/projection/lease model as the native `WorkItemStore` (append-only
+// `tracker_events` = source of truth; `tracker_issues` / `tracker_relations` /
+// `tracker_leases` = disposable projections; claims are runtime leases split
+// from durable status). The native SQL used a rusqlite `Immediate` transaction
+// for the claim CAS; the DO's single-writer per-invocation model supplies that
+// atomicity (these methods never yield mid-sequence), so the check-then-insert
+// claim is exclusive without an explicit transaction — the same argument as the
 // RuntimeStore port.
 
-const DO_ITEM_COLS: &str = "item_id, queue, title, body, status, labels_json, \
-     metadata_json, claimed_by, filed_by, created_at, updated_at";
+const DO_ISSUE_COLS: &str = "issue_id, queue, title, body, status, labels_json, \
+     metadata_json, filed_by, created_at, updated_at";
 
-/// Map a positional `items` row to a `WorkItem` (column order = `DO_ITEM_COLS`).
-fn do_work_item_row(row: &[SqlValue]) -> WorkItem {
+/// The active-lease predicate over `tracker_leases`, with the clock inlined as
+/// `datetime('now')`. A NULL `expires_at` models a lease with no TTL.
+const DO_ACTIVE_LEASE: &str =
+    "released_at IS NULL AND (expires_at IS NULL OR expires_at > datetime('now'))";
+
+/// Map a positional `tracker_issues` row to a `WorkItem` (column order =
+/// `DO_ISSUE_COLS`). `claimed_by` is supplied by the lease overlay, not the
+/// durable projection.
+fn do_issue_row(row: &[SqlValue]) -> WorkItem {
     WorkItem {
         id: as_text(&row[0]),
         queue: as_text(&row[1]),
@@ -6322,14 +6919,182 @@ fn do_work_item_row(row: &[SqlValue]) -> WorkItem {
         status: as_text(&row[4]),
         labels: serde_json::from_str(&as_text(&row[5])).unwrap_or_default(),
         metadata: serde_json::from_str(&as_text(&row[6])).unwrap_or_else(|_| serde_json::json!({})),
-        claimed_by: as_opt_text(&row[7]),
-        filed_by: as_opt_text(&row[8]),
-        created_at: as_text(&row[9]),
-        updated_at: as_text(&row[10]),
+        claimed_by: None,
+        filed_by: as_opt_text(&row[7]),
+        created_at: as_text(&row[8]),
+        updated_at: as_text(&row[9]),
     }
 }
 
+/// Capture a single now-timestamp for one op; every event + projection field it
+/// derives uses this, so a rebuild reproduces the same values.
+fn do_now(sql: &impl DoSql) -> StoreResult<String> {
+    let rows = sql.query("SELECT datetime('now')", &[]).map_err(sql_err)?;
+    Ok(rows
+        .first()
+        .map_or_else(String::new, |row| as_text(&row[0])))
+}
+
+/// Append one immutable tracker event (INSERT only — never updated or deleted).
+fn do_tracker_append(
+    sql: &impl DoSql,
+    issue_id: Option<&str>,
+    kind: &str,
+    payload: &serde_json::Value,
+    actor: Option<&str>,
+    now: &str,
+) -> StoreResult<()> {
+    sql.execute(
+        "INSERT INTO tracker_events (issue_id, kind, payload_json, actor, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        &[
+            opt_text(issue_id),
+            text(kind),
+            text(&payload.to_string()),
+            opt_text(actor),
+            text(now),
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+/// The holder of the active lease on an issue, if any.
+fn do_active_holder(sql: &impl DoSql, item_id: &str) -> StoreResult<Option<String>> {
+    let rows = sql
+        .query(
+            &format!(
+                "SELECT actor FROM tracker_leases WHERE issue_id = ?1 AND {DO_ACTIVE_LEASE} \
+                 ORDER BY acquired_at DESC LIMIT 1"
+            ),
+            &[text(item_id)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows.first().map(|row| as_text(&row[0])))
+}
+
+/// All active leases as an `issue_id -> holder` map (for the list overlay).
+fn do_active_holders(sql: &impl DoSql) -> StoreResult<std::collections::HashMap<String, String>> {
+    let rows = sql
+        .query(
+            &format!("SELECT issue_id, actor FROM tracker_leases WHERE {DO_ACTIVE_LEASE}"),
+            &[],
+        )
+        .map_err(sql_err)?;
+    Ok(rows
+        .iter()
+        .map(|row| (as_text(&row[0]), as_text(&row[1])))
+        .collect())
+}
+
+/// Lazily expire past-due, still-held leases on an issue, so an expired lease
+/// frees the issue for a fresh claim.
+fn do_expire_stale_leases(sql: &impl DoSql, item_id: &str, now: &str) -> StoreResult<()> {
+    let stale = sql
+        .query(
+            "SELECT lease_id FROM tracker_leases \
+             WHERE issue_id = ?1 AND released_at IS NULL AND expires_at IS NOT NULL \
+               AND expires_at <= ?2",
+            &[text(item_id), text(now)],
+        )
+        .map_err(sql_err)?;
+    for row in &stale {
+        let lease_id = as_text(&row[0]);
+        do_mark_lease_released(sql, &lease_id, item_id, "claim.expired", "system", now)?;
+    }
+    Ok(())
+}
+
+/// Release the (single) active lease on an issue, if present.
+fn do_release_active_lease(sql: &impl DoSql, item_id: &str, now: &str) -> StoreResult<bool> {
+    let rows = sql
+        .query(
+            &format!(
+                "SELECT lease_id, actor FROM tracker_leases WHERE issue_id = ?1 AND {DO_ACTIVE_LEASE} \
+                 ORDER BY acquired_at DESC LIMIT 1"
+            ),
+            &[text(item_id)],
+        )
+        .map_err(sql_err)?;
+    match rows.first() {
+        None => Ok(false),
+        Some(row) => {
+            let lease_id = as_text(&row[0]);
+            let actor = as_text(&row[1]);
+            do_mark_lease_released(sql, &lease_id, item_id, "claim.released", &actor, now)?;
+            Ok(true)
+        }
+    }
+}
+
+/// Append a lease-terminal event and fold it into the lease projection.
+fn do_mark_lease_released(
+    sql: &impl DoSql,
+    lease_id: &str,
+    item_id: &str,
+    kind: &str,
+    actor: &str,
+    now: &str,
+) -> StoreResult<()> {
+    let payload = serde_json::json!({"lease_id": lease_id, "actor": actor, "released_at": now});
+    do_tracker_append(sql, Some(item_id), kind, &payload, Some(actor), now)?;
+    sql.execute(
+        "UPDATE tracker_leases SET released_at = ?2 WHERE lease_id = ?1",
+        &[text(lease_id), text(now)],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+/// The restore-marker fold over the EFFECTS plane (DO parity of the
+/// native `live_event_ids_on`): `None` when no `context.restored` marker
+/// exists (the fast path filters nothing).
+fn do_live_event_ids<S: DoSql>(
+    sql: &S,
+    instance_id: &str,
+) -> StoreResult<Option<std::collections::BTreeSet<String>>> {
+    let rows = sql
+        .query(
+            "SELECT event_id, sequence, event_type, payload_json FROM events \
+             WHERE instance_id = ?1 ORDER BY sequence",
+            &[text(instance_id)],
+        )
+        .map_err(sql_err)?;
+    let mut saw_marker = false;
+    let mut live: Vec<(String, i64)> = Vec::new();
+    for row in &rows {
+        let event_type = as_text(&row[2]);
+        if event_type == "context.restored" {
+            saw_marker = true;
+            if let Some(target) = serde_json::from_str::<serde_json::Value>(&as_text(&row[3]))
+                .ok()
+                .and_then(|payload| payload.get("restored_to_sequence")?.as_i64())
+            {
+                live.retain(|(_, seq)| *seq <= target);
+            }
+        }
+        live.push((as_text(&row[0]), as_i64(&row[1])));
+    }
+    if !saw_marker {
+        return Ok(None);
+    }
+    Ok(Some(
+        live.into_iter().map(|(event_id, _)| event_id).collect(),
+    ))
+}
+
 impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
+    fn event_position(&self) -> StoreResult<i64> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT COALESCE(MAX(event_seq), 0) FROM tracker_events",
+                &[],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_i64(&row[0])).unwrap_or(0))
+    }
+
     fn file_item(
         &mut self,
         queue: &str,
@@ -6339,12 +7104,13 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         metadata: &serde_json::Value,
         filed_by: Option<&str>,
     ) -> StoreResult<WorkItem> {
+        let now = do_now(&self.sql)?;
         // Mint the next sequential id (`WS-1`, `WS-2`, …); single-writer per
-        // invocation makes the counter bump + insert atomic without a txn.
+        // invocation makes the counter bump + append + project atomic.
         let bumped = self
             .sql
             .query(
-                "UPDATE item_counter SET next_id = next_id + 1 WHERE singleton = 1 \
+                "UPDATE tracker_counter SET next_id = next_id + 1 WHERE singleton = 1 \
                  RETURNING next_id - 1",
                 &[],
             )
@@ -6352,14 +7118,31 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         let next = bumped
             .first()
             .map(|row| as_i64(&row[0]))
-            .ok_or_else(|| StoreError::Conflict("item_counter row missing".to_owned()))?;
+            .ok_or_else(|| StoreError::Conflict("tracker_counter row missing".to_owned()))?;
         let item_id = format!("WS-{next}");
         let labels_json =
             serde_json::to_string(labels).map_err(|error| sql_err(error.to_string()))?;
+        let payload = serde_json::json!({
+            "queue": queue,
+            "title": title,
+            "body": body,
+            "labels": labels,
+            "metadata": metadata,
+            "filed_by": filed_by,
+        });
+        do_tracker_append(
+            &self.sql,
+            Some(&item_id),
+            "issue.created",
+            &payload,
+            filed_by,
+            &now,
+        )?;
         self.sql
             .execute(
-                "INSERT INTO items (item_id, queue, title, body, labels_json, metadata_json, \
-                 filed_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO tracker_issues \
+                 (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?8)",
                 &[
                     text(&item_id),
                     text(queue),
@@ -6368,6 +7151,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
                     text(&labels_json),
                     text(&metadata.to_string()),
                     opt_text(filed_by),
+                    text(&now),
                 ],
             )
             .map_err(sql_err)?;
@@ -6379,11 +7163,17 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         let rows = self
             .sql
             .query(
-                &format!("SELECT {DO_ITEM_COLS} FROM items WHERE item_id = ?1"),
+                &format!("SELECT {DO_ISSUE_COLS} FROM tracker_issues WHERE issue_id = ?1"),
                 &[text(item_id)],
             )
             .map_err(sql_err)?;
-        Ok(rows.first().map(|row| do_work_item_row(row)))
+        match rows.first() {
+            None => Ok(None),
+            Some(row) => {
+                let holder = do_active_holder(&self.sql, item_id)?;
+                Ok(Some(apply_overlay(do_issue_row(row), holder)))
+            }
+        }
     }
 
     fn list_items(&self, queue: Option<&str>, status: Option<&str>) -> StoreResult<Vec<WorkItem>> {
@@ -6391,96 +7181,240 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
             .sql
             .query(
                 &format!(
-                    "SELECT {DO_ITEM_COLS} FROM items \
-                     WHERE (?1 IS NULL OR queue = ?1) AND (?2 IS NULL OR status = ?2) \
-                     ORDER BY created_at, item_id"
+                    "SELECT {DO_ISSUE_COLS} FROM tracker_issues \
+                     WHERE (?1 IS NULL OR queue = ?1) ORDER BY created_at, issue_id"
                 ),
-                &[opt_text(queue), opt_text(status)],
+                &[opt_text(queue)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|row| do_work_item_row(row)).collect())
+        let holders = do_active_holders(&self.sql)?;
+        // The overlay can turn a durable-`open` issue into effective
+        // `in_progress`, so the status filter runs over the OVERLAID status.
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let base = do_issue_row(row);
+                let holder = holders.get(&base.id).cloned();
+                apply_overlay(base, holder)
+            })
+            .filter(|item| status.is_none_or(|want| item.status == want))
+            .collect())
     }
 
     fn ready_items(&self, queue: &str) -> StoreResult<Vec<WorkItem>> {
+        // Ready iff durable `open`, no active lease, no active blocker (a
+        // `blocks(B, id)` with B still open). Expired/released leases and
+        // closed/canceled blockers do not gate.
         let rows = self
             .sql
             .query(
                 &format!(
-                    "SELECT {DO_ITEM_COLS} FROM items \
-                     WHERE queue = ?1 AND status = 'open' AND claimed_by IS NULL \
-                     ORDER BY created_at, item_id"
+                    "SELECT {DO_ISSUE_COLS} FROM tracker_issues i \
+                     WHERE i.queue = ?1 AND i.status = 'open' \
+                     AND NOT EXISTS ( \
+                       SELECT 1 FROM tracker_leases l \
+                       WHERE l.issue_id = i.issue_id \
+                         AND l.released_at IS NULL \
+                         AND (l.expires_at IS NULL OR l.expires_at > datetime('now'))) \
+                     AND NOT EXISTS ( \
+                       SELECT 1 FROM tracker_relations r JOIN tracker_issues b ON b.issue_id = r.from_issue \
+                       WHERE r.to_issue = i.issue_id AND r.kind = 'blocks' AND b.status = 'open') \
+                     ORDER BY i.created_at, i.issue_id"
                 ),
                 &[text(queue)],
             )
             .map_err(sql_err)?;
-        Ok(rows.iter().map(|row| do_work_item_row(row)).collect())
+        // Ready rows have no active lease by construction; the overlay is a no-op.
+        Ok(rows.iter().map(|row| do_issue_row(row)).collect())
     }
 
     fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome> {
-        let changed = self
-            .sql
-            .execute(
-                "UPDATE items SET status = 'in_progress', claimed_by = ?2, \
-                 updated_at = CURRENT_TIMESTAMP \
-                 WHERE item_id = ?1 AND status = 'open' AND claimed_by IS NULL",
-                &[text(item_id), text(claimed_by)],
-            )
-            .map_err(sql_err)?;
-        if changed == 1 {
-            return Ok(ClaimOutcome::Claimed);
-        }
-        let holder = self
+        let now = do_now(&self.sql)?;
+        let exists = !self
             .sql
             .query(
-                "SELECT claimed_by FROM items WHERE item_id = ?1",
+                "SELECT 1 FROM tracker_issues WHERE issue_id = ?1",
                 &[text(item_id)],
             )
-            .map_err(sql_err)?;
-        match holder.first() {
-            None => Ok(ClaimOutcome::NotFound),
-            Some(row) => Ok(ClaimOutcome::AlreadyClaimed {
-                holder: as_opt_text(&row[0]).unwrap_or_default(),
-            }),
+            .map_err(sql_err)?
+            .is_empty();
+        if !exists {
+            return Ok(ClaimOutcome::NotFound);
         }
+        do_expire_stale_leases(&self.sql, item_id, &now)?;
+        // Exclusivity (tracker-lease I1): grant only when no active lease. The
+        // single-writer invocation serializes this check-then-insert.
+        if let Some(holder) = do_active_holder(&self.sql, item_id)? {
+            return Ok(ClaimOutcome::AlreadyClaimed { holder });
+        }
+        let n = self
+            .sql
+            .query(
+                "SELECT COUNT(*) FROM tracker_events WHERE issue_id = ?1 AND kind = 'claim.acquired'",
+                &[text(item_id)],
+            )
+            .map_err(sql_err)?
+            .first()
+            .map_or(0, |row| as_i64(&row[0]));
+        let lease_id = format!("L-{item_id}-{n}");
+        let payload = serde_json::json!({
+            "lease_id": lease_id, "actor": claimed_by, "expires_at": serde_json::Value::Null
+        });
+        do_tracker_append(
+            &self.sql,
+            Some(item_id),
+            "claim.acquired",
+            &payload,
+            Some(claimed_by),
+            &now,
+        )?;
+        self.sql
+            .execute(
+                "INSERT INTO tracker_leases (lease_id, issue_id, actor, acquired_at, expires_at, released_at) \
+                 VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
+                &[text(&lease_id), text(item_id), text(claimed_by), text(&now)],
+            )
+            .map_err(sql_err)?;
+        Ok(ClaimOutcome::Claimed)
+    }
+
+    fn renew_claim(
+        &mut self,
+        item_id: &str,
+        actor: &str,
+        expires: Option<&str>,
+    ) -> StoreResult<RenewOutcome> {
+        let now = do_now(&self.sql)?;
+        let rows = self
+            .sql
+            .query(
+                "SELECT lease_id, expires_at FROM tracker_leases \
+                 WHERE issue_id = ?1 AND actor = ?2 AND released_at IS NULL \
+                   AND (expires_at IS NULL OR expires_at > ?3)",
+                &[text(item_id), text(actor), text(&now)],
+            )
+            .map_err(sql_err)?;
+        let Some(row) = rows.first() else {
+            return Ok(RenewOutcome::NotHeld);
+        };
+        let lease_id = as_text(&row[0]);
+        let current_expires = as_opt_text(&row[1]);
+        // Monotonicity (tracker-lease I2): a finite deadline may not move back.
+        if let (Some(want), Some(current)) = (expires, current_expires.as_deref()) {
+            if want <= current {
+                return Ok(RenewOutcome::NotMonotonic);
+            }
+        }
+        let new_expires: Option<String> = match expires {
+            Some(want) => Some(want.to_owned()),
+            None => current_expires,
+        };
+        let payload =
+            serde_json::json!({"lease_id": lease_id, "actor": actor, "expires_at": new_expires});
+        do_tracker_append(
+            &self.sql,
+            Some(item_id),
+            "claim.renewed",
+            &payload,
+            Some(actor),
+            &now,
+        )?;
+        if expires.is_some() {
+            self.sql
+                .execute(
+                    "UPDATE tracker_leases SET expires_at = ?2 WHERE lease_id = ?1",
+                    &[text(&lease_id), opt_text(new_expires.as_deref())],
+                )
+                .map_err(sql_err)?;
+        }
+        Ok(RenewOutcome::Renewed {
+            expires_at: new_expires,
+        })
     }
 
     fn release_item(&mut self, item_id: &str) -> StoreResult<bool> {
-        let changed = self
-            .sql
-            .execute(
-                "UPDATE items SET status = 'open', claimed_by = NULL, \
-                 updated_at = CURRENT_TIMESTAMP \
-                 WHERE item_id = ?1 AND status = 'in_progress'",
-                &[text(item_id)],
-            )
-            .map_err(sql_err)?;
-        Ok(changed == 1)
+        let now = do_now(&self.sql)?;
+        do_release_active_lease(&self.sql, item_id, &now)
     }
 
     fn release_claims_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
-        let changed = self
+        // Terminal-releases-all (tracker-lease I3): every active lease the actor
+        // holds across ALL issues is released in one invocation.
+        let now = do_now(&self.sql)?;
+        let rows = self
             .sql
-            .execute(
-                "UPDATE items SET status = 'open', claimed_by = NULL, \
-                 updated_at = CURRENT_TIMESTAMP \
-                 WHERE claimed_by = ?1 AND status = 'in_progress'",
+            .query(
+                &format!(
+                    "SELECT lease_id, issue_id FROM tracker_leases WHERE actor = ?1 AND {DO_ACTIVE_LEASE}"
+                ),
                 &[text(holder)],
             )
             .map_err(sql_err)?;
-        Ok(changed as usize)
+        let leases: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| (as_text(&row[0]), as_text(&row[1])))
+            .collect();
+        for (lease_id, issue_id) in &leases {
+            do_mark_lease_released(
+                &self.sql,
+                lease_id,
+                issue_id,
+                "claim.released",
+                holder,
+                &now,
+            )?;
+        }
+        Ok(leases.len())
     }
 
     fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> StoreResult<bool> {
-        let changed = self
+        let now = do_now(&self.sql)?;
+        let status = self
             .sql
+            .query(
+                "SELECT status FROM tracker_issues WHERE issue_id = ?1",
+                &[text(item_id)],
+            )
+            .map_err(sql_err)?
+            .first()
+            .map(|row| as_text(&row[0]));
+        if status.as_deref() != Some("open") {
+            return Ok(false);
+        }
+        let payload = serde_json::json!({"status": "closed", "summary": summary});
+        do_tracker_append(
+            &self.sql,
+            Some(item_id),
+            "issue.closed",
+            &payload,
+            None,
+            &now,
+        )?;
+        self.sql
             .execute(
-                "UPDATE items SET status = 'closed', claim_summary = ?2, \
-                 updated_at = CURRENT_TIMESTAMP \
-                 WHERE item_id = ?1 AND status IN ('open', 'in_progress')",
-                &[text(item_id), opt_text(summary)],
+                "UPDATE tracker_issues SET status = 'closed', claim_summary = ?2, updated_at = ?3 \
+                 WHERE issue_id = ?1",
+                &[text(item_id), opt_text(summary), text(&now)],
             )
             .map_err(sql_err)?;
-        Ok(changed == 1)
+        do_release_active_lease(&self.sql, item_id, &now)?;
+        Ok(true)
+    }
+
+    fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()> {
+        // `from` blocks `to`: append `relation.added` and fold into
+        // `tracker_relations` (mirror of the native `add_blocks` door).
+        let now = do_now(&self.sql)?;
+        let payload = serde_json::json!({"from": from, "to": to, "kind": "blocks"});
+        do_tracker_append(&self.sql, Some(to), "relation.added", &payload, None, &now)?;
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO tracker_relations (from_issue, to_issue, kind, dep_kind) \
+                 VALUES (?1, ?2, 'blocks', NULL)",
+                &[text(from), text(to)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
     }
 }
 
@@ -6505,6 +7439,20 @@ fn do_norm_owner(owner: &str) -> &str {
 }
 
 impl<Sql: DoSql> Coordination for DoSqliteStore<Sql> {
+    fn ledger_positions(&self) -> StoreResult<Vec<(String, String, i64)>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT owner, ledger, next_seq FROM coord_ledger_seq ORDER BY owner, ledger",
+                &[],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| (as_text(&row[0]), as_text(&row[1]), as_i64(&row[2])))
+            .collect())
+    }
+
     fn try_acquire_for_owner(
         &mut self,
         owner: &str,
@@ -6994,6 +7942,28 @@ pub(crate) mod test_support {
                 terminal_event_id TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT
             );
+            CREATE TABLE project_context_docs (
+                position INTEGER PRIMARY KEY, path TEXT NOT NULL,
+                content_hash TEXT NOT NULL, body TEXT NOT NULL
+            );
+            CREATE TABLE compute_result_cache (
+                content_key TEXT PRIMARY KEY, effect_kind TEXT NOT NULL,
+                result_json TEXT NOT NULL, source_instance_id TEXT NOT NULL,
+                source_effect_id TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE content_blobs (
+                id TEXT PRIMARY KEY, body TEXT NOT NULL, byte_len INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE files (
+                key TEXT PRIMARY KEY, content TEXT NOT NULL
+            );
+            CREATE TABLE script_capabilities (
+                name TEXT PRIMARY KEY, argv_json TEXT NOT NULL, sha256 TEXT NOT NULL,
+                env_json TEXT NOT NULL DEFAULT '{}', hermetic INTEGER NOT NULL DEFAULT 0,
+                body TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE skills (
                 skill_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, version TEXT NOT NULL,
                 source TEXT NOT NULL, source_path TEXT NOT NULL, content_hash TEXT NOT NULL,
@@ -7038,18 +8008,35 @@ pub(crate) mod test_support {
             CREATE TABLE agent_turn_snapshots (
                 effect_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL
             );
-            CREATE TABLE items (
-                item_id TEXT PRIMARY KEY, queue TEXT NOT NULL, title TEXT NOT NULL,
+            CREATE TABLE tracker_events (
+                event_seq INTEGER PRIMARY KEY AUTOINCREMENT, issue_id TEXT, kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}', actor TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE tracker_issues (
+                issue_id TEXT PRIMARY KEY, queue TEXT NOT NULL, title TEXT NOT NULL,
                 body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'open',
                 labels_json TEXT NOT NULL DEFAULT '[]', metadata_json TEXT NOT NULL DEFAULT '{}',
-                claimed_by TEXT, claim_summary TEXT, filed_by TEXT,
+                claim_summary TEXT, filed_by TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
-            CREATE TABLE item_counter (
+            CREATE TABLE tracker_relations (
+                from_issue TEXT NOT NULL, to_issue TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'blocks', dep_kind TEXT,
+                PRIMARY KEY (from_issue, to_issue, kind)
+            );
+            CREATE TABLE tracker_leases (
+                lease_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, actor TEXT NOT NULL,
+                acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, expires_at TEXT, released_at TEXT
+            );
+            CREATE TABLE tracker_counter (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1), next_id INTEGER NOT NULL
             );
-            INSERT INTO item_counter (singleton, next_id) VALUES (1, 1);
+            INSERT INTO tracker_counter (singleton, next_id) VALUES (1, 1);
+            CREATE INDEX idx_tracker_issues_queue ON tracker_issues(queue, status);
+            CREATE INDEX idx_tracker_leases_issue ON tracker_leases(issue_id, released_at);
+            CREATE INDEX idx_tracker_events_issue ON tracker_events(issue_id, kind);
             CREATE TABLE coord_leases (
                 owner TEXT NOT NULL, resource TEXT NOT NULL, key TEXT NOT NULL, holder TEXT NOT NULL,
                 acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, expires_at TEXT NOT NULL,
@@ -7112,6 +8099,33 @@ mod tests {
     /// Backs `DoSql` with real in-memory SQLite, so the ported store SQL is
     /// checked against an actual engine.
     use super::test_support::store;
+
+    /// P1: the production `DoSqlStorage` drives the file plane over REAL DO
+    /// SQLite (the `files` table) through the `FileStore` seam — write, read,
+    /// append, overwrite-replaces, exists, and missing-errors.
+    #[test]
+    fn do_sql_storage_round_trips_the_file_plane_over_real_sqlite() {
+        use whipplescript_store::files::FileStore;
+        // `store()` applies the schema (now carrying the `files` table); take its
+        // real `RusqliteDoSql` and back the file plane with it.
+        let files = crate::DoFileStore::new(DoSqlStorage::new(store().sql));
+        let path = std::path::Path::new("notes/todo.txt");
+
+        assert!(!files.exists(path));
+        assert!(files.read_to_string(path).is_err(), "missing file errors");
+        files.write(path, b"hello").expect("write");
+        assert!(files.exists(path));
+        assert_eq!(files.read_to_string(path).expect("read"), "hello");
+        files.append(path, b" world").expect("append");
+        assert_eq!(files.read_to_string(path).expect("read"), "hello world");
+        // A write REPLACES (does not append) — the live path->bytes semantics.
+        files.write(path, b"fresh").expect("rewrite");
+        assert_eq!(files.read_to_string(path).expect("read"), "fresh");
+        // P2: remove drops the file; removing an absent path is a no-op.
+        files.remove(path).expect("remove");
+        assert!(!files.exists(path), "removed file is gone");
+        files.remove(path).expect("remove absent is idempotent");
+    }
 
     #[test]
     fn do_work_items_file_claim_release_finish_over_dosql() {
@@ -9702,6 +10716,455 @@ mod tests {
         let runs = store.list_runs("i1").expect("runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "completed");
+    }
+
+    /// RC-2 Delta A (DO mirror): rebuild_projections_to reflects instance state
+    /// AS OF event N — an effect committed after N is absent; one at/before N is
+    /// present. Unbounded rebuild restores the full current state.
+    #[test]
+    fn do_store_rebuild_projections_to_bounded_by_sequence() {
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text("i1"),
+                    text("p"),
+                    text("ver_1"),
+                    int(0),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed instance");
+
+        let effect_exists =
+            |store: &DoSqliteStore<super::test_support::RusqliteDoSql>, effect_id: &str| -> bool {
+                !store
+                    .sql
+                    .query(
+                        "SELECT 1 FROM effects WHERE effect_id = ?1",
+                        &[text(effect_id)],
+                    )
+                    .expect("effect count")
+                    .is_empty()
+            };
+        let max_sequence = |store: &DoSqliteStore<super::test_support::RusqliteDoSql>| -> i64 {
+            let rows = store
+                .sql
+                .query(
+                    "SELECT MAX(sequence) FROM events WHERE instance_id = ?1",
+                    &[text("i1")],
+                )
+                .expect("max sequence");
+            match &rows[0][0] {
+                SqlValue::Int(n) => *n,
+                other => panic!("expected integer sequence, got {other:?}"),
+            }
+        };
+
+        let effect_a = [NewEffect {
+            effect_id: "eff_a",
+            kind: "queue.push",
+            target: None,
+            input_json: "{}",
+            status: "queued",
+            idempotency_key: "e_a",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "i1",
+                rule: "r.a",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effect_a,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("c_a"),
+            })
+            .expect("commit A");
+        let cut = max_sequence(&store);
+
+        let effect_b = [NewEffect {
+            effect_id: "eff_b",
+            kind: "queue.push",
+            target: None,
+            input_json: "{}",
+            status: "queued",
+            idempotency_key: "e_b",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "i1",
+                rule: "r.b",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effect_b,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("c_b"),
+            })
+            .expect("commit B");
+
+        // Cut AT effect A's commit sequence: A is in, B (later) is out.
+        store
+            .rebuild_projections_to("i1", cut)
+            .expect("bounded rebuild");
+        assert!(effect_exists(&store, "eff_a"), "effect A (<= N) present");
+        assert!(!effect_exists(&store, "eff_b"), "effect B (> N) absent");
+
+        // Unbounded rebuild restores both.
+        store.rebuild_projections("i1").expect("full rebuild");
+        assert!(effect_exists(&store, "eff_a"), "effect A present in full");
+        assert!(effect_exists(&store, "eff_b"), "effect B present in full");
+    }
+
+    /// RC-3 DO mirror: capture_checkpoint folds the file manifest from
+    /// file.write.completed facts (latest-write-wins), stores it
+    /// content-addressed (INV-4), records the context.checkpoint cut carrier,
+    /// and refuses while an effect is running (INV-2 no-in-flight straddle).
+    #[test]
+    fn do_store_capture_checkpoint_folds_manifest_and_guards_quiescence() {
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text("i1"),
+                    text("p"),
+                    text("ver_1"),
+                    int(0),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed instance");
+
+        // Insert file.write.completed fact.derived events in the RC-1 payload
+        // shape (write descriptor nested at value.value); a.txt is overwritten.
+        let write_event = |store: &DoSqliteStore<super::test_support::RusqliteDoSql>,
+                           seq: i64,
+                           key: &str,
+                           path: &str,
+                           content_hash: &str| {
+            let payload = serde_json::json!({
+                "name": "file.write.completed",
+                "key": key,
+                "value": {
+                    "effect_id": key,
+                    "value": { "store": "workspace", "path": path, "content_hash": content_hash },
+                },
+            })
+            .to_string();
+            store
+                .sql
+                .execute(
+                    "INSERT INTO events (event_id, instance_id, sequence, event_type, \
+                     payload_json, occurred_at, source) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    &[
+                        text(&format!("evt_{key}")),
+                        text("i1"),
+                        int(seq),
+                        text("fact.derived"),
+                        text(&payload),
+                        text("2030-01-01T00:00:00Z"),
+                        text("kernel"),
+                    ],
+                )
+                .expect("insert fact.derived event");
+        };
+        write_event(&store, 1, "w-a1", "a.txt", "hash-a1");
+        write_event(&store, 2, "w-b1", "b.txt", "hash-b1");
+        write_event(&store, 3, "w-a2", "a.txt", "hash-a2");
+
+        let checkpoint = store
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: "i1",
+                cut_id: "cut-1",
+                transcript_ref: Some("step-7"),
+                idempotency_key: Some("checkpoint-cut-1"),
+            })
+            .expect("checkpoint captures at quiescence");
+        assert_eq!(checkpoint.file_count, 2);
+        assert!(checkpoint.sequence > 3, "checkpoint is the latest sequence");
+
+        let manifest_body = store
+            .get_content(&checkpoint.manifest_hash)
+            .expect("manifest read")
+            .expect("manifest present");
+        let manifest: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&manifest_body).expect("manifest parses");
+        assert_eq!(manifest.get("a.txt").map(String::as_str), Some("hash-a2"));
+        assert_eq!(manifest.get("b.txt").map(String::as_str), Some("hash-b1"));
+
+        let carrier = store
+            .sql
+            .query(
+                "SELECT event_type FROM events WHERE instance_id = ?1 AND sequence = ?2",
+                &[text("i1"), int(checkpoint.sequence)],
+            )
+            .expect("carrier row");
+        assert_eq!(as_text(&carrier[0][0]), "context.checkpoint");
+
+        // INV-2: with an effect running, a further capture refuses.
+        store
+            .sql
+            .execute(
+                "INSERT INTO effects (effect_id, instance_id, kind, status) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    text("eff_run"),
+                    text("i1"),
+                    text("agent.tell"),
+                    text("running"),
+                ],
+            )
+            .expect("seed running effect");
+        let refused = store.capture_checkpoint(CheckpointCapture {
+            instance_id: "i1",
+            cut_id: "cut-busy",
+            transcript_ref: None,
+            idempotency_key: None,
+        });
+        assert!(
+            matches!(refused, Err(StoreError::Conflict(_))),
+            "checkpoint refuses while an effect runs, got {refused:?}"
+        );
+    }
+
+    /// RC-4c DO mirror: plan_restore returns the full reconcile (writes + removes)
+    /// and commit_restore's marker rewinds the file plane so a later checkpoint
+    /// hashes to the cut; refuses on unknown cut / dangling manifest.
+    #[test]
+    fn do_store_plan_restore_reconciles_and_commit_restore_rewinds() {
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text("i1"),
+                    text("p"),
+                    text("ver_1"),
+                    int(0),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed instance");
+
+        // Record a mediated file write: capture the blob content-addressed and
+        // append the matching file.write.completed fact.derived event.
+        fn record_file_write(
+            store: &mut DoSqliteStore<super::test_support::RusqliteDoSql>,
+            key: &str,
+            path: &str,
+            body: &str,
+        ) {
+            let content_hash = store.put_content(body).expect("blob captures");
+            let payload = serde_json::json!({
+                "name": "file.write.completed",
+                "key": key,
+                "value": {
+                    "effect_id": key,
+                    "value": { "store": "workspace", "path": path, "content_hash": content_hash },
+                },
+            })
+            .to_string();
+            store
+                .append_event(NewEvent {
+                    instance_id: "i1",
+                    event_type: "fact.derived",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: None,
+                    correlation_id: None,
+                    idempotency_key: Some(key),
+                })
+                .expect("fact.derived appends");
+        }
+
+        record_file_write(&mut store, "w-a1", "a.txt", "A1");
+        record_file_write(&mut store, "w-b1", "b.txt", "B1");
+        let cut = store
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: "i1",
+                cut_id: "cut-1",
+                transcript_ref: Some("step-3"),
+                idempotency_key: Some("checkpoint-cut-1"),
+            })
+            .expect("checkpoint captures");
+        record_file_write(&mut store, "w-a2", "a.txt", "A2");
+        record_file_write(&mut store, "w-c1", "c.txt", "C1");
+
+        let plan = match store.plan_restore("i1", "cut-1").expect("plan resolves") {
+            RestoreDecision::Ready(plan) => plan,
+            RestoreDecision::Refused { reason } => panic!("unexpected refusal: {reason}"),
+        };
+        assert_eq!(plan.restored_to_sequence, cut.sequence);
+        assert_eq!(plan.writes.get("a.txt").map(String::as_str), Some("A1"));
+        assert_eq!(plan.writes.get("b.txt").map(String::as_str), Some("B1"));
+        assert_eq!(plan.removes, vec!["c.txt".to_owned()]);
+
+        store
+            .commit_restore("i1", plan.restored_to_sequence, "cut-1", Some("restore-1"))
+            .expect("restore commits");
+        let after = store
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: "i1",
+                cut_id: "cut-after",
+                transcript_ref: None,
+                idempotency_key: Some("checkpoint-after"),
+            })
+            .expect("post-restore checkpoint");
+        assert_eq!(
+            after.manifest_hash, cut.manifest_hash,
+            "the file plane rewound to the cut"
+        );
+
+        assert!(
+            matches!(
+                store.plan_restore("i1", "nope").expect("plan resolves"),
+                RestoreDecision::Refused { .. }
+            ),
+            "unknown cut refuses"
+        );
+    }
+
+    /// RC-4b DO mirror: an unbounded rebuild folds `context.restored` markers —
+    /// an effect committed after the cut but before the marker is abandoned;
+    /// post-restore work survives (models/maude/restore-replay.maude).
+    #[test]
+    fn do_store_rebuild_projections_honors_restore_marker() {
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text("i1"),
+                    text("p"),
+                    text("ver_1"),
+                    int(0),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed instance");
+
+        let effect_exists =
+            |store: &DoSqliteStore<super::test_support::RusqliteDoSql>, effect_id: &str| -> bool {
+                !store
+                    .sql
+                    .query(
+                        "SELECT 1 FROM effects WHERE effect_id = ?1",
+                        &[text(effect_id)],
+                    )
+                    .expect("effect count")
+                    .is_empty()
+            };
+        let max_sequence = |store: &DoSqliteStore<super::test_support::RusqliteDoSql>| -> i64 {
+            match &store
+                .sql
+                .query(
+                    "SELECT MAX(sequence) FROM events WHERE instance_id = ?1",
+                    &[text("i1")],
+                )
+                .expect("max sequence")[0][0]
+            {
+                SqlValue::Int(n) => *n,
+                other => panic!("expected integer sequence, got {other:?}"),
+            }
+        };
+        let commit = |store: &mut DoSqliteStore<super::test_support::RusqliteDoSql>,
+                      rule: &str,
+                      effect_id: &str,
+                      key: &str| {
+            let effects = [NewEffect {
+                effect_id,
+                kind: "queue.push",
+                target: None,
+                input_json: "{}",
+                status: "queued",
+                idempotency_key: key,
+                required_capabilities_json: "[]",
+                profile: None,
+                correlation_id: None,
+                source_span_json: None,
+                timeout_seconds: None,
+            }];
+            store
+                .commit_rule(RuleCommit {
+                    instance_id: "i1",
+                    rule,
+                    trigger_event_id: None,
+                    facts: &[],
+                    consumed_fact_ids: &[],
+                    effects: &effects,
+                    dependencies: &[],
+                    terminal: None,
+                    idempotency_key: Some(key),
+                })
+                .expect("commit");
+        };
+
+        commit(&mut store, "r.a", "eff_a", "c_a");
+        let cut = max_sequence(&store);
+        commit(&mut store, "r.b", "eff_b", "c_b");
+
+        let marker_payload = serde_json::json!({ "restored_to_sequence": cut }).to_string();
+        store
+            .append_event(NewEvent {
+                instance_id: "i1",
+                event_type: "context.restored",
+                payload_json: &marker_payload,
+                source: "restorable-context",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some("restore-marker-1"),
+            })
+            .expect("marker appends");
+        commit(&mut store, "r.c", "eff_c", "c_c");
+
+        store
+            .rebuild_projections("i1")
+            .expect("marker-aware rebuild");
+        assert!(effect_exists(&store, "eff_a"), "A survives the restore");
+        assert!(!effect_exists(&store, "eff_b"), "B abandoned by the marker");
+        assert!(
+            effect_exists(&store, "eff_c"),
+            "C (post-restore) stays live"
+        );
     }
 
     /// answer_inbox_item answers a pending item (guarded), records the

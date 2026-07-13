@@ -1,6 +1,6 @@
 workflow MemoryPoolDemo
 
-use memory
+use std.memory
 
 // MEM-1: a declared memory pool. `context limit` is the optional recall packing
 // budget; v1 pools are provider-less (provider selection is binding-owned).

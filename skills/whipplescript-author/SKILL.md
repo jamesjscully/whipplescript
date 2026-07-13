@@ -351,7 +351,7 @@ rule work_ready_item
 Package context with provenance:
 
 ```whip
-use memory
+use std.memory
 
 rule recall_before_work
   when WorkItem as item where item.status == "queued"

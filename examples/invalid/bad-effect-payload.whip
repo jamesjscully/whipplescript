@@ -39,9 +39,3 @@ rule bad_coerce
     "high"
   ) as review
 }
-
-rule bad_claim
-  when Task as task
-=> {
-  claim task.title with loft as claim
-}

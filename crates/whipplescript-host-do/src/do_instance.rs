@@ -9,7 +9,7 @@
 //!
 //! What is wired: the rule pass (`advance_rules`), ready-effect discovery
 //! (`next_ready_effect`), and `run_effect` dispatch of the lifted store-only
-//! handler cores over the DO store — `event.emit`, `loft.claim`, `human.ask`, the
+//! handler cores over the DO store — `event.emit`, `human.ask`, the
 //! `queue.*` family (via `WorkItems`), the lease/ledger/counter coordination family
 //! (via `Coordination`), and the `file.*` family (via the `FileStore` seam). The
 //! HTTP effects (coerce/agent) will suspend with `EffectStep::NeedsHttp` and be
@@ -21,16 +21,24 @@ use whipplescript_kernel::coerce::{CoerceRequest, CoerceResult, CoerceStatus};
 use whipplescript_kernel::coerce_native::{
     build_coerce_call_parts, build_request, parse_response, CoerceCall, CoerceProvider,
 };
+use whipplescript_kernel::context_assembly::{
+    render_project_context, BundleKind, BundleProvenance, ProjectInstruction,
+};
 use whipplescript_kernel::effect_config::EffectConfig;
 use whipplescript_kernel::effect_handlers::{
     run_capability_effect_generic, run_coordination_effect_generic, run_event_effect_generic,
     run_file_effect_generic, run_file_import_effect_generic, run_file_write_effect_generic,
-    run_human_effect_generic, run_loft_effect_generic, run_notify_effect_generic,
-    run_queue_effect_generic, CapabilityContract, DeliveryGovernance, FixtureCapabilityProvider,
+    run_human_effect_generic, run_notify_effect_generic, run_queue_effect_generic,
+    CapabilityContract, DeliveryGovernance, FixtureCapabilityProvider,
+};
+use whipplescript_kernel::exec_http::{
+    build_executor_exec_request, decode_cached_exec_result, exec_content_key, ingest_exec_stdout,
+    parse_executor_exec_response, settle_exec_http_result, ExecSettleContext,
 };
 use whipplescript_kernel::harness_loop::{
     provider_result_from_brokered_turn, BrokeredTurnInput, BrokeredTurnMachine,
-    BrokeredTurnSnapshot, ChatMessage, HttpModelClient, NoopCompactor, ToolExecutor,
+    BrokeredTurnOutcome, BrokeredTurnSnapshot, ChatMessage, HttpModelClient, NoopCompactor,
+    ToolExecutor, TurnStatus,
 };
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::rule_lowering::json_from_str;
@@ -42,7 +50,7 @@ use whipplescript_kernel::AgentTurnExecution;
 use whipplescript_kernel::{idempotency_key, CoerceExecution, RuntimeKernel};
 use whipplescript_parser::IrProgram;
 use whipplescript_store::files::FileStore;
-use whipplescript_store::{ClaimableEffect, RunStart, RuntimeStore, StoreError};
+use whipplescript_store::{ClaimableEffect, EvidenceRecord, RunStart, RuntimeStore, StoreError};
 
 /// Projected coerce provider credentials (the DO secrets plane supplies these; a
 /// live worker reads them from its bindings). Everything else the coerce HTTP
@@ -60,6 +68,33 @@ pub struct CoerceProviderConfig {
 }
 
 use crate::do_store::{do_load_agent_snapshot, do_save_agent_snapshot, DoSql, DoSqliteStore};
+
+/// Projected executor-sidecar wiring (compute plane P8): where Class-A exec
+/// effects go (the DO cannot spawn processes — exec is HTTP to the sidecar,
+/// DR-0033 Decision 7). `env_values` backs the script manifests' `env:`
+/// references (the DO secrets plane supplies them); `environment_epoch` is
+/// the delta-kernel cache's environment component (the workspace image
+/// digest once the container tier wires it).
+pub struct ExecutorSidecarConfig {
+    pub base_url: String,
+    pub env_values: std::collections::BTreeMap<String, String>,
+    pub environment_epoch: String,
+    pub timeout_ms: Option<u64>,
+    pub auth_token: Option<String>,
+}
+
+/// Projected Class-B turn-container wiring (compute plane P8): when present,
+/// agent turns run WHOLE inside a per-turn container over `whip-turn/1`
+/// (v1 = the blocking `POST /turn` form; the shell routes the sentinel host
+/// to a per-turn container instance). `provider` is the provider-config JSON
+/// forwarded verbatim to the container ({"provider":"fixture"} runs
+/// credential-free).
+pub struct TurnContainerConfig {
+    pub base_url: String,
+    pub provider: serde_json::Value,
+    pub max_steps: u64,
+    pub auth_token: Option<String>,
+}
 
 /// Drives a workflow instance's rule pass + effect discovery on the durable object.
 pub struct DoInstanceDriver<'a, Sql: DoSql> {
@@ -79,6 +114,12 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     /// Executes tool calls the model requests within a turn (nested effects). A live
     /// DO brokers these as HTTP to a sidecar; tests inject a fake.
     pub agent_tools: &'a dyn ToolExecutor,
+    /// Executor-sidecar wiring for Class-A exec effects (compute plane P8), or
+    /// `None` if no sidecar is configured (an `exec.command` then errors).
+    pub exec: Option<&'a ExecutorSidecarConfig>,
+    /// Class-B turn-container wiring: when present, agent turns run whole in
+    /// a per-turn container instead of the in-DO brokered machine.
+    pub turn: Option<&'a TurnContainerConfig>,
     pub ir: &'a IrProgram,
     pub instance_id: &'a str,
 }
@@ -129,6 +170,46 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
             .next())
     }
 
+    fn advance_time(&mut self, now: &str) -> Result<(), StoreError> {
+        // The lifted due-time passes (DR-0033 Phase 6): complete due timers,
+        // expire deadline-passed effects, and fire due clock-source
+        // occurrences as durable signal facts — the same passes the native
+        // dev loop runs, over the DO's threaded store. `now` is injected.
+        whipplescript_kernel::time_pass::resolve_due_time_effects(
+            &mut self.kernel,
+            self.instance_id,
+            now,
+        )?;
+        whipplescript_kernel::time_pass::resolve_due_clock_sources(
+            &mut self.kernel,
+            self.instance_id,
+            now,
+            self.ir,
+        )?;
+        Ok(())
+    }
+
+    fn next_due_unix_ms(&mut self, now: &str) -> Result<Option<i64>, StoreError> {
+        // The earliest of: pending timed effects (creation-anchored timeouts
+        // + explicit deadlines) and the next clock-source occurrence.
+        let effect_due = self
+            .kernel
+            .store()
+            .next_effect_due_epoch_ms(self.instance_id)?;
+        let clock_due = whipplescript_kernel::time_pass::next_clock_due_unix_ms(
+            &mut self.kernel,
+            self.instance_id,
+            now,
+            self.ir,
+        )?;
+        Ok(match (effect_due, clock_due) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        })
+    }
+
     fn run_effect(
         &mut self,
         effect: &ClaimableEffect,
@@ -146,9 +227,6 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
         let event = match effect.kind.as_str() {
             "event.emit" => {
                 run_event_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
-            }
-            "loft.claim" => {
-                run_loft_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
             }
             "human.ask" => {
                 run_human_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
@@ -171,6 +249,138 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
             // BrokeredTurnMachine one provider call, persisting its snapshot so an
             // eviction between fetches loses nothing (snapshot/restore); on the final
             // reply the outcome settles through the shared kernel seam.
+            // Class-B (compute plane P8): with a turn container configured,
+            // the WHOLE agent turn runs in a per-turn container — one
+            // blocking whip-turn/1 round; dispatch is idempotent (a re-sent
+            // start re-attaches to the same turn in the container registry),
+            // so an eviction mid-await recovers by re-entering this arm.
+            "agent.tell" if self.turn.is_some() => {
+                let cfg = self.turn.expect("guarded by arm pattern");
+                let input = json_from_str(&effect.input_json);
+                let prompt = input
+                    .get("prompt")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "agent-run"]);
+                let lease_id =
+                    idempotency_key(&[self.instance_id, &effect.effect_id, "agent-lease"]);
+                match incoming {
+                    None => {
+                        self.kernel.start_run(RunStart {
+                            instance_id: self.instance_id,
+                            effect_id: &effect.effect_id,
+                            run_id: &run_id,
+                            provider: "agent",
+                            worker_id: "whip-turn-container",
+                            lease_id: &lease_id,
+                            lease_expires_at: "2030-01-01T00:00:00Z",
+                            metadata_json: r#"{"class":"B"}"#,
+                        })?;
+                        let mut headers =
+                            vec![("content-type".to_owned(), "application/json".to_owned())];
+                        if let Some(token) = &cfg.auth_token {
+                            headers.push(("authorization".to_owned(), format!("Bearer {token}")));
+                        }
+                        let request = whipplescript_kernel::sansio::HttpRequest {
+                            url: format!("{}/turn", cfg.base_url.trim_end_matches('/')),
+                            headers,
+                            body: serde_json::json!({
+                                "protocol": "whip-turn/1",
+                                "turn_id": effect.effect_id,
+                                "provider": cfg.provider,
+                                "user": prompt,
+                                "tools": "file",
+                                "max_steps": cfg.max_steps,
+                            }),
+                        };
+                        return Ok(EffectStep::NeedsHttp(request));
+                    }
+                    Some(resumed) => {
+                        let outcome = match resumed {
+                            Ok(response) if response.status == 200 => {
+                                let outcome = response
+                                    .body
+                                    .get("outcome")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                let status = match outcome
+                                    .get("status")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("failed")
+                                {
+                                    "completed" => TurnStatus::Completed,
+                                    "timed_out" => TurnStatus::TimedOut,
+                                    "cancelled" => TurnStatus::Cancelled,
+                                    _ => TurnStatus::Failed,
+                                };
+                                BrokeredTurnOutcome {
+                                    status,
+                                    summary: outcome
+                                        .get("summary")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                    steps: outcome
+                                        .get("steps")
+                                        .and_then(|value| value.as_u64())
+                                        .unwrap_or(0)
+                                        as usize,
+                                    observations: Vec::new(),
+                                    usage: outcome
+                                        .get("usage")
+                                        .cloned()
+                                        .unwrap_or_else(|| serde_json::json!({})),
+                                    pending_human_ask: None,
+                                }
+                            }
+                            Ok(response) => BrokeredTurnOutcome {
+                                status: TurnStatus::Failed,
+                                summary: format!(
+                                    "turn container returned status {}: {}",
+                                    response.status,
+                                    response
+                                        .body
+                                        .get("error")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or("no detail")
+                                ),
+                                steps: 0,
+                                observations: Vec::new(),
+                                usage: serde_json::json!({}),
+                                pending_human_ask: None,
+                            },
+                            Err(transport) => BrokeredTurnOutcome {
+                                status: TurnStatus::Failed,
+                                summary: format!("turn container transport error: {transport:?}"),
+                                steps: 0,
+                                observations: Vec::new(),
+                                usage: serde_json::json!({}),
+                                pending_human_ask: None,
+                            },
+                        };
+                        let result = provider_result_from_brokered_turn(&outcome);
+                        let execution = AgentTurnExecution {
+                            instance_id: self.instance_id,
+                            effect_id: &effect.effect_id,
+                            run_id: &run_id,
+                            provider: "agent",
+                            worker_id: "whip-turn-container",
+                            lease_id: &lease_id,
+                            lease_expires_at: "2030-01-01T00:00:00Z",
+                            agent: "agent",
+                            profile: None,
+                            input_json: &effect.input_json,
+                            skill_names: &[],
+                        };
+                        self.kernel.settle_provider_run_result(
+                            execution,
+                            r#"{"class":"B"}"#,
+                            &result,
+                        )?
+                    }
+                }
+            }
             "agent.tell" => {
                 let model = self.agent_model.ok_or_else(|| {
                     StoreError::Conflict(
@@ -183,15 +393,47 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     .and_then(|value| value.as_str())
                     .unwrap_or_default()
                     .to_owned();
+                // Store-backed project instructions (context-assembly Phase 3
+                // item 4): the DO has no filesystem, so AGENTS.md/CLAUDE.md
+                // content registered at deploy resolves from the store — the
+                // same wrapper bytes the native fs path injects.
+                let docs = self.kernel.store().list_project_context_docs()?;
+                let (system, context_bundles) = if docs.is_empty() {
+                    ("You are a WhippleScript agent.".to_owned(), Vec::new())
+                } else {
+                    let instructions: Vec<ProjectInstruction> = docs
+                        .iter()
+                        .map(|doc| ProjectInstruction {
+                            path: doc.path.clone(),
+                            content: doc.body.clone(),
+                        })
+                        .collect();
+                    let block = render_project_context(&instructions);
+                    let bundles = docs
+                        .iter()
+                        .map(|doc| BundleProvenance {
+                            kind: BundleKind::ProjectContext,
+                            source: doc.path.clone(),
+                            version: String::new(),
+                            content_hash: doc.content_hash.clone(),
+                        })
+                        .collect();
+                    (
+                        format!("You are a WhippleScript agent.\n\n{block}"),
+                        bundles,
+                    )
+                };
                 let turn_input = BrokeredTurnInput {
-                    system: "You are a WhippleScript agent.".to_owned(),
+                    system,
                     user: prompt,
-                    tools: Vec::new(),
+                    // P4: the DO agent turn advertises the in-isolate tool set
+                    // (read/write/edit/ls/find/grep/recall + the tracker todos),
+                    // brokered by the `DoToolExecutor` over the DO file plane.
+                    tools: crate::do_tools::do_tool_specs(),
                     max_steps: 8,
                     resume_from: Vec::new(),
                     user_images: Vec::new(),
-                    // DO agent stub: no context assembler yet, so no bundle rows.
-                    context_bundles: Vec::new(),
+                    context_bundles,
                     pinned_skills: Vec::new(),
                 };
                 let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "agent-run"]);
@@ -209,11 +451,33 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                         lease_expires_at: "2030-01-01T00:00:00Z",
                         metadata_json: "{}",
                     })?;
+                    // Context-assembly Phase 1 seam: one context.bundle row per
+                    // assembled bundle, fresh starts only (resume must not
+                    // duplicate) — same discipline as the native owned turn.
+                    for bundle in &turn_input.context_bundles {
+                        let metadata = serde_json::json!({
+                            "kind": bundle.kind.tag(),
+                            "source": bundle.source,
+                            "version": bundle.version,
+                            "content_hash": bundle.content_hash,
+                        })
+                        .to_string();
+                        self.kernel.store_mut().record_evidence(EvidenceRecord {
+                            instance_id: self.instance_id,
+                            kind: "context.bundle",
+                            subject_type: "run",
+                            subject_id: &run_id,
+                            causation_id: None,
+                            correlation_id: Some(&effect.effect_id),
+                            summary: Some(bundle.kind.tag()),
+                            metadata_json: &metadata,
+                        })?;
+                    }
                 }
                 let mut discard = |_: &[ChatMessage]| {};
-                // The DO agent turn is still a no-tools stub; conversation compaction
-                // (context-assembly Phase 4 Layer B) lands with the DO agent-tool
-                // executor, so drive the machine with the no-op compactor for now.
+                // The DO agent turn now brokers a real in-isolate tool set (P4);
+                // conversation compaction (context-assembly Phase 4 Layer B) is a
+                // separate lift, so drive the machine with the no-op compactor for now.
                 let compactor = NoopCompactor;
                 let mut machine = match loaded {
                     None => BrokeredTurnMachine::new(
@@ -296,6 +560,11 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "coerce-run"]);
                 let lease_id =
                     idempotency_key(&[self.instance_id, &effect.effect_id, "coerce-lease"]);
+                // Stable per-effect `Idempotency-Key` (DR-0033): identical across a
+                // resume of this coerce effect so OpenAI/codex dedupe the resumed
+                // provider call after a worker eviction. Derived here where the
+                // effect identity (instance_id + effect_id) is in scope.
+                let idem_key = idempotency_key(&[self.instance_id, &effect.effect_id, "coerce"]);
                 let request = CoerceRequest {
                     function_name,
                     arguments_json: arguments.to_string(),
@@ -327,6 +596,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             schema_name: &schema_name,
                             max_tokens: cfg.max_tokens,
                             codex: None,
+                            idempotency_key: &idem_key,
                         };
                         return Ok(EffectStep::NeedsHttp(build_request(&call)));
                     }
@@ -361,6 +631,202 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             model: None,
                         };
                         self.kernel.settle_coerce_result(execution, &result)?
+                    }
+                }
+            }
+            // Class-A exec (compute plane P8): the DO cannot spawn processes,
+            // so a script-capability exec is one `whip-executor/1` HTTP round
+            // to the sidecar — with the delta-kernel result cache consulted
+            // first (a hit settles without any HTTP at all).
+            "exec.command" => {
+                let cfg = self.exec.ok_or_else(|| {
+                    StoreError::Conflict(
+                        "executor sidecar is not configured on this durable object".to_owned(),
+                    )
+                })?;
+                let input = json_from_str(&effect.input_json);
+                let mode = input
+                    .get("mode")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("raw");
+                if mode != "capability" {
+                    return Err(StoreError::Conflict(
+                        "raw exec is not allowed on the durable object; declare a script \
+                         capability"
+                            .to_owned(),
+                    ));
+                }
+                let capability = input
+                    .get("capability")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                let parse_contract = input.get("parse").cloned();
+                let stdin = input
+                    .get("stdin")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let stdin_json = stdin.to_string();
+                let script = self
+                    .kernel
+                    .store()
+                    .get_script_capability(&capability)?
+                    .ok_or_else(|| {
+                        StoreError::Conflict(format!(
+                            "script capability `{capability}` is not registered in the store"
+                        ))
+                    })?;
+                let argv: Vec<String> =
+                    serde_json::from_str(&script.argv_json).map_err(|error| {
+                        StoreError::Conflict(format!(
+                            "script capability `{capability}` argv is invalid: {error}"
+                        ))
+                    })?;
+                let env_refs: std::collections::BTreeMap<String, String> =
+                    serde_json::from_str(&script.env_json).map_err(|error| {
+                        StoreError::Conflict(format!(
+                            "script capability `{capability}` env is invalid: {error}"
+                        ))
+                    })?;
+                let mut resolved_env = Vec::new();
+                for (name, reference) in env_refs {
+                    let Some(env_name) = reference.strip_prefix("env:") else {
+                        return Err(StoreError::Conflict(format!(
+                            "script capability `{capability}` env `{name}` must use an env: \
+                             reference"
+                        )));
+                    };
+                    let value = cfg.env_values.get(env_name).ok_or_else(|| {
+                        StoreError::Conflict(format!(
+                            "script capability `{capability}` requires `{env_name}`, which the \
+                             executor config does not supply"
+                        ))
+                    })?;
+                    resolved_env.push((name, value.clone()));
+                }
+                let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "exec-run"]);
+                let lease_id =
+                    idempotency_key(&[self.instance_id, &effect.effect_id, "exec-lease"]);
+                let content_key = script.hermetic.then(|| {
+                    exec_content_key(
+                        &script.sha256,
+                        &argv,
+                        &resolved_env,
+                        &cfg.environment_epoch,
+                        &stdin_json,
+                        &parse_contract,
+                    )
+                });
+                let ingest_schema = parse_contract
+                    .as_ref()
+                    .and_then(|contract| contract.get("schema"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("json")
+                    .to_owned();
+                match incoming {
+                    None => {
+                        self.kernel.start_run(RunStart {
+                            instance_id: self.instance_id,
+                            effect_id: &effect.effect_id,
+                            run_id: &run_id,
+                            provider: "exec",
+                            worker_id: "whip-exec",
+                            lease_id: &lease_id,
+                            lease_expires_at: "2030-01-01T00:00:00Z",
+                            metadata_json: &serde_json::json!({
+                                "mode": "capability", "capability": capability,
+                            })
+                            .to_string(),
+                        })?;
+                        // Delta-kernel cache: a hit settles right here — no
+                        // container wakes, no HTTP round.
+                        if let Some(key) = &content_key {
+                            if let Some(hit) = self
+                                .kernel
+                                .store()
+                                .lookup_compute_result(key)?
+                                .and_then(|entry| decode_cached_exec_result(&entry.result_json))
+                            {
+                                let ctx = ExecSettleContext {
+                                    instance_id: self.instance_id,
+                                    effect_id: &effect.effect_id,
+                                    run_id: &run_id,
+                                    capability: &capability,
+                                    script_sha256: &script.sha256,
+                                    cache: Some((key, true)),
+                                    ingest_schema: &ingest_schema,
+                                };
+                                let event =
+                                    settle_exec_http_result(&mut self.kernel, &ctx, Ok(hit))?;
+                                return Ok(EffectStep::Done(event));
+                            }
+                        }
+                        let mut request = build_executor_exec_request(
+                            &cfg.base_url,
+                            &effect.effect_id,
+                            &script.sha256,
+                            &script.body,
+                            &argv,
+                            &resolved_env,
+                            &stdin,
+                            cfg.timeout_ms,
+                        )
+                        .map_err(StoreError::Conflict)?;
+                        if let Some(token) = &cfg.auth_token {
+                            request
+                                .headers
+                                .push(("authorization".to_owned(), format!("Bearer {token}")));
+                        }
+                        return Ok(EffectStep::NeedsHttp(request));
+                    }
+                    resumed => {
+                        let outcome = match resumed {
+                            Some(Ok(response)) => match parse_executor_exec_response(&response) {
+                                Ok(result) if result.timed_out => Err((
+                                    Some((result.exit_code, result.stdout, result.stderr)),
+                                    "exec command timed out on the executor sidecar".to_owned(),
+                                )),
+                                Ok(result) if result.exit_code != 0 => Err((
+                                    Some((result.exit_code, result.stdout.clone(), result.stderr)),
+                                    format!("exec command exited with status {}", result.exit_code),
+                                )),
+                                Ok(result) => match &parse_contract {
+                                    Some(contract) => {
+                                        match ingest_exec_stdout(contract, &result.stdout) {
+                                            Ok(ingested) => Ok((
+                                                result.exit_code,
+                                                result.stdout,
+                                                result.stderr,
+                                                Some(ingested),
+                                            )),
+                                            Err(reason) => Err((
+                                                Some((
+                                                    result.exit_code,
+                                                    result.stdout,
+                                                    result.stderr,
+                                                )),
+                                                reason,
+                                            )),
+                                        }
+                                    }
+                                    None => {
+                                        Ok((result.exit_code, result.stdout, result.stderr, None))
+                                    }
+                                },
+                                Err(reason) => Err((None, reason)),
+                            },
+                            other => Err((None, format!("executor transport error: {other:?}"))),
+                        };
+                        let ctx = ExecSettleContext {
+                            instance_id: self.instance_id,
+                            effect_id: &effect.effect_id,
+                            run_id: &run_id,
+                            capability: &capability,
+                            script_sha256: &script.sha256,
+                            cache: content_key.as_deref().map(|key| (key, false)),
+                            ingest_schema: &ingest_schema,
+                        };
+                        settle_exec_http_result(&mut self.kernel, &ctx, outcome)?
                     }
                 }
             }
@@ -451,6 +917,9 @@ mod tests {
         fn append(&self, _path: &std::path::Path, _bytes: &[u8]) -> std::io::Result<()> {
             Err(std::io::Error::other("no files in this test"))
         }
+        fn remove(&self, _path: &std::path::Path) -> std::io::Result<()> {
+            Err(std::io::Error::other("no files in this test"))
+        }
     }
 
     // The DO drives an effect-free workflow's rule pass to its terminal through the
@@ -504,6 +973,8 @@ mod tests {
             coerce: None,
             agent_model: None,
             agent_tools: &NoTools,
+            exec: None,
+            turn: None,
             ir: &ir,
             instance_id: &instance_id,
         };
@@ -540,6 +1011,223 @@ mod tests {
                 }),
             }))
         }
+    }
+
+    // Class-A exec over the sidecar (compute plane P8): the first exec builds a
+    // `whip-executor/1` request and suspends on HTTP; settling records the
+    // delta-kernel cache entry; an identical second exec settles from the cache
+    // with NO HTTP round at all.
+    #[test]
+    fn do_instance_driver_execs_over_the_sidecar_and_serves_the_second_from_cache() {
+        use whipplescript_kernel::exec_http;
+        use whipplescript_store::{NewEffect, RuleCommit, ScriptCapabilityRegistration};
+
+        let source = "workflow ExecJudge\n\noutput result Verdict\n\n\
+             class Verdict {\n  ok int\n}\n";
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("exec program compiles");
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('script.judge', 'Run an operator-pinned script capability.', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_script_judge', NULL, 'script.judge', 'builtin-script', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed script capability");
+        }
+        let script_body = "read line\necho '{\"verdict\":\"pass\"}'\n";
+        let script_sha = exec_http::sha256_hex(script_body.as_bytes());
+        store
+            .register_script_capability(ScriptCapabilityRegistration {
+                name: "judge",
+                argv_json: r#"["sh", "{script}"]"#,
+                sha256: &script_sha,
+                env_json: "{}",
+                hermetic: true,
+                body: script_body,
+            })
+            .expect("register script");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: "src-exec",
+                    ir_hash: "ir-exec",
+                    compiler_version: "test",
+                },
+                &ir,
+            )
+            .expect("program version");
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/ExecJudge",
+                    effective_authority_json: "{}",
+                },
+            )
+            .expect("instance");
+        let effect_input = serde_json::json!({
+            "mode": "capability",
+            "capability": "judge",
+            "stdin": {"n": 1},
+        })
+        .to_string();
+        let effects = [
+            NewEffect {
+                effect_id: "exec-1",
+                kind: "exec.command",
+                target: None,
+                input_json: &effect_input,
+                status: "queued",
+                idempotency_key: "rule=go;effect=exec-1",
+                required_capabilities_json: r#"["script.judge"]"#,
+                profile: None,
+                correlation_id: None,
+                source_span_json: None,
+                timeout_seconds: None,
+            },
+            NewEffect {
+                effect_id: "exec-2",
+                kind: "exec.command",
+                target: None,
+                input_json: &effect_input,
+                status: "queued",
+                idempotency_key: "rule=go;effect=exec-2",
+                required_capabilities_json: r#"["script.judge"]"#,
+                profile: None,
+                correlation_id: None,
+                source_span_json: None,
+                timeout_seconds: None,
+            },
+        ];
+        kernel
+            .store_mut()
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "go",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-go"),
+            })
+            .expect("commit exec effects");
+
+        let exec_cfg = ExecutorSidecarConfig {
+            base_url: "http://executor:8080".to_owned(),
+            env_values: std::collections::BTreeMap::new(),
+            environment_epoch: "test-epoch".to_owned(),
+            timeout_ms: Some(10_000),
+            auth_token: None,
+        };
+        let mut driver = DoInstanceDriver {
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            agent_model: None,
+            agent_tools: &NoTools,
+            exec: Some(&exec_cfg),
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+        };
+        let claimable = |effect_id: &str| ClaimableEffect {
+            effect_id: effect_id.to_owned(),
+            kind: "exec.command".to_owned(),
+            target: None,
+            profile: None,
+            input_json: effect_input.clone(),
+            required_capabilities_json: r#"["script.judge"]"#.to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        };
+
+        // First exec: builds the whip-executor/1 request and suspends on HTTP.
+        let step = driver
+            .run_effect(&claimable("exec-1"), None)
+            .expect("first exec prepares");
+        let request = match step {
+            EffectStep::NeedsHttp(request) => request,
+            other => panic!("expected NeedsHttp, got {other:?}"),
+        };
+        assert_eq!(request.url, "http://executor:8080/exec");
+        assert_eq!(
+            request.body["protocol"],
+            serde_json::json!(exec_http::EXECUTOR_PROTOCOL)
+        );
+        assert_eq!(request.body["script_sha256"], serde_json::json!(script_sha));
+        assert_eq!(request.body["script_index"], serde_json::json!(1));
+        assert_eq!(
+            exec_http::base64_decode(request.body["script_b64"].as_str().expect("b64"))
+                .expect("decodes"),
+            script_body.as_bytes()
+        );
+
+        // Resume with the sidecar's canned response: the effect settles.
+        let response = HttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                "protocol": exec_http::EXECUTOR_PROTOCOL,
+                "effect_id": "exec-1",
+                "exit_code": 0,
+                "timed_out": false,
+                "stdout": "{\"verdict\":\"pass\"}\n",
+                "stderr": "",
+            }),
+        };
+        let step = driver
+            .run_effect(&claimable("exec-1"), Some(Ok(response)))
+            .expect("first exec settles");
+        assert!(matches!(step, EffectStep::Done(_)), "{step:?}");
+
+        // Second identical exec: served from the delta-kernel cache — DONE
+        // immediately on prepare, no HTTP round.
+        let step = driver
+            .run_effect(&claimable("exec-2"), None)
+            .expect("second exec settles from cache");
+        assert!(
+            matches!(step, EffectStep::Done(_)),
+            "expected a cache-hit settle with no HTTP, got {step:?}"
+        );
+
+        let runs = driver.kernel.store().list_runs(&instance_id).expect("runs");
+        let meta_for = |effect_id: &str| {
+            serde_json::from_str::<serde_json::Value>(
+                &runs
+                    .iter()
+                    .find(|run| run.effect_id == effect_id)
+                    .unwrap_or_else(|| panic!("run for {effect_id}"))
+                    .metadata_json,
+            )
+            .expect("metadata json")
+        };
+        let first = meta_for("exec-1");
+        let second = meta_for("exec-2");
+        assert_eq!(first["cache"]["hit"], serde_json::json!(false), "{first}");
+        assert_eq!(second["cache"]["hit"], serde_json::json!(true), "{second}");
+        assert_eq!(
+            first["cache"]["content_key"],
+            second["cache"]["content_key"]
+        );
+        assert_eq!(first["stdout"], second["stdout"]);
+        assert_eq!(first["sha256"], serde_json::json!(script_sha));
+
+        let content_key = first["cache"]["content_key"]
+            .as_str()
+            .expect("content key")
+            .to_owned();
+        let entry = driver
+            .kernel
+            .store()
+            .lookup_compute_result(&content_key)
+            .expect("cache lookup")
+            .expect("cache entry");
+        assert_eq!(entry.source_effect_id, "exec-1");
     }
 
     // The architectural crux (DR-0033): a coerce HTTP effect SUSPENDS the instance
@@ -609,6 +1297,8 @@ mod tests {
             coerce: Some(&cfg),
             agent_model: None,
             agent_tools: &NoTools,
+            exec: None,
+            turn: None,
             ir: &ir,
             instance_id: &instance_id,
         };
@@ -719,6 +1409,8 @@ mod tests {
             coerce: None,
             agent_model: Some(&model),
             agent_tools: &NoTools,
+            exec: None,
+            turn: None,
             ir: &ir,
             instance_id: &instance_id,
         };
@@ -738,6 +1430,152 @@ mod tests {
         assert_eq!(status.instance.status, "completed");
     }
 
+    /// Store-backed project instructions (context-assembly Phase 3 item 4):
+    /// docs registered in the DO store ride into the agent turn's system prompt
+    /// with pi's exact wrapper, and each doc records a `context.bundle`
+    /// provenance row through the Phase 1 seam.
+    #[test]
+    fn do_agent_turn_injects_store_backed_project_context() {
+        use std::cell::RefCell;
+
+        /// A fake model that captures the system prompt it was asked to send.
+        struct CapturingModel {
+            systems: RefCell<Vec<String>>,
+        }
+        impl HttpModelClient for CapturingModel {
+            fn build_request(
+                &self,
+                messages: &[ChatMessage],
+                _tools: &[whipplescript_kernel::harness_loop::ToolSpec],
+            ) -> whipplescript_kernel::sansio::HttpRequest {
+                for message in messages {
+                    if let ChatMessage::System(system) = message {
+                        self.systems.borrow_mut().push(system.clone());
+                    }
+                }
+                whipplescript_kernel::sansio::HttpRequest {
+                    url: "https://provider/agent".to_owned(),
+                    headers: Vec::new(),
+                    body: serde_json::json!({}),
+                }
+            }
+            fn parse_response(
+                &self,
+                _response: Result<HttpResponse, TransportError>,
+            ) -> Result<
+                whipplescript_kernel::harness_loop::ModelReply,
+                whipplescript_kernel::harness_loop::HarnessModelError,
+            > {
+                Ok(whipplescript_kernel::harness_loop::ModelReply {
+                    text: "done".to_owned(),
+                    tool_calls: Vec::new(),
+                    usage: Default::default(),
+                })
+            }
+        }
+
+        let source = "workflow AgentDemo\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             agent helper {\n  provider owned\n  profile \"repo-reader\"\n  capacity 1\n}\n\n\
+             rule go\n  when started\n=> {\n  tell helper as reply \"\"\"\n  Do the thing.\n  \"\"\"\n\n\
+             \x20 after reply succeeds {\n    complete result { ok 1 }\n  }\n\n\
+             \x20 after reply fails {\n    complete result { ok 0 }\n  }\n}\n";
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("agent program compiles");
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('agent.tell', 'Run an agent turn.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+            "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) \
+             VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed agent provider");
+        }
+        store
+            .register_project_context_doc(0, "repo/AGENTS.md", "Always be excellent.")
+            .expect("doc registers");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: "src",
+                    ir_hash: "ir",
+                    compiler_version: "test",
+                },
+                &ir,
+            )
+            .expect("program version");
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/AgentDemo",
+                    effective_authority_json: "{}",
+                },
+            )
+            .expect("instance");
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .expect("start event");
+
+        let model = CapturingModel {
+            systems: RefCell::new(Vec::new()),
+        };
+        let driver = DoInstanceDriver {
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            agent_model: Some(&model),
+            agent_tools: &NoTools,
+            exec: None,
+            turn: None,
+            ir: &ir,
+            instance_id: &instance_id,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &OkHost);
+        assert!(
+            matches!(outcome, InstanceOutcome::Terminal),
+            "turn completes: {outcome:?}"
+        );
+
+        // The system prompt carried the store-resolved project context in pi's
+        // exact wrapper.
+        let systems = model.systems.borrow();
+        let system = systems.first().expect("a model round ran");
+        assert!(
+            system.contains("<project_instructions path=\"repo/AGENTS.md\">"),
+            "{system}"
+        );
+        assert!(system.contains("Always be excellent."), "{system}");
+
+        // One context.bundle provenance row rode the Phase 1 seam.
+        let driver = machine.into_driver();
+        let evidence = driver
+            .kernel
+            .store()
+            .list_evidence(&instance_id)
+            .expect("evidence");
+        let bundles: Vec<_> = evidence
+            .iter()
+            .filter(|row| row.kind == "context.bundle")
+            .collect();
+        assert_eq!(bundles.len(), 1, "one project-context bundle row");
+        assert!(
+            bundles[0].metadata_json.contains("project_context")
+                && bundles[0].metadata_json.contains("repo/AGENTS.md"),
+            "{}",
+            bundles[0].metadata_json
+        );
+    }
+
     /// A host that answers any request with a 200 (the fake model ignores the body).
     struct OkHost;
     impl HostDriver for OkHost {
@@ -747,5 +1585,135 @@ mod tests {
                 body: serde_json::json!({}),
             }))
         }
+    }
+
+    /// A canned Class-B turn container: asserts the whip-turn/1 start
+    /// request shape and answers the blocking form's final outcome.
+    struct TurnContainerHost;
+    impl HostDriver for TurnContainerHost {
+        fn fulfill(&self, request: &IoRequest) -> IoResult {
+            let IoRequest::Http(request) = request;
+            assert!(request.url.ends_with("/turn"), "{}", request.url);
+            assert_eq!(request.body["protocol"], serde_json::json!("whip-turn/1"));
+            assert_eq!(request.body["tools"], serde_json::json!("file"));
+            assert_eq!(
+                request.body["provider"]["provider"],
+                serde_json::json!("fixture")
+            );
+            let turn_id = request.body["turn_id"]
+                .as_str()
+                .expect("turn_id")
+                .to_owned();
+            IoResult::Http(Ok(HttpResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "protocol": "whip-turn/1",
+                    "turn_id": turn_id,
+                    "resumed": false,
+                    "outcome": {
+                        "status": "completed",
+                        "summary": "container turn complete",
+                        "steps": 2,
+                        "usage": {"input_tokens": 5, "output_tokens": 7},
+                    },
+                }),
+            }))
+        }
+    }
+
+    // Class-B (compute plane P8): with a turn container configured, the agent
+    // turn dispatches WHOLE to the per-turn container over whip-turn/1 and the
+    // delivered outcome settles through settle_provider_run_result.
+    #[test]
+    fn do_instance_driver_runs_an_agent_turn_in_a_turn_container() {
+        let source = "workflow AgentDemo\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             agent helper {\n  provider owned\n  profile \"repo-reader\"\n  capacity 1\n}\n\n\
+             rule go\n  when started\n=> {\n  tell helper as reply \"\"\"\n  Do the thing.\n  \"\"\"\n\n\
+             \x20 after reply succeeds {\n    complete result { ok 1 }\n  }\n\n\
+             \x20 after reply fails {\n    complete result { ok 0 }\n  }\n}\n";
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("agent program compiles");
+        let store = store();
+        for stmt in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('agent.tell', 'Run an agent turn.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+            "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) \
+             VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
+        ] {
+            store.sql.execute(stmt, &[]).expect("seed agent provider");
+        }
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: "src-turn",
+                    ir_hash: "ir-turn",
+                    compiler_version: "test",
+                },
+                &ir,
+            )
+            .expect("program version");
+        let instance_id = kernel
+            .create_instance_with_authority(
+                &version,
+                "{}",
+                NewInstanceAuthority {
+                    workflow_principal: "local/AgentDemo",
+                    effective_authority_json: "{}",
+                },
+            )
+            .expect("instance");
+        kernel
+            .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
+            .expect("start event");
+
+        let turn_cfg = TurnContainerConfig {
+            base_url: "http://turn".to_owned(),
+            provider: serde_json::json!({"provider": "fixture"}),
+            max_steps: 8,
+            auth_token: None,
+        };
+        let driver = DoInstanceDriver {
+            kernel,
+            files: &NoFiles,
+            coerce: None,
+            // No in-DO model configured: the container owns the turn.
+            agent_model: None,
+            agent_tools: &NoTools,
+            exec: None,
+            turn: Some(&turn_cfg),
+            ir: &ir,
+            instance_id: &instance_id,
+        };
+        let mut machine = InstanceStepMachine::new(driver);
+        let outcome = run_to_completion(&mut machine, &TurnContainerHost);
+        assert!(
+            matches!(outcome, InstanceOutcome::Terminal),
+            "the container turn settles to a terminal: {outcome:?}"
+        );
+        let driver = machine.into_driver();
+        let status = driver
+            .kernel
+            .store()
+            .status(&instance_id)
+            .expect("status")
+            .expect("instance row");
+        assert_eq!(status.instance.status, "completed");
+
+        // The settle carries the container's outcome (summary + usage) on the
+        // run, and the worker id marks the Class-B path.
+        let runs = driver.kernel.store().list_runs(&instance_id).expect("runs");
+        let run = runs
+            .iter()
+            .find(|run| run.worker_id == "whip-turn-container")
+            .expect("class-B run row");
+        assert_eq!(run.status, "completed");
     }
 }

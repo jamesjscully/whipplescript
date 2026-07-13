@@ -308,8 +308,12 @@ fn build_request(
         CoerceProvider::Anthropic => {
             // Anthropic caches by prefix hash via `cache_control` breakpoints, so
             // the stable-key intent (Decision 7) is carried by the breakpoint, not
-            // an explicit key.
-            build_anthropic_request(base_url, api_key, model, max_tokens, messages, tools)
+            // an explicit key. The `cache_key` still rides as an `Idempotency-Key`
+            // header (DR-0033) — harmless to Anthropic (an unknown request header
+            // is ignored), and correct for any provider that dedupes on it.
+            build_anthropic_request(
+                base_url, api_key, model, max_tokens, cache_key, messages, tools,
+            )
         }
         CoerceProvider::OpenAi => {
             build_openai_request(base_url, api_key, model, cache_key, messages, tools)
@@ -322,6 +326,7 @@ fn build_anthropic_request(
     api_key: &str,
     model: &str,
     max_tokens: u64,
+    cache_key: Option<&str>,
     messages: &[ChatMessage],
     tools: &[ToolSpec],
 ) -> HttpRequest {
@@ -356,13 +361,20 @@ fn build_anthropic_request(
     }
     body.insert("messages".into(), json!(msgs));
     body.insert("tools".into(), json!(tool_defs));
+    let mut headers = vec![
+        ("x-api-key".into(), api_key.to_owned()),
+        ("anthropic-version".into(), "2023-06-01".into()),
+        ("content-type".into(), "application/json".into()),
+    ];
+    if let Some(key) = cache_key {
+        // The resume-stable per-effect run id as an `Idempotency-Key` header
+        // (DR-0033): Anthropic ignores it today, but sending it costs nothing and
+        // dedupes on any provider that honors it.
+        headers.push(("Idempotency-Key".into(), key.to_owned()));
+    }
     HttpRequest {
         url: format!("{base_url}/v1/messages"),
-        headers: vec![
-            ("x-api-key".into(), api_key.to_owned()),
-            ("anthropic-version".into(), "2023-06-01".into()),
-            ("content-type".into(), "application/json".into()),
-        ],
+        headers,
         body: Value::Object(body),
     }
 }
@@ -465,12 +477,19 @@ fn build_openai_request(
         // request prefix from cache instead of re-reading it each round.
         body["prompt_cache_key"] = json!(key);
     }
+    let mut headers = vec![
+        ("authorization".into(), format!("Bearer {api_key}")),
+        ("content-type".into(), "application/json".into()),
+    ];
+    if let Some(key) = cache_key {
+        // Same run/effect id as an `Idempotency-Key` header (DR-0033): OpenAI
+        // dedupes a resumed duplicate against it. This is idempotency, distinct
+        // from `prompt_cache_key` above (caching) — both ride together.
+        headers.push(("Idempotency-Key".into(), key.to_owned()));
+    }
     HttpRequest {
         url: format!("{base_url}/v1/responses"),
-        headers: vec![
-            ("authorization".into(), format!("Bearer {api_key}")),
-            ("content-type".into(), "application/json".into()),
-        ],
+        headers,
         body,
     }
 }
@@ -523,10 +542,19 @@ fn openai_input(messages: &[ChatMessage]) -> Vec<Value> {
             }
             ChatMessage::ToolResults(results) => {
                 for result in results {
+                    // The Responses `function_call_output` item has no error flag
+                    // (unlike Anthropic's `tool_result.is_error`), so a failed tool
+                    // call is marked in-band: prefix the output text so the model
+                    // sees the failure (pi-conformance §5).
+                    let output = if result.is_error {
+                        format!("error: {}", result.content)
+                    } else {
+                        result.content.clone()
+                    };
                     out.push(json!({
                         "type": "function_call_output",
                         "call_id": result.tool_call_id,
-                        "output": result.content,
+                        "output": output,
                     }));
                 }
             }
@@ -736,6 +764,7 @@ mod tests {
             "sk-ant-api-key",
             "claude-opus-4-8",
             4096,
+            None,
             &convo(),
             &tool_specs(),
         );
@@ -897,6 +926,7 @@ mod tests {
             "k",
             "m",
             4096,
+            Some("turn-42"),
             &convo(),
             &tool_specs(),
         );
@@ -907,6 +937,26 @@ mod tests {
             system.last().expect("a system block")["cache_control"]["type"],
             json!("ephemeral")
         );
+        // The per-effect key rides as an `Idempotency-Key` header even on
+        // Anthropic (DR-0033): sent, harmless, deduped only where honored.
+        assert!(anthropic
+            .headers
+            .iter()
+            .any(|(k, v)| k == "Idempotency-Key" && v == "turn-42"));
+        // No cache_key => no idempotency header (byte-identical to before).
+        let anthropic_nokey = build_anthropic_request(
+            "https://api.anthropic.com",
+            "k",
+            "m",
+            4096,
+            None,
+            &convo(),
+            &tool_specs(),
+        );
+        assert!(!anthropic_nokey
+            .headers
+            .iter()
+            .any(|(k, _)| k == "Idempotency-Key"));
 
         // OpenAI: a stable per-turn-thread key rides as `prompt_cache_key` when
         // supplied, and is absent otherwise (no key => no field, not null).
@@ -919,6 +969,12 @@ mod tests {
             &tool_specs(),
         );
         assert_eq!(with_key.body["prompt_cache_key"], json!("turn-42"));
+        // The same key is also the `Idempotency-Key` header (dedup, not caching);
+        // both are present together.
+        assert!(with_key
+            .headers
+            .iter()
+            .any(|(k, v)| k == "Idempotency-Key" && v == "turn-42"));
         let without_key = build_openai_request(
             "https://api.openai.com",
             "k",
@@ -928,6 +984,10 @@ mod tests {
             &tool_specs(),
         );
         assert!(without_key.body.get("prompt_cache_key").is_none());
+        assert!(!without_key
+            .headers
+            .iter()
+            .any(|(k, _)| k == "Idempotency-Key"));
     }
 
     #[test]

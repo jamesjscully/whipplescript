@@ -122,6 +122,28 @@
                 terminal_event_id TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT
             );
+            CREATE TABLE project_context_docs (
+                position INTEGER PRIMARY KEY, path TEXT NOT NULL,
+                content_hash TEXT NOT NULL, body TEXT NOT NULL
+            );
+            CREATE TABLE compute_result_cache (
+                content_key TEXT PRIMARY KEY, effect_kind TEXT NOT NULL,
+                result_json TEXT NOT NULL, source_instance_id TEXT NOT NULL,
+                source_effect_id TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE content_blobs (
+                id TEXT PRIMARY KEY, body TEXT NOT NULL, byte_len INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE files (
+                key TEXT PRIMARY KEY, content TEXT NOT NULL
+            );
+            CREATE TABLE script_capabilities (
+                name TEXT PRIMARY KEY, argv_json TEXT NOT NULL, sha256 TEXT NOT NULL,
+                env_json TEXT NOT NULL DEFAULT '{}', hermetic INTEGER NOT NULL DEFAULT 0,
+                body TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE skills (
                 skill_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, version TEXT NOT NULL,
                 source TEXT NOT NULL, source_path TEXT NOT NULL, content_hash TEXT NOT NULL,
@@ -165,18 +187,35 @@
             CREATE TABLE agent_turn_snapshots (
                 effect_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL
             );
-            CREATE TABLE items (
-                item_id TEXT PRIMARY KEY, queue TEXT NOT NULL, title TEXT NOT NULL,
+            CREATE TABLE tracker_events (
+                event_seq INTEGER PRIMARY KEY AUTOINCREMENT, issue_id TEXT, kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}', actor TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE tracker_issues (
+                issue_id TEXT PRIMARY KEY, queue TEXT NOT NULL, title TEXT NOT NULL,
                 body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'open',
                 labels_json TEXT NOT NULL DEFAULT '[]', metadata_json TEXT NOT NULL DEFAULT '{}',
-                claimed_by TEXT, claim_summary TEXT, filed_by TEXT,
+                claim_summary TEXT, filed_by TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
-            CREATE TABLE item_counter (
+            CREATE TABLE tracker_relations (
+                from_issue TEXT NOT NULL, to_issue TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'blocks', dep_kind TEXT,
+                PRIMARY KEY (from_issue, to_issue, kind)
+            );
+            CREATE TABLE tracker_leases (
+                lease_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, actor TEXT NOT NULL,
+                acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, expires_at TEXT, released_at TEXT
+            );
+            CREATE TABLE tracker_counter (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1), next_id INTEGER NOT NULL
             );
-            INSERT INTO item_counter (singleton, next_id) VALUES (1, 1);
+            INSERT INTO tracker_counter (singleton, next_id) VALUES (1, 1);
+            CREATE INDEX idx_tracker_issues_queue ON tracker_issues(queue, status);
+            CREATE INDEX idx_tracker_leases_issue ON tracker_leases(issue_id, released_at);
+            CREATE INDEX idx_tracker_events_issue ON tracker_events(issue_id, kind);
             CREATE TABLE coord_leases (
                 owner TEXT NOT NULL, resource TEXT NOT NULL, key TEXT NOT NULL, holder TEXT NOT NULL,
                 acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, expires_at TEXT NOT NULL,

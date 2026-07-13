@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
     io::{self, Write},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     time::Duration,
@@ -10,22 +11,30 @@ use std::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use whipplescript_core::{
-    ConstructField, ConstructInterface, ConstructRegistration, ConstructTargetCapabilityPolicy,
-    ContractRegistry, EffectContract, LibraryRegistration, PlatformConstructLowering, Severity,
-    TypedOutputValidation, CONSTRUCT_FAMILY_EFFECT_OPERATION, CONSTRUCT_INTERFACE_CAPABILITY,
-    CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE, CONSTRUCT_INTERFACE_EFFECT_HANDLE,
-    CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME, CONSTRUCT_LOWERING_CAPABILITY_CALL,
-    CONSTRUCT_LOWERING_METADATA_ONLY, CORE_CAPABILITY_CALL_CONSTRUCT_ID,
+    ConstructField, ConstructInterface, ConstructRegistration, ContractRegistry, EffectContract,
+    LibraryRegistration, Severity, TypedOutputValidation, CONSTRUCT_FAMILY_EFFECT_OPERATION,
+    CONSTRUCT_INTERFACE_CAPABILITY, CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE,
+    CONSTRUCT_INTERFACE_EFFECT_HANDLE, CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME,
+    CONSTRUCT_LOWERING_CAPABILITY_CALL, CORE_CAPABILITY_CALL_CONSTRUCT_ID,
     PLATFORM_CONSTRUCT_CATALOG,
 };
+// Generic JSON/string utilities relocated to the leaf core crate (S7 Step 2)
+// so the wasm-kernel-hostable package-registry validators can share them.
+use whipplescript_core::json::{require_json_array_field, required_json_string};
+// The pure, wasm-kernel-hostable package-registry parse + validation core, lifted
+// out of this binary (S7 Step 3). The filesystem-coupled DR-0025 `@tool`
+// attestation and the embedded std manifest bytes stay in the CLI below.
 #[cfg(feature = "claude")]
 use whipplescript_kernel::claude_agent_sdk::{
     ClaudeAgentSdkAdapter, ClaudeAgentSdkClient, StdioClaudeAgentSdkTransport,
+    WHIP_SIDECAR_PROTOCOL,
 };
 #[cfg(feature = "codex")]
 use whipplescript_kernel::codex_app_server::{
     CodexAppServerAdapter, CodexAppServerClient, StdioCodexAppServerTransport,
 };
+use whipplescript_kernel::exec_http::{ingest_exec_stdout, ExecIngest};
+use whipplescript_kernel::package_registry::*;
 use whipplescript_kernel::{
     coerce::{CoerceRequest, FakeCoerceClient},
     effect_config::EffectConfig,
@@ -60,24 +69,24 @@ use whipplescript_kernel::{
     RuntimeKernel,
 };
 use whipplescript_parser::{
-    format_program, format_program_preserving_comments, lex_comments, parse_expression, BinaryOp,
-    CalendarPattern, DependencyPredicate as IrDependencyPredicate, Diagnostic,
+    format_program, format_program_preserving_comments, harness_class, lex_comments,
+    parse_expression, BinaryOp, DependencyPredicate as IrDependencyPredicate, Diagnostic,
     EffectStatus as TestEffectStatus, ExpectTarget, Expr, ExprLiteral, ExprObjectField,
-    FormatOutput, GivenClause, IrConstructUse, IrEffectDependency, IrEffectKind, IrEffectNode,
-    IrInclude, IrPrimitiveType, IrProgram, IrProjectionRead, IrRule, IrSchema, IrSource, IrTest,
-    IrType, IrWorkflowContract, IrWorkflowContractKind, Item, MissedPolicy, ProjQueryKind,
-    QueryKind, Recurrence, RuleStatus, RunKind, SourceSpan, SourceValue, StubPayload, TestClause,
-    TestField, TimeOfDay, UnaryOp, Weekday,
+    FormatOutput, GivenClause, HarnessClass, IrConstructUse, IrEffectDependency, IrEffectKind,
+    IrEffectNode, IrExecTarget, IrInclude, IrPrimitiveType, IrProgram, IrProjectionRead, IrRule,
+    IrSchema, IrTest, IrType, IrWorkflowContract, IrWorkflowContractKind, Item, ProjQueryKind,
+    QueryKind, RuleStatus, RunKind, SourceSpan, StubPayload, TestClause, TestField, UnaryOp,
 };
 use whipplescript_store::{
-    ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, ClaimableEffect, DerivedFact,
-    DiagnosticRecord, DiagnosticView, EffectCancellation, EffectCancellationRequest,
-    EffectCompletion, EffectView, EventView, EvidenceLink, EvidenceLinkView, EvidenceRecord,
-    EvidenceView, FactView, HumanAnswer, InboxItemView, InstanceView, NewEvent, NewFact,
-    NewInboxItem, NewInstanceAuthority, NewWorkflowInvocation, ProviderValidationEvidence,
-    RetryEffect, RevisionActivation, RevisionCancellationImpact, RevisionCandidate,
-    RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RunStart, RunView, RuntimeStore,
-    SqliteStore, StatusView, StoreError, WorkflowInvocationView, WorkflowRevisionView,
+    ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, CheckpointCapture,
+    ClaimableEffect, ComputeResultRegistration, DerivedFact, DiagnosticRecord, DiagnosticView,
+    EffectCancellation, EffectCompletion, EffectView, EventView, EvidenceLink, EvidenceLinkView,
+    EvidenceRecord, EvidenceView, FactView, HumanAnswer, InboxItemView, InstanceView, NewEvent,
+    NewFact, NewInboxItem, NewInstanceAuthority, NewWorkflowInvocation, ProviderValidationEvidence,
+    RestoreDecision, RetryEffect, RevisionActivation, RevisionCancellationImpact,
+    RevisionCandidate, RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RunStart,
+    RunView, RuntimeStore, SqliteStore, StatusView, StoreError, WorkflowInvocationView,
+    WorkflowRevisionView,
 };
 // File-effect byte I/O routes through the FileStore seam (DR-0033 Phase 4); the
 // native backing is `std::fs`.
@@ -90,9 +99,13 @@ use whipplescript_store::native_stores::NativeStores;
 
 mod auth;
 mod coerce_runtime;
+mod exec_server;
 mod harness_tools;
+mod improve;
 mod project_context;
 mod skills_loader;
+mod turn_server;
+mod web_tools;
 
 const CORE_EFFECT_LOWERING_CLASS: &str = "core_effect";
 const SCHEDULE_LOWERING_CLASS: &str = "schedule_emitter";
@@ -195,16 +208,30 @@ fn main() -> ExitCode {
         Some("leases") => coordination_list(&options, "leases"),
         Some("ledger") => coordination_list(&options, "ledger"),
         Some("counters") => coordination_list(&options, "counters"),
-        Some("items") => items(&options),
+        Some("issue") => issue(&options),
         Some("evidence") => evidence(&options),
+        Some("improve") => improve::improve_command(&options),
+        Some("campaigns") => improve::campaigns_command(&options),
+        Some("campaign") => improve::campaign_detail_command(&options),
+        Some("adopt") => improve::adopt_command(&options),
+        Some("pin") => improve::pin_command(&options),
+        Some("gauges") => improve::gauges_command(&options),
         Some("diagnostics") => diagnostics(&options),
         Some("trace") => trace(&options),
         Some("pause") => pause(&options),
         Some("resume") => resume(&options),
         Some("cancel") => cancel(&options),
+        Some("checkpoint") => checkpoint(&options),
+        Some("restore") => restore(&options),
+        Some("fork") => fork_instance_command(&options),
+        Some("handles") => handles_command(&options),
+        Some("branch") => branch_command(&options),
+        Some("stream") => stream_command(&options),
         Some("retry") => retry(&options),
         Some("recover") => recover(&options),
         Some("auth") => auth_command(&options),
+        Some("deploy") => deploy_command(&options),
+        Some("executor") => executor_command(&options),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             ExitCode::SUCCESS
@@ -271,6 +298,324 @@ impl CliOptions {
     }
 }
 
+/// `whip deploy` v1 (compute plane P8): one command that ships the DO runtime
+/// to Cloudflare — wasm kernel build, optional provider secrets, deploy —
+/// with wrangler underneath, never surfaced as something the user must learn.
+/// v1 deploys the worker shell (workspace image + pool provisioning join when
+/// the container tier lands).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeployPlan {
+    worker_dir: PathBuf,
+    name: Option<String>,
+    dry_run: bool,
+    skip_build: bool,
+    set_secrets: bool,
+}
+
+/// One subprocess the deploy will run, in order. `stdin_value` is piped to
+/// the child (used to hand secret values to `wrangler secret put` without
+/// putting them in argv).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeployStep {
+    label: &'static str,
+    program: &'static str,
+    args: Vec<String>,
+    stdin_value: Option<String>,
+}
+
+fn parse_deploy_args(
+    args: &[String],
+    env_worker_dir: Option<&Path>,
+    cwd: &Path,
+) -> Result<DeployPlan, String> {
+    let mut worker_dir: Option<PathBuf> = env_worker_dir.map(Path::to_path_buf);
+    let mut name = None;
+    let mut dry_run = false;
+    let mut skip_build = false;
+    let mut set_secrets = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--worker-dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--worker-dir requires a path".to_owned())?;
+                worker_dir = Some(PathBuf::from(value));
+            }
+            "--name" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--name requires a worker name".to_owned())?;
+                name = Some(value.clone());
+            }
+            "--dry-run" => dry_run = true,
+            "--skip-build" => skip_build = true,
+            "--set-secrets" => set_secrets = true,
+            other => return Err(format!("unknown deploy argument `{other}`")),
+        }
+    }
+    let worker_dir = match worker_dir {
+        Some(dir) => dir,
+        None => discover_worker_dir(cwd).ok_or_else(|| {
+            "no worker directory found: pass --worker-dir <path>, set \
+             WHIPPLESCRIPT_WORKER_DIR, or run inside a checkout containing \
+             crates/whipplescript-host-do/worker"
+                .to_owned()
+        })?,
+    };
+    if !worker_dir.join("wrangler.toml").is_file() {
+        return Err(format!(
+            "`{}` is not a deployable worker directory (no wrangler.toml)",
+            worker_dir.display()
+        ));
+    }
+    Ok(DeployPlan {
+        worker_dir,
+        name,
+        dry_run,
+        skip_build,
+        set_secrets,
+    })
+}
+
+/// Walk upward from `cwd` looking for the in-repo worker shell.
+fn discover_worker_dir(cwd: &Path) -> Option<PathBuf> {
+    let mut current = Some(cwd);
+    while let Some(dir) = current {
+        let candidate = dir.join("crates/whipplescript-host-do/worker");
+        if candidate.join("wrangler.toml").is_file() {
+            return Some(candidate);
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+/// The ordered subprocess sequence for a plan. Pure so the sequence is
+/// testable; `node_modules_present` and `secret_values` are probed by the
+/// caller.
+fn deploy_steps(
+    plan: &DeployPlan,
+    node_modules_present: bool,
+    secret_values: &[(&str, String)],
+    executor_present: bool,
+) -> Vec<DeployStep> {
+    let mut steps = Vec::new();
+    if !plan.skip_build && !node_modules_present {
+        steps.push(DeployStep {
+            label: "install worker dependencies",
+            program: "npm",
+            args: vec!["install".to_owned()],
+            stdin_value: None,
+        });
+    }
+    if !plan.skip_build {
+        steps.push(DeployStep {
+            label: "build wasm kernel",
+            program: "npm",
+            args: vec!["run".to_owned(), "build:wasm".to_owned()],
+            stdin_value: None,
+        });
+    }
+    if !plan.skip_build && executor_present {
+        steps.push(DeployStep {
+            label: "stage executor binary",
+            program: "npm",
+            args: vec!["run".to_owned(), "build:executor".to_owned()],
+            stdin_value: None,
+        });
+    }
+    if plan.set_secrets && !plan.dry_run {
+        for (key, value) in secret_values {
+            let mut args = vec!["secret".to_owned(), "put".to_owned(), (*key).to_owned()];
+            if let Some(name) = &plan.name {
+                args.push("--name".to_owned());
+                args.push(name.clone());
+            }
+            steps.push(DeployStep {
+                label: "set provider secret",
+                program: "wrangler",
+                args,
+                stdin_value: Some(value.clone()),
+            });
+        }
+    }
+    let mut deploy_args = vec!["deploy".to_owned()];
+    if plan.dry_run {
+        deploy_args.push("--dry-run".to_owned());
+    }
+    if let Some(name) = &plan.name {
+        deploy_args.push("--name".to_owned());
+        deploy_args.push(name.clone());
+    }
+    steps.push(DeployStep {
+        label: if plan.dry_run {
+            "validate deploy (dry run)"
+        } else {
+            "deploy to Cloudflare"
+        },
+        program: "wrangler",
+        args: deploy_args,
+        stdin_value: None,
+    });
+    steps
+}
+
+/// The provider secrets `--set-secrets` forwards from the local environment.
+const DEPLOY_SECRET_KEYS: [&str; 2] = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
+
+fn deploy_command(options: &CliOptions) -> ExitCode {
+    let env_worker_dir = env::var_os("WHIPPLESCRIPT_WORKER_DIR").map(PathBuf::from);
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let plan = match parse_deploy_args(&options.args, env_worker_dir.as_deref(), &cwd) {
+        Ok(plan) => plan,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
+    for tool in ["npm", "wrangler"] {
+        if which_on_path(tool).is_none() {
+            eprintln!(
+                "`{tool}` is required for deployment but was not found on PATH; \
+                 install Node.js (npm) and wrangler (`npm install -g wrangler`)"
+            );
+            return ExitCode::from(2);
+        }
+    }
+    let secret_values = DEPLOY_SECRET_KEYS
+        .iter()
+        .filter_map(|key| env::var(key).ok().map(|value| (*key, value)))
+        .collect::<Vec<_>>();
+    if plan.set_secrets {
+        for key in DEPLOY_SECRET_KEYS {
+            if !secret_values.iter().any(|(name, _)| *name == key) {
+                println!("note: {key} is not set locally; skipping that secret");
+            }
+        }
+    }
+    let node_modules_present = plan.worker_dir.join("node_modules").is_dir();
+    let executor_present = plan.worker_dir.join("executor/Dockerfile").is_file();
+    let steps = deploy_steps(
+        &plan,
+        node_modules_present,
+        &secret_values,
+        executor_present,
+    );
+    let last_index = steps.len().saturating_sub(1);
+    for (index, step) in steps.iter().enumerate() {
+        println!("deploy: {} ...", step.label);
+        let mut command = Command::new(step.program);
+        command.args(&step.args).current_dir(&plan.worker_dir);
+        // Image digest = environment hash (compute plane P8): the executor
+        // image identity — Dockerfile + the staged whip binary — becomes the
+        // delta-kernel cache's environment epoch, injected at deploy so a
+        // toolchain bump is a visible warm-start epoch that rolls the cache.
+        // Computed here, after the staging step has run.
+        if index == last_index && executor_present {
+            if let Some(epoch) = executor_environment_hash(&plan.worker_dir) {
+                command.arg("--var");
+                command.arg(format!("WHIP_COMPUTE_ENV_HASH:{epoch}"));
+            } else {
+                println!(
+                    "note: executor binary not staged; deploying without an environment epoch"
+                );
+            }
+        }
+        let status = if let Some(stdin_value) = &step.stdin_value {
+            command.stdin(Stdio::piped());
+            match command.spawn() {
+                Ok(mut child) => {
+                    if let Some(stdin) = child.stdin.as_mut() {
+                        if let Err(error) = stdin.write_all(stdin_value.as_bytes()) {
+                            eprintln!("deploy: failed to hand off secret: {error}");
+                            let _ = child.kill();
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                    drop(child.stdin.take());
+                    child.wait()
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            command.status()
+        };
+        match status {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                eprintln!(
+                    "deploy: step `{}` failed with status {}",
+                    step.label,
+                    status.code().unwrap_or(-1)
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("deploy: step `{}` failed to start: {error}", step.label);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if plan.dry_run {
+        println!("deploy: dry run complete — bundle validated, nothing published");
+    } else {
+        println!("deploy: complete");
+    }
+    ExitCode::SUCCESS
+}
+
+/// `whip executor` (compute plane P8): the Class-A exec sidecar. Containers
+/// run this as their entrypoint with `--bind 0.0.0.0:8080`; the default bind
+/// is loopback-only for local runs.
+fn executor_command(options: &CliOptions) -> ExitCode {
+    let mut bind = "127.0.0.1:8080".to_owned();
+    let mut iter = options.args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--bind" => match iter.next() {
+                Some(value) => bind = value.clone(),
+                None => {
+                    eprintln!("--bind requires an addr:port");
+                    return ExitCode::from(2);
+                }
+            },
+            other => {
+                eprintln!("unknown executor argument `{other}`");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    match exec_server::serve(&bind) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("executor failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The executor image identity: sha256 over the Dockerfile and the staged
+/// whip binary. This IS the environment hash the delta-kernel cache keys on
+/// (image digest = environment hash, compute-plane note §5) — any change to
+/// either rolls every cached result.
+fn executor_environment_hash(worker_dir: &Path) -> Option<String> {
+    let dockerfile = fs::read(worker_dir.join("executor/Dockerfile")).ok()?;
+    let binary = fs::read(worker_dir.join("executor/whip")).ok()?;
+    let mut material = dockerfile;
+    material.extend_from_slice(&binary);
+    Some(whipplescript_kernel::exec_http::sha256_hex(&material))
+}
+
+/// Locate `tool` on PATH (portable `which`).
+fn which_on_path(tool: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(tool);
+        candidate.is_file().then_some(candidate)
+    })
+}
+
 fn print_usage() {
     println!(
         "whipplescript {} ({})",
@@ -280,9 +625,10 @@ fn print_usage() {
     println!("usage: whip [--store path] [--json] <command> [args]");
     println!("commands: package, check, compile, verify-report, run, revise, step, worker, dev, accept, instances, status, log, facts, effects, runs");
     println!(
-        "          artifacts, inbox, signal, items, leases, ledger, counters, evidence, diagnostics, trace"
+        "          artifacts, inbox, signal, issue, leases, ledger, counters, evidence, diagnostics, trace"
     );
-    println!("          otel-export, pause, resume, cancel, retry, recover, doctor");
+    println!("          otel-export, pause, resume, cancel, checkpoint, restore, fork, retry, recover, doctor, deploy");
+    println!("          improve, campaigns, campaign, adopt, pin, gauges");
     println!("run `whip <command> --help` or `whip help <command>` for command usage");
 }
 
@@ -290,6 +636,12 @@ fn command_usage(command: &str) -> Option<&'static str> {
     Some(match command {
         "check" => "usage: whip check [--model-search] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--package-lock <path>] <workflow.whip>...",
         "lint" => "usage: whip [--json] lint [--root <workflow>] <workflow.whip>",
+        "improve" => "usage: whip [--json] improve [<gauge>[><=<target>] ... [then ...] | <campaign>] [--program <workflow.whip>] [--sacrifice <gauge>] [--within <gauge>=<band>%] [--spend-cap $<n>] [--proposer fixture|native] [--provider <name>]\n  bare `whip improve` = repair mode (restore violated bars, touch nothing else)",
+        "campaigns" => "usage: whip [--json] campaigns",
+        "campaign" => "usage: whip [--json] campaign <id>",
+        "adopt" => "usage: whip [--json] adopt <campaign>:<candidate> [--program <workflow.whip>]",
+        "pin" => "usage: whip [--json] pin <instance> --as <name>",
+        "gauges" => "usage: whip [--json] gauges [<gauge>]",
         "lsp" => "usage: whip lsp   (Language Server over stdio; launched by an editor)",
         "compile" => "usage: whip compile [--model-search] [--root <workflow>] [--package-lock <path>] <workflow.whip>",
         "fmt" => "usage: whip fmt [--check] <workflow.whip>...",
@@ -316,13 +668,19 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "leases" => "usage: whip leases [<resource>]",
         "ledger" => "usage: whip ledger [<ledger>] [--partition <value>]",
         "counters" => "usage: whip counters [<counter>]",
-        "items" => "usage: whip items [list [--queue Q] [--status S]|add --queue Q --title T [--body B] [--label L]...|show <id>]",
+        "issue" => ISSUE_USAGE,
         "evidence" => "usage: whip evidence <instance>",
         "diagnostics" => "usage: whip diagnostics [--grouped] <instance>",
         "trace" => "usage: whip trace <instance> [--check]",
         "pause" => "usage: whip pause <instance>",
         "resume" => "usage: whip resume <instance>",
         "cancel" => "usage: whip cancel <instance>",
+        "checkpoint" => "usage: whip [--json] checkpoint <instance> [--cut-id <id>] [--external-positions <json|@file>]",
+        "restore" => "usage: whip [--json] restore <instance> <cut-id>",
+        "fork" => "usage: whip [--json] fork <instance> [--agent <name>] [--branch-id <id>]",
+        "handles" => "usage: whip [--json] handles <instance>",
+        "branch" => BRANCH_USAGE,
+        "stream" => STREAM_USAGE,
         "retry" => "usage: whip retry <instance> <effect>",
         "recover" => "usage: whip recover <instance>",
         "doctor" => "usage: whip doctor [--providers] [--provider-config <path>] [--record-provider-evidence <instance>]",
@@ -331,6 +689,8 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "skills" => "usage: whip [--json] skills [--root <workflow>] <workflow.whip>",
         "skill" => "usage: whip [--store path] [--json] skill <list | validate <SKILL.md|dir> | install <SKILL.md|dir>>",
         "auth" => "usage: whip auth <status | set <openai|anthropic> <key>>",
+        "deploy" => "usage: whip deploy [--worker-dir <path>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]",
+        "executor" => "usage: whip executor [--bind <addr:port>]   (Class-A exec sidecar; default 127.0.0.1:8080)",
         "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--from <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
         _ => return None,
     })
@@ -915,13 +1275,6 @@ fn doctor_tool_checks() -> Vec<ToolCheck> {
             &["pi"][..],
             false,
             "needed for Pi RPC provider runs",
-        ),
-        (
-            "loft",
-            "provider",
-            &["loft"][..],
-            false,
-            "needed for no-mock Loft claim/release/note/status effects",
         ),
     ]
     .into_iter()
@@ -2089,19 +2442,37 @@ fn lsp_path_to_uri(path: &Path) -> String {
 
 /// Recursively collects `.whip` files under `dir`, skipping VCS/build/hidden
 /// directories so the workspace scan stays bounded.
-fn lsp_collect_whip_files(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Recursion-depth ceiling for the LSP workspace scan: a guard against a
+/// pathologically deep tree exhausting the stack. With the symlink skip below,
+/// a crafted workspace (e.g. a `evil -> .` directory-symlink cycle, or one
+/// pointing at `/`) can neither loop the scanner nor walk outside the project.
+const LSP_MAX_SCAN_DEPTH: usize = 64;
+
+fn lsp_collect_whip_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth >= LSP_MAX_SCAN_DEPTH {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
+        // `file_type()` reports the entry WITHOUT resolving a final symlink, so
+        // a symlink is never recursed into or read — a directory-symlink cycle
+        // can't loop the scan and a symlink out of the tree can't escape it.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if path.is_dir() {
+        if file_type.is_dir() {
             if name.starts_with('.') || name == "target" || name == "node_modules" {
                 continue;
             }
-            lsp_collect_whip_files(&path, out);
+            lsp_collect_whip_files(&path, out, depth + 1);
         } else if path.extension().and_then(|ext| ext.to_str()) == Some("whip") {
             out.push(path);
         }
@@ -2119,7 +2490,7 @@ fn lsp_workspace_documents(
     let mut docs = std::collections::HashMap::new();
     for root in roots {
         let mut files = Vec::new();
-        lsp_collect_whip_files(root, &mut files);
+        lsp_collect_whip_files(root, &mut files, 0);
         for file in files {
             if let Ok(text) = std::fs::read_to_string(&file) {
                 docs.insert(lsp_path_to_uri(&file), text);
@@ -2874,12 +3245,8 @@ fn check(options: &CliOptions) -> ExitCode {
                 };
                 let package_contract =
                     package_contract_json(package_lock.as_ref(), &contract_registry);
-                let hosted_exec_diagnostics = lint_hosted_exec(
-                    &source,
-                    &ir,
-                    check_options.exec_profile,
-                    script_manifest.as_ref(),
-                );
+                let hosted_exec_diagnostics =
+                    lint_hosted_exec(&ir, check_options.exec_profile, script_manifest.as_ref());
                 if !hosted_exec_diagnostics.is_empty() {
                     failed = true;
                     if options.json {
@@ -3287,6 +3654,11 @@ struct ScriptCapability {
     argv: Vec<String>,
     sha256: String,
     env: BTreeMap<String, String>,
+    /// Operator-declared hermeticity (compute plane P8-1): the script's output
+    /// depends only on its argv, declared env, and stdin, so results are
+    /// memoizable by content key in the delta-kernel result cache. Opt-in per
+    /// manifest entry (`"hermetic": true`); default false = never cached.
+    hermetic: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -3316,6 +3688,22 @@ impl ScriptManifest {
         })?;
         let mut capabilities = BTreeMap::new();
         for (name, entry) in object {
+            // Reserved-key namespace (spec/std-script.md "Capability ids"): an
+            // operator entry named `raw` would shadow the `script.raw`
+            // capability id the raw dev form is demoted onto, collapsing the
+            // Layer-2 two-key namespace.
+            if name == "raw" {
+                return Err(
+                    "script manifest key `raw` is reserved: `script.raw` is the raw dev-exec \
+                     capability id; rename the entry"
+                        .to_owned(),
+                );
+            }
+            if !is_valid_script_manifest_key(name) {
+                return Err(format!(
+                    "script manifest key `{name}` is invalid: keys must match [a-z_][a-z0-9_]*"
+                ));
+            }
             let entry_object = entry
                 .as_object()
                 .ok_or_else(|| format!("script manifest entry `{name}` must be a JSON object"))?;
@@ -3333,6 +3721,15 @@ impl ScriptManifest {
             if argv.is_empty() {
                 return Err(format!(
                     "script manifest entry `{name}` argv must not be empty"
+                ));
+            }
+            // Control-plane deny-list at pin time (spec/std-script.md "Static
+            // checks" item 5): same list the runtime exec path re-checks, so
+            // operators learn at manifest load, not first execution.
+            if let Some(denied) = script_argv_denied_executable(&argv) {
+                return Err(format!(
+                    "script manifest entry `{name}` argv may not execute the `{denied}` \
+                     control-plane binary"
                 ));
             }
             let sha256 = entry_object
@@ -3366,6 +3763,15 @@ impl ScriptManifest {
                 })
                 .transpose()?
                 .unwrap_or_default();
+            let hermetic = match entry_object.get("hermetic") {
+                None => false,
+                Some(Value::Bool(flag)) => *flag,
+                Some(_) => {
+                    return Err(format!(
+                        "script manifest entry `{name}` hermetic must be a boolean"
+                    ))
+                }
+            };
             capabilities.insert(
                 name.clone(),
                 ScriptCapability {
@@ -3373,6 +3779,7 @@ impl ScriptManifest {
                     argv,
                     sha256,
                     env,
+                    hermetic,
                 },
             );
         }
@@ -3386,6 +3793,17 @@ impl ScriptManifest {
     fn get(&self, name: &str) -> Option<&ScriptCapability> {
         self.capabilities.get(name)
     }
+}
+
+/// Operator script-manifest keys name `script.<key>` capability ids, so they
+/// keep the id grammar: `[a-z_][a-z0-9_]*` (spec/std-script.md "Capability
+/// ids"). `raw` is additionally reserved (checked separately at load).
+fn is_valid_script_manifest_key(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_lowercase() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
 }
 
 fn load_script_manifest(path: Option<&Path>) -> Result<Option<ScriptManifest>, String> {
@@ -3417,23 +3835,47 @@ fn register_script_manifest_capabilities(
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ExecSurface {
-    Raw,
-    Capability { name: String },
+/// Whether the operator granted any raw exec at all: a non-empty
+/// `WHIPPLESCRIPT_EXEC_ALLOW` allowlist (the same source `exec_command_granted`
+/// filters against). Presence is seeding key (b) for `script.raw`
+/// (spec/std-script.md "Raw `exec` demotion"); the per-command glob match stays
+/// the raw handler's convenience filter, not the boundary.
+fn exec_allowlist_present() -> bool {
+    env::var("WHIPPLESCRIPT_EXEC_ALLOW")
+        .map(|allow| allow.split(':').any(|pattern| !pattern.is_empty()))
+        .unwrap_or(false)
 }
 
-fn exec_surface_from_statement(statement: &str) -> Option<ExecSurface> {
-    let rest = statement.trim().strip_prefix("exec ")?.trim_start();
-    if rest.starts_with('"') {
-        return Some(ExecSurface::Raw);
-    }
-    let name = rest.split_whitespace().next()?.to_owned();
-    Some(ExecSurface::Capability { name })
+/// Seeds the `script.raw` capability row for `program_id` (script hard-off
+/// Layer 2, raw form). Callers must have verified BOTH seeding keys: the
+/// program's IR imports std.script, and the dev-profile allowlist authority
+/// exists. Hosted profiles never seed `script.raw`, so hosted raw exec blocks
+/// at store admission even from forged IR.
+fn register_raw_script_capability(store: &SqliteStore, program_id: &str) -> Result<(), StoreError> {
+    store.register_capability_schema(CapabilitySchemaRegistration {
+        capability: "script.raw",
+        description: "Run raw dev-profile exec commands behind the operator allowlist.",
+        schema_json: "{}",
+        registered_by_package_id: None,
+    })?;
+    store.bind_capability(CapabilityBinding {
+        binding_id: &format!("binding_script_raw_{}", stable_hash_hex(program_id)),
+        program_id: Some(program_id),
+        capability: "script.raw",
+        provider: "builtin-script",
+        config_json: "{}",
+    })?;
+    Ok(())
 }
 
+/// Hosted-profile exec gate (spec/std-script.md "Static checks" item 2): raw
+/// string exec is a check error suggesting the capability form, and a
+/// capability name absent from the supplied manifest is a check error listing
+/// the declared capabilities. Walks the IR effect nodes (the same structures
+/// `check_script_hard_off` walks) — `IrEffectKind::ExecCommand` carries its
+/// surface form as `exec_target` — so exec-looking text inside prompts or
+/// string literals cannot misfire the gate.
 fn lint_hosted_exec(
-    source: &str,
     ir: &IrProgram,
     exec_profile: ExecProfile,
     script_manifest: Option<&ScriptManifest>,
@@ -3446,30 +3888,23 @@ fn lint_hosted_exec(
         .unwrap_or_default();
     let mut diagnostics = Vec::new();
     for rule in &ir.rules {
-        for line in rule.body.lines() {
-            let statement = line.trim();
-            if !statement.starts_with("exec ") {
+        for effect in &rule.metadata.effects {
+            if effect.kind != IrEffectKind::ExecCommand {
                 continue;
             }
-            let span = source
-                .find(statement)
-                .map(|start| SourceSpan {
-                    start,
-                    end: start + statement.len(),
-                })
-                .unwrap_or(SourceSpan { start: 0, end: 0 });
-            match exec_surface_from_statement(statement) {
-                Some(ExecSurface::Raw) => diagnostics.push(Diagnostic { related: Vec::new(),
-                    span,
+            match &effect.exec_target {
+                Some(IrExecTarget::Raw) => diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: effect.span,
                     message: "raw `exec \"...\"` is not allowed in hosted exec profile".to_owned(),
                     suggestion: Some(
                         "use `exec <capability> with <record> -> <Type> as <binding>` from the script manifest"
                             .to_owned(),
                     ),
                 }),
-                Some(ExecSurface::Capability { name })
+                Some(IrExecTarget::Capability { name })
                     if script_manifest
-                        .and_then(|manifest| manifest.get(&name))
+                        .and_then(|manifest| manifest.get(name))
                         .is_none() =>
                 {
                     let declared = if available.is_empty() {
@@ -3477,16 +3912,16 @@ fn lint_hosted_exec(
                     } else {
                         format!("declared script capabilities: {}", available.join(", "))
                     };
-                    diagnostics.push(Diagnostic { related: Vec::new(),
-                        span,
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: effect.span,
                         message: format!(
                             "exec capability `{name}` is not declared in the script manifest"
                         ),
                         suggestion: Some(declared),
                     });
                 }
-                Some(ExecSurface::Capability { .. }) => {}
-                None => {}
+                _ => {}
             }
         }
     }
@@ -3680,6 +4115,10 @@ fn contract_registry_from_artifact_json(
                 .to_owned(),
                 keyword: required_json_str(construct, "keyword", &construct_label)?.to_owned(),
                 scope: required_json_str(construct, "scope", &construct_label)?.to_owned(),
+                // Contract-registry artifacts carry the derived `fields[]`
+                // view only; the grammar object stays a manifest-side input
+                // (nothing downstream of the artifact boundary parses by it).
+                grammar: None,
                 fields,
                 requires: contract_registry_interfaces_from_json(
                     construct,
@@ -4653,7 +5092,7 @@ fn construct_graph_json_with_digests(
             };
             let contract_version = contract
                 .map(|contract| contract.version.as_str())
-                .unwrap_or("v0");
+                .unwrap_or("0.1.0");
             let owner = contract
                 .map(|contract| contract.library_id.as_str())
                 .unwrap_or("core");
@@ -13185,7 +13624,7 @@ fn verify_contract_registry_shape(registry: &Value, label: &str) -> Result<(), S
     }
     verify_contract_registry_schema_fragments(registry, label)?;
     verify_contract_registry_package_uniqueness(registry, label)?;
-    verify_contract_registry_platform_vocabulary(registry, label)?;
+    verify_contract_registry_platform_vocabulary(registry, label, &embedded_std_manifests())?;
     verify_contract_registry_construct_input_fields(registry, label)?;
     Ok(())
 }
@@ -13353,320 +13792,6 @@ fn contract_registry_interface_signature(interface: &Value) -> String {
         .join("|")
 }
 
-fn verify_contract_registry_platform_vocabulary(
-    registry: &Value,
-    label: &str,
-) -> Result<(), String> {
-    let package_library_ids = report_package_library_ids(registry);
-    let contracts = require_json_array_field(registry, "effect_contracts", label)?;
-    let mut package_capability_call_contract_ids = BTreeSet::new();
-    for (index, contract) in contracts.iter().enumerate() {
-        let contract_label = format!("{label}.effect_contracts[{index}]");
-        if !contract.is_object() {
-            return Err(format!("{contract_label} must be an object"));
-        }
-        if !contract
-            .get("library_id")
-            .and_then(Value::as_str)
-            .is_some_and(|library_id| package_library_ids.contains(library_id))
-        {
-            continue;
-        }
-        let Some(effect_kind) = contract.get("effect_kind").and_then(Value::as_str) else {
-            continue;
-        };
-        if effect_kind != "capability.call" {
-            return Err(format!(
-                "{contract_label}.effect_kind uses unsupported package effect kind `{effect_kind}`; expected `capability.call`"
-            ));
-        }
-        if let Some(id) = contract.get("id").and_then(Value::as_str) {
-            package_capability_call_contract_ids.insert(id.to_owned());
-        }
-    }
-    for (index, contract) in contracts.iter().enumerate() {
-        let contract_label = format!("{label}.effect_contracts[{index}]");
-        if !contract
-            .get("library_id")
-            .and_then(Value::as_str)
-            .is_some_and(|library_id| package_library_ids.contains(library_id))
-        {
-            continue;
-        }
-        for capability in contract
-            .get("required_capabilities")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-        {
-            if capability == "*" || package_capability_call_contract_ids.contains(capability) {
-                continue;
-            }
-            return Err(format!(
-                "{contract_label}.required_capabilities references `{capability}` but no matching package `capability.call` effect contract is declared"
-            ));
-        }
-    }
-
-    let constructs = require_json_array_field(registry, "constructs", label)?;
-    for (index, construct) in constructs.iter().enumerate() {
-        let construct_label = format!("{label}.constructs[{index}]");
-        if !construct.is_object() {
-            return Err(format!("{construct_label} must be an object"));
-        }
-        if !construct
-            .get("library_id")
-            .and_then(Value::as_str)
-            .is_some_and(|library_id| package_library_ids.contains(library_id))
-        {
-            continue;
-        }
-        let Some(family) = construct.get("construct_family").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(lowering_target) = construct.get("lowering_target").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(scope) = construct.get("scope").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(keyword) = construct.get("keyword").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(lowering) = PLATFORM_CONSTRUCT_CATALOG.lowering(lowering_target) else {
-            return Err(format!(
-                "{construct_label}.lowering_target uses unsupported construct lowering `{lowering_target}`"
-            ));
-        };
-        if PLATFORM_CONSTRUCT_CATALOG.family(family).is_none() {
-            return Err(format!(
-                "{construct_label}.construct_family uses unsupported construct family `{family}`"
-            ));
-        }
-        if !lowering.compatible_families.contains(&family) {
-            return Err(format!(
-                "{construct_label} uses lowering_target `{lowering_target}` incompatible with construct_family `{family}`"
-            ));
-        }
-        if !lowering.package_authorable {
-            return Err(format!(
-                "{construct_label}.lowering_target `{lowering_target}` is platform-internal and cannot be used by package constructs"
-            ));
-        }
-        if let Some(required_scope) = lowering.required_scope {
-            if scope != required_scope {
-                return Err(format!(
-                    "{construct_label}.scope `{scope}` is unsupported for lowering_target `{lowering_target}`; expected `{required_scope}`"
-                ));
-            }
-        }
-        if !PLATFORM_CONSTRUCT_CATALOG.contains_scope(scope) {
-            return Err(format!(
-                "{construct_label}.scope uses unsupported construct scope `{scope}`"
-            ));
-        }
-        if let Some(error) = reserved_keyword_privilege_error(
-            construct
-                .get("library_id")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            keyword,
-            family,
-            scope,
-            lowering_target,
-        ) {
-            return Err(format!("{construct_label}.keyword {error}"));
-        }
-        for (field_index, field) in construct
-            .get("fields")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
-            let field_label = format!("{construct_label}.fields[{field_index}]");
-            let Some(kind) = field.get("kind").and_then(Value::as_str) else {
-                continue;
-            };
-            if !PLATFORM_CONSTRUCT_CATALOG.contains_field_kind(kind) {
-                return Err(format!(
-                    "{field_label}.kind uses unsupported construct field kind `{kind}`"
-                ));
-            }
-        }
-        for direction in ["requires", "provides"] {
-            for (interface_index, interface) in construct
-                .get(direction)
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .enumerate()
-            {
-                let interface_label = format!("{construct_label}.{direction}[{interface_index}]");
-                verify_contract_registry_construct_interface_vocabulary(
-                    interface,
-                    &interface_label,
-                )?;
-            }
-        }
-        verify_contract_registry_construct_lowering_interfaces(
-            construct,
-            lowering,
-            &package_capability_call_contract_ids,
-            &construct_label,
-        )?;
-    }
-    Ok(())
-}
-
-fn reserved_keyword_privilege_error(
-    library_id: &str,
-    keyword: &str,
-    construct_family: &str,
-    scope: &str,
-    lowering_target: &str,
-) -> Option<String> {
-    if !PLATFORM_CONSTRUCT_CATALOG.contains_reserved_keyword(keyword) {
-        return None;
-    }
-    if PLATFORM_CONSTRUCT_CATALOG
-        .reserved_keyword_privilege(
-            library_id,
-            keyword,
-            construct_family,
-            scope,
-            lowering_target,
-        )
-        .is_some()
-    {
-        return None;
-    }
-    Some(format!(
-        "uses reserved construct keyword `{keyword}` without platform catalog authorization for library `{library_id}` as {scope} {construct_family} lowering `{lowering_target}`"
-    ))
-}
-
-fn verify_contract_registry_construct_interface_vocabulary(
-    interface: &Value,
-    label: &str,
-) -> Result<(), String> {
-    let Some(kind) = interface.get("kind").and_then(Value::as_str) else {
-        return Ok(());
-    };
-    if !PLATFORM_CONSTRUCT_CATALOG.contains_interface_kind(kind) {
-        return Err(format!(
-            "{label}.kind uses unsupported construct interface kind `{kind}`"
-        ));
-    }
-    let Some(phase) = interface.get("phase").and_then(Value::as_str) else {
-        return Ok(());
-    };
-    if !PLATFORM_CONSTRUCT_CATALOG.contains_interface_phase(phase) {
-        return Err(format!(
-            "{label}.phase uses unsupported construct interface phase `{phase}`"
-        ));
-    }
-    let Some(cardinality) = interface.get("cardinality").and_then(Value::as_str) else {
-        return Ok(());
-    };
-    if !PLATFORM_CONSTRUCT_CATALOG.contains_interface_cardinality(cardinality) {
-        return Err(format!(
-            "{label}.cardinality uses unsupported construct interface cardinality `{cardinality}`"
-        ));
-    }
-    if kind == CONSTRUCT_INTERFACE_CAPABILITY
-        && interface.get("name").and_then(Value::as_str).is_none()
-    {
-        return Err(format!("{label} Capability interface must declare `name`"));
-    }
-    Ok(())
-}
-
-fn verify_contract_registry_construct_lowering_interfaces(
-    construct: &Value,
-    lowering: &PlatformConstructLowering,
-    package_capability_call_contract_ids: &BTreeSet<String>,
-    label: &str,
-) -> Result<(), String> {
-    for kind in lowering.required_interfaces {
-        if !contract_registry_construct_declares_interface(construct, "requires", kind) {
-            return Err(format!(
-                "{label} uses lowering_target `{}` but declares no required `{kind}` interface",
-                lowering.id
-            ));
-        }
-    }
-    for kind in lowering.provided_interfaces {
-        if !contract_registry_construct_declares_interface(construct, "provides", kind) {
-            return Err(format!(
-                "{label} uses lowering_target `{}` but declares no provided `{kind}` interface",
-                lowering.id
-            ));
-        }
-    }
-    if lowering.target_capability == ConstructTargetCapabilityPolicy::RequiredCapabilityCallContract
-    {
-        let Some(target_capability) = construct.get("target_capability").and_then(Value::as_str)
-        else {
-            return Err(format!(
-                "{label} uses lowering_target `{}` but has no target_capability",
-                lowering.id
-            ));
-        };
-        if !package_capability_call_contract_ids.contains(target_capability) {
-            return Err(format!(
-                "{label} target_capability `{target_capability}` has no matching package `capability.call` effect contract"
-            ));
-        }
-        if !construct
-            .get("requires")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .any(|interface| {
-                interface.get("kind").and_then(Value::as_str)
-                    == Some(CONSTRUCT_INTERFACE_CAPABILITY)
-                    && interface.get("name").and_then(Value::as_str) == Some(target_capability)
-            })
-        {
-            return Err(format!(
-                "{label} uses lowering_target `{}` to `{target_capability}` but declares no required Capability interface named `{target_capability}`",
-                lowering.id
-            ));
-        }
-    }
-    // A `Forbidden` lowering (e.g. `typed_effect_call`) must NOT name a generic
-    // `target_capability` the way `capability_call` does — its authority comes
-    // from the typed effect contract + its required `Capability` interface, not a
-    // capability-call target. (DR-0020 chain / `std.files`.)
-    if lowering.target_capability == ConstructTargetCapabilityPolicy::Forbidden
-        && construct
-            .get("target_capability")
-            .and_then(Value::as_str)
-            .is_some()
-    {
-        return Err(format!(
-            "{label} uses lowering_target `{}` which forbids a `target_capability`, but one is declared",
-            lowering.id
-        ));
-    }
-    Ok(())
-}
-
-fn contract_registry_construct_declares_interface(
-    construct: &Value,
-    direction: &str,
-    kind: &str,
-) -> bool {
-    construct
-        .get(direction)
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|interface| interface.get("kind").and_then(Value::as_str) == Some(kind))
-}
-
 fn verify_contract_registry_construct_input_fields(
     registry: &Value,
     label: &str,
@@ -13744,24 +13869,6 @@ fn verify_contract_registry_construct_input_fields(
         }
     }
     Ok(())
-}
-
-fn report_package_library_ids(registry: &Value) -> BTreeSet<String> {
-    registry
-        .get("libraries")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|library| {
-            let id = library.get("id").and_then(Value::as_str)?;
-            let standard = library
-                .get("standard")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let version = library.get("version").and_then(Value::as_str);
-            (!standard && version != Some("unlocked")).then(|| id.to_owned())
-        })
-        .collect()
 }
 
 fn verify_package_contract_artifact(
@@ -13903,17 +14010,6 @@ fn require_json_object_field<'a>(
         return Err(format!("{owner}.{field} must be an object"));
     }
     Ok(object)
-}
-
-fn require_json_array_field<'a>(
-    value: &'a Value,
-    field: &str,
-    owner: &str,
-) -> Result<&'a Vec<Value>, String> {
-    value
-        .get(field)
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("{owner}.{field} must be an array"))
 }
 
 fn verify_report_entry_construct_graph_artifact(entry: &Value, label: &str) -> Result<(), String> {
@@ -16150,48 +16246,6 @@ fn revise(options: &CliOptions) -> ExitCode {
 }
 
 const PACKAGE_LOCK_SCHEMA: &str = "whipplescript.package_lock.v0";
-const PACKAGE_MANIFEST_SCHEMA: &str = "whipplescript.package_manifest.v0";
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PackageManifest {
-    path: PathBuf,
-    manifest_json: String,
-    manifest_sha256: String,
-    package_id: String,
-    name: String,
-    version: String,
-    registry: ContractRegistry,
-    /// `@tool` workflows this package exports for cross-package invocation
-    /// (DR-0025). Derived + convergence-checked when the manifest is loaded, so a
-    /// non-`@tool`/non-convergent export fails manifest validation on both the
-    /// producer (`whip package`) and the consumer (`use`) side.
-    workflow_tools: Vec<PackageWorkflowTool>,
-}
-
-/// A `@tool` workflow exported by a package (DR-0025 cross-package attestation):
-/// the tool name, the resolved source path it is driven from, and the derived
-/// input/output JSON schemas (canonical JSON strings) that make up its tool
-/// contract.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PackageWorkflowTool {
-    name: String,
-    source: PathBuf,
-    input_schema: String,
-    output_schema: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PackageCapabilityContract {
-    input_schema: Option<String>,
-    output_schema: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PackageProviderContract {
-    capability: String,
-    provider_kind: String,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LoadedPackageLock {
     path: PathBuf,
@@ -16255,14 +16309,41 @@ impl LoadedPackageLock {
 
 /// Standard-library package manifests compiled into the binary (M5 "embedded
 /// manifest"). Each entry is `(import name, manifest JSON)`; the binary is its
-/// own supply chain, so a workflow that `use`s one of these names validates and
-/// runs with no `--package-lock` at all. An explicit lock for the same name
-/// still wins — the embedded copy is only a fallback. Add more std packages by
-/// appending `(name, include_str!(..))` pairs here.
-const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[(
-    "memory",
-    include_str!("../../../examples/packages/memory.json"),
-)];
+/// own supply chain, so a workflow that `use`s one of these names (e.g.
+/// `use std.memory`) validates and runs with no `--package-lock` at all. Std
+/// packages live in the reserved `std.*` namespace: a package lock can never
+/// claim such a name (see `is_reserved_std_package_name`), so the embedded copy
+/// always wins. Add more std packages by appending `(name, include_str!(..))`
+/// pairs here.
+const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
+    (
+        "std.memory",
+        include_str!("../../../std/manifests/memory.json"),
+    ),
+    (
+        "std.messaging",
+        include_str!("../../../std/manifests/messaging.json"),
+    ),
+    // Contracts-only: `exec` is core grammar (never manifest-authored — the
+    // package pipeline forbids `core_effect` lowering), so this manifest
+    // carries the library identity and the `script.raw` capability row shape;
+    // the `script.<name>` family is instantiated from the operator script
+    // manifest at seeding time (spec/std-script.md). Deliberately absent from
+    // the parser build.rs manifest list, which is grammar-only.
+    (
+        "std.script",
+        include_str!("../../../std/manifests/script.json"),
+    ),
+];
+
+/// Whether `name` claims the reserved `std.*` package namespace. Std packages
+/// ship embedded in the platform binary (the binary is its own supply chain), so
+/// a package lock entry — or a lock/sync input manifest — claiming a `std.*`
+/// name is refused: a supply-chain lock must never be able to shadow a platform
+/// std package.
+fn is_reserved_std_package_name(name: &str) -> bool {
+    name == "std" || name.starts_with("std.")
+}
 
 /// Whether `name` is shipped as an embedded std manifest.
 fn is_embedded_std_manifest(name: &str) -> bool {
@@ -16285,16 +16366,6 @@ fn embedded_std_manifests() -> Vec<PackageManifest> {
         .collect()
 }
 
-/// A registry holding every embedded std manifest's contracts/constructs — used
-/// to authorize a construct use (e.g. `recall`) without a lock.
-fn embedded_std_registry() -> ContractRegistry {
-    let mut registry = ContractRegistry::default();
-    for manifest in embedded_std_manifests() {
-        registry.merge(manifest.registry);
-    }
-    registry
-}
-
 /// Merge embedded std manifests into `registry` for every imported name that is
 /// NOT already `provided` (e.g. by the lock). The lock wins: a provided name is
 /// skipped so its manifest is never double-merged with the embedded copy.
@@ -16315,17 +16386,23 @@ fn merge_embedded_std_manifests(
     }
 }
 
+/// The embedded std package (import name) that provides `use_form`, if any.
+/// Drives both the lock exemption (`construct_use_is_embedded_std`) and the
+/// "add `use <package>`" hint when the package is not imported.
+fn embedded_std_package_for_use(use_form: &IrConstructUse) -> Option<String> {
+    embedded_std_manifests()
+        .into_iter()
+        .find(|manifest| registry_construct_for_use(&manifest.registry, use_form).is_some())
+        .map(|manifest| manifest.name)
+}
+
 /// Whether a construct use is authorized by an embedded std manifest whose owning
-/// package is actually imported. This is the no-lock exemption for embedded
-/// packages, mirroring the standard-library built-in exemption.
+/// package is actually imported. This is the single no-lock exemption: the binary
+/// is its own supply chain for `std.*` packages, and importing the package is
+/// what authorizes its constructs (the import ladder).
 fn construct_use_is_embedded_std(ir: &IrProgram, use_form: &IrConstructUse) -> bool {
-    let embedded_registry = embedded_std_registry();
-    let Some(form) = registry_construct_for_use(&embedded_registry, use_form) else {
-        return false;
-    };
-    ir.uses
-        .iter()
-        .any(|use_decl| use_decl.name == form.library_id)
+    embedded_std_package_for_use(use_form)
+        .is_some_and(|package| ir.uses.iter().any(|use_decl| use_decl.name == package))
 }
 
 fn contract_registry_for_ir(
@@ -16337,7 +16414,8 @@ fn contract_registry_for_ir(
         None => {
             let mut registry = ir.contract_registry();
             // No lock at all: embedded std manifests still resolve their imported
-            // names (M5), so `use memory` + `recall` validates with no supply chain.
+            // names (M5), so `use std.memory` + `recall` validates with no supply
+            // chain.
             merge_embedded_std_manifests(&mut registry, ir, &BTreeSet::new());
             validate_construct_uses(None, ir, &registry)?;
             Ok(registry)
@@ -16356,18 +16434,17 @@ fn validate_construct_uses(
         // use are unsatisfiable. Name every blocker so a workflow that imports a
         // package without (yet) using a construct is still reported.
         //
-        // EXCEPTION (1929 OPTION A): standard-library constructs are built into
-        // the compiler, not fetched from a supply chain, so they are exempt from
-        // the lock requirement. A construct use is exempt only when the (built-in)
-        // registry authorizes it AND its owning library is `standard` — keying on a
-        // recognized built-in registration, not a name, so a third-party package
+        // EXCEPTION (M5 embedded manifest): a std package compiled into the binary
+        // (e.g. `std.memory`, `std.messaging`) is its own supply chain, so an
+        // import of — or a construct owned by — an embedded manifest is exempt
+        // from the lock, provided the owning package is actually imported. A
+        // construct owned by an embedded manifest that is NOT imported gets an
+        // "add `use <package>`" fix instead of the lock advice. Keyed on a
+        // recognized embedded registration, not a name, so a third-party package
         // cannot bypass the lock by claiming the std namespace. Modeled in
         // `models/maude/std-construct-authorization.maude`.
-        //
-        // EXCEPTION (M5 embedded manifest): a std package compiled into the binary
-        // (e.g. `memory`) is likewise its own supply chain, so an import of — or a
-        // construct owned by — an embedded manifest is exempt from the lock too.
         let mut blockers = BTreeSet::new();
+        let mut missing_imports = BTreeSet::new();
         for use_decl in &ir.uses {
             if use_decl.name.starts_with("std.") || is_embedded_std_manifest(&use_decl.name) {
                 continue;
@@ -16375,26 +16452,47 @@ fn validate_construct_uses(
             blockers.insert(format!("import `{}`", use_decl.name));
         }
         for form in &uses {
-            if construct_use_is_standard_builtin(registry, form)
-                || construct_use_is_embedded_std(ir, form)
-            {
+            if construct_use_is_embedded_std(ir, form) {
                 continue;
             }
-            blockers.insert(format!("construct `{}`", form.keyword));
+            match embedded_std_package_for_use(form) {
+                Some(package) => {
+                    missing_imports.insert(format!(
+                        "construct `{}` is provided by the embedded std package `{package}`; add `use {package}`",
+                        form.keyword
+                    ));
+                }
+                None => {
+                    blockers.insert(format!("construct `{}`", form.keyword));
+                }
+            }
         }
-        if blockers.is_empty() {
+        let mut problems = missing_imports.into_iter().collect::<Vec<_>>();
+        if !blockers.is_empty() {
+            problems.push(format!(
+                "{} requires a package lock; run `whip package sync` to create `{DEFAULT_PACKAGE_LOCK_FILE}`, or pass `--package-lock <path>`",
+                blockers.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if problems.is_empty() {
             return Ok(());
         }
-        return Err(format!(
-            "{} requires a package lock; run `whip package sync` to create `{DEFAULT_PACKAGE_LOCK_FILE}`, or pass `--package-lock <path>`",
-            blockers.into_iter().collect::<Vec<_>>().join(", ")
-        ));
+        return Err(problems.join("; "));
     };
     if uses.is_empty() {
         return Ok(());
     }
     for use_form in uses {
         let Some(form) = registry_construct_for_use(registry, use_form) else {
+            // An embedded std construct fails here only when its package is not
+            // imported (an imported embedded manifest is merged before this
+            // check), so the fix is the import, not the lock.
+            if let Some(package) = embedded_std_package_for_use(use_form) {
+                return Err(format!(
+                    "construct `{}` is provided by the embedded std package `{package}`; add `use {package}`",
+                    use_form.keyword
+                ));
+            }
             return Err(format!(
                 "package lock `{}` does not authorize `{}` as a {} {} construct lowering to `{}`",
                 package_lock.path.display(),
@@ -16414,33 +16512,6 @@ fn validate_construct_uses(
         }
     }
     Ok(())
-}
-
-/// Whether a construct use is authorized by a standard-library built-in (1929
-/// OPTION A): the registry must hold a matching construct registration AND a
-/// matching `capability.call` effect contract, both owned by a `standard` library.
-/// This is the lock exemption — keyed on a real built-in registration, never on a
-/// name alone, so a third-party package cannot bypass the lock by claiming the std
-/// namespace.
-fn construct_use_is_standard_builtin(
-    registry: &ContractRegistry,
-    use_form: &IrConstructUse,
-) -> bool {
-    let Some(form) = registry_construct_for_use(registry, use_form) else {
-        return false;
-    };
-    let library_is_standard = registry
-        .libraries
-        .iter()
-        .any(|library| library.id == form.library_id && library.standard);
-    if !library_is_standard {
-        return false;
-    }
-    registry.effect_contracts.iter().any(|contract| {
-        contract.id == use_form.target_capability
-            && contract.effect_kind == "capability.call"
-            && contract.library_id == form.library_id
-    })
 }
 
 fn registry_construct_for_use<'a>(
@@ -16576,6 +16647,16 @@ fn package_lock(options: &CliOptions, args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    for manifest in &manifests {
+        if is_reserved_std_package_name(&manifest.name) {
+            eprintln!(
+                "package manifest `{}` name `{}` claims the reserved std namespace; std packages ship embedded in the platform and cannot be provided by a package lock",
+                manifest.path.display(),
+                manifest.name
+            );
+            return ExitCode::from(2);
+        }
+    }
     let registry = package_registry(&manifests);
     let diagnostics = registry.validate();
     if !diagnostics.is_empty() {
@@ -16883,6 +16964,17 @@ fn read_package_set(
                 code: "package_set.identity_mismatch",
                 message: format!(
                     "{label} expects package name `{name}` but manifest `{}` declares `{}`",
+                    resolved.display(),
+                    manifest.name
+                ),
+            });
+            continue;
+        }
+        if is_reserved_std_package_name(&manifest.name) {
+            diagnostics.push(PackageSyncDiagnostic {
+                code: "package_manifest.reserved_std_name",
+                message: format!(
+                    "{label} manifest `{}` name `{}` claims the reserved std namespace; std packages ship embedded in the platform and cannot be provided by a package lock",
                     resolved.display(),
                     manifest.name
                 ),
@@ -17209,83 +17301,45 @@ fn load_package_manifest(path: &Path) -> Result<PackageManifest, String> {
             path.display()
         )
     })?;
-    package_manifest_from_json(path, manifest_json)
+    // Parse + structurally validate (pure, wasm-kernel-hostable), then run the
+    // filesystem-coupled DR-0025 `@tool` attestation as a separate pass. This is
+    // the single load-from-disk chokepoint every real caller funnels through
+    // (`load_package_manifests` for `whip package check`/`lock`, `read_package_set`
+    // for `whip package sync`, and `load_package_lock_file` for lock load / `whip
+    // run` bootstrap), so attestation still runs at every site it did before the
+    // split. The embedded std manifests parse via `package_manifest_from_json`
+    // directly and correctly skip attestation (they declare no `@tool`s).
+    let mut manifest = package_manifest_from_json(path, manifest_json)?;
+    attest_manifest_workflow_tools(&mut manifest)?;
+    Ok(manifest)
 }
 
 fn package_manifest_from_json(
     path: &Path,
     manifest_json: String,
 ) -> Result<PackageManifest, String> {
-    let value = serde_json::from_str::<Value>(&manifest_json).map_err(|error| {
-        format!(
-            "failed to parse package manifest `{}`: {error}",
-            path.display()
-        )
-    })?;
-    let schema = required_json_string(&value, "schema", "package manifest")?;
-    if schema != PACKAGE_MANIFEST_SCHEMA {
-        return Err(format!(
-            "package manifest `{}` has unsupported schema `{schema}`; expected `{PACKAGE_MANIFEST_SCHEMA}`",
-            path.display()
-        ));
-    }
-    validate_package_manifest_closed_shape(path, &value)?;
-    let package_id = required_json_string(&value, "package_id", "package manifest")?;
-    let name = required_json_string(&value, "name", "package manifest")?;
-    let version = required_json_string(&value, "version", "package manifest")?;
-
-    validate_package_manifest_identity_uniqueness(path, &value)?;
-    let capabilities = package_capability_contracts(path, &value)?;
-    let providers = package_provider_contracts(path, &value)?;
-    let registry =
-        package_manifest_registry(path, &value, &name, &version, &capabilities, &providers)?;
-    validate_package_manifest_consistency(path, &value, &capabilities, &providers, &registry)?;
-    let workflow_tools = package_manifest_workflow_tools(path, &value)?;
-
-    Ok(PackageManifest {
-        path: path.to_path_buf(),
-        manifest_sha256: sha256_hex(manifest_json.as_bytes()),
-        manifest_json,
-        package_id,
-        name,
-        version,
-        registry,
-        workflow_tools,
-    })
+    package_manifest_from_json_with_embedded(path, manifest_json, EMBEDDED_STD_MANIFESTS)
 }
 
-/// Parse, validate, and derive the attestation for a package's exported `@tool`
-/// workflows (DR-0025). Each entry names a workflow and a source path relative to
-/// the manifest; the source is compiled (with `root = name`) and convergence-
-/// checked here, so a non-`@tool`/non-convergent export fails manifest loading on
-/// both the producer and the consumer. The input/output contracts are derived
-/// into JSON schemas — the cross-package tool contract a consumer checks against.
-fn package_manifest_workflow_tools(
-    path: &Path,
-    value: &Value,
-) -> Result<Vec<PackageWorkflowTool>, String> {
-    let Some(entries) = value.get("workflow_tools") else {
-        return Ok(Vec::new());
-    };
-    let entries = entries.as_array().ok_or_else(|| {
-        format!(
-            "package manifest `{}` field `workflow_tools` must be an array",
-            path.display()
-        )
-    })?;
-    let manifest_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tools = Vec::new();
-    let mut seen = BTreeSet::new();
-    for entry in entries {
-        let name = required_json_string(entry, "name", "workflow_tools entry")?;
-        let source_rel = required_json_string(entry, "source", "workflow_tools entry")?;
-        if !seen.insert(name.clone()) {
-            return Err(format!(
-                "package manifest `{}` exports workflow tool `{name}` more than once",
-                path.display()
-            ));
-        }
-        let source = manifest_dir.join(&source_rel);
+/// Attest a package's exported `@tool` workflows (DR-0025) by compiling their
+/// declared sources, filling the derived input/output tool schemas back onto the
+/// already-parsed declarations. Each source is compiled (with `root = name`) and
+/// convergence-checked, so a non-`@tool`/non-convergent export fails manifest
+/// loading on both the producer (`whip package`) and the consumer (`use`) side.
+/// The input/output contracts are derived into JSON schemas — the cross-package
+/// tool contract a consumer checks against.
+///
+/// This is the filesystem-coupled half of manifest loading, split out of parse so
+/// the parse+validate core stays wasm-kernel-hostable. It runs as a separate pass
+/// right after `package_manifest_from_json` at every load site that loads a
+/// manifest from disk (`load_package_manifest`); manifests parsed without a
+/// backing source tree (e.g. the embedded std manifests, which declare no
+/// cross-package `@tool`s) simply skip it.
+fn attest_manifest_workflow_tools(manifest: &mut PackageManifest) -> Result<(), String> {
+    let path = manifest.path.clone();
+    for tool in &mut manifest.workflow_tools {
+        let name = tool.name.clone();
+        let source = tool.source.clone();
         let (_, ir) =
             compile_source_path_for_validation(source.to_str().unwrap_or_default(), Some(&name))
                 .map_err(|error| {
@@ -17328,1541 +17382,10 @@ fn package_manifest_workflow_tools(
                 whipplescript_kernel::coerce_native::json_schema_for_type(&contract.ty, &ir.schemas)
             })
             .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": false }));
-        tools.push(PackageWorkflowTool {
-            name,
-            source,
-            input_schema: input_schema.to_string(),
-            output_schema: output_schema.to_string(),
-        });
+        tool.input_schema = input_schema.to_string();
+        tool.output_schema = output_schema.to_string();
     }
-    Ok(tools)
-}
-
-fn validate_package_manifest_consistency(
-    path: &Path,
-    value: &Value,
-    capabilities: &BTreeMap<String, PackageCapabilityContract>,
-    providers: &[PackageProviderContract],
-    registry: &ContractRegistry,
-) -> Result<(), String> {
-    let declared_capabilities = capabilities.keys().cloned().collect::<BTreeSet<_>>();
-    let mut provider_kinds_by_capability = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut problems = Vec::new();
-
-    for provider in providers {
-        provider_kinds_by_capability
-            .entry(provider.capability.clone())
-            .or_default()
-            .insert(provider.provider_kind.clone());
-        validate_declared_capability(
-            path,
-            &declared_capabilities,
-            &provider.capability,
-            &format!("provider `{}`", provider.provider_kind),
-            &mut problems,
-        );
-    }
-
-    for contract in &registry.effect_contracts {
-        if contract.effect_kind != "capability.call" {
-            problems.push(format!(
-                "effect contract `{}` uses unsupported effect_kind `{}`; packages currently support only `capability.call`",
-                contract.id, contract.effect_kind
-            ));
-        }
-        validate_declared_capability(
-            path,
-            &declared_capabilities,
-            &contract.id,
-            &format!("effect contract `{}`", contract.id),
-            &mut problems,
-        );
-        for capability in &contract.required_capabilities {
-            validate_declared_capability(
-                path,
-                &declared_capabilities,
-                capability,
-                &format!("effect contract `{}` required_capabilities", contract.id),
-                &mut problems,
-            );
-        }
-    }
-
-    for form in &registry.constructs {
-        let family = PLATFORM_CONSTRUCT_CATALOG.family(&form.construct_family);
-        let lowering = PLATFORM_CONSTRUCT_CATALOG.lowering(&form.lowering_target);
-        if family.is_none() {
-            problems.push(format!(
-                "construct `{}` uses unsupported construct_family `{}`; expected one of {}",
-                form.id,
-                form.construct_family,
-                quoted_platform_values(PLATFORM_CONSTRUCT_CATALOG.family_ids())
-            ));
-        }
-        match lowering {
-            Some(lowering) => {
-                if family.is_some()
-                    && !lowering
-                        .compatible_families
-                        .contains(&form.construct_family.as_str())
-                {
-                    let expected = quoted_platform_values(
-                        PLATFORM_CONSTRUCT_CATALOG
-                            .lowerings_for_family(&form.construct_family)
-                            .filter(|lowering| lowering.package_authorable)
-                            .map(|lowering| lowering.id),
-                    );
-                    if form.lowering_target == CONSTRUCT_LOWERING_CAPABILITY_CALL {
-                        problems.push(format!(
-                            "construct `{}` uses capability_call lowering but construct_family is `{}`; expected `{}`",
-                            form.id, form.construct_family, CONSTRUCT_FAMILY_EFFECT_OPERATION
-                        ));
-                    } else {
-                        problems.push(format!(
-                            "construct `{}` is a {} but uses lowering_target `{}`; expected one of {}",
-                            form.id, form.construct_family, form.lowering_target, expected
-                        ));
-                    }
-                }
-                if !lowering.package_authorable {
-                    problems.push(format!(
-                        "construct `{}` uses platform-internal lowering_target `{}`; package constructs must use an authorable platform lowering",
-                        form.id, form.lowering_target
-                    ));
-                }
-                if let Some(required_scope) = lowering.required_scope {
-                    if form.scope != required_scope {
-                        problems.push(format!(
-                            "construct `{}` uses {} lowering in unsupported scope `{}`; {} forms are currently {} only",
-                            form.id,
-                            lowering.id,
-                            form.scope,
-                            lowering.id,
-                            required_scope
-                        ));
-                    }
-                }
-                match lowering.target_capability {
-                    ConstructTargetCapabilityPolicy::Forbidden => {
-                        if form.target_capability.is_some() {
-                            problems.push(format!(
-                                "construct `{}` is {} but declares target_capability",
-                                form.id, lowering.id
-                            ));
-                        }
-                    }
-                    ConstructTargetCapabilityPolicy::RequiredCapabilityCallContract => {
-                        let Some(target_capability) = form.target_capability.as_deref() else {
-                            problems.push(format!(
-                                "construct `{}` uses {} lowering but has no target_capability",
-                                form.id, lowering.id
-                            ));
-                            continue;
-                        };
-                        validate_declared_capability(
-                            path,
-                            &declared_capabilities,
-                            target_capability,
-                            &format!("construct `{}` target_capability", form.id),
-                            &mut problems,
-                        );
-                        let target_contract = registry.effect_contracts.iter().find(|contract| {
-                            contract.id == target_capability
-                                && contract.effect_kind == "capability.call"
-                        });
-                        if let Some(contract) = target_contract {
-                            validate_construct_input_schema_fields(form, contract, &mut problems);
-                        } else {
-                            problems.push(format!(
-                                "construct `{}` lowers to `{target_capability}` but no matching `capability.call` effect contract is declared",
-                                form.id
-                            ));
-                        }
-                    }
-                }
-            }
-            None => {
-                problems.push(format!(
-                    "construct `{}` uses unsupported lowering_target `{}`; expected one of {}",
-                    form.id,
-                    form.lowering_target,
-                    quoted_platform_values(
-                        PLATFORM_CONSTRUCT_CATALOG
-                            .lowerings
-                            .iter()
-                            .filter(|lowering| lowering.package_authorable)
-                            .map(|lowering| lowering.id),
-                    )
-                ));
-            }
-        }
-        if !PLATFORM_CONSTRUCT_CATALOG.contains_scope(&form.scope) {
-            problems.push(format!(
-                "construct `{}` uses unsupported scope `{}`; expected one of {}",
-                form.id,
-                form.scope,
-                quoted_platform_values(PLATFORM_CONSTRUCT_CATALOG.scopes.iter().copied())
-            ));
-        }
-        if let Some(error) = reserved_keyword_privilege_error(
-            &form.library_id,
-            &form.keyword,
-            &form.construct_family,
-            &form.scope,
-            &form.lowering_target,
-        ) {
-            problems.push(format!("construct `{}` {error}", form.id));
-        }
-        for field in &form.fields {
-            if !PLATFORM_CONSTRUCT_CATALOG.contains_field_kind(&field.kind) {
-                problems.push(format!(
-                    "construct `{}` field `{}` uses unsupported kind `{}`; expected one of {}",
-                    form.id,
-                    field.name,
-                    field.kind,
-                    quoted_platform_values(PLATFORM_CONSTRUCT_CATALOG.field_kinds.iter().copied())
-                ));
-            }
-        }
-        validate_construct_interface_records(path, form, &declared_capabilities, &mut problems);
-        if let Some(lowering) = lowering {
-            validate_construct_lowering_interfaces(form, lowering, &mut problems);
-        }
-    }
-
-    for profile in value
-        .get("profiles")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let profile_name = optional_json_string(profile, "name")
-            .or_else(|| optional_json_string(profile, "id"))
-            .unwrap_or_else(|| "<unnamed>".to_owned());
-        for capability in
-            optional_json_string_array(profile, "allowed_capabilities").unwrap_or_default()
-        {
-            validate_declared_capability(
-                path,
-                &declared_capabilities,
-                &capability,
-                &format!("profile `{profile_name}` allowed_capabilities"),
-                &mut problems,
-            );
-        }
-    }
-
-    for binding in value
-        .get("bindings")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let binding_name =
-            optional_json_string(binding, "id").unwrap_or_else(|| "<unnamed>".to_owned());
-        let capability = match required_json_string(binding, "capability", "binding") {
-            Ok(capability) => capability,
-            Err(message) => {
-                problems.push(format!("{message} in `{}`", path.display()));
-                continue;
-            }
-        };
-        validate_declared_capability(
-            path,
-            &declared_capabilities,
-            &capability,
-            &format!("binding `{binding_name}`"),
-            &mut problems,
-        );
-        let provider_kind = match required_json_string(binding, "provider", "binding") {
-            Ok(provider_kind) => provider_kind,
-            Err(message) => {
-                problems.push(format!("{message} in `{}`", path.display()));
-                continue;
-            }
-        };
-        match provider_kinds_by_capability.get(&capability) {
-            Some(kinds) if kinds.contains(&provider_kind) => {}
-            Some(kinds) => problems.push(format!(
-                "binding `{binding_name}` in `{}` references provider `{provider_kind}` for capability `{capability}`, but declared providers for that capability are: {}",
-                path.display(),
-                kinds.iter()
-                    .map(|kind| format!("`{kind}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-            None => problems.push(format!(
-                "binding `{binding_name}` in `{}` references capability `{capability}` without a provider",
-                path.display()
-            )),
-        }
-    }
-
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "package manifest `{}` has invalid package contracts:\n- {}",
-            path.display(),
-            problems.join("\n- ")
-        ))
-    }
-}
-
-fn validate_package_manifest_closed_shape(path: &Path, value: &Value) -> Result<(), String> {
-    let mut problems = Vec::new();
-    validate_manifest_object_fields(
-        value,
-        "package manifest",
-        &[
-            "schema",
-            "package_id",
-            "name",
-            "version",
-            "libraries",
-            "capabilities",
-            "providers",
-            "profiles",
-            "bindings",
-            "workflow_tools",
-        ],
-        &mut problems,
-    );
-    validate_manifest_required_fields(
-        value,
-        "package manifest",
-        &["schema", "package_id", "name", "version"],
-        &mut problems,
-    );
-    validate_manifest_array_objects(
-        value,
-        "package manifest",
-        "workflow_tools",
-        &mut problems,
-        |tool, label, problems| {
-            validate_manifest_object_fields(tool, &label, &["name", "source"], problems);
-            validate_manifest_required_fields(tool, &label, &["name", "source"], problems);
-            validate_manifest_string_fields(tool, &label, &["name", "source"], problems);
-        },
-    );
-    validate_manifest_string_fields(
-        value,
-        "package manifest",
-        &["schema", "package_id", "name", "version"],
-        &mut problems,
-    );
-
-    validate_manifest_array_objects(
-        value,
-        "package manifest",
-        "libraries",
-        &mut problems,
-        |library, label, problems| {
-            validate_manifest_object_fields(
-                library,
-                &label,
-                &[
-                    "id",
-                    "version",
-                    "standard",
-                    "effect_contracts",
-                    "effects",
-                    "constructs",
-                ],
-                problems,
-            );
-            validate_manifest_required_fields(library, &label, &["id"], problems);
-            validate_manifest_string_fields(library, &label, &["id", "version"], problems);
-            validate_manifest_bool_fields(library, &label, &["standard"], problems);
-            for field in ["effect_contracts", "effects"] {
-                validate_manifest_array_objects(
-                    library,
-                    &label,
-                    field,
-                    problems,
-                    |contract, label, problems| {
-                        validate_manifest_object_fields(
-                            contract,
-                            &label,
-                            &[
-                                "id",
-                                "effect_kind",
-                                "core_effect_kind",
-                                "source_forms",
-                                "input_schema",
-                                "output_schema",
-                                "required_capabilities",
-                                "provider_kinds",
-                                "projected_facts",
-                                "validation",
-                            ],
-                            problems,
-                        );
-                        validate_manifest_required_fields(contract, &label, &["id"], problems);
-                        validate_manifest_string_fields(
-                            contract,
-                            &label,
-                            &["id", "effect_kind", "core_effect_kind", "validation"],
-                            problems,
-                        );
-                        validate_manifest_string_array_fields(
-                            contract,
-                            &label,
-                            &[
-                                "source_forms",
-                                "required_capabilities",
-                                "provider_kinds",
-                                "projected_facts",
-                            ],
-                            problems,
-                        );
-                    },
-                );
-            }
-            validate_manifest_array_objects(
-                library,
-                &label,
-                "constructs",
-                problems,
-                |construct, label, problems| {
-                    validate_manifest_object_fields(
-                        construct,
-                        &label,
-                        &[
-                            "id",
-                            "construct_family",
-                            "keyword",
-                            "scope",
-                            "fields",
-                            "requires",
-                            "provides",
-                            "lowering_target",
-                            "target_capability",
-                        ],
-                        problems,
-                    );
-                    validate_manifest_required_fields(
-                        construct,
-                        &label,
-                        &["id", "construct_family", "keyword"],
-                        problems,
-                    );
-                    validate_manifest_string_fields(
-                        construct,
-                        &label,
-                        &[
-                            "id",
-                            "construct_family",
-                            "keyword",
-                            "scope",
-                            "lowering_target",
-                            "target_capability",
-                        ],
-                        problems,
-                    );
-                    validate_manifest_array_objects(
-                        construct,
-                        &label,
-                        "fields",
-                        problems,
-                        |field, label, problems| {
-                            validate_manifest_object_fields(
-                                field,
-                                &label,
-                                &["name", "kind", "required"],
-                                problems,
-                            );
-                            validate_manifest_required_fields(
-                                field,
-                                &label,
-                                &["name", "kind"],
-                                problems,
-                            );
-                            validate_manifest_string_fields(
-                                field,
-                                &label,
-                                &["name", "kind"],
-                                problems,
-                            );
-                            validate_manifest_bool_fields(field, &label, &["required"], problems);
-                        },
-                    );
-                    for direction in ["requires", "provides"] {
-                        validate_manifest_array_objects(
-                            construct,
-                            &label,
-                            direction,
-                            problems,
-                            |interface, label, problems| {
-                                validate_manifest_object_fields(
-                                    interface,
-                                    &label,
-                                    &["kind", "name", "type", "type_ref", "phase", "cardinality"],
-                                    problems,
-                                );
-                                validate_manifest_required_fields(
-                                    interface,
-                                    &label,
-                                    &["kind"],
-                                    problems,
-                                );
-                                validate_manifest_string_fields(
-                                    interface,
-                                    &label,
-                                    &["kind", "name", "type", "type_ref", "phase", "cardinality"],
-                                    problems,
-                                );
-                            },
-                        );
-                    }
-                },
-            );
-        },
-    );
-
-    validate_manifest_array_objects(
-        value,
-        "package manifest",
-        "capabilities",
-        &mut problems,
-        |capability, label, problems| {
-            validate_manifest_object_fields(
-                capability,
-                &label,
-                &[
-                    "id",
-                    "description",
-                    "schema",
-                    "input_schema",
-                    "output_schema",
-                ],
-                problems,
-            );
-            validate_manifest_required_fields(capability, &label, &["id"], problems);
-            validate_manifest_string_fields(capability, &label, &["id", "description"], problems);
-        },
-    );
-    validate_manifest_array_objects(
-        value,
-        "package manifest",
-        "providers",
-        &mut problems,
-        |provider, label, problems| {
-            validate_manifest_object_fields(
-                provider,
-                &label,
-                &[
-                    "id",
-                    "provider_kind",
-                    "capability",
-                    "effect_kind",
-                    "core_effect_kind",
-                    "config",
-                ],
-                problems,
-            );
-            validate_manifest_required_fields(
-                provider,
-                &label,
-                &["id", "provider_kind", "capability"],
-                problems,
-            );
-            validate_manifest_string_fields(
-                provider,
-                &label,
-                &[
-                    "id",
-                    "provider_kind",
-                    "capability",
-                    "effect_kind",
-                    "core_effect_kind",
-                ],
-                problems,
-            );
-        },
-    );
-    validate_manifest_array_objects(
-        value,
-        "package manifest",
-        "profiles",
-        &mut problems,
-        |profile, label, problems| {
-            validate_manifest_object_fields(
-                profile,
-                &label,
-                &[
-                    "id",
-                    "name",
-                    "description",
-                    "enforcement_mode",
-                    "allowed_capabilities",
-                    "config",
-                ],
-                problems,
-            );
-            validate_manifest_required_fields(
-                profile,
-                &label,
-                &["id", "name", "allowed_capabilities"],
-                problems,
-            );
-            validate_manifest_string_fields(
-                profile,
-                &label,
-                &["id", "name", "description", "enforcement_mode"],
-                problems,
-            );
-            validate_manifest_string_array_fields(
-                profile,
-                &label,
-                &["allowed_capabilities"],
-                problems,
-            );
-        },
-    );
-    validate_manifest_array_objects(
-        value,
-        "package manifest",
-        "bindings",
-        &mut problems,
-        |binding, label, problems| {
-            validate_manifest_object_fields(
-                binding,
-                &label,
-                &["id", "program_id", "capability", "provider", "config"],
-                problems,
-            );
-            validate_manifest_required_fields(
-                binding,
-                &label,
-                &["id", "capability", "provider"],
-                problems,
-            );
-            validate_manifest_string_fields(
-                binding,
-                &label,
-                &["id", "capability", "provider"],
-                problems,
-            );
-            validate_manifest_nullable_string_fields(binding, &label, &["program_id"], problems);
-        },
-    );
-
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "package manifest `{}` does not match closed package schema:\n- {}",
-            path.display(),
-            problems.join("\n- ")
-        ))
-    }
-}
-
-fn validate_manifest_object_fields(
-    value: &Value,
-    label: &str,
-    allowed_fields: &[&str],
-    problems: &mut Vec<String>,
-) {
-    let Some(object) = value.as_object() else {
-        problems.push(format!("{label} must be an object"));
-        return;
-    };
-    let allowed = allowed_fields.iter().copied().collect::<BTreeSet<_>>();
-    for key in object.keys() {
-        if !allowed.contains(key.as_str()) {
-            problems.push(format!("{label} field `{key}` is not allowed"));
-        }
-    }
-}
-
-fn validate_manifest_required_fields(
-    value: &Value,
-    label: &str,
-    required_fields: &[&str],
-    problems: &mut Vec<String>,
-) {
-    let Some(object) = value.as_object() else {
-        return;
-    };
-    for field in required_fields {
-        if !object.contains_key(*field) {
-            problems.push(format!("{label} missing required field `{field}`"));
-        }
-    }
-}
-
-fn validate_manifest_string_fields(
-    value: &Value,
-    label: &str,
-    fields: &[&str],
-    problems: &mut Vec<String>,
-) {
-    let Some(object) = value.as_object() else {
-        return;
-    };
-    for field in fields {
-        if object
-            .get(*field)
-            .is_some_and(|value| value.as_str().is_none_or(|string| string.trim().is_empty()))
-        {
-            problems.push(format!(
-                "{label} field `{field}` must be a non-empty string"
-            ));
-        }
-    }
-}
-
-fn validate_manifest_nullable_string_fields(
-    value: &Value,
-    label: &str,
-    fields: &[&str],
-    problems: &mut Vec<String>,
-) {
-    let Some(object) = value.as_object() else {
-        return;
-    };
-    for field in fields {
-        if object
-            .get(*field)
-            .is_some_and(|value| !value.is_null() && value.as_str().is_none())
-        {
-            problems.push(format!("{label} field `{field}` must be a string or null"));
-        }
-    }
-}
-
-fn validate_manifest_bool_fields(
-    value: &Value,
-    label: &str,
-    fields: &[&str],
-    problems: &mut Vec<String>,
-) {
-    let Some(object) = value.as_object() else {
-        return;
-    };
-    for field in fields {
-        if object.get(*field).is_some_and(|value| !value.is_boolean()) {
-            problems.push(format!("{label} field `{field}` must be a boolean"));
-        }
-    }
-}
-
-fn validate_manifest_string_array_fields(
-    value: &Value,
-    label: &str,
-    fields: &[&str],
-    problems: &mut Vec<String>,
-) {
-    let Some(object) = value.as_object() else {
-        return;
-    };
-    for field in fields {
-        let Some(value) = object.get(*field) else {
-            continue;
-        };
-        let Some(items) = value.as_array() else {
-            problems.push(format!("{label} field `{field}` must be an array"));
-            continue;
-        };
-        for (index, item) in items.iter().enumerate() {
-            if item.as_str().is_none_or(|string| string.trim().is_empty()) {
-                problems.push(format!(
-                    "{label}.{field}[{index}] must be a non-empty string"
-                ));
-            }
-        }
-    }
-}
-
-fn validate_manifest_array_objects<F>(
-    value: &Value,
-    parent_label: &str,
-    field: &str,
-    problems: &mut Vec<String>,
-    mut validate_item: F,
-) where
-    F: FnMut(&Value, String, &mut Vec<String>),
-{
-    let Some(items) = value.get(field) else {
-        return;
-    };
-    let Some(items) = items.as_array() else {
-        problems.push(format!("{parent_label}.{field} must be an array"));
-        return;
-    };
-    for (index, item) in items.iter().enumerate() {
-        let label = format!("{parent_label}.{field}[{index}]");
-        if !item.is_object() {
-            problems.push(format!("{label} must be an object"));
-            continue;
-        }
-        validate_item(item, label, problems);
-    }
-}
-
-fn validate_package_manifest_identity_uniqueness(path: &Path, value: &Value) -> Result<(), String> {
-    let mut problems = Vec::new();
-    validate_unique_manifest_collection_ids(value, "libraries", "library", &mut problems);
-    validate_unique_manifest_collection_ids(value, "capabilities", "capability", &mut problems);
-    validate_unique_manifest_collection_ids(value, "providers", "provider", &mut problems);
-    validate_unique_manifest_collection_ids(value, "profiles", "profile", &mut problems);
-    validate_unique_manifest_collection_ids(value, "bindings", "binding", &mut problems);
-
-    let mut effect_contract_ids = BTreeMap::<String, String>::new();
-    let mut construct_ids = BTreeMap::<String, String>::new();
-    for (index, library) in value
-        .get("libraries")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let library_label =
-            optional_json_string(library, "id").unwrap_or_else(|| format!("#{index}"));
-        if library.get("effect_contracts").is_some() && library.get("effects").is_some() {
-            problems.push(format!(
-                "library `{library_label}` declares both `effect_contracts` and `effects`; use `effect_contracts`"
-            ));
-        }
-        for field in ["effect_contracts", "effects"] {
-            for contract in library
-                .get(field)
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let Some(contract_id) = optional_json_string(contract, "id") else {
-                    continue;
-                };
-                let owner = format!("library `{library_label}` {field}");
-                validate_unique_manifest_package_id(
-                    "effect contract",
-                    &contract_id,
-                    owner,
-                    &mut effect_contract_ids,
-                    &mut problems,
-                );
-                for array_field in [
-                    "source_forms",
-                    "required_capabilities",
-                    "provider_kinds",
-                    "projected_facts",
-                ] {
-                    validate_unique_manifest_string_array(
-                        contract,
-                        array_field,
-                        &format!("effect contract `{contract_id}`"),
-                        &mut problems,
-                    );
-                }
-            }
-        }
-        for construct in library
-            .get("constructs")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let Some(construct_id) = optional_json_string(construct, "id") else {
-                continue;
-            };
-            validate_unique_manifest_package_id(
-                "construct",
-                &construct_id,
-                format!("library `{library_label}` constructs"),
-                &mut construct_ids,
-                &mut problems,
-            );
-        }
-    }
-
-    for profile in value
-        .get("profiles")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let profile_label = optional_json_string(profile, "id")
-            .or_else(|| optional_json_string(profile, "name"))
-            .unwrap_or_else(|| "<unnamed>".to_owned());
-        validate_unique_manifest_string_array(
-            profile,
-            "allowed_capabilities",
-            &format!("profile `{profile_label}`"),
-            &mut problems,
-        );
-    }
-
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "package manifest `{}` has duplicate or ambiguous package identities:\n- {}",
-            path.display(),
-            problems.join("\n- ")
-        ))
-    }
-}
-
-fn validate_unique_manifest_collection_ids(
-    value: &Value,
-    collection: &str,
-    label: &str,
-    problems: &mut Vec<String>,
-) {
-    let mut ids = BTreeSet::new();
-    for item in value
-        .get(collection)
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let Some(id) = optional_json_string(item, "id") else {
-            continue;
-        };
-        if !ids.insert(id.clone()) {
-            problems.push(format!("{label} `{id}` is declared more than once"));
-        }
-    }
-}
-
-fn validate_unique_manifest_package_id(
-    label: &str,
-    id: &str,
-    owner: String,
-    seen: &mut BTreeMap<String, String>,
-    problems: &mut Vec<String>,
-) {
-    if let Some(previous_owner) = seen.insert(id.to_owned(), owner.clone()) {
-        problems.push(format!(
-            "{label} `{id}` is declared more than once ({previous_owner} and {owner})"
-        ));
-    }
-}
-
-fn validate_unique_manifest_string_array(
-    value: &Value,
-    field: &str,
-    owner: &str,
-    problems: &mut Vec<String>,
-) {
-    let mut seen = BTreeSet::new();
-    for item in value
-        .get(field)
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .filter(|item| !item.trim().is_empty())
-    {
-        if !seen.insert(item) {
-            problems.push(format!(
-                "{owner} declares `{field}` value `{item}` more than once"
-            ));
-        }
-    }
-}
-
-fn quoted_platform_values<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
-    values
-        .into_iter()
-        .map(|value| format!("`{value}`"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn validate_construct_interface_records(
-    path: &Path,
-    form: &ConstructRegistration,
-    declared_capabilities: &BTreeSet<String>,
-    problems: &mut Vec<String>,
-) {
-    for (direction, interfaces) in [
-        ("requires", form.requires.as_slice()),
-        ("provides", form.provides.as_slice()),
-    ] {
-        for interface in interfaces {
-            if !PLATFORM_CONSTRUCT_CATALOG.contains_interface_kind(&interface.kind) {
-                problems.push(format!(
-                    "construct `{}` {direction} interface uses unsupported kind `{}`; expected one of {}",
-                    form.id,
-                    interface.kind,
-                    quoted_platform_values(PLATFORM_CONSTRUCT_CATALOG.interface_kinds.iter().copied())
-                ));
-            }
-            if !PLATFORM_CONSTRUCT_CATALOG.contains_interface_phase(&interface.phase) {
-                problems.push(format!(
-                    "construct `{}` {direction} interface `{}` uses unsupported phase `{}`; expected one of {}",
-                    form.id,
-                    interface.kind,
-                    interface.phase,
-                    quoted_platform_values(PLATFORM_CONSTRUCT_CATALOG.interface_phases.iter().copied())
-                ));
-            }
-            if !PLATFORM_CONSTRUCT_CATALOG.contains_interface_cardinality(&interface.cardinality) {
-                problems.push(format!(
-                    "construct `{}` {direction} interface `{}` uses unsupported cardinality `{}`; expected one of {}",
-                    form.id,
-                    interface.kind,
-                    interface.cardinality,
-                    quoted_platform_values(PLATFORM_CONSTRUCT_CATALOG.interface_cardinalities.iter().copied())
-                ));
-            }
-            if interface.kind == CONSTRUCT_INTERFACE_CAPABILITY {
-                match interface.name.as_deref() {
-                    Some(capability) => validate_declared_capability(
-                        path,
-                        declared_capabilities,
-                        capability,
-                        &format!("construct `{}` {direction} Capability interface", form.id),
-                        problems,
-                    ),
-                    None => problems.push(format!(
-                        "construct `{}` {direction} Capability interface must declare `name`",
-                        form.id
-                    )),
-                }
-            }
-        }
-    }
-}
-
-fn validate_construct_input_schema_fields(
-    form: &ConstructRegistration,
-    contract: &EffectContract,
-    problems: &mut Vec<String>,
-) {
-    let Some(input_fields) = contract
-        .input_schema
-        .as_deref()
-        .and_then(package_schema_top_level_object_fields)
-    else {
-        return;
-    };
-    let construct_fields = form
-        .fields
-        .iter()
-        .map(|field| (field.name.as_str(), field.required))
-        .collect::<BTreeMap<_, _>>();
-
-    for input_field in input_fields {
-        match construct_fields.get(input_field.as_str()) {
-            Some(true) => {}
-            Some(false) => problems.push(format!(
-                "construct `{}` lowers to `{}` but target input_schema field `{}` is optional in the construct fields",
-                form.id, contract.id, input_field
-            )),
-            None => problems.push(format!(
-                "construct `{}` lowers to `{}` but target input_schema field `{}` has no matching required construct field",
-                form.id, contract.id, input_field
-            )),
-        }
-    }
-}
-
-fn package_schema_top_level_object_fields(schema: &str) -> Option<BTreeSet<String>> {
-    match serde_json::from_str::<Value>(schema).ok()? {
-        Value::Object(fields) => Some(fields.keys().cloned().collect()),
-        _ => None,
-    }
-}
-
-fn validate_construct_lowering_interfaces(
-    form: &ConstructRegistration,
-    lowering: &PlatformConstructLowering,
-    problems: &mut Vec<String>,
-) {
-    for kind in lowering.required_interfaces {
-        if !form
-            .requires
-            .iter()
-            .any(|interface| interface.kind == *kind)
-        {
-            problems.push(format!(
-                "construct `{}` uses {} lowering but declares no required `{kind}` interface",
-                form.id, lowering.id
-            ));
-        }
-    }
-    for kind in lowering.provided_interfaces {
-        if !form
-            .provides
-            .iter()
-            .any(|interface| interface.kind == *kind)
-        {
-            problems.push(format!(
-                "construct `{}` uses {} lowering but declares no provided `{kind}` interface",
-                form.id, lowering.id
-            ));
-        }
-    }
-    if lowering.target_capability == ConstructTargetCapabilityPolicy::RequiredCapabilityCallContract
-    {
-        let Some(target_capability) = form.target_capability.as_deref() else {
-            return;
-        };
-        if !form.requires.iter().any(|interface| {
-            interface.kind == CONSTRUCT_INTERFACE_CAPABILITY
-                && interface.name.as_deref() == Some(target_capability)
-        }) {
-            problems.push(format!(
-                "construct `{}` uses {} lowering to `{target_capability}` but declares no required Capability interface named `{target_capability}`",
-                form.id, lowering.id
-            ));
-        }
-    }
-}
-
-fn validate_declared_capability(
-    path: &Path,
-    declared_capabilities: &BTreeSet<String>,
-    capability: &str,
-    owner: &str,
-    problems: &mut Vec<String>,
-) {
-    if capability == "*" || declared_capabilities.contains(capability) {
-        return;
-    }
-    problems.push(format!(
-        "{owner} in `{}` references undeclared capability `{capability}`",
-        path.display()
-    ));
-}
-
-fn package_capability_contracts(
-    path: &Path,
-    value: &Value,
-) -> Result<BTreeMap<String, PackageCapabilityContract>, String> {
-    let mut capabilities = BTreeMap::new();
-    for capability in value
-        .get("capabilities")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let capability_name = required_json_string(capability, "id", "capability")?;
-        let schema = capability.get("schema").unwrap_or(&Value::Null);
-        let contract = PackageCapabilityContract {
-            input_schema: json_schema_fragment(capability.get("input_schema"))
-                .or_else(|| json_schema_fragment(schema.get("input"))),
-            output_schema: json_schema_fragment(capability.get("output_schema"))
-                .or_else(|| json_schema_fragment(schema.get("output"))),
-        };
-        validate_package_schema_fragment_contract(
-            path,
-            &format!("capability `{capability_name}`"),
-            "input_schema",
-            contract.input_schema.as_deref(),
-        )?;
-        validate_package_schema_fragment_contract(
-            path,
-            &format!("capability `{capability_name}`"),
-            "output_schema",
-            contract.output_schema.as_deref(),
-        )?;
-        if capabilities
-            .insert(capability_name.clone(), contract)
-            .is_some()
-        {
-            return Err(format!(
-                "package manifest `{}` declares capability `{capability_name}` more than once",
-                path.display()
-            ));
-        }
-    }
-    Ok(capabilities)
-}
-
-fn package_provider_contracts(
-    path: &Path,
-    value: &Value,
-) -> Result<Vec<PackageProviderContract>, String> {
-    let mut providers = Vec::new();
-    for provider in value
-        .get("providers")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        providers.push(PackageProviderContract {
-            capability: required_json_string(provider, "capability", "provider")
-                .map_err(|message| format!("{} in `{}`", message, path.display()))?,
-            provider_kind: required_json_string(provider, "provider_kind", "provider")
-                .map_err(|message| format!("{} in `{}`", message, path.display()))?,
-        });
-    }
-    Ok(providers)
-}
-
-fn package_manifest_registry(
-    path: &Path,
-    value: &Value,
-    name: &str,
-    version: &str,
-    capabilities: &BTreeMap<String, PackageCapabilityContract>,
-    providers: &[PackageProviderContract],
-) -> Result<ContractRegistry, String> {
-    let mut registry = ContractRegistry::default();
-    let libraries = value.get("libraries").and_then(Value::as_array);
-
-    if let Some(libraries) = libraries {
-        for library in libraries {
-            let library_id = optional_json_string(library, "id").unwrap_or_else(|| name.to_owned());
-            let library_version =
-                optional_json_string(library, "version").unwrap_or_else(|| version.to_owned());
-            registry.upsert_library(LibraryRegistration {
-                id: library_id.clone(),
-                version: library_version.clone(),
-                standard: library
-                    .get("standard")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            });
-            for contract in library
-                .get("effect_contracts")
-                .or_else(|| library.get("effects"))
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                registry.upsert_effect_contract(package_effect_contract(
-                    path,
-                    contract,
-                    &library_id,
-                    &library_version,
-                    capabilities,
-                    providers,
-                )?);
-            }
-            for construct in library
-                .get("constructs")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                registry.upsert_construct(package_construct(
-                    path,
-                    construct,
-                    &library_id,
-                    &library_version,
-                )?);
-            }
-        }
-    }
-
-    if registry.libraries.is_empty() {
-        registry.upsert_library(LibraryRegistration {
-            id: name.to_owned(),
-            version: version.to_owned(),
-            standard: false,
-        });
-    }
-
-    if registry.effect_contracts.is_empty() {
-        for capability in derived_capability_names(capabilities, providers) {
-            let contract_json = json!({"id": capability});
-            registry.upsert_effect_contract(package_effect_contract(
-                path,
-                &contract_json,
-                name,
-                version,
-                capabilities,
-                providers,
-            )?);
-        }
-    }
-
-    Ok(registry)
-}
-
-fn package_construct(
-    path: &Path,
-    value: &Value,
-    library_id: &str,
-    version: &str,
-) -> Result<ConstructRegistration, String> {
-    let id = required_json_string(value, "id", "construct")
-        .map_err(|message| format!("{} in `{}`", message, path.display()))?;
-    let construct_family = required_json_string(value, "construct_family", "construct")
-        .map_err(|message| format!("{} in `{}`", message, path.display()))?;
-    let keyword = required_json_string(value, "keyword", "construct")
-        .map_err(|message| format!("{} in `{}`", message, path.display()))?;
-    let scope = optional_json_string(value, "scope").unwrap_or_else(|| "top_level".to_owned());
-    let lowering_target = optional_json_string(value, "lowering_target")
-        .unwrap_or_else(|| CONSTRUCT_LOWERING_METADATA_ONLY.to_owned());
-    let target_capability = optional_json_string(value, "target_capability");
-    let fields = value
-        .get("fields")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|field| package_construct_field(path, field, &id))
-        .collect::<Result<Vec<_>, _>>()?;
-    let requires = package_construct_interfaces(path, value, "requires", &id)?;
-    let provides = package_construct_interfaces(path, value, "provides", &id)?;
-
-    Ok(ConstructRegistration {
-        id,
-        library_id: library_id.to_owned(),
-        version: version.to_owned(),
-        construct_family,
-        keyword,
-        scope,
-        fields,
-        requires,
-        provides,
-        lowering_target,
-        target_capability,
-    })
-}
-
-fn package_construct_field(
-    path: &Path,
-    value: &Value,
-    form_id: &str,
-) -> Result<ConstructField, String> {
-    let owner = format!("construct `{form_id}` field");
-    let name = required_json_string(value, "name", &owner)
-        .map_err(|message| format!("{} in `{}`", message, path.display()))?;
-    let kind = required_json_string(value, "kind", &owner)
-        .map_err(|message| format!("{} in `{}`", message, path.display()))?;
-    Ok(ConstructField {
-        name,
-        kind,
-        required: value
-            .get("required")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
-    })
-}
-
-fn package_construct_interfaces(
-    path: &Path,
-    value: &Value,
-    direction: &str,
-    construct_id: &str,
-) -> Result<Vec<ConstructInterface>, String> {
-    value
-        .get(direction)
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|interface| package_construct_interface(path, interface, direction, construct_id))
-        .collect()
-}
-
-fn package_construct_interface(
-    path: &Path,
-    value: &Value,
-    direction: &str,
-    construct_id: &str,
-) -> Result<ConstructInterface, String> {
-    let owner = format!("construct `{construct_id}` {direction} interface");
-    let kind = required_json_string(value, "kind", &owner)
-        .map_err(|message| format!("{} in `{}`", message, path.display()))?;
-    let name = optional_json_string(value, "name");
-    let type_ref =
-        optional_json_string(value, "type").or_else(|| optional_json_string(value, "type_ref"));
-    let phase = optional_json_string(value, "phase")
-        .unwrap_or_else(|| CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME.to_owned());
-    let cardinality = optional_json_string(value, "cardinality")
-        .unwrap_or_else(|| CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE.to_owned());
-
-    Ok(ConstructInterface {
-        kind,
-        name,
-        type_ref,
-        phase,
-        cardinality,
-    })
-}
-
-fn derived_capability_names(
-    capabilities: &BTreeMap<String, PackageCapabilityContract>,
-    providers: &[PackageProviderContract],
-) -> BTreeSet<String> {
-    let mut names = capabilities.keys().cloned().collect::<BTreeSet<_>>();
-    for provider in providers {
-        names.insert(provider.capability.clone());
-    }
-    names
-}
-
-fn package_effect_contract(
-    path: &Path,
-    value: &Value,
-    library_id: &str,
-    version: &str,
-    capabilities: &BTreeMap<String, PackageCapabilityContract>,
-    providers: &[PackageProviderContract],
-) -> Result<EffectContract, String> {
-    let id = required_json_string(value, "id", "effect contract")
-        .map_err(|message| format!("{} in `{}`", message, path.display()))?;
-    let capability_contract = capabilities.get(&id);
-    let output_schema = json_schema_fragment(value.get("output_schema"))
-        .or_else(|| capability_contract.and_then(|contract| contract.output_schema.clone()));
-    let input_schema = json_schema_fragment(value.get("input_schema"))
-        .or_else(|| capability_contract.and_then(|contract| contract.input_schema.clone()));
-    validate_package_schema_fragment_contract(
-        path,
-        &format!("effect contract `{id}`"),
-        "input_schema",
-        input_schema.as_deref(),
-    )?;
-    validate_package_schema_fragment_contract(
-        path,
-        &format!("effect contract `{id}`"),
-        "output_schema",
-        output_schema.as_deref(),
-    )?;
-    let source_forms = optional_json_string_array(value, "source_forms")
-        .filter(|forms| !forms.is_empty())
-        .unwrap_or_else(|| vec![format!("call {id}")]);
-    let required_capabilities = optional_json_string_array(value, "required_capabilities")
-        .filter(|capabilities| !capabilities.is_empty())
-        .unwrap_or_else(|| vec![id.clone()]);
-    let provider_kinds = optional_json_string_array(value, "provider_kinds")
-        .filter(|kinds| !kinds.is_empty())
-        .unwrap_or_else(|| {
-            providers
-                .iter()
-                .filter(|provider| provider.capability == id)
-                .map(|provider| provider.provider_kind.clone())
-                .collect()
-        });
-    let projected_facts =
-        optional_json_string_array(value, "projected_facts").unwrap_or_else(|| {
-            if output_schema.is_some() {
-                vec!["effect.output".to_owned()]
-            } else {
-                Vec::new()
-            }
-        });
-    let validation = package_validation_mode(value, output_schema.is_some())?;
-
-    Ok(EffectContract {
-        id,
-        library_id: library_id.to_owned(),
-        version: version.to_owned(),
-        effect_kind: optional_json_string_any(value, &["effect_kind", "core_effect_kind"])
-            .unwrap_or_else(|| "capability.call".to_owned()),
-        source_forms,
-        input_schema,
-        output_schema,
-        required_capabilities,
-        provider_kinds,
-        projected_facts,
-        validation,
-    })
-}
-
-fn package_validation_mode(
-    value: &Value,
-    has_output_schema: bool,
-) -> Result<TypedOutputValidation, String> {
-    match value.get("validation").and_then(Value::as_str) {
-        Some("none") => Ok(TypedOutputValidation::None),
-        Some("runtime_boundary") | Some("runtime") => Ok(TypedOutputValidation::RuntimeBoundary),
-        Some(other) => Err(format!(
-            "effect contract validation must be `none` or `runtime_boundary`, got `{other}`"
-        )),
-        None if has_output_schema => Ok(TypedOutputValidation::RuntimeBoundary),
-        None => Ok(TypedOutputValidation::None),
-    }
-}
-
-fn validate_package_schema_fragment_contract(
-    path: &Path,
-    owner: &str,
-    field: &str,
-    schema: Option<&str>,
-) -> Result<(), String> {
-    let Some(schema) = schema else {
-        return Ok(());
-    };
-    let mut errors = Vec::new();
-    validate_package_schema_fragment_shape(schema, field, &mut errors, 0);
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "{owner} in `{}` has invalid {field}: {}",
-            path.display(),
-            errors.join("; ")
-        ))
-    }
-}
-
-fn validate_package_schema_fragment_shape(
-    schema: &str,
-    label: &str,
-    errors: &mut Vec<String>,
-    depth: usize,
-) {
-    if depth > 32 {
-        errors.push(format!("{label} exceeded package schema recursion limit"));
-        return;
-    }
-    match serde_json::from_str::<Value>(schema) {
-        Ok(fragment) => validate_package_schema_shape_value(&fragment, label, errors, depth + 1),
-        Err(_) => validate_package_schema_type_name(schema, label, errors),
-    }
-}
-
-fn validate_package_schema_shape_value(
-    schema: &Value,
-    label: &str,
-    errors: &mut Vec<String>,
-    depth: usize,
-) {
-    if depth > 32 {
-        errors.push(format!("{label} exceeded package schema recursion limit"));
-        return;
-    }
-    match schema {
-        Value::String(name) => validate_package_schema_type_name(name, label, errors),
-        Value::Object(fields) => {
-            for (field, field_schema) in fields {
-                if field.trim().is_empty() {
-                    errors.push(format!("{label} contains an empty field name"));
-                    continue;
-                }
-                validate_package_schema_shape_value(
-                    field_schema,
-                    &format!("{label}.{field}"),
-                    errors,
-                    depth + 1,
-                );
-            }
-        }
-        Value::Array(items) if items.len() == 1 => {
-            validate_package_schema_shape_value(&items[0], &format!("{label}[]"), errors, depth + 1)
-        }
-        Value::Array(_) => errors.push(format!("{label} uses unsupported package tuple schema")),
-        Value::Bool(_) | Value::Number(_) | Value::Null => errors.push(format!(
-            "{label} uses unsupported package schema fragment `{schema}`"
-        )),
-    }
-}
-
-fn validate_package_schema_type_name(name: &str, label: &str, errors: &mut Vec<String>) {
-    if !matches!(
-        name,
-        "json"
-            | "any"
-            | "string"
-            | "int"
-            | "integer"
-            | "float"
-            | "number"
-            | "bool"
-            | "boolean"
-            | "null"
-    ) {
-        errors.push(format!("{label} uses unsupported package type `{name}`"));
-    }
+    Ok(())
 }
 
 fn package_registry(manifests: &[PackageManifest]) -> ContractRegistry {
@@ -19227,6 +17750,12 @@ fn load_package_lock_file(path: &Path) -> Result<LoadedPackageLock, String> {
             )
         })?;
         let expected_name = required_json_string(package, "name", "package lock entry")?;
+        if is_reserved_std_package_name(&expected_name) {
+            return Err(format!(
+                "package lock `{}` entry `{expected_name}` claims the reserved std namespace; std packages ship embedded in the platform and cannot be provided by a package lock",
+                path.display()
+            ));
+        }
         let expected_version = required_json_string(package, "version", "package lock entry")?;
         let expected_package_id =
             required_json_string(package, "package_id", "package lock entry")?;
@@ -19251,48 +17780,6 @@ fn load_package_lock_file(path: &Path) -> Result<LoadedPackageLock, String> {
         path: path.to_path_buf(),
         manifests,
     })
-}
-
-fn required_json_string(value: &Value, field: &str, owner: &str) -> Result<String, String> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| format!("{owner} must have non-empty `{field}` string"))
-}
-
-fn optional_json_string(value: &Value, field: &str) -> Option<String> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-}
-
-fn optional_json_string_any(value: &Value, fields: &[&str]) -> Option<String> {
-    fields
-        .iter()
-        .find_map(|field| optional_json_string(value, field))
-}
-
-fn optional_json_string_array(value: &Value, field: &str) -> Option<Vec<String>> {
-    value.get(field).and_then(Value::as_array).map(|items| {
-        items
-            .iter()
-            .filter_map(Value::as_str)
-            .filter(|item| !item.trim().is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-    })
-}
-
-fn json_schema_fragment(value: Option<&Value>) -> Option<String> {
-    match value {
-        Some(Value::String(schema)) if !schema.trim().is_empty() => Some(schema.clone()),
-        Some(Value::Null) | None => None,
-        Some(schema) => Some(schema.to_string()),
-    }
 }
 
 fn register_locked_packages(
@@ -20450,7 +18937,6 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
         let kernel = &mut self.kernel;
         let event = match effect.kind.as_str() {
             "event.emit" => run_event_effect_generic(kernel, id, effect, &config)?,
-            "loft.claim" => run_loft_effect_generic(kernel, id, effect, &config)?,
             "human.ask" => run_human_effect_generic(kernel, id, effect, &config)?,
             // Local mailbox is a native-only, file-based provider; the DO/sans-IO
             // InstanceStepMachine path stays on the fixture provider (out of scope).
@@ -20468,10 +18954,22 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
             "lease.acquire" | "lease.release" | "lease.renew" | "ledger.append"
             | "counter.consume" => run_coordination_effect_generic(kernel, id, effect, "now")?,
             "signal.emit" => run_notify_effect_generic(kernel, id, effect, &IfcDeliveryGovernance)?,
-            "file.read" => run_file_effect_generic(kernel, &NativeFileStore, id, effect)?,
-            "file.write" => run_file_write_effect_generic(kernel, &NativeFileStore, id, effect)?,
-            "file.import" => run_file_import_effect_generic(kernel, &NativeFileStore, id, effect)?,
-            "file.export" => run_file_export_effect_generic(kernel, &NativeFileStore, id, effect)?,
+            "file.read" => {
+                let files = file_store_for_instance(id, &effect.effect_id);
+                run_file_effect_generic(kernel, &*files, id, effect)?
+            }
+            "file.write" => {
+                let files = file_store_for_instance(id, &effect.effect_id);
+                run_file_write_effect_generic(kernel, &*files, id, effect)?
+            }
+            "file.import" => {
+                let files = file_store_for_instance(id, &effect.effect_id);
+                run_file_import_effect_generic(kernel, &*files, id, effect)?
+            }
+            "file.export" => {
+                let files = file_store_for_instance(id, &effect.effect_id);
+                run_file_export_effect_generic(kernel, &*files, id, effect)?
+            }
             other => {
                 return Err(StoreError::Conflict(format!(
                     "effect kind `{other}` is not yet driven by the instance step machine \
@@ -20758,6 +19256,18 @@ struct WorkerReport {
     terminal_events: Vec<String>,
 }
 
+/// One drive pass (rule step + worker) is idle when the step committed no
+/// rules and the worker neither ran effects nor admitted new source input.
+/// Shared by `dev` and the improve evaluation loop so a new admission
+/// channel added to `WorkerReport` cannot silently drift between them.
+fn drive_pass_idle(step_report: &StepReport, worker_report: &WorkerReport) -> bool {
+    step_report.committed_rules == 0
+        && worker_report.ran_effects == 0
+        && worker_report.file_lines_admitted == 0
+        && worker_report.http_items_admitted == 0
+        && worker_report.inbound_messages_admitted == 0
+}
+
 fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerReport, StoreError> {
     guard_no_stale_effect_kinds(store_path)?;
     let mut report = WorkerReport {
@@ -20777,48 +19287,55 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
     report.timers_fired = time_report.timers_fired;
     report.deadlines_expired = time_report.deadlines_expired;
     report.terminal_events.extend(time_report.terminal_events);
+    // Compile the worker's program once (when a path is supplied): the
+    // source-driven admission passes below (clock/file/http sources, local
+    // channel inboxes) and the script hard-off import key (Layer 2,
+    // spec/std-script.md) all read the same IR.
+    let program_ir = options.program_path.as_deref().and_then(|program_path| {
+        fs::read_to_string(program_path)
+            .ok()
+            .and_then(|source_text| {
+                whipplescript_parser::compile_program_with_root(
+                    &source_text,
+                    options.root.as_deref(),
+                )
+                .ir
+            })
+    });
     // Fire due `every <duration>` clock-source occurrences (spec/std-time.md), like
     // timers a worker-boundary clock read. Only when the program declares a clock
     // source, so non-clock workflows pay nothing.
-    if let Some(program_path) = options.program_path.as_deref() {
-        if let Ok(source_text) = fs::read_to_string(program_path) {
-            let compiled = whipplescript_parser::compile_program_with_root(
-                &source_text,
-                options.root.as_deref(),
-            );
-            if let Some(ir) = compiled.ir {
-                if ir.sources.iter().any(|source| source.is_clock) {
-                    report.clock_occurrences_admitted += resolve_due_clock_sources(
-                        store_path,
-                        &options.instance_id,
-                        options.virtual_now.as_deref().unwrap_or("now"),
-                        &ir,
-                    )?;
-                }
-                // Admit new lines from `file` sources (spec/std-time.md). Only
-                // when the program declares one, so other workflows pay nothing.
-                if ir.sources.iter().any(|source| source.is_file) {
-                    report.file_lines_admitted +=
-                        resolve_due_file_sources(store_path, &options.instance_id, &ir)?;
-                }
-                // Admit new elements from `http` sources (GET a JSON array). Only
-                // when the program declares one, so other workflows pay nothing.
-                if ir.sources.iter().any(|source| source.is_http) {
-                    report.http_items_admitted +=
-                        resolve_due_http_sources(store_path, &options.instance_id, &ir)?;
-                }
-                // Admit received messages from `local` channel inboxes
-                // (spec/messaging.md, RECEIVE side). Only when the program
-                // declares a `local` channel, so other workflows pay nothing.
-                if ir
-                    .channels
-                    .iter()
-                    .any(|channel| channel.provider == "local")
-                {
-                    report.inbound_messages_admitted +=
-                        resolve_due_inbound_messages(store_path, &options.instance_id, &ir)?;
-                }
-            }
+    if let Some(ir) = program_ir.as_ref() {
+        if ir.sources.iter().any(|source| source.is_clock) {
+            report.clock_occurrences_admitted += resolve_due_clock_sources(
+                store_path,
+                &options.instance_id,
+                options.virtual_now.as_deref().unwrap_or("now"),
+                ir,
+            )?;
+        }
+        // Admit new lines from `file` sources (spec/std-time.md). Only
+        // when the program declares one, so other workflows pay nothing.
+        if ir.sources.iter().any(|source| source.is_file) {
+            report.file_lines_admitted +=
+                resolve_due_file_sources(store_path, &options.instance_id, ir)?;
+        }
+        // Admit new elements from `http` sources (GET a JSON array). Only
+        // when the program declares one, so other workflows pay nothing.
+        if ir.sources.iter().any(|source| source.is_http) {
+            report.http_items_admitted +=
+                resolve_due_http_sources(store_path, &options.instance_id, ir)?;
+        }
+        // Admit received messages from `local` channel inboxes
+        // (spec/messaging.md, RECEIVE side). Only when the program
+        // declares a `local` channel, so other workflows pay nothing.
+        if ir
+            .channels
+            .iter()
+            .any(|channel| channel.provider == "local")
+        {
+            report.inbound_messages_admitted +=
+                resolve_due_inbound_messages(store_path, &options.instance_id, ir)?;
         }
     }
     let script_manifest = load_script_manifest(options.script_manifest_path.as_deref())
@@ -20827,12 +19344,33 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
     let package_lock =
         load_package_lock(options.package_lock_path.as_deref(), &worker_source_paths)
             .map_err(StoreError::Conflict)?;
-    if let Some(manifest) = script_manifest.as_ref() {
-        let store = SqliteStore::open(store_path)?;
-        let instance = store
-            .get_instance(&options.instance_id)?
-            .ok_or_else(|| StoreError::Conflict("instance not found".to_owned()))?;
-        register_script_manifest_capabilities(&store, manifest, &instance.program_id)?;
+    // Script hard-off Layer 2 (spec/std-script.md "Two layers, both required"):
+    // `script.*` capability rows are seeded ONLY when both keys turn —
+    // (a) the program's IR imports std.script, and (b) the operator-plane
+    // authority exists: a script-manifest entry for `script.<name>`, or dev
+    // profile + a non-empty WHIPPLESCRIPT_EXEC_ALLOW for `script.raw`.
+    // Unseeded, every exec.command effect blocks at the store admission gate
+    // (blocked_by_capability / security.script_disabled) before any provider
+    // run. The import key is forgeable by construction; the operator authority
+    // is not, so forged IR yields at most execution the operator already
+    // authorized.
+    let program_imports_std_script = program_ir
+        .as_ref()
+        .is_some_and(|ir| ir.uses.iter().any(|use_decl| use_decl.name == "std.script"));
+    if program_imports_std_script {
+        let raw_exec_authority = !options.exec_profile.is_hosted() && exec_allowlist_present();
+        if script_manifest.is_some() || raw_exec_authority {
+            let store = SqliteStore::open(store_path)?;
+            let instance = store
+                .get_instance(&options.instance_id)?
+                .ok_or_else(|| StoreError::Conflict("instance not found".to_owned()))?;
+            if let Some(manifest) = script_manifest.as_ref() {
+                register_script_manifest_capabilities(&store, manifest, &instance.program_id)?;
+            }
+            if raw_exec_authority {
+                register_raw_script_capability(&store, &instance.program_id)?;
+            }
+        }
     }
     {
         let store = SqliteStore::open(store_path)?;
@@ -20942,7 +19480,6 @@ fn run_claimable_effect(
     let result = match effect.kind.as_str() {
         "agent.tell" => run_agent_effect(store_path, instance_id, effect, options),
         "schema.coerce" => run_coerce_effect(store_path, instance_id, effect, options),
-        "loft.claim" => run_loft_effect(store_path, instance_id, effect, options),
         "human.ask" => run_human_effect(store_path, instance_id, effect, options),
         "capability.call" => {
             run_capability_effect(store_path, instance_id, effect, options, package_lock)
@@ -20986,6 +19523,18 @@ fn run_claimable_effect(
         // so a non-capacity block reaching here is a real error worth surfacing).
         Err(StoreError::CapacityBlocked { .. }) => Ok(None),
         Err(StoreError::PolicyBlocked { reason, .. }) if reason.contains("capacity exhausted") => {
+            Ok(None)
+        }
+        // Script hard-off Layer 2 (spec/std-script.md): an exec.command effect
+        // with no bound `script.*` capability blocks at admission —
+        // `start_run` has already recorded the block (blocked_by_capability,
+        // reason prefixed `security.script_disabled`) and no run row or spawn
+        // happened. Blocking is the fail-closed design state, not a worker
+        // error: the effect stays durable and visible (`whip effects` carries
+        // the reason), like every other blocked_by_capability effect.
+        Err(StoreError::PolicyBlocked { reason, .. })
+            if reason.contains("security.script_disabled") =>
+        {
             Ok(None)
         }
         Err(other) => Err(other),
@@ -21088,12 +19637,11 @@ fn items_store_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".whipplescript/items.sqlite"))
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct TimePassReport {
-    timers_fired: usize,
-    deadlines_expired: usize,
-    terminal_events: Vec<String>,
-}
+use whipplescript_kernel::time_pass::{clock_emit_payload, TimePassReport};
+#[cfg(test)]
+use whipplescript_kernel::time_pass::{due_calendar_occurrences, select_clock_occurrences};
+#[cfg(test)]
+use whipplescript_parser::{CalendarPattern, MissedPolicy, TimeOfDay, Weekday};
 
 /// Selects which due clock occurrences become durable signal facts under the
 /// source's missed-occurrence policy (spec/std-time.md). Each entry is a
@@ -21102,255 +19650,17 @@ struct TimePassReport {
 /// decides which occurrences are admitted, never their key.
 /// Parses a clock instant (canonical `…Z`, or a lenient SQLite/ISO form) into a
 /// UTC datetime for calendar math.
-fn parse_clock_instant(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
-        return Some(dt.with_timezone(&Utc));
-    }
-    for fmt in [
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d %H:%M",
-    ] {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(value, fmt) {
-            return Some(Utc.from_utc_datetime(&naive));
-        }
-    }
-    NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .ok()
-        .and_then(|date| date.and_hms_opt(0, 0, 0))
-        .map(|naive| Utc.from_utc_datetime(&naive))
-}
-
-fn calendar_weekday(day: Weekday) -> chrono::Weekday {
-    match day {
-        Weekday::Monday => chrono::Weekday::Mon,
-        Weekday::Tuesday => chrono::Weekday::Tue,
-        Weekday::Wednesday => chrono::Weekday::Wed,
-        Weekday::Thursday => chrono::Weekday::Thu,
-        Weekday::Friday => chrono::Weekday::Fri,
-        Weekday::Saturday => chrono::Weekday::Sat,
-        Weekday::Sunday => chrono::Weekday::Sun,
-    }
-}
-
-fn calendar_date_matches(date: chrono::NaiveDate, pattern: CalendarPattern) -> bool {
-    use chrono::Datelike;
-    match pattern {
-        CalendarPattern::Day => true,
-        CalendarPattern::Weekday => {
-            !matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun)
-        }
-        CalendarPattern::Weekly(day) => date.weekday() == calendar_weekday(day),
-    }
-}
-
-/// The UTC instant of `time` on `date` in `tz`, handling DST: a nonexistent local
-/// time (spring-forward gap) yields `None` (the occurrence is skipped); an
-/// ambiguous local time (fall-back) resolves to the earliest instant.
-fn local_occurrence_instant(
-    tz: chrono_tz::Tz,
-    date: chrono::NaiveDate,
-    time: TimeOfDay,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    use chrono::TimeZone;
-    let naive = date.and_hms_opt(u32::from(time.hour), u32::from(time.minute), 0)?;
-    match tz.from_local_datetime(&naive) {
-        chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&chrono::Utc)),
-        chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest.with_timezone(&chrono::Utc)),
-        chrono::LocalResult::None => None,
-    }
-}
-
-/// Calendar occurrences in the half-open window `(cursor, now]`, evaluated in
-/// `tz_name` (DST-correct), returned as canonical ISO-8601 UTC strings — the
-/// calendar analogue of `due_interval_occurrences`. An unparseable instant or
-/// timezone yields no occurrences (the source simply does not fire).
-fn due_calendar_occurrences(
-    cursor: &str,
-    now: &str,
-    tz_name: &str,
-    pattern: CalendarPattern,
-    time: TimeOfDay,
-) -> Vec<String> {
-    let (Some(cursor_utc), Some(now_utc)) = (parse_clock_instant(cursor), parse_clock_instant(now))
-    else {
-        return Vec::new();
-    };
-    let Ok(tz) = tz_name.parse::<chrono_tz::Tz>() else {
-        return Vec::new();
-    };
-    if now_utc <= cursor_utc {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut date = cursor_utc.with_timezone(&tz).date_naive();
-    let end_date = now_utc.with_timezone(&tz).date_naive();
-    // Bound the day scan so a long-idle source can't loop unboundedly; missed
-    // occurrences beyond the bound are coalesced by the missed policy anyway.
-    let mut guard = 0u32;
-    while date <= end_date && guard < 4000 {
-        guard += 1;
-        if calendar_date_matches(date, pattern) {
-            if let Some(occurrence) = local_occurrence_instant(tz, date, time) {
-                if occurrence > cursor_utc && occurrence <= now_utc {
-                    out.push(occurrence.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-                }
-            }
-        }
-        let Some(next) = date.succ_opt() else { break };
-        date = next;
-    }
-    out
-}
-
-fn select_clock_occurrences(due: &[String], missed: Option<&MissedPolicy>) -> Vec<(String, i64)> {
-    if due.is_empty() {
-        return Vec::new();
-    }
-    let last = due.last().expect("non-empty").clone();
-    match missed {
-        // catch_up: admit one fact per occurrence, newest `limit` of them.
-        Some(MissedPolicy::CatchUp { limit }) => {
-            let keep = (*limit as usize).max(1);
-            let start = due.len().saturating_sub(keep);
-            due[start..].iter().map(|at| (at.clone(), 0)).collect()
-        }
-        // skip: emit only the next observed occurrence; missed ones are dropped.
-        Some(MissedPolicy::Skip) => vec![(last, 0)],
-        // coalesce: emit one occurrence representing all missed ticks. Also the
-        // flood-safe default when no policy is declared (a long-idle source must
-        // not admit one fact per elapsed interval at once).
-        _ => vec![(last, (due.len() as i64) - 1)],
-    }
-}
-
-/// Builds a clock signal payload by resolving the source's `emit <signal> { … }`
-/// field mapping against the observation (`scheduled_at`/`observed_at`/
-/// `occurrence_id`/`missed_count`). Paths off the `observe` binding read the
-/// observation; literals pass through.
-fn clock_emit_payload(source: &IrSource, observation: &serde_json::Map<String, Value>) -> Value {
-    let mut payload = serde_json::Map::new();
-    for field in &source.emit_fields {
-        let value = match &field.value {
-            SourceValue::Path {
-                binding, segments, ..
-            } => {
-                if binding.name == source.observe_binding && segments.len() == 1 {
-                    observation
-                        .get(&segments[0].name)
-                        .cloned()
-                        .unwrap_or(Value::Null)
-                } else {
-                    Value::Null
-                }
-            }
-            SourceValue::String(literal) => Value::String(literal.value.clone()),
-            SourceValue::Number(number, _) => serde_json::from_str(number).unwrap_or(Value::Null),
-        };
-        payload.insert(field.name.clone(), value);
-    }
-    Value::Object(payload)
-}
-
-/// Fires due occurrences of `every <duration>` clock sources (spec/std-time.md):
-/// for each interval source, enumerate occurrences due since the cursor (the last
-/// admitted occurrence, else the instance start) up to `now`, apply the missed
-/// policy, and admit each as a durable signal fact keyed by
-/// `occurrence_id = H(source, scheduled_instant)` so re-evaluation and replay are
-/// idempotent. `at`/calendar (timezone) recurrence forms are not fired here.
 fn resolve_due_clock_sources(
     store_path: &Path,
     instance_id: &str,
     now: &str,
     ir: &IrProgram,
 ) -> Result<u64, StoreError> {
-    let mut admitted = 0u64;
-    for source in &ir.sources {
-        if !source.is_clock {
-            continue;
-        }
-        let Some(recurrence) = source.recurrence.as_ref() else {
-            continue;
-        };
-        let store = SqliteStore::open(store_path)?;
-        let Some(instance) = store.get_instance(instance_id)? else {
-            continue;
-        };
-        let last = store.last_clock_occurrence(instance_id, &source.emit_signal)?;
-        let cursor = last.clone().unwrap_or_else(|| instance.created_at.clone());
-        // Calendar/`at` recurrence resolves in the source timezone (required by the
-        // checker for those forms); interval recurrence ignores it.
-        let timezone = source.timezone.as_deref().unwrap_or("UTC");
-        let due = match recurrence {
-            Recurrence::EveryDuration { seconds, .. } => {
-                store.due_interval_occurrences(&cursor, *seconds as i64, now)?
-            }
-            Recurrence::EveryCalendar { pattern, time, .. } => {
-                due_calendar_occurrences(&cursor, now, timezone, *pattern, *time)
-            }
-            // `at <time>` is a single scheduled occurrence (spec/std-time.md): the
-            // first daily occurrence of the time after the source start, fired once.
-            // Once any occurrence has been admitted, it never fires again.
-            Recurrence::At { time, .. } => {
-                if last.is_some() {
-                    Vec::new()
-                } else {
-                    due_calendar_occurrences(
-                        &instance.created_at,
-                        now,
-                        timezone,
-                        CalendarPattern::Day,
-                        *time,
-                    )
-                    .into_iter()
-                    .take(1)
-                    .collect()
-                }
-            }
-        };
-        let observed_at = store.resolve_clock(now)?;
-        drop(store);
-        for (scheduled_at, missed_count) in select_clock_occurrences(&due, source.missed.as_ref()) {
-            let occurrence_id = idempotency_key(&[&source.name, &scheduled_at]);
-            let mut observation = serde_json::Map::new();
-            observation.insert("scheduled_at".to_owned(), Value::String(scheduled_at));
-            observation.insert("observed_at".to_owned(), Value::String(observed_at.clone()));
-            observation.insert(
-                "occurrence_id".to_owned(),
-                Value::String(occurrence_id.clone()),
-            );
-            observation.insert("missed_count".to_owned(), json!(missed_count));
-            let payload_json = clock_emit_payload(source, &observation).to_string();
-            let store = SqliteStore::open(store_path)?;
-            let mut kernel = RuntimeKernel::new(store);
-            // Record the occurrence event, then derive its durable signal fact
-            // (mirroring `whip signal`): the unique index on `occurrence_id` makes
-            // both steps idempotent across re-evaluation and replay.
-            let received = kernel.ingest_external_event(
-                instance_id,
-                &source.emit_signal,
-                &payload_json,
-                Some(&occurrence_id),
-            )?;
-            kernel.derive_fact(
-                instance_id,
-                &source.emit_signal,
-                &received.event_id,
-                &payload_json,
-                Some(&received.event_id),
-                Some(&idempotency_key(&[
-                    instance_id,
-                    "clock-fact",
-                    &received.event_id,
-                ])),
-            )?;
-            admitted += 1;
-        }
-    }
-    Ok(admitted)
+    // Lifted into the kernel (DR-0033 Phase 6 tail) so the DO host fires the
+    // same clock sources; the CLI opens the store once and delegates.
+    let store = SqliteStore::open(store_path)?;
+    let mut kernel = RuntimeKernel::new(store);
+    whipplescript_kernel::time_pass::resolve_due_clock_sources(&mut kernel, instance_id, now, ir)
 }
 
 /// Admits durable signal facts from `file` sources (spec/std-time.md admission
@@ -21473,6 +19783,161 @@ fn resolve_due_file_sources(
 /// assumes an APPEND-ONLY feed (the cursor is keyed by cumulative array index, so
 /// an element inserted at the head or a shrinking feed would desync the cursor).
 /// A recurrence-gated cadence and content-keyed dedup are follow-ons.
+fn http_source_url_policy_error(url: &str) -> Option<String> {
+    if env::var("WHIPPLESCRIPT_HTTP_SOURCE_ALLOW_PRIVATE")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return Some("source URL must include an http(s) scheme".to_owned());
+    };
+    if scheme != "http" && scheme != "https" {
+        return Some("only http(s) source URLs are supported".to_owned());
+    }
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    }
+    .trim()
+    .trim_end_matches('.')
+    .to_ascii_lowercase();
+    if host.is_empty() {
+        return Some("source URL has no host".to_owned());
+    }
+    if !http_source_host_is_allowlisted(&host) {
+        return Some(format!(
+            "host `{host}` is not in WHIPPLESCRIPT_HTTP_SOURCE_ALLOW"
+        ));
+    }
+    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
+        return Some(format!("host `{host}` resolves to a local namespace"));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if private_or_local_ip(ip) {
+            return Some(format!("host `{host}` is not a public routable address"));
+        }
+        return None;
+    }
+    // Not a literal IP: a DNS name can still point at an internal target
+    // (169.254.169.254, 127.0.0.1, RFC1918), which the literal-IP screen
+    // above would miss. Resolve it and refuse if ANY resolved address is
+    // private/local. (Residual: the eventual fetch re-resolves, so a
+    // rebinding DNS server could still swing to an internal address between
+    // this check and the connect — pinning the vetted IP through the HTTP
+    // client is the airtight follow-on.)
+    use std::net::ToSocketAddrs;
+    match (host.as_str(), 0u16).to_socket_addrs() {
+        Ok(addresses) => {
+            let mut resolved_any = false;
+            for address in addresses {
+                resolved_any = true;
+                if private_or_local_ip(address.ip()) {
+                    return Some(format!(
+                        "host `{host}` resolves to a non-public address ({})",
+                        address.ip()
+                    ));
+                }
+            }
+            if !resolved_any {
+                return Some(format!("host `{host}` did not resolve to any address"));
+            }
+        }
+        Err(_) => {
+            return Some(format!("host `{host}` could not be resolved"));
+        }
+    }
+    None
+}
+
+fn http_source_host_is_allowlisted(host: &str) -> bool {
+    let Ok(allow) = env::var("WHIPPLESCRIPT_HTTP_SOURCE_ALLOW") else {
+        return true;
+    };
+    allow
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            let entry = entry.trim_end_matches('.').to_ascii_lowercase();
+            if let Some(suffix) = entry.strip_prefix("*.") {
+                host == suffix || host.ends_with(&format!(".{suffix}"))
+            } else {
+                host == entry
+            }
+        })
+}
+
+fn private_or_local_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => private_or_local_ipv4(ip),
+        IpAddr::V6(ip) => private_or_local_ipv6(ip),
+    }
+}
+
+/// A ureq resolver that screens DNS at CONNECTION time: it resolves `netloc`
+/// and returns the addresses only if every one is public, else errors. Because
+/// this is the same resolution ureq then connects to, it closes the DNS-rebind
+/// gap a separate up-front check leaves open (a name that passed validation but
+/// re-resolves to an internal address at connect time). Used for HTTP-source
+/// ingress; the up-front `http_source_url_policy_error` stays as a fast reject.
+fn screen_public_addrs(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let addresses: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
+    if addresses.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "`{netloc}` did not resolve to any address"
+        )));
+    }
+    // The same operator override the up-front policy check honors: the
+    // connection-time screen must not refuse what the policy admitted
+    // (local feeds in dev/tests), or the override is a dead letter.
+    if env::var("WHIPPLESCRIPT_HTTP_SOURCE_ALLOW_PRIVATE")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return Ok(addresses);
+    }
+    if let Some(internal) = addresses.iter().find(|addr| private_or_local_ip(addr.ip())) {
+        return Err(std::io::Error::other(format!(
+            "`{netloc}` resolves to a non-public address ({})",
+            internal.ip()
+        )));
+    }
+    Ok(addresses)
+}
+
+fn private_or_local_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || a >= 224
+}
+
+fn private_or_local_ipv6(ip: Ipv6Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || (octets[0] & 0xfe) == 0xfc
+        || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+        || octets[0] == 0xff
+}
+
 fn resolve_due_http_sources(
     store_path: &Path,
     instance_id: &str,
@@ -21486,6 +19951,10 @@ fn resolve_due_http_sources(
         let Some(url) = source.url.as_ref() else {
             continue;
         };
+        if let Some(reason) = http_source_url_policy_error(url) {
+            eprintln!("http source `{}`: refused {url}: {reason}", source.name);
+            continue;
+        }
         let already_admitted = {
             let store = SqliteStore::open(store_path)?;
             if store.get_instance(instance_id)?.is_none() {
@@ -21505,6 +19974,9 @@ fn resolve_due_http_sources(
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(5))
             .user_agent("whipplescript-ingress")
+            // Screen at connection time so a rebinding DNS name cannot swing to
+            // an internal address between the policy check and the connect.
+            .resolver(screen_public_addrs)
             .build();
         let body = match agent.get(url).call() {
             Ok(response) => match response.into_string() {
@@ -21711,168 +20183,11 @@ fn resolve_due_time_effects(
     instance_id: &str,
     now: &str,
 ) -> Result<TimePassReport, StoreError> {
-    let mut report = TimePassReport::default();
+    // Lifted into the kernel (DR-0033 Phase 6) so the DO host runs the same
+    // pass over its threaded store; the CLI opens the store once and delegates.
     let store = SqliteStore::open(store_path)?;
-    let due = store.due_time_effects(instance_id, now)?;
-    drop(store);
-    for effect in due {
-        // A `lease.acquire … wait <duration>` carries a creation-anchored
-        // `timeout_seconds` purely to bound its contention retry, so it surfaces
-        // here once the wait elapses. Its terminal is `contended` (give up), not a
-        // timeout/expiry — the coordination handler on the effect pass owns that
-        // completion, so leave it for the handler rather than expiring it here.
-        if effect.kind == "lease.acquire" {
-            continue;
-        }
-        if effect.kind == "timer.wait" {
-            let run_id = idempotency_key(&[instance_id, &effect.effect_id, "timer-run"]);
-            let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "timer-lease"]);
-            let store = SqliteStore::open(store_path)?;
-            let mut kernel = RuntimeKernel::new(store);
-            kernel.start_run(RunStart {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "timer",
-                worker_id: "whip-timer",
-                lease_id: &lease_id,
-                lease_expires_at: "2030-01-01T00:00:00Z",
-                metadata_json: &json!({
-                    "duration_seconds": effect.timeout_seconds,
-                })
-                .to_string(),
-            })?;
-            let terminal = kernel.complete_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "timer",
-                worker_id: "whip-timer",
-                status: "completed",
-                exit_code: Some(0),
-                summary: Some("timer fired"),
-                metadata_json: &json!({
-                    "duration_seconds": effect.timeout_seconds,
-                })
-                .to_string(),
-                idempotency_key: Some(&idempotency_key(&[
-                    instance_id,
-                    &effect.effect_id,
-                    "timer-terminal",
-                ])),
-            })?;
-            let value_json = json!({
-                "effect_id": effect.effect_id,
-                "run_id": run_id,
-                "status": "completed",
-                "fired": true,
-                "duration_seconds": effect.timeout_seconds,
-            })
-            .to_string();
-            kernel.derive_fact(
-                instance_id,
-                "timer.fired",
-                &effect.effect_id,
-                &value_json,
-                Some(&terminal.event_id),
-                Some(&idempotency_key(&[
-                    instance_id,
-                    &effect.effect_id,
-                    "timer.fired",
-                ])),
-            )?;
-            report.timers_fired += 1;
-            report.terminal_events.push(terminal.event_id);
-            continue;
-        }
-        // Deadline expiry: running effects time out at the run level and get
-        // a cancellation request; never-run effects expire directly.
-        let store = SqliteStore::open(store_path)?;
-        let running_run = store
-            .list_runs(instance_id)?
-            .into_iter()
-            .find(|run| run.effect_id == effect.effect_id && run.status == "running");
-        drop(store);
-        let terminal_event_id = match running_run {
-            Some(run) => {
-                let store = SqliteStore::open(store_path)?;
-                let mut kernel = RuntimeKernel::new(store);
-                let terminal = kernel.timeout_run(EffectCompletion {
-                    instance_id,
-                    effect_id: &effect.effect_id,
-                    run_id: &run.run_id,
-                    provider: &run.provider,
-                    worker_id: &run.worker_id,
-                    status: "timed_out",
-                    exit_code: None,
-                    summary: Some("deadline exceeded"),
-                    metadata_json: &json!({
-                        "timeout_seconds": effect.timeout_seconds,
-                        "reason": "deadline exceeded",
-                    })
-                    .to_string(),
-                    idempotency_key: Some(&idempotency_key(&[
-                        instance_id,
-                        &effect.effect_id,
-                        "deadline-terminal",
-                    ])),
-                })?;
-                let store = kernel.into_store();
-                let mut store = store;
-                let _ = store.request_effect_cancellation(EffectCancellationRequest {
-                    instance_id,
-                    effect_id: &effect.effect_id,
-                    revision_id: None,
-                    reason: Some("deadline exceeded"),
-                    requested_by: "deadline",
-                    causation_event_id: Some(&terminal.event_id),
-                    idempotency_key: Some(&idempotency_key(&[
-                        instance_id,
-                        &effect.effect_id,
-                        "deadline-cancel-request",
-                    ])),
-                });
-                terminal.event_id
-            }
-            None => {
-                let mut store = SqliteStore::open(store_path)?;
-                let terminal = store.expire_effect(
-                    instance_id,
-                    &effect.effect_id,
-                    Some(&idempotency_key(&[
-                        instance_id,
-                        &effect.effect_id,
-                        "deadline-terminal",
-                    ])),
-                )?;
-                terminal.event_id
-            }
-        };
-        let store = SqliteStore::open(store_path)?;
-        let mut kernel = RuntimeKernel::new(store);
-        let value_json = json!({
-            "effect_id": effect.effect_id,
-            "status": "timed_out",
-            "reason": "deadline exceeded",
-            "timeout_seconds": effect.timeout_seconds,
-        })
-        .to_string();
-        kernel.derive_fact(
-            instance_id,
-            "effect.timed_out",
-            &effect.effect_id,
-            &value_json,
-            Some(&terminal_event_id),
-            Some(&idempotency_key(&[
-                instance_id,
-                &effect.effect_id,
-                "effect.timed_out",
-            ])),
-        )?;
-        report.deadlines_expired += 1;
-        report.terminal_events.push(terminal_event_id);
-    }
-    Ok(report)
+    let mut kernel = RuntimeKernel::new(store);
+    whipplescript_kernel::time_pass::resolve_due_time_effects(&mut kernel, instance_id, now)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -22093,7 +20408,10 @@ fn run_agent_effect(
     // (Decision 2) — the owned catalogue stays discover-all. Degrades to no skills
     // when the program is unavailable (e.g. `whip worker` without `--program`).
     let agent_name = effect.target.as_deref().unwrap_or("agent");
-    let declared_skills: Vec<String> = options
+    // `settings` rides along (DR-0034 Decision 4): the delegated ambient-config
+    // knob, resolved from the same agent declaration. Degrades to None (provider
+    // default) when the program is unavailable.
+    let (declared_skills, agent_settings): (Vec<String>, Option<String>) = options
         .program_path
         .as_deref()
         .and_then(|path| path.to_str())
@@ -22102,7 +20420,7 @@ fn run_agent_effect(
             ir.agents
                 .iter()
                 .find(|agent| agent.name == agent_name)
-                .map(|agent| agent.skills.clone())
+                .map(|agent| (agent.skills.clone(), agent.settings.clone()))
                 .unwrap_or_default()
         })
         .unwrap_or_default();
@@ -22149,6 +20467,20 @@ fn run_agent_effect(
             "provider_config",
             &reason,
         );
+    }
+    // DR-0034 Decision 5 (D8-2): the evidence path forks on the harness class — this
+    // is the first place dispatch acts on it. A Delegated turn's context is assembled
+    // by the foreign runtime, so instead of the hermetic `context.bundle` provenance a
+    // Managed turn records, we record one `context.attestation` row tagged
+    // `context: provider-assembled` (provider identity, prompt hash, tool/permission
+    // policy) before the turn. Managed kinds (owned/fixture) skip this and emit their
+    // full provenance from within the brokered loop.
+    if harness_class(&provider_selection.kind) == HarnessClass::Delegated {
+        kernel.record_delegated_context_attestation(
+            execution,
+            &provider_selection.kind,
+            &effect.required_capabilities_json,
+        )?;
     }
     if provider_selection.kind == "owned" {
         // Owned brokered harness (DR-0024 slice 1): the kernel drives the model
@@ -22232,6 +20564,7 @@ fn run_agent_effect(
                 effect,
                 &input_json,
                 provider_selection.provider_config.as_ref(),
+                agent_settings.as_deref(),
             )?;
             let mut adapter = match claude_agent_sdk_adapter(&provider_selection.provider_id) {
                 Ok(healthy_adapter) => healthy_adapter,
@@ -22834,11 +21167,10 @@ fn codex_app_server_adapter(
                 && capability.surface == AdapterSurface::CodexAppServer
         })
         .ok_or_else(|| StoreError::Conflict("missing built-in Codex capability".to_owned()))?;
-    Ok(CodexAppServerAdapter::new(
-        provider,
-        capability,
-        CodexAppServerClient::new(transport),
-    ))
+    Ok(
+        CodexAppServerAdapter::new(provider, capability, CodexAppServerClient::new(transport))
+            .with_inactivity_budget(native_provider_inactivity_budget()),
+    )
 }
 
 #[cfg(feature = "codex")]
@@ -22879,16 +21211,52 @@ fn codex_native_turn_request(
     })
 }
 
+/// Locate the bundled Claude Agent SDK sidecar relative to the whip
+/// executable (a trusted install location), never the current working
+/// directory. Walks up from the binary's directory looking for
+/// `scripts/claude-agent-sdk-sidecar.mjs` so both the dev repo layout
+/// (`target/<profile>/whip` → repo root) and a packaged layout resolve,
+/// while a hostile CWD can never inject the path.
+#[cfg(feature = "claude")]
+fn default_claude_sidecar_path() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent();
+    while let Some(base) = dir {
+        let candidate = base.join("scripts/claude-agent-sdk-sidecar.mjs");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        dir = base.parent();
+    }
+    None
+}
+
 #[cfg(feature = "claude")]
 fn claude_agent_sdk_adapter(
     provider: &str,
 ) -> Result<ClaudeAgentSdkAdapter<StdioClaudeAgentSdkTransport>, StoreError> {
-    let sidecar = env::var("WHIPPLESCRIPT_CLAUDE_AGENT_SDK_SIDECAR")
-        .unwrap_or_else(|_| "scripts/claude-agent-sdk-sidecar.mjs".to_owned());
+    // The default sidecar must NOT be resolved against the current working
+    // directory: running whip inside a hostile repo that ships its own
+    // `scripts/claude-agent-sdk-sidecar.mjs` would otherwise execute that
+    // attacker file under `node` with whip's full inherited environment
+    // (provider API keys, WHIP_* tokens) — arbitrary code execution. When the
+    // operator hasn't pinned an explicit path, resolve it relative to the whip
+    // EXECUTABLE (a trusted install location), failing closed if not found.
+    let sidecar = match env::var("WHIPPLESCRIPT_CLAUDE_AGENT_SDK_SIDECAR") {
+        Ok(path) => std::path::PathBuf::from(path),
+        Err(_) => default_claude_sidecar_path().ok_or_else(|| {
+            StoreError::Conflict(
+                "Claude Agent SDK sidecar not found relative to the whip executable; set \
+                 WHIPPLESCRIPT_CLAUDE_AGENT_SDK_SIDECAR to its absolute path"
+                    .to_owned(),
+            )
+        })?,
+    };
     let command =
         env::var("WHIPPLESCRIPT_CLAUDE_AGENT_SDK_COMMAND").unwrap_or_else(|_| "node".to_owned());
-    let transport =
-        StdioClaudeAgentSdkTransport::spawn(&command, &[sidecar.as_str()]).map_err(|error| {
+    let sidecar_arg = sidecar.to_string_lossy().into_owned();
+    let transport = StdioClaudeAgentSdkTransport::spawn(&command, &[sidecar_arg.as_str()])
+        .map_err(|error| {
             StoreError::Conflict(format!(
                 "failed to launch Claude Agent SDK sidecar: {error:?}"
             ))
@@ -22900,11 +21268,23 @@ fn claude_agent_sdk_adapter(
                 && capability.surface == AdapterSurface::ClaudeAgentSdk
         })
         .ok_or_else(|| StoreError::Conflict("missing built-in Claude capability".to_owned()))?;
-    Ok(ClaudeAgentSdkAdapter::new(
-        provider,
-        capability,
-        ClaudeAgentSdkClient::new(transport),
-    ))
+    let mut client = ClaudeAgentSdkClient::new(transport);
+    // Version exchange (DR-0035 Decision 7): a sidecar that ANSWERS with a
+    // mismatched protocol blocks the binding here (provider_health,
+    // recoverable), never mid-turn. A legacy sidecar answering
+    // `unknown_command` is tolerated as `/1` for one release, and a transport
+    // error is NOT a mismatch — a dead or unreachable sidecar keeps surfacing
+    // at start_turn exactly as before (policy checks there run without any
+    // sidecar I/O, so a policy denial never needs a live peer).
+    if let Ok(Some(protocol)) = client.hello() {
+        if protocol != WHIP_SIDECAR_PROTOCOL {
+            return Err(StoreError::Conflict(format!(
+                "Claude sidecar speaks `{protocol}`; this whip requires `{WHIP_SIDECAR_PROTOCOL}`"
+            )));
+        }
+    }
+    Ok(ClaudeAgentSdkAdapter::new(provider, capability, client)
+        .with_inactivity_budget(native_provider_inactivity_budget()))
 }
 
 #[cfg(feature = "claude")]
@@ -22913,6 +21293,7 @@ fn claude_native_turn_request(
     effect: &ClaimableEffect,
     input_json: &str,
     config: Option<&ProviderBindingConfig>,
+    settings: Option<&str>,
 ) -> Result<NativeProviderTurnRequest, StoreError> {
     let input = serde_json::from_str::<Value>(input_json)?;
     let prompt_json = input
@@ -22931,6 +21312,12 @@ fn claude_native_turn_request(
         )),
     );
     apply_provider_config_options(&mut provider_options, config);
+    // Inserted after the config options so the agent's declared `settings` knob
+    // (DR-0034 Decision 4) wins over ambient provider config; absent means the
+    // provider's own default (the adapter omits the sidecar key).
+    if let Some(settings) = settings {
+        provider_options.insert("settings".to_owned(), Value::String(settings.to_owned()));
+    }
     Ok(NativeProviderTurnRequest {
         provider_id: execution.provider.to_owned(),
         provider_kind: ProviderKind::Claude,
@@ -22967,11 +21354,10 @@ fn pi_rpc_adapter(provider: &str) -> Result<PiRpcAdapter<StdioPiRpcTransport>, S
                 && capability.surface == AdapterSurface::PiRpc
         })
         .ok_or_else(|| StoreError::Conflict("missing built-in Pi capability".to_owned()))?;
-    Ok(PiRpcAdapter::new(
-        provider,
-        capability,
-        PiRpcClient::new(transport),
-    ))
+    Ok(
+        PiRpcAdapter::new(provider, capability, PiRpcClient::new(transport))
+            .with_inactivity_budget(native_provider_inactivity_budget()),
+    )
 }
 
 fn pi_native_turn_request(
@@ -23139,6 +21525,17 @@ fn native_provider_max_events() -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(256)
+}
+
+/// DR-0035 Decision 4: the inactivity wall clock for delegated event streams.
+/// When no frame arrives within this window the adapter synthesizes the
+/// TimedOut terminal instead of blocking the worker thread forever.
+fn native_provider_inactivity_budget() -> std::time::Duration {
+    let seconds = env::var("WHIPPLESCRIPT_NATIVE_PROVIDER_INACTIVITY_TIMEOUT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(300);
+    std::time::Duration::from_secs(seconds)
 }
 
 struct NativeFixtureAdapter {
@@ -23458,6 +21855,12 @@ fn auth_status(options: &CliOptions) -> ExitCode {
             };
         rows.push((provider.to_owned(), source, redacted));
     }
+    // Phase 4 auth relocation: when the policy channel hands whip resolved
+    // credentials inside provider profiles, the host owns auth and the rows
+    // above are only the standalone FALLBACK.
+    let host_profiles = std::env::var("WHIPPLESCRIPT_PROVIDER_PROFILES")
+        .ok()
+        .filter(|path| !path.is_empty());
     if options.json {
         let providers: Vec<Value> = rows
             .iter()
@@ -23473,9 +21876,15 @@ fn auth_status(options: &CliOptions) -> ExitCode {
         let _ = emit_json(json!({
             "schema": "whipplescript.auth_status.v0",
             "config_path": auth::auth_config_path().map(|path| path.display().to_string()),
+            "host_resolved_profiles": host_profiles,
             "providers": providers,
         }));
     } else {
+        if let Some(path) = &host_profiles {
+            println!(
+                "host-resolved provider profiles: {path} (whip's own credentials below are the fallback path)"
+            );
+        }
         for (provider, source, redacted) in &rows {
             match redacted {
                 Some(redacted) => println!("{provider}: {redacted} (from {source})"),
@@ -23581,6 +21990,9 @@ fn run_native_coerce_effect(
         schema_name,
         max_tokens: config.max_tokens,
         codex,
+        // Stable per-effect `Idempotency-Key` (DR-0033): resume-stable so
+        // OpenAI/codex dedupe a duplicate provider call after a worker eviction.
+        idempotency_key: idempotency_key(&[instance_id, &effect.effect_id, "coerce"]),
         transport: &transport,
     };
     let store = SqliteStore::open(store_path)?;
@@ -23660,16 +22072,6 @@ fn cancel_coerce_effect(
         ])),
     )?;
     Ok(terminal)
-}
-
-fn run_loft_effect(
-    store_path: &Path,
-    instance_id: &str,
-    effect: &ClaimableEffect,
-    options: &WorkerOptions,
-) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_loft_effect_generic(&mut kernel, instance_id, effect, &options.effect_config())
 }
 
 fn run_human_effect(
@@ -24260,7 +22662,8 @@ fn run_file_effect(
     effect: &ClaimableEffect,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_file_effect_generic(&mut kernel, &NativeFileStore, instance_id, effect)
+    let files = file_store_for_instance(instance_id, &effect.effect_id);
+    run_file_effect_generic(&mut kernel, &*files, instance_id, effect)
 }
 
 /// Executes one `file.write` effect (std.files): resolve `<root>/<path>`, enforce
@@ -24274,7 +22677,8 @@ fn run_file_write_effect(
     effect: &ClaimableEffect,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_file_write_effect_generic(&mut kernel, &NativeFileStore, instance_id, effect)
+    let files = file_store_for_instance(instance_id, &effect.effect_id);
+    run_file_write_effect_generic(&mut kernel, &*files, instance_id, effect)
 }
 
 /// Executes one `file.import` effect (std.files): resolve `<root>/<path>`, decode
@@ -24289,7 +22693,8 @@ fn run_file_import_effect(
     effect: &ClaimableEffect,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_file_import_effect_generic(&mut kernel, &NativeFileStore, instance_id, effect)
+    let files = file_store_for_instance(instance_id, &effect.effect_id);
+    run_file_import_effect_generic(&mut kernel, &*files, instance_id, effect)
 }
 
 /// CSV-escape one field (inverse of `split_csv_record`): quote when the value
@@ -24364,7 +22769,8 @@ fn run_file_export_effect(
     effect: &ClaimableEffect,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_file_export_effect_generic(&mut kernel, &NativeFileStore, instance_id, effect)
+    let files = file_store_for_instance(instance_id, &effect.effect_id);
+    run_file_export_effect_generic(&mut kernel, &*files, instance_id, effect)
 }
 
 /// Host-agnostic core (DR-0033 chunk 3): export facts to a file through the
@@ -24437,7 +22843,11 @@ fn run_file_export_effect_generic<S: RuntimeStore>(
     let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
 
     let outcome: Result<(usize, String), String> = (|| {
-        if let Some(reason) = file_path_policy_error(path, store_name, &allow, "write") {
+        if let Some(reason) =
+            file_path_policy_error(path, store_name, &allow, "write").or_else(|| {
+                files.path_policy_error(Path::new(root), Path::new(path), store_name, "write")
+            })
+        {
             return Err(reason);
         }
         // Resolve the collection: facts of <schema> [where predicate], ordered by
@@ -24578,82 +22988,12 @@ fn run_coordination_effect(
 }
 
 /// The validated result of `-> Schema` / `-> each Schema` stdout ingestion.
-enum ExecIngest {
-    Single(Value),
-    Stream(Vec<Value>),
-}
-
 type ExecOutcome =
     Result<(i32, String, String, Option<ExecIngest>), (Option<(i32, String, String)>, String)>;
 
 /// Parses and validates exec stdout against the effect's embedded contract
 /// (spec/json-ingestion.md). Streams are all-or-nothing: any malformed line
 /// fails the whole effect so a partial stream never half-commits.
-fn ingest_exec_stdout(contract: &Value, stdout: &str) -> Result<ExecIngest, String> {
-    let schema = contract
-        .get("schema")
-        .and_then(Value::as_str)
-        .unwrap_or("json");
-    let shape = contract.get("shape").cloned().unwrap_or(Value::Null);
-    let each = contract
-        .get("each")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let text = stdout.trim();
-    if !each {
-        let value: Value = serde_json::from_str(text)
-            .map_err(|error| format!("stdout is not valid JSON for `{schema}`: {error}"))?;
-        if !value.is_object() {
-            return Err(format!(
-                "stdout must be a single JSON object conforming to `{schema}`"
-            ));
-        }
-        let mut errors = Vec::new();
-        validate_ingest_value(&value, &shape, "$", &mut errors);
-        if !errors.is_empty() {
-            return Err(format!(
-                "stdout does not conform to `{schema}`: {}",
-                errors.join("; ")
-            ));
-        }
-        return Ok(ExecIngest::Single(value));
-    }
-    let elements: Vec<Value> = if text.starts_with('[') {
-        serde_json::from_str::<Value>(text)
-            .map_err(|error| format!("stdout is not a valid JSON array of `{schema}`: {error}"))?
-            .as_array()
-            .cloned()
-            .ok_or_else(|| format!("stdout must be a JSON array or JSONL stream of `{schema}`"))?
-    } else {
-        let mut items = Vec::new();
-        for (index, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let value = serde_json::from_str(line).map_err(|error| {
-                format!(
-                    "line {} is not valid JSON for `{schema}`: {error}",
-                    index + 1
-                )
-            })?;
-            items.push(value);
-        }
-        items
-    };
-    let mut errors = Vec::new();
-    for (index, element) in elements.iter().enumerate() {
-        validate_ingest_value(element, &shape, &format!("[{index}]"), &mut errors);
-    }
-    if !errors.is_empty() {
-        return Err(format!(
-            "stream does not conform to `{schema}`: {}",
-            errors.join("; ")
-        ));
-    }
-    Ok(ExecIngest::Stream(elements))
-}
-
 fn truncate_exec_bytes(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     text.chars().take(8192).collect::<String>()
@@ -24701,11 +23041,7 @@ fn run_script_capability_exec(
             format!("script capability `{capability}` is not declared in the manifest"),
         ));
     };
-    if script
-        .argv
-        .iter()
-        .any(|arg| executable_basename(arg) == "whip")
-    {
+    if script_argv_denied_executable(&script.argv).is_some() {
         return Err((
             None,
             "script capabilities may not execute the `whip` control-plane binary".to_owned(),
@@ -24756,26 +23092,16 @@ fn run_script_capability_exec(
     argv[script_index] = verified_path.display().to_string();
     let mut command = Command::new(&argv[0]);
     command.args(&argv[1..]);
-    for (name, reference) in &script.env {
-        let Some(env_name) = reference.strip_prefix("env:") else {
-            return Err((
-                None,
-                format!("script capability `{capability}` env `{name}` must use an env: reference"),
-            ));
-        };
-        match env::var(env_name) {
-            Ok(value) => {
-                command.env(name, value);
-            }
-            Err(_) => {
-                return Err((
-                    None,
-                    format!(
-                        "script capability `{capability}` requires missing environment variable `{env_name}`"
-                    ),
-                ))
-            }
-        }
+    command.env_clear();
+    if let Some(path) = env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    let resolved_env = match resolve_script_capability_env(script) {
+        Ok(resolved_env) => resolved_env,
+        Err(reason) => return Err((None, reason)),
+    };
+    for (name, value) in &resolved_env {
+        command.env(name, value);
     }
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
@@ -24794,9 +23120,14 @@ fn run_script_capability_exec(
     };
     if let Some(stdin) = child.stdin.as_mut() {
         if let Err(error) = stdin.write_all(stdin_json.as_bytes()) {
-            let _ = child.kill();
-            let _ = fs::remove_file(&verified_path);
-            return Err((None, format!("exec command failed to write stdin: {error}")));
+            // A script that never reads stdin can exit before the write lands;
+            // EPIPE here just means "input not consumed", not a failed run —
+            // the child's own output and exit code decide the outcome.
+            if error.kind() != io::ErrorKind::BrokenPipe {
+                let _ = child.kill();
+                let _ = fs::remove_file(&verified_path);
+                return Err((None, format!("exec command failed to write stdin: {error}")));
+            }
         }
     }
     let output = match child.wait_with_output() {
@@ -24815,6 +23146,23 @@ fn executable_basename(arg: &str) -> &str {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(arg)
+}
+
+/// Control-plane binaries a script capability may never execute
+/// (spec/script-capabilities.md "Hard exclusions"): the single source for both
+/// the manifest load-time refusal and the runtime exec-path backstop, so the
+/// two sites cannot drift.
+const SCRIPT_DENIED_EXECUTABLES: &[&str] = &["whip"];
+
+/// The first denied control-plane executable named anywhere in a script
+/// capability's argv (by basename, so `/usr/bin/whip` is caught), or `None`.
+fn script_argv_denied_executable(argv: &[String]) -> Option<&'static str> {
+    argv.iter().find_map(|arg| {
+        SCRIPT_DENIED_EXECUTABLES
+            .iter()
+            .copied()
+            .find(|denied| executable_basename(arg) == *denied)
+    })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -24845,6 +23193,115 @@ fn write_verified_script_copy(
         let _ = fs::set_permissions(&path, metadata.permissions());
     }
     Ok(path)
+}
+
+/// Resolve a script capability's declared `env:` references against the host
+/// environment. Shared by the runner (which injects the values) and the
+/// delta-kernel content key (the resolved values are inputs to a hermetic
+/// script, so they participate in the cache identity).
+fn resolve_script_capability_env(
+    script: &ScriptCapability,
+) -> Result<BTreeMap<String, String>, String> {
+    let capability = &script.name;
+    let mut resolved = BTreeMap::new();
+    for (name, reference) in &script.env {
+        let Some(env_name) = reference.strip_prefix("env:") else {
+            return Err(format!(
+                "script capability `{capability}` env `{name}` must use an env: reference"
+            ));
+        };
+        match env::var(env_name) {
+            Ok(value) => {
+                resolved.insert(name.clone(), value);
+            }
+            Err(_) => {
+                return Err(format!(
+                    "script capability `{capability}` requires missing environment variable `{env_name}`"
+                ))
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// The host-environment component of the delta-kernel content key. On the
+/// native host this is a declared epoch (`WHIPPLESCRIPT_COMPUTE_ENV_HASH`,
+/// e.g. a toolchain image digest) — bumping it invalidates every cached
+/// result, which is how environment changes roll the cache. The compute-plane
+/// host wires the workspace image digest here (P8 image-digest box).
+fn compute_environment_hash() -> String {
+    env::var("WHIPPLESCRIPT_COMPUTE_ENV_HASH").unwrap_or_else(|_| "native-v0".to_owned())
+}
+
+/// Content key for a hermetic script-capability exec (compute plane P8-1):
+/// sha256 over script hash + argv + resolved env + host environment + effect
+/// input (stdin + parse contract). Identical invocations — same pinned
+/// script, same inputs, same environment — get the same key, so the second
+/// one is served from the delta-kernel result cache without a run.
+fn exec_content_key(
+    script: &ScriptCapability,
+    resolved_env: &BTreeMap<String, String>,
+    stdin_json: &str,
+    parse_contract: &Option<Value>,
+) -> String {
+    let resolved_env = resolved_env
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    whipplescript_kernel::exec_http::exec_content_key(
+        &script.sha256,
+        &script.argv,
+        &resolved_env,
+        &compute_environment_hash(),
+        stdin_json,
+        parse_contract,
+    )
+}
+
+/// Decode a cached exec result back into the success outcome shape. Returns
+/// `None` (treated as a miss) if the recorded JSON does not decode, so a
+/// malformed entry degrades to a real run instead of an error.
+fn decode_cached_exec_result(
+    result_json: &str,
+) -> Option<(i32, String, String, Option<ExecIngest>)> {
+    let value = serde_json::from_str::<Value>(result_json).ok()?;
+    let exit_code = i32::try_from(value.get("exit_code")?.as_i64()?).ok()?;
+    let stdout = value.get("stdout")?.as_str()?.to_owned();
+    let stderr = value.get("stderr")?.as_str()?.to_owned();
+    let ingested = match value.get("ingested") {
+        None | Some(Value::Null) => None,
+        Some(ingested) => {
+            if let Some(single) = ingested.get("single") {
+                Some(ExecIngest::Single(single.clone()))
+            } else if let Some(stream) = ingested.get("stream").and_then(Value::as_array) {
+                Some(ExecIngest::Stream(stream.clone()))
+            } else {
+                return None;
+            }
+        }
+    };
+    Some((exit_code, stdout, stderr, ingested))
+}
+
+/// Encode a successful exec outcome for the delta-kernel result cache.
+fn encode_cached_exec_result(
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+    ingested: &Option<ExecIngest>,
+) -> String {
+    let ingested_value = match ingested {
+        None => Value::Null,
+        Some(ExecIngest::Single(value)) => json!({"single": value}),
+        Some(ExecIngest::Stream(elements)) => json!({"stream": elements}),
+    };
+    json!({
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "ingested": ingested_value,
+    })
+    .to_string()
 }
 
 fn run_exec_effect(
@@ -24883,7 +23340,44 @@ fn run_exec_effect(
             .to_string(),
     })?;
 
-    let outcome = if mode == "capability" {
+    // Delta-kernel result cache (compute plane P8-1): a hermetic script
+    // capability is memoizable by content key (script hash + argv + resolved
+    // env + host environment + stdin/parse inputs). A hit settles the effect
+    // from the recorded result without spawning the script. Env-resolution
+    // failure degrades to the real runner, which owns the error surface.
+    let cache_key = if mode == "capability" {
+        script_manifest
+            .and_then(|manifest| manifest.get(&capability))
+            .filter(|script| script.hermetic)
+            .and_then(|script| {
+                let stdin_json = input
+                    .get("stdin")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_string();
+                resolve_script_capability_env(script).ok().map(|resolved| {
+                    exec_content_key(script, &resolved, &stdin_json, &parse_contract)
+                })
+            })
+    } else {
+        None
+    };
+    let cached_result = match &cache_key {
+        Some(content_key) => kernel
+            .store()
+            .lookup_compute_result(content_key)?
+            .and_then(|hit| decode_cached_exec_result(&hit.result_json)),
+        None => None,
+    };
+    let cache_hit = cached_result.is_some();
+
+    // Set by the branch-bound raw-exec path: the import-back summary that
+    // rides the effect's terminal metadata.
+    let mut branch_import_meta: Option<Value> = None;
+
+    let outcome = if let Some(result) = cached_result {
+        Ok(result)
+    } else if mode == "capability" {
         run_script_capability_exec(script_manifest, &capability, &input, &parse_contract)
     } else if exec_profile.is_hosted() {
         Err((
@@ -24896,18 +23390,57 @@ fn run_exec_effect(
             format!("exec command `{command}` is not granted; add it to WHIPPLESCRIPT_EXEC_ALLOW"),
         ))
     } else {
-        match std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .output()
-        {
-            Ok(output) => exec_output_to_outcome(output, &parse_contract),
-            Err(error) => Err((None, format!("exec command failed to start: {error}"))),
+        // Materialize-on-exec (versioned-workspace note §10): a
+        // branch-bound instance's raw exec runs inside a real scratch
+        // directory projected from the branch's manifest, and the diff
+        // imports back as ONE effect-keyed, idempotent cut. Unbound
+        // instances keep the inherited working directory.
+        match branch_exec_scratch(instance_id, &effect.effect_id) {
+            Err(message) => Err((None, message)),
+            Ok(None) => match std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .output()
+            {
+                Ok(output) => exec_output_to_outcome(output, &parse_contract),
+                Err(error) => Err((None, format!("exec command failed to start: {error}"))),
+            },
+            Ok(Some((branch_id, scratch_root, scratch))) => {
+                let spawned = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .current_dir(&scratch_root)
+                    .output();
+                match spawned {
+                    Ok(output) => match exec_output_to_outcome(output, &parse_contract) {
+                        Ok(ok) => {
+                            match import_branch_exec_scratch(
+                                &branch_id,
+                                &scratch_root,
+                                &scratch,
+                                &effect.effect_id,
+                            ) {
+                                Ok(import_meta) => {
+                                    branch_import_meta = Some(import_meta);
+                                    let _ = std::fs::remove_dir_all(&scratch_root);
+                                    Ok(ok)
+                                }
+                                Err(message) => Err((None, message)),
+                            }
+                        }
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err((None, format!("exec command failed to start: {error}"))),
+                }
+            }
         }
     };
 
     match outcome {
         Ok((exit_code, stdout, stderr, ingested)) => {
+            let cache_payload = cache_key
+                .as_ref()
+                .map(|_| encode_cached_exec_result(exit_code, &stdout, &stderr, &ingested));
             let mut value = json!({
                 "mode": mode,
                 "command": command,
@@ -24923,6 +23456,29 @@ fn run_exec_effect(
                 {
                     insert_json_field(&mut value, "sha256", Value::String(sha256));
                 }
+            }
+            if let Some(meta) = branch_import_meta.take() {
+                insert_json_field(&mut value, "branch_import", meta);
+            }
+            if let (Some(content_key), Some(result_json)) = (&cache_key, &cache_payload) {
+                // First writer wins: an existing entry for the key stays
+                // canonical, so a replayed populate is a no-op.
+                if !cache_hit {
+                    kernel
+                        .store()
+                        .record_compute_result(ComputeResultRegistration {
+                            content_key,
+                            effect_kind: "exec.command",
+                            result_json,
+                            source_instance_id: instance_id,
+                            source_effect_id: &effect.effect_id,
+                        })?;
+                }
+                insert_json_field(
+                    &mut value,
+                    "cache",
+                    json!({"content_key": content_key, "hit": cache_hit}),
+                );
             }
             let terminal = kernel.complete_run(EffectCompletion {
                 instance_id,
@@ -26162,6 +24718,18 @@ fn dev(options: &CliOptions) -> ExitCode {
         Ok(started) => started,
         Err(code) => return code,
     };
+    // Born on a branch: bind BEFORE any step runs, so every file.* effect
+    // dispatches onto the branch working set and every derived effect key
+    // carries the branch ref. A refused binding aborts the run before any
+    // side effect.
+    if let Some(branch_id) = dev_options.branch.as_deref() {
+        if let Err(message) =
+            bind_instance_to_branch(&options.store_path, &started.instance_id, branch_id)
+        {
+            eprintln!("--branch {branch_id}: {message}");
+            return ExitCode::FAILURE;
+        }
+    }
     // Load workspace skills (context-assembly Phase 2) into the store so the owned
     // harness can offer them in its `<available_skills>` catalogue. Idempotent
     // (UPSERT by name); a missing skills directory loads nothing.
@@ -26266,11 +24834,7 @@ fn dev(options: &CliOptions) -> ExitCode {
         // must evaluate rules against, so an admitting pass is never idle. File
         // admission is idempotent, so this converges: the pass after admission
         // admits nothing more.
-        let idle = step_report.committed_rules == 0
-            && worker_report.ran_effects == 0
-            && worker_report.file_lines_admitted == 0
-            && worker_report.http_items_admitted == 0
-            && worker_report.inbound_messages_admitted == 0;
+        let idle = drive_pass_idle(&step_report, &worker_report);
         steps.push(step_report);
         workers.push(worker_report);
         if idle {
@@ -26289,6 +24853,9 @@ fn dev(options: &CliOptions) -> ExitCode {
             break;
         }
     }
+    // Ambient measurement (experimentation surface): gauges score every dev
+    // run; the primary evidence source has no verb at all.
+    improve::ambient_score_after_dev(&options.store_path, &started.instance_id, &ir, options.json);
     let store = match SqliteStore::open(&options.store_path) {
         Ok(store) => store,
         Err(error) => return report_store_error("failed to open store", error),
@@ -26523,7 +25090,7 @@ fn validate_hosted_exec_for_path(
         Ok(compiled) => compiled,
         Err(error) => return Err(report_compile_failure(path, error)),
     };
-    let diagnostics = lint_hosted_exec(&source, &ir, exec_profile, script_manifest.as_ref());
+    let diagnostics = lint_hosted_exec(&ir, exec_profile, script_manifest.as_ref());
     if diagnostics.is_empty() {
         return Ok(());
     }
@@ -27051,6 +25618,7 @@ fn acceptance_dev_options(fixture: &Value, fixture_dir: &Path) -> Result<DevOpti
     Ok(DevOptions {
         program_path: workflow.to_string_lossy().into_owned(),
         root,
+        branch: None,
         provider,
         exec_profile: ExecProfile::Dev,
         script_manifest_path: None,
@@ -27187,11 +25755,7 @@ fn acceptance_dev_report(
         // must evaluate rules against, so an admitting pass is never idle. File
         // admission is idempotent, so this converges: the pass after admission
         // admits nothing more.
-        let idle = step_report.committed_rules == 0
-            && worker_report.ran_effects == 0
-            && worker_report.file_lines_admitted == 0
-            && worker_report.http_items_admitted == 0
-            && worker_report.inbound_messages_admitted == 0;
+        let idle = drive_pass_idle(&step_report, &worker_report);
         steps.push(step_report);
         workers.push(worker_report);
         if idle {
@@ -28596,6 +27160,9 @@ fn trace_event_mentions_effect(event: &TraceEvent, effect_id: &str) -> bool {
             effect_id: candidate,
             ..
         }
+        | TraceEvent::EffectRetried {
+            effect_id: candidate,
+        }
         | TraceEvent::EffectCancelled {
             effect_id: candidate,
         }
@@ -29049,6 +27616,7 @@ impl DevStream {
 struct DevOptions {
     program_path: String,
     root: Option<String>,
+    branch: Option<String>,
     provider: String,
     exec_profile: ExecProfile,
     script_manifest_path: Option<PathBuf>,
@@ -29065,6 +27633,7 @@ impl DevOptions {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut program_path = None;
         let mut root = None;
+        let mut branch = None;
         let mut provider = "fixture".to_owned();
         let mut exec_profile = ExecProfile::from_env();
         let mut script_manifest_path = script_manifest_path_from_env();
@@ -29172,6 +27741,13 @@ impl DevOptions {
                         return Err("only `--until idle` is supported".to_owned());
                     }
                 }
+                "--branch" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected a branch id after `--branch`".to_owned());
+                    };
+                    branch = Some(value.clone());
+                }
                 other if other.starts_with('-') => {
                     return Err(format!("unknown dev option `{other}`"))
                 }
@@ -29194,6 +27770,7 @@ impl DevOptions {
         Ok(Self {
             program_path,
             root,
+            branch,
             provider,
             exec_profile,
             script_manifest_path,
@@ -30486,68 +29063,102 @@ fn artifacts(options: &CliOptions) -> ExitCode {
     }
 }
 
-fn items(options: &CliOptions) -> ExitCode {
-    use whipplescript_store::items::WorkItemStore;
-    let usage = "usage: whip items [list [--queue Q] [--status S]|add --queue Q --title T [--body B] [--label L]...|show <id>]";
+const ISSUE_USAGE: &str = "usage: whip issue <\
+new --queue Q --title T [--body B] [--label L]... [--actor A]|\
+list [--queue Q] [--status S]|\
+show <id>|\
+ready <queue> [--limit N]|\
+claim <id> [--actor A]|\
+renew <id> [--actor A]|\
+release <id>|\
+finish <id> [--summary S]|complete <id> [--summary S]|\
+fail <id> [--actor A]|\
+dep add <blocked> [depends-on] <blocker>|\
+rebuild>";
+
+/// Run-identity provenance stamp: anything filed/claimed from inside a turn is
+/// attributed to the exact turn that produced it ("two doors, one stamp").
+fn run_identity_stamp() -> Option<String> {
+    let stamp = ["WHIPPLESCRIPT_RUN_ID", "WHIPPLESCRIPT_INSTANCE_ID"]
+        .iter()
+        .filter_map(|name| env::var(name).ok().map(|value| format!("{name}={value}")))
+        .collect::<Vec<_>>()
+        .join(",");
+    (!stamp.is_empty()).then_some(stamp)
+}
+
+/// Actor identity for a mutating verb: `--actor` override, else the run-identity
+/// stamp, else `cli` for a direct human at a shell.
+fn issue_actor(explicit: Option<String>) -> String {
+    explicit
+        .or_else(run_identity_stamp)
+        .unwrap_or_else(|| "cli".to_owned())
+}
+
+/// The value following `--name` in `args`, if present.
+fn flag_value(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|arg| arg == name)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+}
+
+/// Emit the full issue row after a mutation (DR-0002 "CLI Requirements": no
+/// show-after-claim round trip). Human mode prints a one-line confirmation.
+fn emit_issue_row(
+    store: &whipplescript_store::items::WorkItemStore,
+    id: &str,
+    note: &str,
+    json_mode: bool,
+) -> ExitCode {
+    match store.get_item(id) {
+        Ok(Some(item)) => {
+            if json_mode {
+                emit_json(work_item_to_json(&item))
+            } else {
+                println!(
+                    "{} {note} [{}]{}",
+                    item.id,
+                    item.status,
+                    item.claimed_by
+                        .as_deref()
+                        .map(|c| format!(" (claimed by {c})"))
+                        .unwrap_or_default()
+                );
+                ExitCode::SUCCESS
+            }
+        }
+        Ok(None) => {
+            eprintln!("issue `{id}` was not found");
+            ExitCode::FAILURE
+        }
+        Err(error) => report_store_error("failed to load issue", error),
+    }
+}
+
+fn issue(options: &CliOptions) -> ExitCode {
+    use whipplescript_store::items::{ClaimOutcome, RenewOutcome, WorkItemStore};
+    let usage = ISSUE_USAGE;
     let args = &options.args;
     let command = args.first().map(String::as_str).unwrap_or("list");
-    let store = match WorkItemStore::open(items_store_path()) {
+    let mut store = match WorkItemStore::open(items_store_path()) {
         Ok(store) => store,
         Err(error) => return report_store_error("failed to open items store", error),
     };
     match command {
-        "list" => {
-            let mut queue = None;
-            let mut status = None;
-            let mut iter = args.iter().skip(1);
-            while let Some(arg) = iter.next() {
-                match arg.as_str() {
-                    "--queue" => queue = iter.next().cloned(),
-                    "--status" => status = iter.next().cloned(),
-                    _ => {
-                        eprintln!("{usage}");
-                        return ExitCode::from(2);
-                    }
-                }
-            }
-            let listed = match store.list_items(queue.as_deref(), status.as_deref()) {
-                Ok(items) => items,
-                Err(error) => return report_store_error("failed to list items", error),
-            };
-            if options.json {
-                return emit_json(Value::Array(
-                    listed.iter().map(work_item_to_json).collect::<Vec<_>>(),
-                ));
-            }
-            if listed.is_empty() {
-                println!("no items");
-            }
-            for item in listed {
-                println!(
-                    "{} [{}] queue={} {}{}",
-                    item.id,
-                    item.status,
-                    item.queue,
-                    item.title,
-                    item.claimed_by
-                        .as_deref()
-                        .map(|claimed| format!(" (claimed by {claimed})"))
-                        .unwrap_or_default()
-                );
-            }
-            ExitCode::SUCCESS
-        }
-        "add" => {
+        "new" | "add" => {
             let mut queue = None;
             let mut title = None;
             let mut item_body = String::new();
             let mut labels = Vec::new();
+            let mut actor = None;
             let mut iter = args.iter().skip(1);
             while let Some(arg) = iter.next() {
                 match arg.as_str() {
                     "--queue" => queue = iter.next().cloned(),
                     "--title" => title = iter.next().cloned(),
                     "--body" => item_body = iter.next().cloned().unwrap_or_default(),
+                    "--actor" => actor = iter.next().cloned(),
                     "--label" => {
                         if let Some(label) = iter.next() {
                             labels.push(label.clone());
@@ -30563,15 +29174,7 @@ fn items(options: &CliOptions) -> ExitCode {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             };
-            // Run-identity provenance: anything filed from inside a turn is
-            // attributed to the exact turn that produced it.
-            let filed_by = ["WHIPPLESCRIPT_RUN_ID", "WHIPPLESCRIPT_INSTANCE_ID"]
-                .iter()
-                .filter_map(|name| env::var(name).ok().map(|value| format!("{name}={value}")))
-                .collect::<Vec<_>>()
-                .join(",");
-            let filed_by = (!filed_by.is_empty()).then_some(filed_by);
-            let mut store = store;
+            let filed_by = actor.or_else(run_identity_stamp);
             match store.file_item(
                 &queue,
                 &title,
@@ -30588,8 +29191,49 @@ fn items(options: &CliOptions) -> ExitCode {
                         ExitCode::SUCCESS
                     }
                 }
-                Err(error) => report_store_error("failed to file item", error),
+                Err(error) => report_store_error("failed to file issue", error),
             }
+        }
+        "list" => {
+            let mut queue = None;
+            let mut status = None;
+            let mut iter = args.iter().skip(1);
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--queue" => queue = iter.next().cloned(),
+                    "--status" => status = iter.next().cloned(),
+                    _ => {
+                        eprintln!("{usage}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let listed = match store.list_items(queue.as_deref(), status.as_deref()) {
+                Ok(items) => items,
+                Err(error) => return report_store_error("failed to list issues", error),
+            };
+            if options.json {
+                return emit_json(Value::Array(
+                    listed.iter().map(work_item_to_json).collect::<Vec<_>>(),
+                ));
+            }
+            if listed.is_empty() {
+                println!("no issues");
+            }
+            for item in listed {
+                println!(
+                    "{} [{}] queue={} {}{}",
+                    item.id,
+                    item.status,
+                    item.queue,
+                    item.title,
+                    item.claimed_by
+                        .as_deref()
+                        .map(|claimed| format!(" (claimed by {claimed})"))
+                        .unwrap_or_default()
+                );
+            }
+            ExitCode::SUCCESS
         }
         "show" => {
             let Some(id) = args.get(1) else {
@@ -30619,12 +29263,167 @@ fn items(options: &CliOptions) -> ExitCode {
                     }
                 }
                 Ok(None) => {
-                    eprintln!("item `{id}` was not found");
+                    eprintln!("issue `{id}` was not found");
                     ExitCode::FAILURE
                 }
-                Err(error) => report_store_error("failed to load item", error),
+                Err(error) => report_store_error("failed to load issue", error),
             }
         }
+        "ready" => {
+            let Some(queue) = args.get(1).filter(|q| !q.starts_with('-')) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let mut limit = None;
+            let mut iter = args.iter().skip(2);
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--limit" => limit = iter.next().and_then(|v| v.parse::<usize>().ok()),
+                    _ => {
+                        eprintln!("{usage}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let mut ready = match store.ready_items(queue) {
+                Ok(items) => items,
+                Err(error) => return report_store_error("failed to list ready issues", error),
+            };
+            if let Some(limit) = limit {
+                ready.truncate(limit);
+            }
+            if options.json {
+                return emit_json(Value::Array(
+                    ready.iter().map(work_item_to_json).collect::<Vec<_>>(),
+                ));
+            }
+            if ready.is_empty() {
+                println!("no ready issues");
+            }
+            for item in ready {
+                println!("{} [{}] {}", item.id, item.status, item.title);
+            }
+            ExitCode::SUCCESS
+        }
+        "claim" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let actor = issue_actor(flag_value(args, "--actor"));
+            match store.claim_item(id, &actor) {
+                Ok(ClaimOutcome::Claimed) => emit_issue_row(&store, id, "claimed", options.json),
+                Ok(ClaimOutcome::AlreadyClaimed { holder }) => {
+                    eprintln!("issue `{id}` is already claimed by {holder}");
+                    ExitCode::FAILURE
+                }
+                Ok(ClaimOutcome::NotFound) => {
+                    eprintln!("issue `{id}` was not found");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to claim issue", error),
+            }
+        }
+        "renew" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let actor = issue_actor(flag_value(args, "--actor"));
+            // v1 renew is a holder heartbeat (no `--ttl`; the TTL mechanism is
+            // T3-gated). `expires = None` re-affirms the lease unchanged.
+            match store.renew_claim(id, &actor, None) {
+                Ok(RenewOutcome::Renewed { .. }) => {
+                    emit_issue_row(&store, id, "renewed", options.json)
+                }
+                Ok(RenewOutcome::NotHeld) => {
+                    eprintln!("actor `{actor}` holds no active claim on `{id}`");
+                    ExitCode::FAILURE
+                }
+                Ok(RenewOutcome::NotMonotonic) => {
+                    eprintln!("renew would move the lease deadline backward");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to renew claim", error),
+            }
+        }
+        "release" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.release_item(id) {
+                Ok(true) => emit_issue_row(&store, id, "released", options.json),
+                Ok(false) => {
+                    eprintln!("issue `{id}` had no active claim to release");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to release claim", error),
+            }
+        }
+        "finish" | "complete" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let summary = flag_value(args, "--summary");
+            match store.finish_item(id, summary.as_deref()) {
+                Ok(true) => emit_issue_row(&store, id, "finished", options.json),
+                Ok(false) => {
+                    eprintln!("issue `{id}` is not open (cannot finish)");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to finish issue", error),
+            }
+        }
+        "fail" => {
+            // v1 `fail` releases the actor's lease so the issue re-projects as
+            // ready (the ADR `fail --release` behavior). A durable failure
+            // status is deferred to the event-sourced rebuild's op set.
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.release_item(id) {
+                Ok(true) => emit_issue_row(&store, id, "failed (claim released)", options.json),
+                Ok(false) => {
+                    eprintln!("issue `{id}` had no active claim to fail");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to fail issue", error),
+            }
+        }
+        "dep" => {
+            // `dep add <blocked> [depends-on] <blocker>`: blocker blocks blocked.
+            if args.get(1).map(String::as_str) != Some("add") {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+            let rest = args
+                .iter()
+                .skip(2)
+                .filter(|token| token.as_str() != "depends-on")
+                .collect::<Vec<_>>();
+            let (Some(blocked), Some(blocker)) = (rest.first(), rest.get(1)) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.add_blocks(blocker, blocked) {
+                Ok(()) => emit_issue_row(&store, blocked, "gated by dependency", options.json),
+                Err(error) => report_store_error("failed to add dependency", error),
+            }
+        }
+        "rebuild" => match store.rebuild_projection() {
+            Ok(()) => {
+                if options.json {
+                    emit_json(json!({"rebuilt": true}))
+                } else {
+                    println!("projection rebuilt from the event log");
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(error) => report_store_error("failed to rebuild projection", error),
+        },
         _ => {
             eprintln!("{usage}");
             ExitCode::from(2)
@@ -32236,6 +31035,17 @@ fn reconstruct_trace_records(events: &[EventView]) -> Vec<TraceRecord> {
                     },
                 );
             }
+            "effect.retried" => {
+                let Some(effect_id) = payload.get("effect_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                push_trace_record(
+                    &mut records,
+                    TraceEvent::EffectRetried {
+                        effect_id: effect_id.to_owned(),
+                    },
+                );
+            }
             "effect.cancelled" => {
                 let Some(effect_id) = payload.get("effect_id").and_then(Value::as_str) else {
                     continue;
@@ -32456,6 +31266,2514 @@ fn cancel(options: &CliOptions) -> ExitCode {
     )
 }
 
+/// `whip checkpoint <instance> [--cut-id <id>]` — capture a restorable
+/// consistent-cut checkpoint (RC-5). Binds the transcript, instance event-log,
+/// and file-manifest planes at one quiescent point; refuses if an effect is
+/// mid-run. `--cut-id` names the cut for a later `whip restore`; a timestamped
+/// id is generated when omitted.
+fn checkpoint(options: &CliOptions) -> ExitCode {
+    let usage =
+        "usage: whip checkpoint <instance> [--cut-id <id>] [--external-positions <json|@file>]";
+    let mut instance_id: Option<&str> = None;
+    let mut cut_id: Option<String> = None;
+    let mut external_positions: Option<Value> = None;
+    let mut iter = options.args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--cut-id" => {
+                let Some(id) = iter.next() else {
+                    eprintln!("expected an id after `--cut-id`");
+                    return ExitCode::from(2);
+                };
+                cut_id = Some(id.clone());
+            }
+            // Position-pair cut (untie tracker Phase 5): the external
+            // authority's own scope positions, recorded in the SAME fenced
+            // pass as the workspace cut so a cross-store backup/handoff
+            // restores both stores to one coherent coordinate.
+            "--external-positions" => {
+                let Some(raw) = iter.next() else {
+                    eprintln!("expected JSON (or @file) after `--external-positions`");
+                    return ExitCode::from(2);
+                };
+                let text = if let Some(path) = raw.strip_prefix('@') {
+                    match fs::read_to_string(path) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            eprintln!("cannot read external positions file `{path}`: {error}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    raw.clone()
+                };
+                match serde_json::from_str::<Value>(&text) {
+                    Ok(value) => external_positions = Some(value),
+                    Err(error) => {
+                        eprintln!("external positions must be valid JSON: {error}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            other if instance_id.is_none() => instance_id = Some(other),
+            other => {
+                eprintln!("unexpected argument `{other}`");
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(instance_id) = instance_id else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let cut_id = cut_id.unwrap_or_else(generated_cut_id);
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let mut kernel = RuntimeKernel::new(store);
+    let key = idempotency_key(&[instance_id, &cut_id, "checkpoint"]);
+    // Two-plane consistent cut (vw note §9.3): the workspace plane's
+    // monotone stores snapshot by HIGH-WATER POSITION, recorded in the
+    // same quiescent pass as the substance cut. The plane enumeration
+    // (coordination ledgers, tracker event log) is the pump audit's twin
+    // walk; leases/counters are current-state and have no position.
+    let plane_positions = {
+        use whipplescript_store::coordination::Coordination;
+        use whipplescript_store::items::WorkItems;
+        let ledgers =
+            whipplescript_store::coordination::CoordinationStore::open(coordination_store_path())
+                .ok()
+                .and_then(|coordination| coordination.ledger_positions().ok())
+                .unwrap_or_default();
+        let tracker_seq = whipplescript_store::items::WorkItemStore::open(items_store_path())
+            .ok()
+            .and_then(|items| items.event_position().ok())
+            .unwrap_or(0);
+        json!({
+            "coordination_ledgers": ledgers
+                .iter()
+                .map(|(owner, ledger, seq)| json!({
+                    "owner": owner, "ledger": ledger, "seq": seq,
+                }))
+                .collect::<Vec<_>>(),
+            "tracker_event_seq": tracker_seq,
+        })
+    };
+    let positions_payload = json!({
+        "cut_id": cut_id,
+        "positions": plane_positions,
+        // The position pair: the external store's positions travel INSIDE
+        // the same event as the workspace cut id — one coherent coordinate,
+        // or absent when no external scope was supplied.
+        "external": external_positions,
+    })
+    .to_string();
+    if let Err(error) = kernel.store().append_event(whipplescript_store::NewEvent {
+        instance_id,
+        event_type: "plane.positions",
+        payload_json: &positions_payload,
+        source: "cli",
+        causation_id: None,
+        correlation_id: None,
+        idempotency_key: Some(&idempotency_key(&[instance_id, &cut_id, "plane-positions"])),
+    }) {
+        eprintln!("could not record plane positions: {}", store_error(error));
+        return ExitCode::FAILURE;
+    }
+    match kernel.store_mut().capture_checkpoint(CheckpointCapture {
+        instance_id,
+        cut_id: &cut_id,
+        transcript_ref: None,
+        idempotency_key: Some(&key),
+    }) {
+        Ok(checkpoint) if options.json => emit_json(json!({
+            "instance_id": instance_id,
+            "cut_id": checkpoint.cut_id,
+            "plane_positions": plane_positions,
+            "sequence": checkpoint.sequence,
+            "manifest_hash": checkpoint.manifest_hash,
+            "file_count": checkpoint.file_count,
+        })),
+        Ok(checkpoint) => {
+            println!(
+                "checkpoint `{}` captured at event #{} ({} file(s))",
+                checkpoint.cut_id, checkpoint.sequence, checkpoint.file_count
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => report_store_error("failed to capture checkpoint", error),
+    }
+}
+
+/// `whip restore <instance> <cut-id>` — restore the three planes to a prior
+/// checkpoint (RC-5). Coherence-checks the cut up front (refuse-or-complete),
+/// auto-checkpoints the current head so the restore is itself undoable, applies
+/// the full file reconcile (write manifest paths to cut content, remove
+/// post-cut mediated files) through the native file store, then commits the
+/// `context.restored` marker so the instance and transcript planes fold to the
+/// cut.
+fn restore(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip restore <instance> <cut-id>";
+    if options.args.len() != 2 {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    }
+    let instance_id = options.args[0].as_str();
+    let cut_id = options.args[1].as_str();
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let mut kernel = RuntimeKernel::new(store);
+
+    // 1) Plan: the whole coherence check up front. A refusal mutates nothing.
+    let plan = match kernel.store().plan_restore(instance_id, cut_id) {
+        Ok(RestoreDecision::Ready(plan)) => plan,
+        Ok(RestoreDecision::Refused { reason }) => {
+            eprintln!("restore refused: {reason}");
+            return ExitCode::FAILURE;
+        }
+        Err(error) => return report_store_error("failed to plan restore", error),
+    };
+
+    // 2) Auto-checkpoint the current head so this restore is itself undoable.
+    let auto_cut_id = format!("auto-before-{cut_id}");
+    let auto_key = idempotency_key(&[instance_id, &auto_cut_id, "checkpoint"]);
+    if let Err(error) = kernel.store_mut().capture_checkpoint(CheckpointCapture {
+        instance_id,
+        cut_id: &auto_cut_id,
+        transcript_ref: None,
+        idempotency_key: Some(&auto_key),
+    }) {
+        return report_store_error("failed to auto-checkpoint before restore", error);
+    }
+
+    // 3) Apply the file reconcile through the native file store. Every content
+    //    hash was verified present in step 1, so writes cannot fail for missing
+    //    bytes.
+    let files = NativeFileStore;
+    for (path, body) in &plan.writes {
+        let target = Path::new(path);
+        if let Some(parent) = target.parent() {
+            if let Err(error) = files.create_dir_all(parent) {
+                eprintln!("restore: create parent of `{path}`: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+        if let Err(error) = files.write(target, body.as_bytes()) {
+            eprintln!("restore: write `{path}`: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    for path in &plan.removes {
+        if let Err(error) = files.remove(Path::new(path)) {
+            eprintln!("restore: remove `{path}`: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // 4) Commit: the marker + marker-aware rebuild fold the instance and
+    //    transcript planes to the cut.
+    let commit_key = idempotency_key(&[instance_id, cut_id, "restore"]);
+    match kernel.store_mut().commit_restore(
+        instance_id,
+        plan.restored_to_sequence,
+        cut_id,
+        Some(&commit_key),
+    ) {
+        Ok(marker) if options.json => emit_json(json!({
+            "instance_id": instance_id,
+            "cut_id": cut_id,
+            "restored_to_sequence": plan.restored_to_sequence,
+            "marker_sequence": marker.sequence,
+            "files_written": plan.writes.len(),
+            "files_removed": plan.removes.len(),
+            "auto_checkpoint": auto_cut_id,
+        })),
+        Ok(marker) => {
+            println!(
+                "restored `{instance_id}` to cut `{cut_id}` (event #{}); {} written, {} removed; undo with `whip restore {instance_id} {auto_cut_id}`",
+                marker.sequence,
+                plan.writes.len(),
+                plan.removes.len(),
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => report_store_error("failed to commit restore", error),
+    }
+}
+
+/// `whip handles <instance>` — the referenceable-handles surface (untie
+/// tracker Phase 5): the stable pointers an external policy authority admits
+/// decisions against, one-owner-per-fact — the authority's log records
+/// *decisions plus these pointers*; the facts they name stay whip-owned.
+/// Event-log position, effect ids with status, the workspace binding's line
+/// and recorded cut ids, and the latest position-pair cut.
+fn handles_command(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip [--json] handles <instance>";
+    let [instance_id] = options.args.as_slice() else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    if !matches!(store.get_instance(instance_id), Ok(Some(_))) {
+        eprintln!("no such instance `{instance_id}`");
+        return ExitCode::from(2);
+    }
+    let events = match store.list_events(instance_id) {
+        Ok(events) => events,
+        Err(error) => return report_store_error("failed to list events", error),
+    };
+    let event_position = events.last().map(|event| event.sequence).unwrap_or(0);
+    // The latest position-pair cut: workspace cut id + monotone plane
+    // positions (+ the external authority's own positions when the pair was
+    // captured through `whip checkpoint --external-positions`).
+    let position_pair = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "plane.positions")
+        .and_then(|event| serde_json::from_str::<Value>(&event.payload_json).ok());
+    let effects = match store.list_effects(instance_id) {
+        Ok(effects) => effects
+            .iter()
+            .map(|effect| {
+                json!({
+                    "effect_id": effect.effect_id,
+                    "kind": effect.kind,
+                    "status": effect.status,
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => return report_store_error("failed to list effects", error),
+    };
+    let mut workspace = Value::Null;
+    if branch_store_path().exists() {
+        let vcs = match whipplescript_store::vcs::WorkspaceVcs::open(
+            branch_store_path(),
+            vcs_content_store_path(),
+        ) {
+            Ok(vcs) => vcs,
+            Err(error) => return report_store_error("branch stores unavailable", error),
+        };
+        if let Ok(Some(branch_id)) = vcs.instance_branch(instance_id) {
+            let row = match vcs.get_branch(&branch_id) {
+                Ok(row) => row,
+                Err(error) => return report_store_error("failed to load the branch", error),
+            };
+            let cuts = match vcs.list_cuts(&branch_id, 10) {
+                Ok(cuts) => cuts
+                    .iter()
+                    .map(|cut| {
+                        json!({
+                            "cut_id": cut.cut_id,
+                            "origin": cut.origin,
+                            "recorded_at": cut.recorded_at,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                Err(error) => return report_store_error("failed to list cuts", error),
+            };
+            workspace = json!({
+                "branch_id": branch_id,
+                "head_cut_id": row.as_ref().and_then(|row| row.head_cut_id.clone()),
+                "head_manifest_hash": row.as_ref().and_then(|row| row.head_manifest_hash.clone()),
+                "recent_cuts": cuts,
+            });
+        }
+    }
+    if options.json {
+        emit_json(json!({
+            "schema": "whipplescript.handles.v0",
+            "instance_ref": instance_id,
+            "event_position": { "instance_ref": instance_id, "sequence": event_position },
+            "effects": effects,
+            "workspace": workspace,
+            "position_pair": position_pair,
+        }))
+    } else {
+        println!("instance `{instance_id}` at event position {event_position}");
+        println!("{} effect id(s)", effects.len());
+        match &workspace {
+            Value::Null => println!("no workspace binding"),
+            workspace => println!(
+                "workspace line `{}` head cut {}",
+                workspace
+                    .get("branch_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
+                workspace
+                    .get("head_cut_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(none)"),
+            ),
+        }
+        if position_pair.is_some() {
+            println!("latest position-pair cut recorded (see --json for the pair)");
+        }
+        ExitCode::SUCCESS
+    }
+}
+
+/// `whip fork <instance>` — the chat-fork surface (Phase 3 fork item over
+/// Phase 1 branches; chat-fork.maude): birth a NEW instance whose agent
+/// thread seeds from the source's completed turns and whose file surface
+/// is a fresh branch forked at the source line's head — both planes taken
+/// from one quiescent coordinate. The fork does not replay the source's
+/// workflow start (no `external.started`): it inherits the conversation
+/// and reacts to new input (`whip signal`/`whip message`), with
+/// branch-distinct effect keys by construction. An unbound source forks
+/// thread-only, honestly reported.
+fn fork_instance_command(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip [--json] fork <instance> [--agent <name>] [--branch-id <id>]";
+    let mut source_id: Option<&str> = None;
+    let mut agent_flag: Option<String> = None;
+    let mut branch_id_flag: Option<String> = None;
+    let mut iter = options.args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--agent" => {
+                let Some(name) = iter.next() else {
+                    eprintln!("expected a name after `--agent`");
+                    return ExitCode::from(2);
+                };
+                agent_flag = Some(name.clone());
+            }
+            "--branch-id" => {
+                let Some(id) = iter.next() else {
+                    eprintln!("expected an id after `--branch-id`");
+                    return ExitCode::from(2);
+                };
+                branch_id_flag = Some(id.clone());
+            }
+            other if source_id.is_none() => source_id = Some(other),
+            other => {
+                eprintln!("unexpected argument `{other}`");
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(source_id) = source_id else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let source = match store.get_instance(source_id) {
+        Ok(Some(view)) => view,
+        Ok(None) => {
+            eprintln!("no such instance `{source_id}`");
+            return ExitCode::from(2);
+        }
+        Err(error) => return report_store_error("failed to load the instance", error),
+    };
+    // The fork coordinate must be quiescent (chat-fork.maude's mid-turn
+    // bite): a running effect means the branch may already carry writes
+    // the completed-turn transcript has never heard of.
+    match store.list_effects(source_id) {
+        Ok(effects) => {
+            if let Some(running) = effects.iter().find(|effect| effect.status == "running") {
+                eprintln!(
+                    "fork refused: effect `{}` is running — the thread/branch coordinate is not quiescent; let the worker drain first",
+                    running.effect_id
+                );
+                return ExitCode::from(2);
+            }
+        }
+        Err(error) => return report_store_error("failed to list effects", error),
+    }
+    let events = match store.list_events(source_id) {
+        Ok(events) => events,
+        Err(error) => return report_store_error("failed to list events", error),
+    };
+    let source_sequence = events.last().map(|event| event.sequence).unwrap_or(0);
+    let agent = match agent_flag.or_else(|| {
+        events.iter().rev().find_map(|event| {
+            if event.event_type != "agent.turn.completed" {
+                return None;
+            }
+            serde_json::from_str::<Value>(&event.payload_json)
+                .ok()?
+                .get("agent")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+    }) {
+        Some(agent) => agent,
+        None => {
+            eprintln!(
+                "fork refused: `{source_id}` has no completed agent turn — nothing to seed (pass --agent to pick one explicitly)"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let mut kernel = RuntimeKernel::new(store);
+    let messages = match kernel.snapshot_agent_thread(source_id, &agent, Some(source_sequence)) {
+        Ok(messages) => messages,
+        Err(error) => return report_store_error("failed to snapshot the thread", error),
+    };
+    if messages.is_empty() {
+        eprintln!(
+            "fork refused: agent `{agent}` has no live thread on `{source_id}` — nothing to seed"
+        );
+        return ExitCode::from(2);
+    }
+    // Branch pre-flight BEFORE minting the target, so a refusable branch
+    // state never leaves a half-forked instance behind.
+    let branch_stores_present = branch_store_path().exists();
+    if branch_stores_present {
+        let vcs = match whipplescript_store::vcs::WorkspaceVcs::open(
+            branch_store_path(),
+            vcs_content_store_path(),
+        ) {
+            Ok(vcs) => vcs,
+            Err(error) => return report_store_error("branch stores unavailable", error),
+        };
+        match vcs.instance_branch(source_id) {
+            Ok(Some(branch_id)) => match vcs.get_branch(&branch_id) {
+                Ok(Some(row))
+                    if row.status == whipplescript_store::branches::BranchStatus::Active => {}
+                Ok(Some(row)) => {
+                    eprintln!(
+                        "fork refused: source branch `{branch_id}` is {} — a closed line cannot fork",
+                        row.status.as_str()
+                    );
+                    return ExitCode::from(2);
+                }
+                Ok(None) => {
+                    eprintln!("fork refused: source branch `{branch_id}` no longer exists");
+                    return ExitCode::from(2);
+                }
+                Err(error) => return report_store_error("failed to load the branch", error),
+            },
+            Ok(None) => {}
+            Err(error) => return report_store_error("failed to look up the binding", error),
+        }
+        if let Some(requested) = branch_id_flag.as_deref() {
+            match vcs.get_branch(requested) {
+                Ok(Some(_)) => {
+                    eprintln!("fork refused: branch id `{requested}` is already taken");
+                    return ExitCode::from(2);
+                }
+                Ok(None) => {}
+                Err(error) => return report_store_error("failed to check the branch id", error),
+            }
+        }
+    }
+    // Mint the target: same program version, input, and authority — a
+    // fresh event history that never pretends to have executed the
+    // source's effects.
+    let target = match kernel.store().create_instance_with_authority(
+        whipplescript_store::NewInstance {
+            program_id: &source.program_id,
+            version_id: &source.version_id,
+            input_json: &source.input_json,
+        },
+        whipplescript_store::NewInstanceAuthority {
+            workflow_principal: &source.workflow_principal,
+            effective_authority_json: &source.effective_authority_json,
+        },
+    ) {
+        Ok(record) => record,
+        Err(error) => return report_store_error("failed to create the fork instance", error),
+    };
+    let target_id = target.instance_id.clone();
+    if let Err(error) = kernel.seed_agent_thread(whipplescript_kernel::AgentThreadSeed {
+        instance_id: &target_id,
+        agent: &agent,
+        messages: &messages,
+        source_instance_id: source_id,
+        source_sequence,
+        idempotency_key: &idempotency_key(&[&target_id, source_id, "fork-thread-seed"]),
+    }) {
+        return report_store_error("failed to seed the fork thread", error);
+    }
+    // The branch half (chat-fork.maude's sound fork): a fresh line forked
+    // at the source line's head, bound to the target at birth.
+    let mut branch_json = Value::Null;
+    if branch_stores_present {
+        let mut vcs = match whipplescript_store::vcs::WorkspaceVcs::open(
+            branch_store_path(),
+            vcs_content_store_path(),
+        ) {
+            Ok(vcs) => vcs,
+            Err(error) => return report_store_error("branch stores unavailable", error),
+        };
+        let fork_branch_id = branch_id_flag.unwrap_or_else(|| {
+            format!(
+                "fork_{}",
+                target_id
+                    .trim_start_matches("ins_")
+                    .chars()
+                    .take(8)
+                    .collect::<String>()
+            )
+        });
+        use whipplescript_store::vcs::InstanceForkBinding;
+        match vcs.fork_binding_for_instance(
+            source_id,
+            &target_id,
+            &fork_branch_id,
+            None,
+            &now_stamp(),
+        ) {
+            Ok(InstanceForkBinding::Forked {
+                source_branch_id,
+                fork_branch,
+            }) => {
+                // The `branch.bound` birth event on the fork's own log, so
+                // the kernel derives branch-distinct effect keys from state
+                // it already reads (P1i).
+                let payload = json!({ "branch_id": fork_branch.branch_id }).to_string();
+                if let Err(error) = kernel.store().append_event(whipplescript_store::NewEvent {
+                    instance_id: &target_id,
+                    event_type: "branch.bound",
+                    payload_json: &payload,
+                    source: "cli",
+                    causation_id: None,
+                    correlation_id: None,
+                    idempotency_key: Some(&idempotency_key(&[
+                        &target_id,
+                        &fork_branch.branch_id,
+                        "branch-bind",
+                    ])),
+                }) {
+                    return report_store_error("failed to record the binding event", error);
+                }
+                branch_json = json!({
+                    "source_branch_id": source_branch_id,
+                    "fork_branch_id": fork_branch.branch_id,
+                    "head_cut_id": fork_branch.head_cut_id,
+                    "head_manifest_hash": fork_branch.head_manifest_hash,
+                });
+            }
+            Ok(InstanceForkBinding::SourceUnbound) => {}
+            Ok(refusal) => {
+                eprintln!("fork branch refused: {refusal:?}");
+                return ExitCode::FAILURE;
+            }
+            Err(error) => return report_store_error("failed to fork the branch", error),
+        }
+    }
+    let forked_payload = json!({
+        "source_instance_id": source_id,
+        "source_sequence": source_sequence,
+        "agent": agent,
+        "branch": branch_json,
+    })
+    .to_string();
+    if let Err(error) = kernel.store().append_event(whipplescript_store::NewEvent {
+        instance_id: &target_id,
+        event_type: "instance.forked",
+        payload_json: &forked_payload,
+        source: "cli",
+        causation_id: None,
+        correlation_id: None,
+        idempotency_key: Some(&idempotency_key(&[
+            &target_id,
+            source_id,
+            "instance-forked",
+        ])),
+    }) {
+        return report_store_error("failed to record the fork event", error);
+    }
+    if options.json {
+        emit_json(json!({
+            "instance_id": target_id,
+            "source_instance_id": source_id,
+            "source_sequence": source_sequence,
+            "agent": agent,
+            "seeded_messages": messages.len(),
+            "branch": branch_json,
+        }))
+    } else {
+        println!(
+            "forked `{source_id}` into `{target_id}` (agent `{agent}`, {} seeded messages)",
+            messages.len()
+        );
+        if let Some(fork_branch) = branch_json.get("fork_branch_id").and_then(Value::as_str) {
+            println!(
+                "fork branch `{fork_branch}` created at the source line's head and bound at birth"
+            );
+        } else {
+            println!("source has no branch binding: the fork is thread-only");
+        }
+        println!("drive it with `whip signal {target_id} ...` or `whip message {target_id} ...`, then `whip worker {target_id}`");
+        ExitCode::SUCCESS
+    }
+}
+
+/// A timestamped default cut id for `whip checkpoint` when `--cut-id` is omitted.
+const BRANCH_USAGE: &str =
+    "usage: whip [--json] branch <create|fork|list|show|status|write|read|ls|remove|cut|probe|merge|restore|discard|ops|bind|reconcile> ...\n\
+  whip branch create <branch> [--name <label>] [--from <parent>]\n\
+  whip branch fork <branch> --from <parent> [--at-cut <cut>] [--name <label>]\n\
+  whip branch list [--all]\n\
+  whip branch show <branch>\n\
+  whip branch status <branch>\n\
+  whip branch write <branch> <path> --body <text>\n\
+  whip branch read <branch> <path>\n\
+  whip branch ls <branch>\n\
+  whip branch remove <branch> <path>\n\
+  whip branch cut <branch>\n\
+  whip branch diff <branch> [--against <branch-or-cut>] [--context <n>]\n\
+  whip branch probe <branch>\n\
+  whip branch merge <branch>\n\
+  whip branch restore <branch> <cut>\n\
+  whip branch attribution <branch>\n\
+  whip branch log <branch> [--limit <n>]\n\
+  whip branch bisect <branch> --good <cut> --bad <cut> --run <command>\n\
+  whip branch select <branch> <expr>\n\
+  whip branch undo <branch> <expr> [--apply]\n\
+  whip branch transport <branch> <expr> --onto <target> [--apply]\n\
+  whip branch adopt-only <branch> <expr> [--apply]\n\
+  whip branch conflicts <branch>\n\
+  whip branch resolve <branch> <path> <--ours|--theirs|--body <text>>\n\
+  whip branch discard <branch>\n\
+  whip branch ops [--limit <n>]\n\
+  whip branch undo-op [<op-id>]\n\
+  whip branch export <branch> [--out <file>] [--delta-have <ids-file>]\n\
+  whip branch import <file>\n\
+  whip branch digest <branch>\n\
+  whip branch have <ids-file>\n\
+  whip branch erase <branch> <path>\n\
+  whip branch bind <branch> <instance>\n\
+  whip branch reconcile\n\
+  whip branch reconcile-list";
+
+const STREAM_USAGE: &str =
+    "usage: whip [--json] stream <create|join|leave|archive|promote|list|show> ...\n\
+  whip stream create <stream> [--name <label>]\n\
+  whip stream join <stream> <branch>\n\
+  whip stream leave <branch>\n\
+  whip stream archive <stream>\n\
+  whip stream promote <stream>\n\
+  whip stream list\n\
+  whip stream show <stream>";
+
+fn workstream_store_path() -> PathBuf {
+    env::var("WHIPPLESCRIPT_WORKSTREAM_STORE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".whipplescript/workstreams.sqlite"))
+}
+
+fn open_streams() -> Result<whipplescript_store::workstreams::WorkstreamStore, ExitCode> {
+    whipplescript_store::workstreams::WorkstreamStore::open(workstream_store_path()).map_err(
+        |error| {
+            eprintln!("could not open the workstream store: {error:?}");
+            ExitCode::FAILURE
+        },
+    )
+}
+
+fn stream_row_json(row: &whipplescript_store::workstreams::WorkstreamRow) -> Value {
+    json!({
+        "stream_id": row.stream_id,
+        "name": row.name,
+        "line_branch_id": row.line_branch_id,
+        "status": row.status.as_str(),
+    })
+}
+
+/// `whip stream …` — the workstream tier: named shared lines +
+/// membership. Members auto-admit during `whip branch reconcile`
+/// (greedy, certificate-gated); promotion is the explicit boundary hop
+/// to mainline under the adoption lease.
+fn stream_command(options: &CliOptions) -> ExitCode {
+    use whipplescript_store::workstreams::{
+        ArchiveOutcome, CreateStreamOutcome, JoinOutcome, StreamStatus, Workstreams,
+    };
+    let mut args = options.args.iter().map(String::as_str);
+    let Some(verb) = args.next() else {
+        eprintln!("{STREAM_USAGE}");
+        return ExitCode::from(2);
+    };
+    let rest: Vec<&str> = args.collect();
+    let at = now_stamp();
+    let mut streams = match open_streams() {
+        Ok(streams) => streams,
+        Err(code) => return code,
+    };
+    match verb {
+        "create" => {
+            let mut name: Option<&str> = None;
+            let mut stream_id: Option<&str> = None;
+            let mut iter = rest.iter();
+            while let Some(arg) = iter.next() {
+                match *arg {
+                    "--name" => name = iter.next().copied(),
+                    other if stream_id.is_none() => stream_id = Some(other),
+                    other => {
+                        eprintln!("unexpected argument `{other}`\n{STREAM_USAGE}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let Some(stream_id) = stream_id else {
+                eprintln!("{STREAM_USAGE}");
+                return ExitCode::from(2);
+            };
+            // The stream's shared line is an ordinary branch off mainline.
+            let line_branch_id = format!("line-{stream_id}");
+            let mut vcs = match open_vcs() {
+                Ok(vcs) => vcs,
+                Err(code) => return code,
+            };
+            if let Err(error) = vcs.init(&at) {
+                eprintln!("stream create failed: {error:?}");
+                return ExitCode::FAILURE;
+            }
+            match vcs.create_branch(
+                &line_branch_id,
+                None,
+                whipplescript_store::branches::MAINLINE_BRANCH_ID,
+                &at,
+            ) {
+                Ok(whipplescript_store::branches::CreateBranchOutcome::Created(_))
+                | Ok(whipplescript_store::branches::CreateBranchOutcome::Existing(_)) => {}
+                Ok(other) => {
+                    eprintln!("stream line not created: {other:?}");
+                    return ExitCode::FAILURE;
+                }
+                Err(error) => {
+                    eprintln!("stream line create failed: {error:?}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            match streams.create_stream(stream_id, name, &line_branch_id, &at, None) {
+                Ok(CreateStreamOutcome::Created(row)) => {
+                    emit_json(json!({"created": stream_row_json(&row)}))
+                }
+                Ok(CreateStreamOutcome::Existing(row)) => {
+                    emit_json(json!({"existing": stream_row_json(&row)}))
+                }
+                Ok(CreateStreamOutcome::NameTaken { holder_stream_id }) => {
+                    eprintln!("stream name taken by `{holder_stream_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("stream create failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "join" => {
+            let (Some(stream_id), Some(branch_id)) = (rest.first(), rest.get(1)) else {
+                eprintln!("{STREAM_USAGE}");
+                return ExitCode::from(2);
+            };
+            match streams.join(branch_id, stream_id, &at) {
+                Ok(JoinOutcome::Joined { left_stream_id }) => emit_json(json!({
+                    "joined": branch_id, "stream_id": stream_id,
+                    "left_stream_id": left_stream_id,
+                })),
+                Ok(other) => {
+                    eprintln!("join refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("join failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "leave" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{STREAM_USAGE}");
+                return ExitCode::from(2);
+            };
+            match streams.leave(branch_id) {
+                Ok(left) => emit_json(json!({"left": branch_id, "stream_id": left})),
+                Err(error) => {
+                    eprintln!("leave failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "archive" => {
+            let Some(stream_id) = rest.first() else {
+                eprintln!("{STREAM_USAGE}");
+                return ExitCode::from(2);
+            };
+            match streams.archive_stream(stream_id, &at) {
+                Ok(ArchiveOutcome::Archived { rehomed_branch_ids }) => emit_json(json!({
+                    "archived": stream_id,
+                    "rehomed_branch_ids": rehomed_branch_ids,
+                })),
+                Ok(other) => {
+                    eprintln!("archive refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("archive failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "promote" => {
+            let Some(stream_id) = rest.first() else {
+                eprintln!("{STREAM_USAGE}");
+                return ExitCode::from(2);
+            };
+            let Ok(Some(stream)) = streams.get_stream(stream_id) else {
+                eprintln!("no such stream `{stream_id}`");
+                return ExitCode::FAILURE;
+            };
+            if stream.status != StreamStatus::Active {
+                eprintln!("stream `{stream_id}` is archived");
+                return ExitCode::FAILURE;
+            }
+            let mut vcs = match open_vcs() {
+                Ok(vcs) => vcs,
+                Err(code) => return code,
+            };
+            // The boundary hop runs under the adoption lease on mainline.
+            let holder = format!("whip-{}", std::process::id());
+            let lease_key = format!(
+                "{}::{}",
+                branch_store_path().display(),
+                whipplescript_store::branches::MAINLINE_BRANCH_ID
+            );
+            let mut coordination = match whipplescript_store::coordination::CoordinationStore::open(
+                coordination_store_path(),
+            ) {
+                Ok(coordination) => coordination,
+                Err(error) => {
+                    eprintln!("coordination store unavailable: {error:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match coordination.try_acquire("adoption", &lease_key, 1, 60, &holder) {
+                Ok(whipplescript_store::coordination::AcquireOutcome::Held) => {}
+                Ok(whipplescript_store::coordination::AcquireOutcome::Contended { holders }) => {
+                    eprintln!("adoption lease is held by {holders:?}; retry");
+                    return ExitCode::FAILURE;
+                }
+                Err(error) => {
+                    eprintln!("adoption lease unavailable: {error:?}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            let sync_cut = generated_cut_id();
+            let outcome = vcs.sync_to_line(
+                &stream.line_branch_id,
+                whipplescript_store::branches::MAINLINE_BRANCH_ID,
+                &format!("{sync_cut}-promote"),
+                &at,
+            );
+            let _ = coordination.release("adoption", &lease_key, &holder);
+            match outcome {
+                Ok(whipplescript_store::vcs::SyncOutcome::Synced { sync_cut_id }) => {
+                    emit_json(json!({
+                        "promoted": stream_id, "into": "main",
+                        "sync_cut_id": sync_cut_id,
+                    }))
+                }
+                Ok(whipplescript_store::vcs::SyncOutcome::UpToDate) => {
+                    emit_json(json!({"promoted": stream_id, "outcome": "up_to_date"}))
+                }
+                Ok(whipplescript_store::vcs::SyncOutcome::Conflicts { conflicts }) => {
+                    let payload = json!({
+                        "conflicted": stream_id,
+                        "conflicts": conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+                    });
+                    eprintln!("promotion conflicted: {payload}");
+                    ExitCode::FAILURE
+                }
+                Ok(other) => {
+                    eprintln!("promotion refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("promotion failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "list" => {
+            let all = rest.contains(&"--all");
+            let status = if all {
+                None
+            } else {
+                Some(StreamStatus::Active)
+            };
+            match streams.list_streams(status) {
+                Ok(rows) => emit_json(Value::Array(
+                    rows.iter().map(stream_row_json).collect::<Vec<_>>(),
+                )),
+                Err(error) => {
+                    eprintln!("stream list failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "show" => {
+            let Some(stream_id) = rest.first() else {
+                eprintln!("{STREAM_USAGE}");
+                return ExitCode::from(2);
+            };
+            match streams.get_stream(stream_id) {
+                Ok(Some(row)) => {
+                    let members = streams.members(stream_id).unwrap_or_default();
+                    let mut value = stream_row_json(&row);
+                    insert_json_field(&mut value, "members", json!(members));
+                    emit_json(value)
+                }
+                Ok(None) => {
+                    eprintln!("no such stream `{stream_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("stream show failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        other => {
+            eprintln!("unknown stream verb `{other}`\n{STREAM_USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// The versioned-workspace branch stores, workspace-scoped like the
+/// coordination store (env-overridable for tests).
+fn branch_store_path() -> PathBuf {
+    env::var("WHIPPLESCRIPT_BRANCH_STORE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".whipplescript/branches.sqlite"))
+}
+
+fn vcs_content_store_path() -> PathBuf {
+    env::var("WHIPPLESCRIPT_VCS_CONTENT_STORE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".whipplescript/vcs-content.sqlite"))
+}
+
+fn open_vcs() -> Result<whipplescript_store::vcs::NativeWorkspaceVcs, ExitCode> {
+    whipplescript_store::vcs::WorkspaceVcs::open(branch_store_path(), vcs_content_store_path())
+        .map(|mut vcs| {
+            // Declaration-granularity source merges (kernel parser-backed):
+            // conflicted `.whip` paths refine to certified merges where the
+            // anti-dependence discipline holds; absent this, every source
+            // conflict escalates.
+            vcs.set_source_merger(Box::new(
+                whipplescript_kernel::source_merge::WhipSourceMerger,
+            ));
+            vcs
+        })
+        .map_err(|error| {
+            eprintln!("could not open the branch stores: {error:?}");
+            ExitCode::FAILURE
+        })
+}
+
+fn now_stamp() -> String {
+    // Seconds-resolution wall stamp, matching the store idiom of
+    // caller-provided clocks.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    format!("unix:{secs}")
+}
+
+/// The file surface an instance's `file.*` effects dispatch onto: the
+/// branch working set when the instance was born on a branch (its writes
+/// then mint COW cuts on that branch and touch no real directory), the
+/// native filesystem otherwise. The branch store is consulted only when
+/// it already exists, so non-VCS workspaces never create one. `cut_seed`
+/// (the effect id) keys the write-through cuts for attribution.
+fn file_store_for_instance(
+    instance_id: &str,
+    cut_seed: &str,
+) -> Box<dyn whipplescript_store::files::FileStore> {
+    use whipplescript_store::vcs::{BranchFileStore, WorkspaceVcs};
+    if !branch_store_path().exists() {
+        return Box::new(NativeFileStore);
+    }
+    let Ok(vcs) = WorkspaceVcs::open(branch_store_path(), vcs_content_store_path()) else {
+        return Box::new(NativeFileStore);
+    };
+    match vcs.instance_branch(instance_id) {
+        Ok(Some(branch_id)) => Box::new(BranchFileStore::new(
+            vcs,
+            &branch_id,
+            cut_seed,
+            &now_stamp(),
+        )),
+        _ => Box::new(NativeFileStore),
+    }
+}
+
+/// Materialize-on-exec, setup half: when the instance is branch-bound,
+/// project the branch's head manifest into an effect-keyed scratch
+/// directory and hand back the seeded stat cache. A crash-retried effect
+/// re-materializes fresh (the whole effect re-runs; the import stays
+/// idempotent by cut id). `None` = unbound instance, run in place.
+#[allow(clippy::type_complexity)]
+fn branch_exec_scratch(
+    instance_id: &str,
+    effect_id: &str,
+) -> Result<
+    Option<(
+        String,
+        PathBuf,
+        whipplescript_store::materialize::MaterializedScratch,
+    )>,
+    String,
+> {
+    if !branch_store_path().exists() {
+        return Ok(None);
+    }
+    let vcs =
+        whipplescript_store::vcs::WorkspaceVcs::open(branch_store_path(), vcs_content_store_path())
+            .map_err(|error| format!("branch stores unavailable: {error:?}"))?;
+    let Some(branch_id) = vcs
+        .instance_branch(instance_id)
+        .map_err(|error| format!("binding lookup failed: {error:?}"))?
+    else {
+        return Ok(None);
+    };
+    let scratch_root = std::env::temp_dir().join(format!("whip-exec-scratch-{effect_id}"));
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let now_unix_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as i128)
+        .unwrap_or(0);
+    let scratch = vcs
+        .materialize_branch(&branch_id, &scratch_root, now_unix_nanos)
+        .map_err(|error| format!("materialize failed: {error:?}"))?
+        .ok_or_else(|| format!("instance is bound to unknown branch `{branch_id}`"))?;
+    Ok(Some((branch_id, scratch_root, scratch)))
+}
+
+/// Materialize-on-exec, import half: scan the scratch, store every changed
+/// blob, commit the diff as ONE cut keyed by the effect id, and return the
+/// summary that rides the effect's terminal metadata.
+fn import_branch_exec_scratch(
+    branch_id: &str,
+    scratch_root: &Path,
+    scratch: &whipplescript_store::materialize::MaterializedScratch,
+    effect_id: &str,
+) -> Result<Value, String> {
+    use whipplescript_store::vcs::VcsWriteOutcome;
+    let mut vcs =
+        whipplescript_store::vcs::WorkspaceVcs::open(branch_store_path(), vcs_content_store_path())
+            .map_err(|error| format!("branch stores unavailable: {error:?}"))?;
+    let now_unix_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as i128)
+        .unwrap_or(0);
+    let cut_id = format!("cut-exec-{effect_id}");
+    let (import, outcome) = vcs
+        .import_scratch(
+            branch_id,
+            scratch_root,
+            scratch,
+            &cut_id,
+            &now_stamp(),
+            now_unix_nanos,
+        )
+        .map_err(|error| format!("import-back failed: {error:?}"))?;
+    match outcome {
+        VcsWriteOutcome::Written { cut_id, .. } => Ok(json!({
+            "branch_id": branch_id,
+            "cut_id": cut_id,
+            "changed": import.changed.len(),
+            "removed": import.removed.len(),
+            "trusted": import.trusted,
+            "rehashed": import.rehashed,
+        })),
+        VcsWriteOutcome::BranchNotActive => Err(format!(
+            "branch `{branch_id}` closed during the exec; the diff was not adopted"
+        )),
+        VcsWriteOutcome::BranchMissing => Err(format!("branch `{branch_id}` disappeared")),
+    }
+}
+
+/// Record an instance's branch binding: write-once in the branch store,
+/// plus a `branch.bound` event on the instance log so the host-agnostic
+/// kernel derives branch-distinct effect keys from state it already
+/// reads.
+fn bind_instance_to_branch(
+    store_path: &Path,
+    instance_id: &str,
+    branch_id: &str,
+) -> Result<(), String> {
+    use whipplescript_store::branches::BindOutcome;
+    let mut vcs =
+        whipplescript_store::vcs::WorkspaceVcs::open(branch_store_path(), vcs_content_store_path())
+            .map_err(|error| format!("could not open the branch stores: {error:?}"))?;
+    match vcs
+        .bind_instance(instance_id, branch_id, &now_stamp())
+        .map_err(|error| format!("bind failed: {error:?}"))?
+    {
+        BindOutcome::Bound => {}
+        BindOutcome::AlreadyBound { branch_id: other } => {
+            return Err(format!(
+                "instance `{instance_id}` is already bound to branch `{other}`"
+            ));
+        }
+        BindOutcome::BranchMissing => {
+            return Err(format!("no such branch `{branch_id}`"));
+        }
+        BindOutcome::BranchNotActive { status } => {
+            return Err(format!(
+                "branch `{branch_id}` is {} — instances cannot be born on a closed line",
+                status.as_str()
+            ));
+        }
+    }
+    let store = SqliteStore::open(store_path)
+        .map_err(|error| format!("could not open the runtime store: {error:?}"))?;
+    let payload = json!({ "branch_id": branch_id }).to_string();
+    store
+        .append_event(whipplescript_store::NewEvent {
+            instance_id,
+            event_type: "branch.bound",
+            payload_json: &payload,
+            source: "cli",
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: Some(&idempotency_key(&[instance_id, branch_id, "branch-bind"])),
+        })
+        .map_err(|error| format!("could not record the binding event: {error:?}"))?;
+    Ok(())
+}
+
+fn branch_row_json(row: &whipplescript_store::branches::BranchRow) -> Value {
+    json!({
+        "branch_id": row.branch_id,
+        "name": row.name,
+        "parent_branch_id": row.parent_branch_id,
+        "branch_point_cut_id": row.branch_point_cut_id,
+        "head_cut_id": row.head_cut_id,
+        "head_manifest_hash": row.head_manifest_hash,
+        "status": row.status.as_str(),
+        "adopted_merge_cut_id": row.adopted_merge_cut_id,
+    })
+}
+
+fn conflict_json(conflict: &whipplescript_store::merge::PathConflict) -> Value {
+    json!({
+        "path": conflict.path,
+        "base": conflict.base,
+        "ours": conflict.ours,
+        "theirs": conflict.theirs,
+        "ours_branch": conflict.ours_side.label,
+        "ours_cut": conflict.ours_side.cut_id,
+        "theirs_branch": conflict.theirs_side.label,
+        "theirs_cut": conflict.theirs_side.cut_id,
+    })
+}
+
+/// `whip branch …` — the versioned-workspace surface: branch, write on a
+/// branch's virtual working set, merge back (certified or honest
+/// structured conflicts), discard. Every operation is a proposal over
+/// immutable content; no destructive verb exists.
+fn branch_command(options: &CliOptions) -> ExitCode {
+    use whipplescript_store::branches::BranchStatus;
+    use whipplescript_store::vcs::{VcsMergeOutcome, VcsWriteOutcome};
+
+    let mut args = options.args.iter().map(String::as_str);
+    let Some(verb) = args.next() else {
+        eprintln!("{BRANCH_USAGE}");
+        return ExitCode::from(2);
+    };
+    let rest: Vec<&str> = args.collect();
+    let at = now_stamp();
+    let mut vcs = match open_vcs() {
+        Ok(vcs) => vcs,
+        Err(code) => return code,
+    };
+    match verb {
+        "create" => {
+            let mut name: Option<&str> = None;
+            let mut parent: &str = whipplescript_store::branches::MAINLINE_BRANCH_ID;
+            let mut branch_id: Option<&str> = None;
+            let mut iter = rest.iter();
+            while let Some(arg) = iter.next() {
+                match *arg {
+                    "--name" => name = iter.next().copied(),
+                    "--from" => parent = iter.next().copied().unwrap_or(parent),
+                    other if branch_id.is_none() => branch_id = Some(other),
+                    other => {
+                        eprintln!("unexpected argument `{other}`\n{BRANCH_USAGE}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let Some(branch_id) = branch_id else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.create_branch(branch_id, name, parent, &at) {
+                Ok(whipplescript_store::branches::CreateBranchOutcome::Created(row)) => {
+                    emit_json(json!({"created": branch_row_json(&row)}))
+                }
+                Ok(whipplescript_store::branches::CreateBranchOutcome::Existing(row)) => {
+                    emit_json(json!({"existing": branch_row_json(&row)}))
+                }
+                Ok(other) => {
+                    eprintln!("branch not created: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch create failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "list" => {
+            let all = rest.contains(&"--all");
+            let status = if all {
+                None
+            } else {
+                Some(BranchStatus::Active)
+            };
+            if let Err(error) = vcs.init(&at) {
+                eprintln!("branch list failed: {error:?}");
+                return ExitCode::FAILURE;
+            }
+            match vcs.list_branches(status) {
+                Ok(rows) => emit_json(Value::Array(
+                    rows.iter().map(branch_row_json).collect::<Vec<_>>(),
+                )),
+                Err(error) => {
+                    eprintln!("branch list failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "show" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.get_branch(branch_id) {
+                Ok(Some(row)) => emit_json(branch_row_json(&row)),
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch show failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "write" | "remove" => {
+            let Some(branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let Some(path) = rest.get(1).copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let body = if verb == "write" {
+                let Some(index) = rest.iter().position(|arg| *arg == "--body") else {
+                    eprintln!("`branch write` requires --body <text>\n{BRANCH_USAGE}");
+                    return ExitCode::from(2);
+                };
+                let Some(body) = rest.get(index + 1).copied() else {
+                    eprintln!("expected text after `--body`");
+                    return ExitCode::from(2);
+                };
+                Some(body)
+            } else {
+                None
+            };
+            if let Err(error) = vcs.init(&at) {
+                eprintln!("branch {verb} failed: {error:?}");
+                return ExitCode::FAILURE;
+            }
+            let cut_id = generated_cut_id();
+            match vcs.write(branch_id, path, body, &cut_id, &at) {
+                Ok(VcsWriteOutcome::Written {
+                    cut_id,
+                    manifest_hash,
+                }) => emit_json(json!({
+                    "branch_id": branch_id,
+                    "path": path,
+                    "cut_id": cut_id,
+                    "manifest_hash": manifest_hash,
+                    "removed": body.is_none(),
+                })),
+                Ok(other) => {
+                    eprintln!("branch {verb} refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch {verb} failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "read" => {
+            let (Some(branch_id), Some(path)) = (rest.first(), rest.get(1)) else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.read(branch_id, path) {
+                Ok(Some(body)) => {
+                    if options.json {
+                        emit_json(json!({"branch_id": branch_id, "path": path, "body": body}))
+                    } else {
+                        println!("{body}");
+                        ExitCode::SUCCESS
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("no file at `{path}` on branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch read failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "ls" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.manifest(branch_id) {
+                Ok(Some(manifest)) => emit_json(json!({
+                    "branch_id": branch_id,
+                    "files": manifest,
+                })),
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch ls failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "merge" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            // Merge-up is serialized by the ADOPTION LEASE on the target
+            // line (vw note §7.1; ReconciliationDaemonLifecycle.tla):
+            // multi-writer hosts contend here instead of racing head
+            // advances.
+            let target = match vcs.get_branch(branch_id) {
+                Ok(Some(row)) => row.parent_branch_id.unwrap_or_default(),
+                _ => String::new(),
+            };
+            let holder = format!("whip-{}", std::process::id());
+            // The lease guards THIS workspace's target line: the key
+            // carries the branch-store identity so distinct workspaces
+            // sharing one coordination store never contend.
+            let lease_key = format!("{}::{target}", branch_store_path().display());
+            let mut adoption_lease = None;
+            if !target.is_empty() {
+                match whipplescript_store::coordination::CoordinationStore::open(
+                    coordination_store_path(),
+                ) {
+                    Ok(mut coordination) => {
+                        match coordination.try_acquire("adoption", &lease_key, 1, 60, &holder) {
+                            Ok(whipplescript_store::coordination::AcquireOutcome::Held) => {
+                                adoption_lease = Some((coordination, lease_key.clone()));
+                            }
+                            Ok(whipplescript_store::coordination::AcquireOutcome::Contended {
+                                holders,
+                            }) => {
+                                eprintln!(
+                                    "adoption lease for `{target}` is held by {holders:?}; retry"
+                                );
+                                return ExitCode::FAILURE;
+                            }
+                            Err(error) => {
+                                eprintln!("adoption lease unavailable: {error:?}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("coordination store unavailable: {error:?}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            let merge_cut_id = generated_cut_id();
+            let outcome = vcs.merge(branch_id, &merge_cut_id, &at);
+            if let Some((mut coordination, lease_key)) = adoption_lease {
+                let _ = coordination.release("adoption", &lease_key, &holder);
+            }
+            match outcome {
+                Ok(VcsMergeOutcome::Adopted {
+                    merge_cut_id,
+                    into_branch_id,
+                })
+                | Ok(VcsMergeOutcome::Landed {
+                    merge_cut_id,
+                    into_branch_id,
+                }) => emit_json(json!({
+                    "adopted": branch_id,
+                    "into": into_branch_id,
+                    "merge_cut_id": merge_cut_id,
+                })),
+                Ok(VcsMergeOutcome::Conflicted { conflicts }) => {
+                    let payload = json!({
+                        "conflicted": branch_id,
+                        "conflicts": conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+                    });
+                    // Conflicts are an honest, non-zero outcome: nothing
+                    // moved; resolve on the branch and merge again.
+                    if options.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&payload)
+                                .unwrap_or_else(|_| payload.to_string())
+                        );
+                    } else {
+                        eprintln!("merge conflicted: {payload}");
+                    }
+                    ExitCode::FAILURE
+                }
+                Ok(other) => {
+                    eprintln!("merge refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch merge failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "bind" => {
+            let (Some(branch_id), Some(instance_id)) = (rest.first(), rest.get(1)) else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            drop(vcs);
+            match bind_instance_to_branch(&options.store_path, instance_id, branch_id) {
+                Ok(()) => emit_json(json!({
+                    "bound": instance_id,
+                    "branch_id": branch_id,
+                })),
+                Err(message) => {
+                    eprintln!("branch bind failed: {message}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "reconcile" => {
+            // One reconciliation-daemon pass over every live branch:
+            // fold parent deltas down. Quiescence is detected from the
+            // branch's bound instances — any still-running instance keeps
+            // the branch mid-run, so intersecting deltas defer.
+            let branches = match vcs.list_branches(Some(BranchStatus::Active)) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    eprintln!("branch list failed: {error:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let store = SqliteStore::open(&options.store_path).ok();
+            // Stream membership redirects a member's sync target to its
+            // stream's line, and quiescent members AUTO-ADMIT greedily
+            // (certificate-gated; conflicts isolate per contribution).
+            let streams =
+                whipplescript_store::workstreams::WorkstreamStore::open(workstream_store_path())
+                    .ok();
+            let mut report = Vec::new();
+            for row in branches {
+                if row.parent_branch_id.is_none() {
+                    continue; // mainline has nothing to fold down from
+                }
+                let quiescent = match (&store, vcs.list_bound_instances_of(&row.branch_id)) {
+                    (Some(store), Ok(instances)) => instances.iter().all(|instance_id| {
+                        store
+                            .status(instance_id)
+                            .ok()
+                            .flatten()
+                            .map(|status| status.instance.status != "running")
+                            .unwrap_or(true)
+                    }),
+                    (None, _) | (_, Err(_)) => false,
+                };
+                use whipplescript_store::workstreams::{StreamStatus, Workstreams};
+                let stream_line = streams.as_ref().and_then(|streams| {
+                    let stream_id = streams.home_of(&row.branch_id).ok().flatten()?;
+                    let stream = streams.get_stream(&stream_id).ok().flatten()?;
+                    (stream.status == StreamStatus::Active).then_some(stream.line_branch_id)
+                });
+                let cut_id = generated_cut_id();
+                if let Some(line_id) = stream_line {
+                    if quiescent {
+                        use whipplescript_store::vcs::SyncOutcome;
+                        let entry = match vcs.sync_to_line(
+                            &row.branch_id,
+                            &line_id,
+                            &format!("{cut_id}-admit"),
+                            &at,
+                        ) {
+                            Ok(SyncOutcome::Synced { sync_cut_id }) => json!({
+                                "branch_id": row.branch_id, "outcome": "admitted",
+                                "line_branch_id": line_id, "sync_cut_id": sync_cut_id,
+                            }),
+                            Ok(SyncOutcome::UpToDate) => json!({
+                                "branch_id": row.branch_id, "outcome": "up_to_date",
+                                "line_branch_id": line_id,
+                            }),
+                            Ok(SyncOutcome::Conflicts { conflicts }) => json!({
+                                "branch_id": row.branch_id, "outcome": "conflicts",
+                                "line_branch_id": line_id,
+                                "conflicts":
+                                    conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+                            }),
+                            Ok(other) => json!({
+                                "branch_id": row.branch_id,
+                                "outcome": format!("{other:?}"),
+                            }),
+                            Err(error) => {
+                                eprintln!("auto-admit `{}` failed: {error:?}", row.branch_id);
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        report.push(entry);
+                    } else {
+                        report.push(json!({
+                            "branch_id": row.branch_id, "outcome": "deferred_mid_run",
+                            "line_branch_id": line_id,
+                        }));
+                    }
+                    continue;
+                }
+                let outcome = match vcs.reconcile_branch(
+                    &row.branch_id,
+                    quiescent,
+                    &format!("{cut_id}-reconcile"),
+                    &at,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        eprintln!("reconcile `{}` failed: {error:?}", row.branch_id);
+                        return ExitCode::FAILURE;
+                    }
+                };
+                use whipplescript_store::vcs::ReconcileOutcome;
+                let entry = match outcome {
+                    ReconcileOutcome::UpToDate => json!({
+                        "branch_id": row.branch_id, "outcome": "up_to_date",
+                    }),
+                    ReconcileOutcome::Rebased { rebase_cut_id } => json!({
+                        "branch_id": row.branch_id, "outcome": "rebased",
+                        "rebase_cut_id": rebase_cut_id,
+                    }),
+                    ReconcileOutcome::DeferredMidRun => json!({
+                        "branch_id": row.branch_id, "outcome": "deferred_mid_run",
+                    }),
+                    ReconcileOutcome::Conflicts { conflicts } => json!({
+                        "branch_id": row.branch_id, "outcome": "conflicts",
+                        "conflicts": conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+                    }),
+                    other => json!({
+                        "branch_id": row.branch_id, "outcome": format!("{other:?}"),
+                    }),
+                };
+                report.push(entry);
+            }
+            emit_json(Value::Array(report))
+        }
+        "discard" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.discard_branch(branch_id, &at) {
+                Ok(whipplescript_store::branches::StatusOutcome::Done(row)) => {
+                    emit_json(json!({"discarded": branch_row_json(&row)}))
+                }
+                Ok(other) => {
+                    eprintln!("discard refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch discard failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "fork" => {
+            let mut name: Option<&str> = None;
+            let mut from: &str = whipplescript_store::branches::MAINLINE_BRANCH_ID;
+            let mut at_cut: Option<&str> = None;
+            let mut branch_id: Option<&str> = None;
+            let mut iter = rest.iter();
+            while let Some(arg) = iter.next() {
+                match *arg {
+                    "--name" => name = iter.next().copied(),
+                    "--from" => from = iter.next().copied().unwrap_or(from),
+                    "--at-cut" => at_cut = iter.next().copied(),
+                    other if branch_id.is_none() => branch_id = Some(other),
+                    other => {
+                        eprintln!("unexpected argument `{other}`\n{BRANCH_USAGE}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let Some(branch_id) = branch_id else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.fork_with_lineage(branch_id, name, from, at_cut, &at) {
+                Ok(whipplescript_store::branches::CreateBranchOutcome::Created(row)) => {
+                    emit_json(json!({"forked": branch_row_json(&row)}))
+                }
+                Ok(whipplescript_store::branches::CreateBranchOutcome::Existing(row)) => {
+                    emit_json(json!({"existing": branch_row_json(&row)}))
+                }
+                Ok(other) => {
+                    eprintln!("fork refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch fork failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "status" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.status_report(branch_id) {
+                Ok(Some(report)) => match serde_json::to_value(&report) {
+                    Ok(payload) => emit_json(payload),
+                    Err(error) => {
+                        eprintln!("branch status failed: {error}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch status failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "cut" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let cut_id = generated_cut_id();
+            match vcs.cut_at_quiescence(branch_id, &cut_id, &at) {
+                Ok(Some(cut)) => emit_json(json!({
+                    "branch_id": branch_id,
+                    "cut_id": cut.cut_id,
+                    "manifest_hash": cut.manifest_hash,
+                    "change_id": cut.change_id,
+                })),
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch cut failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "diff" => {
+            let Some(branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let against = rest
+                .iter()
+                .position(|arg| *arg == "--against")
+                .and_then(|index| rest.get(index + 1))
+                .copied();
+            let context = rest
+                .iter()
+                .position(|arg| *arg == "--context")
+                .and_then(|index| rest.get(index + 1))
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(3);
+            match vcs.diff_against(branch_id, against, context) {
+                Ok(Some(entries)) => {
+                    if options.json {
+                        match serde_json::to_value(&entries) {
+                            Ok(payload) => emit_json(json!({
+                                "branch_id": branch_id,
+                                "against": against.unwrap_or("branch-point"),
+                                "entries": payload,
+                            })),
+                            Err(error) => {
+                                eprintln!("branch diff failed: {error}");
+                                ExitCode::FAILURE
+                            }
+                        }
+                    } else {
+                        for entry in &entries {
+                            print!("{}", entry.to_unified());
+                        }
+                        ExitCode::SUCCESS
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch diff failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "probe" => {
+            let Some(branch_id) = rest.first() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            use whipplescript_store::vcs::MergeProbeOutcome;
+            match vcs.merge_probe(branch_id) {
+                Ok(MergeProbeOutcome::UpToDate) => emit_json(json!({
+                    "branch_id": branch_id, "probe": "up_to_date",
+                })),
+                Ok(MergeProbeOutcome::Clean {
+                    merged_manifest_hash,
+                    changed_paths,
+                }) => emit_json(json!({
+                    "branch_id": branch_id, "probe": "clean",
+                    "merged_manifest_hash": merged_manifest_hash,
+                    "changed_paths": changed_paths,
+                })),
+                Ok(MergeProbeOutcome::Conflicted { conflicts }) => {
+                    // An honest preview, not a failure: the probe reports
+                    // what the merge would escalate.
+                    emit_json(json!({
+                        "branch_id": branch_id, "probe": "conflicted",
+                        "conflicts": conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+                    }))
+                }
+                Ok(other) => {
+                    eprintln!("probe refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch probe failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "restore" => {
+            let (Some(branch_id), Some(to_cut)) = (rest.first(), rest.get(1)) else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            use whipplescript_store::vcs::RestoreOutcome;
+            let new_cut_id = generated_cut_id();
+            match vcs.restore(branch_id, to_cut, &new_cut_id, &at) {
+                Ok(RestoreOutcome::Restored {
+                    cut_id,
+                    manifest_hash,
+                }) => emit_json(json!({
+                    "restored": branch_id,
+                    "to_cut_id": to_cut,
+                    "cut_id": cut_id,
+                    "manifest_hash": manifest_hash,
+                })),
+                Ok(RestoreOutcome::AlreadyThere) => emit_json(json!({
+                    "restored": branch_id,
+                    "to_cut_id": to_cut,
+                    "already_there": true,
+                })),
+                Ok(other) => {
+                    eprintln!("restore refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch restore failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "ops" => {
+            let limit = rest
+                .iter()
+                .position(|arg| *arg == "--limit")
+                .and_then(|index| rest.get(index + 1))
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(50);
+            match vcs.list_ops(limit) {
+                Ok(ops) => match serde_json::to_value(&ops) {
+                    Ok(payload) => emit_json(payload),
+                    Err(error) => {
+                        eprintln!("branch ops failed: {error}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(error) => {
+                    eprintln!("branch ops failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "export" => {
+            let Some(branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let out = rest
+                .iter()
+                .position(|arg| *arg == "--out")
+                .and_then(|index| rest.get(index + 1))
+                .copied();
+            // Pull-missing: --delta-have carries the receiver's declared
+            // inventory (JSON array of ids from `whip branch have`).
+            let have: std::collections::BTreeSet<String> = match rest
+                .iter()
+                .position(|arg| *arg == "--delta-have")
+                .and_then(|index| rest.get(index + 1))
+            {
+                None => Default::default(),
+                Some(path) => match std::fs::read_to_string(path)
+                    .map_err(|error| error.to_string())
+                    .and_then(|body| {
+                        serde_json::from_str::<Vec<String>>(&body)
+                            .map_err(|error| error.to_string())
+                    }) {
+                    Ok(ids) => ids.into_iter().collect(),
+                    Err(error) => {
+                        eprintln!("branch export failed reading `{path}`: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+            };
+            match vcs.export_bundle_delta(branch_id, &have) {
+                Ok(Some(bundle)) => {
+                    let encoded = match serde_json::to_string_pretty(&bundle) {
+                        Ok(encoded) => encoded,
+                        Err(error) => {
+                            eprintln!("branch export failed: {error}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    match out {
+                        Some(path) => {
+                            if let Err(error) = std::fs::write(path, &encoded) {
+                                eprintln!("branch export failed writing `{path}`: {error}");
+                                return ExitCode::FAILURE;
+                            }
+                            emit_json(json!({
+                                "exported": branch_id,
+                                "out": path,
+                                "blobs": bundle.blobs.len(),
+                                "files": bundle.manifest.len(),
+                            }))
+                        }
+                        None => {
+                            println!("{encoded}");
+                            ExitCode::SUCCESS
+                        }
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch export failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "import" => {
+            let Some(path) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let body = match std::fs::read_to_string(path) {
+                Ok(body) => body,
+                Err(error) => {
+                    eprintln!("branch import failed reading `{path}`: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let bundle: whipplescript_store::bundle::WorkspaceBundle =
+                match serde_json::from_str(&body) {
+                    Ok(bundle) => bundle,
+                    Err(error) => {
+                        eprintln!("branch import failed decoding `{path}`: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            use whipplescript_store::bundle::BundleImportOutcome;
+            match vcs.import_bundle(&bundle, &at) {
+                Ok(BundleImportOutcome::Imported {
+                    branch_id,
+                    cut_id,
+                    manifest_hash,
+                }) => emit_json(json!({
+                    "imported": branch_id,
+                    "cut_id": cut_id,
+                    "manifest_hash": manifest_hash,
+                })),
+                Ok(BundleImportOutcome::AlreadyPresent { branch_id }) => emit_json(json!({
+                    "imported": branch_id,
+                    "already_present": true,
+                })),
+                Ok(BundleImportOutcome::DivergentBranch {
+                    branch_id,
+                    local_head_manifest_hash,
+                }) => {
+                    eprintln!(
+                        "import refused: branch `{branch_id}` has divergent local content \
+                         (head manifest {local_head_manifest_hash:?}); import never clobbers"
+                    );
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch import failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "attribution" => {
+            let Some(branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.attribution(branch_id) {
+                Ok(Some(rows)) => match serde_json::to_value(&rows) {
+                    Ok(payload) => emit_json(payload),
+                    Err(error) => {
+                        eprintln!("branch attribution failed: {error}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch attribution failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "log" => {
+            let Some(branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let limit = rest
+                .iter()
+                .position(|arg| *arg == "--limit")
+                .and_then(|index| rest.get(index + 1))
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(50);
+            match vcs.list_cuts(branch_id, limit) {
+                Ok(cuts) => match serde_json::to_value(&cuts) {
+                    Ok(payload) => emit_json(payload),
+                    Err(error) => {
+                        eprintln!("branch log failed: {error}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(error) => {
+                    eprintln!("branch log failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "bisect" => {
+            // Checkout-free bisect: candidate cuts materialize into
+            // scratch directories and the predicate runs there — no
+            // branch pointer ever moves.
+            let Some(_branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let flag = |name: &str| {
+                rest.iter()
+                    .position(|arg| *arg == name)
+                    .and_then(|index| rest.get(index + 1))
+                    .copied()
+            };
+            let (Some(good), Some(bad), Some(run)) = (flag("--good"), flag("--bad"), flag("--run"))
+            else {
+                eprintln!("`branch bisect` requires --good, --bad, --run\n{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let chain = match vcs.cut_chain(bad, good) {
+                Ok(Some(chain)) if chain.len() >= 2 => chain,
+                Ok(_) => {
+                    eprintln!("no recorded lineage from `{bad}` back to `{good}`");
+                    return ExitCode::FAILURE;
+                }
+                Err(error) => {
+                    eprintln!("branch bisect failed: {error:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let probe = |cut_id: &str| -> Result<bool, String> {
+                let manifest = vcs
+                    .cut_manifest(cut_id)
+                    .map_err(|error| format!("{error:?}"))?
+                    .ok_or_else(|| format!("cut `{cut_id}` has no manifest"))?;
+                let scratch = std::env::temp_dir()
+                    .join(format!("whip-bisect-{}-{cut_id}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&scratch);
+                whipplescript_store::materialize::materialize_manifest(
+                    &manifest,
+                    vcs.content_store(),
+                    &scratch,
+                    0,
+                )
+                .map_err(|error| format!("{error:?}"))?;
+                let status = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(run)
+                    .current_dir(&scratch)
+                    .status()
+                    .map_err(|error| error.to_string())?;
+                let _ = std::fs::remove_dir_all(&scratch);
+                Ok(status.success())
+            };
+            // Invariant: chain[lo] is good, chain[hi] is bad; find the
+            // first bad cut.
+            let mut lo = 0usize;
+            let mut hi = chain.len() - 1;
+            let mut steps = Vec::new();
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                match probe(&chain[mid].cut_id) {
+                    Ok(true) => {
+                        steps.push(json!({"cut_id": chain[mid].cut_id, "verdict": "good"}));
+                        lo = mid;
+                    }
+                    Ok(false) => {
+                        steps.push(json!({"cut_id": chain[mid].cut_id, "verdict": "bad"}));
+                        hi = mid;
+                    }
+                    Err(error) => {
+                        eprintln!("bisect probe failed at `{}`: {error}", chain[mid].cut_id);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            emit_json(json!({
+                "first_bad_cut": chain[hi].cut_id,
+                "last_good_cut": chain[lo].cut_id,
+                "change_id": chain[hi].change_id,
+                "origin": chain[hi].origin,
+                "steps": steps,
+            }))
+        }
+        "select" | "undo" | "transport" | "adopt-only" => {
+            let (Some(branch_id), Some(expr_text)) = (rest.first().copied(), rest.get(1).copied())
+            else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let expr = match whipplescript_store::selection::parse(expr_text) {
+                Ok(expr) => expr,
+                Err(error) => {
+                    eprintln!("selection did not parse: {error}");
+                    return ExitCode::from(2);
+                }
+            };
+            let apply = rest.contains(&"--apply");
+            match verb {
+                "select" => {
+                    let units = match vcs.change_units(branch_id, 500) {
+                        Ok(units) => units,
+                        Err(error) => {
+                            eprintln!("branch select failed: {error:?}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    let picked: Vec<_> = whipplescript_store::selection::eval(&expr, &units)
+                        .into_iter()
+                        .map(|index| units[index].clone())
+                        .collect();
+                    match serde_json::to_value(&picked) {
+                        Ok(payload) => emit_json(payload),
+                        Err(error) => {
+                            eprintln!("branch select failed: {error}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                "undo" => {
+                    // Dry-run is the default interaction: show the plan
+                    // (including what it would strand); --apply executes.
+                    if !apply {
+                        return match vcs.plan_undo_selection(branch_id, &expr) {
+                            Ok(Some(plan)) => match serde_json::to_value(&plan) {
+                                Ok(payload) => emit_json(json!({
+                                    "dry_run": true,
+                                    "plan": payload,
+                                })),
+                                Err(error) => {
+                                    eprintln!("branch undo failed: {error}");
+                                    ExitCode::FAILURE
+                                }
+                            },
+                            Ok(None) => {
+                                eprintln!("no such branch `{branch_id}`");
+                                ExitCode::FAILURE
+                            }
+                            Err(error) => {
+                                eprintln!("branch undo failed: {error:?}");
+                                ExitCode::FAILURE
+                            }
+                        };
+                    }
+                    use whipplescript_store::vcs::UndoSelectionOutcome;
+                    let cut_id = generated_cut_id();
+                    match vcs.apply_undo_selection(branch_id, &expr, &cut_id, &at) {
+                        Ok(UndoSelectionOutcome::Proposed {
+                            cut_id,
+                            manifest_hash,
+                            reverted_paths,
+                        }) => emit_json(json!({
+                            "undone": branch_id,
+                            "cut_id": cut_id,
+                            "manifest_hash": manifest_hash,
+                            "reverted_paths": reverted_paths,
+                        })),
+                        Ok(UndoSelectionOutcome::WouldStrand { stranded }) => {
+                            let payload = serde_json::to_value(&stranded).unwrap_or_default();
+                            eprintln!(
+                                "undo refused: the exclusion strands retained work: {payload}"
+                            );
+                            ExitCode::FAILURE
+                        }
+                        Ok(other) => {
+                            eprintln!("undo refused: {other:?}");
+                            ExitCode::FAILURE
+                        }
+                        Err(error) => {
+                            eprintln!("branch undo failed: {error:?}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                transport_like => {
+                    use whipplescript_store::vcs::TransportOutcome;
+                    let onto = rest
+                        .iter()
+                        .position(|arg| *arg == "--onto")
+                        .and_then(|index| rest.get(index + 1))
+                        .copied();
+                    if transport_like == "transport" && onto.is_none() {
+                        eprintln!("`branch transport` requires --onto <target>\n{BRANCH_USAGE}");
+                        return ExitCode::from(2);
+                    }
+                    if !apply {
+                        // Dry-run: the universe filtered to the selection
+                        // is the preview (the apply reports conflicts
+                        // instead of moving anything anyway).
+                        let units = match vcs.change_units(branch_id, 500) {
+                            Ok(units) => units,
+                            Err(error) => {
+                                eprintln!("branch {transport_like} failed: {error:?}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        let picked: Vec<_> = whipplescript_store::selection::eval(&expr, &units)
+                            .into_iter()
+                            .map(|index| units[index].clone())
+                            .collect();
+                        return match serde_json::to_value(&picked) {
+                            Ok(payload) => emit_json(json!({
+                                "dry_run": true,
+                                "would_move": payload,
+                            })),
+                            Err(error) => {
+                                eprintln!("branch {transport_like} failed: {error}");
+                                ExitCode::FAILURE
+                            }
+                        };
+                    }
+                    let cut_id = generated_cut_id();
+                    let outcome = if transport_like == "transport" {
+                        vcs.transport_selection(
+                            branch_id,
+                            &expr,
+                            onto.expect("checked above"),
+                            &cut_id,
+                            &at,
+                        )
+                    } else {
+                        vcs.adopt_only(branch_id, &expr, &cut_id, &at)
+                    };
+                    match outcome {
+                        Ok(TransportOutcome::Transported {
+                            cut_id,
+                            change_id,
+                            moved_paths,
+                        }) => emit_json(json!({
+                            "transported": branch_id,
+                            "cut_id": cut_id,
+                            "change_id": change_id,
+                            "moved_paths": moved_paths,
+                        })),
+                        Ok(TransportOutcome::UpToDate) => emit_json(json!({
+                            "transported": branch_id,
+                            "up_to_date": true,
+                        })),
+                        Ok(TransportOutcome::Conflicted { conflicts }) => {
+                            let payload = json!({
+                                "conflicted": branch_id,
+                                "conflicts":
+                                    conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
+                            });
+                            eprintln!("{transport_like} conflicted: {payload}");
+                            ExitCode::FAILURE
+                        }
+                        Ok(other) => {
+                            eprintln!("{transport_like} refused: {other:?}");
+                            ExitCode::FAILURE
+                        }
+                        Err(error) => {
+                            eprintln!("branch {transport_like} failed: {error:?}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+            }
+        }
+        "conflicts" => {
+            let Some(branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.open_conflicts(branch_id) {
+                Ok(rows) => match serde_json::to_value(&rows) {
+                    Ok(payload) => emit_json(payload),
+                    Err(error) => {
+                        eprintln!("branch conflicts failed: {error}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(error) => {
+                    eprintln!("branch conflicts failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "resolve" => {
+            let (Some(branch_id), Some(path)) = (rest.first().copied(), rest.get(1).copied())
+            else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            use whipplescript_store::vcs::{ResolutionChoice, ResolveOutcome};
+            let body_arg = rest
+                .iter()
+                .position(|arg| *arg == "--body")
+                .and_then(|index| rest.get(index + 1))
+                .copied();
+            let choice = if rest.contains(&"--ours") {
+                ResolutionChoice::TakeOurs
+            } else if rest.contains(&"--theirs") {
+                ResolutionChoice::TakeTheirs
+            } else if let Some(body) = body_arg {
+                ResolutionChoice::Body(body)
+            } else {
+                eprintln!("`branch resolve` needs --ours, --theirs, or --body\n{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let cut_id = generated_cut_id();
+            match vcs.resolve_conflict(branch_id, path, choice, &cut_id, &at) {
+                Ok(ResolveOutcome::Resolved { cut_id, resolution }) => emit_json(json!({
+                    "resolved": path,
+                    "branch_id": branch_id,
+                    "cut_id": cut_id,
+                    "resolution": resolution,
+                })),
+                Ok(ResolveOutcome::NoOpenConflict) => {
+                    eprintln!("no open conflict at `{path}` on branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Ok(other) => {
+                    eprintln!("resolve refused: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch resolve failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "undo-op" => {
+            // Default target: the newest op — jj's `undo` ergonomics.
+            let op_id = match rest.first().copied() {
+                Some(op_id) => op_id.to_owned(),
+                None => match vcs.list_ops(1) {
+                    Ok(ops) => match ops.first() {
+                        Some(op) => op.op_id.clone(),
+                        None => {
+                            eprintln!("the op log is empty; nothing to undo");
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("branch undo-op failed: {error:?}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+            };
+            use whipplescript_store::vcs::UndoOpOutcome;
+            let undo_op_id = format!("op-undo-{}", generated_cut_id());
+            match vcs.undo_op(&op_id, &undo_op_id, &at) {
+                Ok(UndoOpOutcome::Undone { undo_op_id }) => emit_json(json!({
+                    "undone": op_id,
+                    "undo_op_id": undo_op_id,
+                })),
+                Ok(UndoOpOutcome::HeadMoved {
+                    branch_id,
+                    current_head_cut_id,
+                    expected_head_cut_id,
+                }) => {
+                    eprintln!(
+                        "undo refused: branch `{branch_id}` moved since op `{op_id}` \
+                         (head {current_head_cut_id:?}, op left it at {expected_head_cut_id:?}); \
+                         undo the newer ops first"
+                    );
+                    ExitCode::FAILURE
+                }
+                Ok(UndoOpOutcome::OpMissing) => {
+                    eprintln!("no op `{op_id}` in the log");
+                    ExitCode::FAILURE
+                }
+                Ok(UndoOpOutcome::NothingToUndo) => {
+                    eprintln!("op `{op_id}` moved no branch pointers; nothing to undo");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch undo-op failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "digest" => {
+            let Some(branch_id) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            match vcs.transferable_ids(branch_id) {
+                Ok(Some(ids)) => emit_json(json!(ids)),
+                Ok(None) => {
+                    eprintln!("no such branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch digest failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "have" => {
+            let Some(path) = rest.first().copied() else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            let ids: Vec<String> = match std::fs::read_to_string(path)
+                .map_err(|error| error.to_string())
+                .and_then(|body| serde_json::from_str(&body).map_err(|error| error.to_string()))
+            {
+                Ok(ids) => ids,
+                Err(error) => {
+                    eprintln!("branch have failed reading `{path}`: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match whipplescript_store::bundle::held_subset(&ids, vcs.content_store()) {
+                Ok(held) => emit_json(json!(held)),
+                Err(error) => {
+                    eprintln!("branch have failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "erase" => {
+            let (Some(branch_id), Some(path)) = (rest.first(), rest.get(1)) else {
+                eprintln!("{BRANCH_USAGE}");
+                return ExitCode::from(2);
+            };
+            use whipplescript_store::content::EraseOutcome;
+            match vcs.erase_path(branch_id, path, &at) {
+                Ok(Some((hash, EraseOutcome::Erased { byte_len }))) => emit_json(json!({
+                    "erased": path,
+                    "branch_id": branch_id,
+                    "hash": hash,
+                    "byte_len": byte_len,
+                })),
+                Ok(Some((hash, EraseOutcome::AlreadyErased))) => emit_json(json!({
+                    "erased": path,
+                    "branch_id": branch_id,
+                    "hash": hash,
+                    "already_erased": true,
+                })),
+                Ok(Some((hash, other))) => {
+                    eprintln!("erase refused for {hash}: {other:?}");
+                    ExitCode::FAILURE
+                }
+                Ok(None) => {
+                    eprintln!("no file at `{path}` on branch `{branch_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("branch erase failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "reconcile-list" => match vcs.reconcile_list() {
+            Ok(entries) => match serde_json::to_value(&entries) {
+                Ok(payload) => emit_json(payload),
+                Err(error) => {
+                    eprintln!("branch reconcile-list failed: {error}");
+                    ExitCode::FAILURE
+                }
+            },
+            Err(error) => {
+                eprintln!("branch reconcile-list failed: {error:?}");
+                ExitCode::FAILURE
+            }
+        },
+        other => {
+            eprintln!("unknown branch verb `{other}`\n{BRANCH_USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn generated_cut_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    format!("cut-{nanos}")
+}
+
 fn transition_instance(
     options: &CliOptions,
     usage: &str,
@@ -32632,8 +33950,8 @@ fn compile_source_path_for_validation(
     let mut blocking = lint_workflow_liveness(&ir);
     // Script hard-off (M5 import ladder, Layer 1): `exec` is a check error unless
     // the program imports `std.script`. This is the author-facing consent surface;
-    // the load-bearing runtime backstop (import-conditional capability seeding) is
-    // Layer 2, which lands with the embedded-manifest seeding infrastructure (S6d).
+    // the load-bearing runtime backstop is Layer 2 (S6d-6): import-conditional
+    // two-key capability seeding + the store admission gate (`policy_block_on`).
     blocking.extend(check_script_hard_off(&ir));
     if !blocking.is_empty() {
         // Workflow-level diagnostics (span 0 for liveness) render against the root
@@ -32653,7 +33971,8 @@ fn compile_source_path_for_validation(
 /// `IrEffectKind::ExecCommand` — is a check error with id `security.script_disabled`
 /// unless the program contains `use std.script`. The import is the author-facing
 /// declaration that script execution is intended; without it, scripts are truly
-/// off. (Layer 2, the anti-forged-IR runtime backstop, is deferred to S6d.)
+/// off. (Layer 2, the anti-forged-IR runtime backstop, is the two-key seeding in
+/// `run_worker_once` + the `script.*` requirement at the store admission gate.)
 fn check_script_hard_off(ir: &IrProgram) -> Vec<Diagnostic> {
     if ir.uses.iter().any(|use_decl| use_decl.name == "std.script") {
         return Vec::new();
@@ -32929,15 +34248,13 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
             }
             let first = pattern.split_whitespace().next().unwrap_or_default();
             if !first.chars().next().is_some_and(char::is_uppercase) {
-                // Remaining lowercase patterns (loft, manual review) are fed
+                // Remaining lowercase patterns (manual review) are fed
                 // by external systems the lint cannot see.
                 continue;
             }
             let builtin = matches!(
                 first,
                 "AgentTurn"
-                    | "LoftIssue"
-                    | "LoftClaim"
                     | "WorkItem"
                     | "Evidence"
                     | "HumanAnswer"
@@ -36300,6 +37617,10 @@ fn trace_event_to_json(event: &TraceEvent) -> Value {
             "status": status,
             "reason": reason,
         }),
+        TraceEvent::EffectRetried { effect_id } => json!({
+            "type": "effect_retried",
+            "effect_id": effect_id,
+        }),
         TraceEvent::EffectCancelled { effect_id } => json!({
             "type": "effect_cancelled",
             "effect_id": effect_id,
@@ -37395,6 +38716,119 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn http_source_guard_refuses_internal_targets_and_screens_dns() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("WHIPPLESCRIPT_HTTP_SOURCE_ALLOW_PRIVATE");
+        std::env::remove_var("WHIPPLESCRIPT_HTTP_SOURCE_ALLOW");
+
+        // Literal internal / link-local / RFC1918 addresses are refused.
+        for url in [
+            "http://127.0.0.1/x",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/x",
+            "http://192.168.1.1/x",
+            "https://[::1]/x",
+        ] {
+            assert!(
+                http_source_url_policy_error(url).is_some(),
+                "internal target must be refused: {url}"
+            );
+        }
+        // Local namespaces are refused before any lookup.
+        assert!(http_source_url_policy_error("http://localhost/x").is_some());
+        assert!(http_source_url_policy_error("http://svc.local/x").is_some());
+        // Non-http schemes and hostless URLs are refused.
+        assert!(http_source_url_policy_error("file:///etc/passwd").is_some());
+        // A public literal address is allowed when no allowlist is configured.
+        assert!(http_source_url_policy_error("http://1.1.1.1/x").is_none());
+        // A DNS NAME is now screened (not just literal IPs): a name that does
+        // not resolve is refused fail-closed rather than passing through — the
+        // branch that also refuses names resolving to internal addresses.
+        assert!(
+            http_source_url_policy_error("http://nonexistent-host.invalid/x").is_some(),
+            "an unresolvable DNS name must be refused, not passed through"
+        );
+    }
+
+    #[test]
+    fn screen_public_addrs_rejects_internal_resolutions() {
+        // Literal addresses parse without DNS, so this is deterministic. The
+        // connection-time resolver refuses any netloc that resolves to an
+        // internal target, closing the DNS-rebind gap for HTTP-source ingress.
+        assert!(screen_public_addrs("127.0.0.1:80").is_err());
+        assert!(screen_public_addrs("169.254.169.254:80").is_err());
+        assert!(screen_public_addrs("10.0.0.5:443").is_err());
+        assert!(screen_public_addrs("[::1]:80").is_err());
+        // A public literal address resolves through.
+        assert!(screen_public_addrs("1.1.1.1:443").is_ok());
+    }
+
+    #[cfg(feature = "claude")]
+    #[test]
+    fn claude_sidecar_default_resolves_from_executable_not_cwd() {
+        // Resolved relative to the test binary, walking up to the repo's
+        // `scripts/` — never the current working directory.
+        let path = default_claude_sidecar_path().expect("bundled sidecar found from exe dir");
+        assert!(path.is_absolute(), "resolved sidecar path must be absolute");
+        assert!(path.ends_with("scripts/claude-agent-sdk-sidecar.mjs"));
+        assert!(path.is_file(), "resolved sidecar must be a real file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_scan_skips_symlinks_and_terminates_on_cycles() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("whip-lsp-scan-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("whip-lsp-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(root.join("sub")).expect("mkdir sub");
+        std::fs::write(root.join("a.whip"), "workflow A").expect("a");
+        std::fs::write(root.join("sub/b.whip"), "workflow B").expect("b");
+        // A `.whip` outside the tree that a symlink would otherwise expose.
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        std::fs::write(outside.join("secret.whip"), "workflow Secret").expect("secret");
+        // A directory-symlink CYCLE (`loop -> .`) and an out-of-tree ESCAPE.
+        symlink(&root, root.join("loop")).expect("loop symlink");
+        symlink(&outside, root.join("escape")).expect("escape symlink");
+
+        // Must terminate (the test completing at all proves no infinite loop /
+        // stack overflow from the cycle).
+        let mut files = Vec::new();
+        lsp_collect_whip_files(&root, &mut files, 0);
+
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            names.contains(&"a.whip".to_owned()),
+            "found a.whip: {names:?}"
+        );
+        assert!(
+            names.contains(&"b.whip".to_owned()),
+            "found b.whip: {names:?}"
+        );
+        assert!(
+            !names.contains(&"secret.whip".to_owned()),
+            "must not escape the tree via a symlink: {names:?}"
+        );
+        assert_eq!(
+            files.len(),
+            2,
+            "exactly the two real files, no cycle dups: {names:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
     fn retired_effect_kinds_are_flagged_but_current_kinds_are_not() {
         // The S1 rename retired event.notify -> signal.emit; a store still holding
         // an event.notify effect must be flagged, while every current kind
@@ -38017,16 +39451,16 @@ coerce review() -> Review {
     fn package_manifest_accepts_first_class_library_shape() {
         let manifest = package_manifest_from_json(
             Path::new("memory.json"),
-            include_str!("../../../examples/packages/memory.json").to_owned(),
+            include_str!("../../../std/manifests/memory.json").to_owned(),
         )
         .expect("manifest parses");
 
-        assert_eq!(manifest.package_id, "package-memory");
+        assert_eq!(manifest.package_id, "std.memory");
         assert!(manifest
             .registry
             .libraries
             .iter()
-            .any(|library| library.id == "memory" && library.version == "0.1.0"));
+            .any(|library| library.id == "std.memory" && library.version == "0.1.0"));
         let query_contract = manifest
             .registry
             .effect_contracts
@@ -38055,7 +39489,7 @@ coerce review() -> Review {
             .iter()
             .find(|form| form.id == "memory.recall")
             .expect("memory recall construct");
-        assert_eq!(recall_form.library_id, "memory");
+        assert_eq!(recall_form.library_id, "std.memory");
         assert_eq!(recall_form.construct_family, "effect_operation");
         assert_eq!(recall_form.keyword, "recall");
         assert_eq!(recall_form.scope, "rule_body");
@@ -38977,6 +40411,227 @@ coerce review() -> Review {
         );
     }
 
+    /// A synthetic std manifest declaring a construct in a real
+    /// `package_authorable: false` lowering class (`signal_source`,
+    /// `source_declaration` family, no grammar/interfaces required) — otherwise
+    /// fully valid, so the only failure under test is the authorability door.
+    const INTERNAL_LOWERING_STD_MANIFEST: &str = r#"
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.pulse",
+  "name": "std.pulse",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.pulse",
+      "version": "0.1.0",
+      "constructs": [
+        {
+          "id": "pulse.source",
+          "construct_family": "source_declaration",
+          "keyword": "pulse",
+          "scope": "top_level",
+          "lowering_target": "signal_source"
+        }
+      ]
+    }
+  ]
+}
+"#;
+
+    #[test]
+    fn package_manifest_rejects_internal_lowering_without_embedded_privilege() {
+        // The normal (vendor/lock/file) path: the manifest is not the platform's
+        // embedded copy, so the flat rejection stands.
+        let error = package_manifest_from_json(
+            Path::new("std-pulse.json"),
+            INTERNAL_LOWERING_STD_MANIFEST.to_owned(),
+        )
+        .expect_err("a non-embedded manifest must not author an internal lowering");
+        assert!(
+            error.contains("platform-internal lowering_target `signal_source`")
+                && error.contains("only platform-embedded std manifests"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn package_manifest_admits_internal_lowering_for_embedded_copy() {
+        // The authorability door: the same bytes validated as an entry of the
+        // embedded manifest set are the platform copy and may use internal
+        // lowerings.
+        let manifest = package_manifest_from_json_with_embedded(
+            Path::new("<embedded:std.pulse>"),
+            INTERNAL_LOWERING_STD_MANIFEST.to_owned(),
+            &[("std.pulse", INTERNAL_LOWERING_STD_MANIFEST)],
+        )
+        .expect("the platform's own embedded copy may use internal lowerings");
+        assert_eq!(manifest.name, "std.pulse");
+        assert_eq!(manifest.registry.constructs.len(), 1);
+        assert_eq!(
+            manifest.registry.constructs[0].lowering_target,
+            "signal_source"
+        );
+    }
+
+    #[test]
+    fn package_manifest_std_name_grants_no_internal_lowering_privilege() {
+        // Name alone grants nothing: a `std.evil` manifest with an internal
+        // lowering is rejected through the normal path, and stays rejected even
+        // against an embedded set whose entries have different bytes — only
+        // byte-identity with the embedded copy is the privilege key.
+        let evil = INTERNAL_LOWERING_STD_MANIFEST.replace("std.pulse", "std.evil");
+        let error = package_manifest_from_json(Path::new("std-evil.json"), evil.clone())
+            .expect_err("a std.*-named manifest file must not author an internal lowering");
+        assert!(
+            error.contains("platform-internal lowering_target `signal_source`"),
+            "{error}"
+        );
+        let error = package_manifest_from_json_with_embedded(
+            Path::new("std-evil.json"),
+            evil,
+            &[("std.pulse", INTERNAL_LOWERING_STD_MANIFEST)],
+        )
+        .expect_err("different bytes must not inherit embedded privilege");
+        assert!(
+            error.contains("platform-internal lowering_target `signal_source`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn embedded_std_manifests_parse() {
+        // Guard: every real embedded manifest validates clean through the full
+        // manifest validation (`embedded_std_manifests` panics otherwise). None
+        // declares a non-authorable lowering today, so the authorability door is
+        // exercised only by the synthetic tests above.
+        let manifests = embedded_std_manifests();
+        assert_eq!(manifests.len(), EMBEDDED_STD_MANIFESTS.len());
+        for ((name, _), manifest) in EMBEDDED_STD_MANIFESTS.iter().zip(&manifests) {
+            assert_eq!(&manifest.name, name);
+        }
+    }
+
+    #[test]
+    fn std_manifests_all_embedded() {
+        // Blocker B1 door mirror: `scripts/artifact_admission.py`
+        // (`embedded_std_construct_identities`) globs `std/manifests/*.json`
+        // indiscriminately and treats every construct it finds as embedded-std
+        // (door-privileged). The Rust authority instead reads only
+        // `EMBEDDED_STD_MANIFESTS`. If a construct-bearing manifest that is NOT
+        // embedded ever lands under `std/manifests/`, Python would privilege it
+        // (fail-open) while Rust would not — re-opening the gap the
+        // grammar-only-manifests-live-in-std/grammars decision closed. This
+        // test fails the build the moment such a manifest appears, forcing it
+        // into `std/grammars/` (build.rs-only, un-globbed) or into the embedded
+        // set. Keep the two sources in lockstep.
+        let manifests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../std/manifests");
+        let entries = std::fs::read_dir(&manifests_dir)
+            .expect("std/manifests directory must exist and be readable");
+        let embedded_names: std::collections::HashSet<&str> = EMBEDDED_STD_MANIFESTS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        let mut checked = 0usize;
+        for entry in entries {
+            let path = entry.expect("std/manifests entry must be readable").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("could not read `{}`: {error}", path.display()));
+            let manifest: serde_json::Value = serde_json::from_str(&raw)
+                .unwrap_or_else(|error| panic!("`{}` is not valid JSON: {error}", path.display()));
+            let has_construct = manifest
+                .get("libraries")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|library| {
+                    library
+                        .get("constructs")
+                        .and_then(serde_json::Value::as_array)
+                })
+                .any(|constructs| !constructs.is_empty());
+            if !has_construct {
+                continue;
+            }
+            let name = manifest
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("`{}` is missing a top-level `name`", path.display()));
+            assert!(
+                embedded_names.contains(name),
+                "construct-bearing std manifest `{}` (name `{name}`) is under std/manifests/ but not in \
+                 EMBEDDED_STD_MANIFESTS; either embed it (and update the parser build.rs list + the \
+                 Python door) or move it to std/grammars/ (grammar-only, build.rs-read, un-globbed by the door)",
+                path.display()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "expected at least one construct-bearing manifest under std/manifests/"
+        );
+    }
+
+    #[test]
+    fn registry_construct_embedded_std_copy_requires_full_identity() {
+        // The report-registry layer keys on registration identity with an
+        // embedded std construct; any drifted field breaks the match.
+        let recall = json!({
+            "id": "memory.recall",
+            "library_id": "std.memory",
+            "version": "0.1.0",
+            "construct_family": "effect_operation",
+            "keyword": "recall",
+            "scope": "rule_body",
+            "lowering_target": "capability_call",
+            "target_capability": "memory.query",
+        });
+        let embedded = embedded_std_manifests();
+        assert!(registry_construct_is_embedded_std_copy(&recall, &embedded));
+        let mut forged = recall.clone();
+        forged["lowering_target"] = json!("core_effect");
+        assert!(!registry_construct_is_embedded_std_copy(&forged, &embedded));
+        let mut renamed = recall;
+        renamed["library_id"] = json!("std.evil");
+        assert!(!registry_construct_is_embedded_std_copy(
+            &renamed, &embedded
+        ));
+    }
+
+    #[test]
+    fn report_registry_rejects_internal_lowering_for_non_embedded_construct() {
+        // The report-registry enforcement site: a package-library construct
+        // with an internal lowering that is not the platform's embedded copy is
+        // rejected (a reserved-looking library name grants nothing).
+        let registry = json!({
+            "libraries": [{ "id": "std.evil", "version": "0.1.0", "standard": false }],
+            "constructs": [{
+                "id": "evil.source",
+                "library_id": "std.evil",
+                "version": "0.1.0",
+                "construct_family": "source_declaration",
+                "keyword": "pulse",
+                "scope": "top_level",
+                "lowering_target": "signal_source",
+            }],
+            "effect_contracts": [],
+        });
+        let error = verify_contract_registry_platform_vocabulary(
+            &registry,
+            "report",
+            &embedded_std_manifests(),
+        )
+        .expect_err("a non-embedded internal-lowering construct must be rejected");
+        assert!(
+            error.contains("platform-internal")
+                && error.contains("only platform-embedded std manifests"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn package_manifest_rejects_unsupported_construct_family() {
         let error = package_manifest_from_json(
@@ -39311,8 +40966,7 @@ coerce review() -> Review {
           "provides": [
             {"kind": "EffectHandle"}
           ],
-          "lowering_target": "capability_call",
-          "target_capability": "tracker.claim"
+          "lowering_target": "typed_effect_call"
         }
       ]
     }
@@ -39329,7 +40983,7 @@ coerce review() -> Review {
         assert!(manifest.registry.constructs.iter().any(|form| {
             form.library_id == "std.tracker"
                 && form.keyword == "claim"
-                && form.lowering_target == "capability_call"
+                && form.lowering_target == "typed_effect_call"
         }));
     }
 
@@ -39394,6 +41048,219 @@ coerce review() -> Review {
         );
     }
 
+    /// A `declaration_block` grammar-only manifest with a single clause, for the
+    /// decl-grammar validator tests. `clause` is the raw JSON of one clause; the
+    /// library uses the non-reserved keyword `widget` so no privilege is needed.
+    fn declaration_grammar_manifest(clause: &str) -> String {
+        format!(
+            r#"{{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "gadget",
+  "name": "gadget",
+  "version": "0.1.0",
+  "libraries": [
+    {{
+      "id": "gadget",
+      "constructs": [
+        {{
+          "id": "gadget.widget",
+          "construct_family": "declaration_block",
+          "keyword": "widget",
+          "scope": "top_level",
+          "grammar": {{
+            "shape": "declaration_block",
+            "keyword": "widget",
+            "clauses": [{clause}]
+          }}
+        }}
+      ]
+    }}
+  ]
+}}"#
+        )
+    }
+
+    #[test]
+    fn package_manifest_accepts_declaration_block_grammar() {
+        // A flag clause, a connective-introduced value clause, and a list
+        // clause. The default `metadata_only` lowering is declaration_block-
+        // compatible, so no capabilities or effect contracts are required.
+        let manifest = package_manifest_from_json(
+            Path::new("gadget-grammar.json"),
+            declaration_grammar_manifest(
+                r#"
+              {"name": "shared", "kind": "flag", "required": false, "list": false,
+               "unknown_hint": "no such field", "missing_summary": "add a field"},
+              {"name": "partition", "kind": "identifier", "required": true, "list": false,
+               "connective": "by", "unknown_hint": "no such field", "missing_summary": "add a field"},
+              {"name": "allow read", "kind": "glob", "required": false, "list": true,
+               "unknown_hint": "no such field", "missing_summary": "add a field"}
+            "#,
+            ),
+        )
+        .expect("declaration_block grammar manifest should validate");
+
+        let form = manifest
+            .registry
+            .constructs
+            .iter()
+            .find(|form| form.id == "gadget.widget")
+            .expect("gadget.widget construct");
+        assert_eq!(form.construct_family, "declaration_block");
+        let grammar = form
+            .grammar
+            .as_ref()
+            .expect("grammar carried on the registration");
+        assert_eq!(
+            grammar.shape,
+            whipplescript_core::CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK
+        );
+        let clauses = grammar
+            .clauses
+            .as_ref()
+            .expect("declaration_block grammar carries clauses");
+        assert_eq!(clauses.len(), 3);
+        assert_eq!(clauses[1].connective.as_deref(), Some("by"));
+        // The derived flat `fields[]` view: flag -> optional boolean, value
+        // clause -> its own kind, list clause -> the `list` field kind.
+        assert_eq!(
+            form.fields,
+            vec![
+                ConstructField {
+                    name: "shared".to_owned(),
+                    kind: "boolean".to_owned(),
+                    required: false,
+                },
+                ConstructField {
+                    name: "partition".to_owned(),
+                    kind: "identifier".to_owned(),
+                    required: true,
+                },
+                ConstructField {
+                    name: "allow read".to_owned(),
+                    kind: "list".to_owned(),
+                    required: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn package_manifest_rejects_declaration_flag_with_list() {
+        let error = package_manifest_from_json(
+            Path::new("gadget-grammar.json"),
+            declaration_grammar_manifest(
+                r#"{"name": "shared", "kind": "flag", "required": false, "list": true,
+                    "unknown_hint": "h", "missing_summary": "s"}"#,
+            ),
+        )
+        .expect_err("a flag clause cannot be a list");
+        assert!(
+            error.contains("is a `flag` and cannot set `list: true`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn package_manifest_rejects_declaration_flag_with_connective() {
+        let error = package_manifest_from_json(
+            Path::new("gadget-grammar.json"),
+            declaration_grammar_manifest(
+                r#"{"name": "shared", "kind": "flag", "required": false, "list": false,
+                    "connective": "by", "unknown_hint": "h", "missing_summary": "s"}"#,
+            ),
+        )
+        .expect_err("a flag clause cannot carry a connective");
+        assert!(
+            error.contains("is a `flag` and cannot carry a connective"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn package_manifest_rejects_declaration_unknown_clause_kind() {
+        let error = package_manifest_from_json(
+            Path::new("gadget-grammar.json"),
+            declaration_grammar_manifest(
+                r#"{"name": "x", "kind": "mystery", "required": true, "list": false,
+                    "unknown_hint": "h", "missing_summary": "s"}"#,
+            ),
+        )
+        .expect_err("an unknown clause kind is rejected");
+        assert!(error.contains("uses unsupported kind `mystery`"), "{error}");
+    }
+
+    #[test]
+    fn package_manifest_rejects_declaration_unknown_connective() {
+        let error = package_manifest_from_json(
+            Path::new("gadget-grammar.json"),
+            declaration_grammar_manifest(
+                r#"{"name": "x", "kind": "identifier", "required": true, "list": false,
+                    "connective": "beside", "unknown_hint": "h", "missing_summary": "s"}"#,
+            ),
+        )
+        .expect_err("an unknown connective is rejected");
+        assert!(
+            error.contains("uses unsupported connective `beside`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn package_manifest_rejects_declaration_unknown_clause_key() {
+        let error = package_manifest_from_json(
+            Path::new("gadget-grammar.json"),
+            declaration_grammar_manifest(
+                r#"{"name": "x", "kind": "identifier", "required": true, "list": false,
+                    "unknown_hint": "h", "missing_summary": "s", "extra": true}"#,
+            ),
+        )
+        .expect_err("an unknown clause key is rejected");
+        assert!(error.contains("field `extra` is not allowed"), "{error}");
+    }
+
+    #[test]
+    fn package_check_accepts_std_grammar_manifests() {
+        // The five grammar-only std manifests (read by `build.rs` for the parse
+        // table) are now fully-checkable first-class package manifests: each
+        // passes `whip package check` (parse + consistency + registry
+        // diagnostics) now that `declaration_block` is a supported shape.
+        let sources = [
+            (
+                "std/grammars/tracker.json",
+                include_str!("../../../std/grammars/tracker.json"),
+            ),
+            (
+                "std/grammars/coord.json",
+                include_str!("../../../std/grammars/coord.json"),
+            ),
+            (
+                "std/grammars/files.json",
+                include_str!("../../../std/grammars/files.json"),
+            ),
+            (
+                "std/grammars/messaging-grammar.json",
+                include_str!("../../../std/grammars/messaging-grammar.json"),
+            ),
+            (
+                "std/grammars/memory-grammar.json",
+                include_str!("../../../std/grammars/memory-grammar.json"),
+            ),
+        ];
+        for (label, json) in sources {
+            let manifest = package_manifest_from_json(Path::new(label), json.to_owned())
+                .unwrap_or_else(|error| {
+                    panic!("std grammar manifest `{label}` must validate: {error}")
+                });
+            let registry = package_registry(std::slice::from_ref(&manifest));
+            let diagnostics = registry.validate();
+            assert!(
+                diagnostics.is_empty(),
+                "std grammar manifest `{label}` must pass package check: {diagnostics:?}"
+            );
+        }
+    }
+
     #[test]
     fn package_manifest_rejects_unsupported_construct_field_kind() {
         let error = package_manifest_from_json(
@@ -39435,7 +41302,7 @@ coerce review() -> Review {
     #[test]
     fn package_lock_json_emits_portable_source_shape_no_absolute_path() {
         let manifest_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
         let manifest = load_package_manifest(&manifest_path).expect("manifest loads");
         let base_dir = manifest_path
             .parent()
@@ -39448,7 +41315,7 @@ coerce review() -> Review {
         assert!(entry.get("manifest_path").is_none(), "{lock_json}");
         assert_eq!(entry["source"]["type"], "path");
         let source_path = entry["source"]["path"].as_str().expect("source path");
-        assert_eq!(source_path, "memory.json");
+        assert_eq!(source_path, "notes.json");
         assert!(
             is_portable_relative_path(source_path),
             "source path must be portable: {source_path}"
@@ -39526,22 +41393,22 @@ coerce review() -> Review {
         );
     }
 
-    /// Set up a temp project containing the memory manifest and a `whip.packages.json`.
+    /// Set up a temp project containing the notes manifest and a `whip.packages.json`.
     /// Returns (temp_dir, package_set_path).
-    fn write_memory_package_set(slug: &str) -> (PathBuf, PathBuf) {
+    fn write_notes_package_set(slug: &str) -> (PathBuf, PathBuf) {
         let manifest_src =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
         let temp_dir = env::temp_dir().join(format!(
             "whipplescript-sync-{slug}-{}",
             stable_hash_hex(&manifest_src.display().to_string())
         ));
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(temp_dir.join("packages")).expect("packages dir");
-        fs::copy(&manifest_src, temp_dir.join("packages/memory.json")).expect("manifest copies");
+        fs::copy(&manifest_src, temp_dir.join("packages/notes.json")).expect("manifest copies");
         let set = json!({
             "schema": PACKAGE_SET_SCHEMA,
             "packages": [
-                {"name": "memory", "source": {"type": "path", "path": "packages/memory.json"}}
+                {"name": "notes", "source": {"type": "path", "path": "packages/notes.json"}}
             ],
         });
         let set_path = temp_dir.join("whip.packages.json");
@@ -39551,7 +41418,7 @@ coerce review() -> Review {
 
     #[test]
     fn package_sync_resolution_is_byte_identical_across_runs() {
-        let (temp_dir, set_path) = write_memory_package_set("deterministic");
+        let (temp_dir, set_path) = write_notes_package_set("deterministic");
         let lock_path = temp_dir.join("whip.lock");
 
         let first = resolve_package_sync(Some(set_path.clone()), Some(lock_path.clone()))
@@ -39569,7 +41436,7 @@ coerce review() -> Review {
             first.lock_text
         );
         assert!(
-            first.lock_text.contains("packages/memory.json"),
+            first.lock_text.contains("packages/notes.json"),
             "{}",
             first.lock_text
         );
@@ -39585,7 +41452,7 @@ coerce review() -> Review {
     #[test]
     fn package_sync_rejects_nonportable_source_path() {
         let manifest_src =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
         let temp_dir = env::temp_dir().join(format!(
             "whipplescript-sync-escape-{}",
             stable_hash_hex(&manifest_src.display().to_string())
@@ -39595,7 +41462,7 @@ coerce review() -> Review {
         let set = json!({
             "schema": PACKAGE_SET_SCHEMA,
             "packages": [
-                {"name": "memory", "source": {"type": "path", "path": "../escape.json"}}
+                {"name": "notes", "source": {"type": "path", "path": "../escape.json"}}
             ],
         });
         let set_path = temp_dir.join("whip.packages.json");
@@ -39613,19 +41480,19 @@ coerce review() -> Review {
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
-    /// Copy the `memory` example manifest into a fresh temp directory and write
+    /// Copy the `notes` example manifest into a fresh temp directory and write
     /// a portable lock alongside it. Returns the temp directory (caller cleans
     /// up), the lock path, and the parsed lock JSON so tests can mutate it.
-    fn write_portable_memory_lock(slug: &str) -> (PathBuf, PathBuf, Value) {
+    fn write_portable_notes_lock(slug: &str) -> (PathBuf, PathBuf, Value) {
         let manifest_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
         let temp_dir = env::temp_dir().join(format!(
             "whipplescript-lock-{slug}-{}",
             stable_hash_hex(&manifest_path.display().to_string())
         ));
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).expect("temp dir");
-        let copied_manifest = temp_dir.join("memory.json");
+        let copied_manifest = temp_dir.join("notes.json");
         fs::copy(&manifest_path, &copied_manifest).expect("manifest copies");
         let manifest = load_package_manifest(&copied_manifest).expect("manifest loads");
         let lock_json = package_lock_json(&[manifest], &temp_dir);
@@ -39636,12 +41503,12 @@ coerce review() -> Review {
 
     #[test]
     fn package_lock_supplies_package_import_registry() {
-        let (temp_dir, lock_path, lock_json) = write_portable_memory_lock("import-registry");
+        let (temp_dir, lock_path, lock_json) = write_portable_notes_lock("import-registry");
         // The portable lock must record a relative source, never an absolute path.
         let source_path = lock_json["packages"][0]["source"]["path"]
             .as_str()
             .expect("source path");
-        assert_eq!(source_path, "memory.json");
+        assert_eq!(source_path, "notes.json");
         assert!(lock_json["packages"][0].get("manifest_path").is_none());
         let lock = load_package_lock_file(&lock_path).expect("lock loads");
         let _ = fs::remove_dir_all(&temp_dir);
@@ -39649,7 +41516,28 @@ coerce review() -> Review {
         let source = r#"
 workflow PackageLockRegistry
 
-use memory
+use notes
+
+class Task {
+  title string
+}
+
+rule start
+  when Task as task
+=> {
+  call notes.query for task as context
+}
+"#;
+        let compiled = whipplescript_parser::compile_program(source);
+        let ir = compiled.ir.expect("source compiles");
+        // `memory` ships as the embedded `std.memory` manifest (M5), so
+        // `use std.memory` + `recall` resolves with no lock at all — no supply
+        // chain required.
+        let embedded_ir = whipplescript_parser::compile_program(
+            r#"
+workflow EmbeddedMemory
+
+use std.memory
 
 class Task {
   title string
@@ -39660,13 +41548,12 @@ rule start
 => {
   recall project_memory for task as context
 }
-"#;
-        let compiled = whipplescript_parser::compile_program(source);
-        let ir = compiled.ir.expect("source compiles");
-        // `memory` now ships as an embedded std manifest (M5), so `use memory` +
-        // `recall` resolves with no lock at all — no supply chain required.
-        let embedded = contract_registry_for_ir(None, &ir)
-            .expect("embedded `memory` manifest resolves without a lock");
+"#,
+        )
+        .ir
+        .expect("embedded source compiles");
+        let embedded = contract_registry_for_ir(None, &embedded_ir)
+            .expect("embedded `std.memory` manifest resolves without a lock");
         assert!(
             embedded.constructs.iter().any(|form| {
                 form.keyword == "recall"
@@ -39709,23 +41596,197 @@ rule start
         assert!(registry
             .libraries
             .iter()
-            .any(|library| library.id == "memory" && library.version == "0.1.0"));
+            .any(|library| library.id == "notes" && library.version == "0.1.0"));
         assert!(registry
             .effect_contracts
             .iter()
-            .any(|contract| contract.id == "memory.query"
+            .any(|contract| contract.id == "notes.query"
                 && contract.effect_kind == "capability.call"));
-        assert!(registry.constructs.iter().any(|form| {
-            form.keyword == "recall"
-                && form.lowering_target == "capability_call"
-                && form.target_capability.as_deref() == Some("memory.query")
-        }));
         assert_eq!(registry.validate(), Vec::new());
     }
 
     #[test]
+    fn package_lock_rejects_reserved_std_namespace_entries() {
+        // A supply-chain lock can never provide a `std.*` package: std packages
+        // ship embedded in the platform, and embedded always wins.
+        let (temp_dir, lock_path, mut lock_json) = write_portable_notes_lock("reserved-std");
+        let manifest_path = temp_dir.join("std.memory.json");
+        let manifest_json = fs::read_to_string(temp_dir.join("notes.json"))
+            .expect("read notes manifest")
+            .replace("\"name\": \"notes\"", "\"name\": \"std.memory\"");
+        fs::write(&manifest_path, &manifest_json).expect("write std-named manifest");
+        let entry = lock_json
+            .get_mut("packages")
+            .and_then(Value::as_array_mut)
+            .and_then(|packages| packages.first_mut())
+            .and_then(Value::as_object_mut)
+            .expect("package entry object");
+        entry.insert("name".to_owned(), Value::String("std.memory".to_owned()));
+        entry.insert(
+            "source".to_owned(),
+            json!({"type": "path", "path": "std.memory.json"}),
+        );
+        entry.insert(
+            "manifest_sha256".to_owned(),
+            Value::String(sha256_hex(manifest_json.as_bytes())),
+        );
+        fs::write(&lock_path, canonical_lock_text(&lock_json)).expect("lock writes");
+        let error = load_package_lock_file(&lock_path)
+            .expect_err("a reserved std.* lock entry must be rejected");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        assert!(
+            error.contains("entry `std.memory` claims the reserved std namespace")
+                && error.contains("cannot be provided by a package lock"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn embedded_messaging_manifest_matches_core_reference_data() {
+        // The embedded `std.messaging` manifest must transcribe the core
+        // reference data (`std_messaging_send_construct` /
+        // `std_messaging_send_effect_contract`) field-for-field, so the two can
+        // never drift while both exist. Both now share the `0.1.0` package
+        // version, so the comparison is a full field-for-field equality.
+        let manifest = embedded_std_manifests()
+            .into_iter()
+            .find(|manifest| manifest.name == "std.messaging")
+            .expect("std.messaging ships as an embedded manifest");
+
+        let construct = manifest
+            .registry
+            .constructs
+            .iter()
+            .find(|form| form.keyword == "send")
+            .expect("manifest registers the send construct");
+        let expected_construct = whipplescript_core::std_messaging_send_construct();
+        assert_eq!(construct, &expected_construct);
+
+        let contract = manifest
+            .registry
+            .effect_contracts
+            .iter()
+            .find(|contract| contract.id == "messaging.send")
+            .expect("manifest registers the messaging.send effect contract");
+        let expected_contract = whipplescript_core::std_messaging_send_effect_contract();
+        assert_eq!(contract, &expected_contract);
+    }
+
+    #[test]
+    fn send_requires_std_messaging_import_and_validates_lock_free_with_it() {
+        // `send` migrated from an ambient parser builtin to the embedded
+        // `std.messaging` manifest (the import ladder): without
+        // `use std.messaging` it is rejected with the import hint; with the
+        // import it validates with no package lock at all.
+        let source = |uses: &str| {
+            format!(
+                r##"
+@service
+workflow Notify
+{uses}
+class Trigger {{
+  id string
+}}
+
+channel alerts {{
+  provider slack
+  destination "#ops"
+}}
+
+rule notify
+  when Trigger as t
+=> {{
+  send via alerts {{
+    text "hello"
+  }} as sent
+}}
+"##
+            )
+        };
+        let without_import = whipplescript_parser::compile_program(&source(""))
+            .ir
+            .expect("source compiles");
+        let error = contract_registry_for_ir(None, &without_import)
+            .expect_err("send without `use std.messaging` must be rejected");
+        assert!(
+            error.contains("construct `send`")
+                && error.contains("embedded std package `std.messaging`")
+                && error.contains("add `use std.messaging`"),
+            "{error}"
+        );
+
+        // A package lock does not change the fix: `send` is embedded-owned, so
+        // the lock path emits the same import hint instead of blaming the lock.
+        let (temp_dir, lock_path, _) = write_portable_notes_lock("send-import-hint");
+        let lock = load_package_lock_file(&lock_path).expect("lock loads");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let locked_error = lock
+            .registry_for_ir(&without_import)
+            .expect_err("send without `use std.messaging` is rejected under a lock too");
+        assert!(
+            locked_error.contains("add `use std.messaging`"),
+            "{locked_error}"
+        );
+
+        let with_import = whipplescript_parser::compile_program(&source("\nuse std.messaging\n"))
+            .ir
+            .expect("source compiles");
+        let registry = contract_registry_for_ir(None, &with_import)
+            .expect("`use std.messaging` authorizes send with no lock");
+        assert!(
+            registry.constructs.iter().any(|form| {
+                form.keyword == "send"
+                    && form.library_id == "std.messaging"
+                    && form.target_capability.as_deref() == Some("messaging.send")
+            }),
+            "embedded resolution authorizes the `send` construct"
+        );
+        assert!(
+            registry.effect_contracts.iter().any(|contract| {
+                contract.id == "messaging.send" && contract.effect_kind == "capability.call"
+            }),
+            "embedded resolution registers the messaging.send contract"
+        );
+        assert_eq!(registry.validate(), Vec::new());
+    }
+
+    #[test]
+    fn package_sync_refuses_reserved_std_manifest_names() {
+        let (temp_dir, set_path) = write_notes_package_set("reserved-std");
+        // Point the package set at a manifest claiming the reserved namespace.
+        let manifest_path = temp_dir.join("packages/notes.json");
+        let manifest_json = fs::read_to_string(&manifest_path)
+            .expect("read notes manifest")
+            .replace("\"name\": \"notes\"", "\"name\": \"std.notes\"");
+        fs::write(&manifest_path, manifest_json).expect("write std-named manifest");
+        let set = json!({
+            "schema": PACKAGE_SET_SCHEMA,
+            "packages": [
+                {"name": "std.notes", "source": {"type": "path", "path": "packages/notes.json"}}
+            ],
+        });
+        fs::write(&set_path, canonical_lock_text(&set)).expect("set writes");
+
+        let diagnostics = resolve_package_sync(Some(set_path), Some(temp_dir.join("whip.lock")))
+            .expect_err("a reserved std.* manifest name must refuse to sync");
+        let _ = fs::remove_dir_all(&temp_dir);
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "package_manifest.reserved_std_name"
+                    && diagnostic.message.contains("reserved std namespace")
+            }),
+            "{:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.code, diagnostic.message.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn package_lock_rejects_duplicate_package_entries() {
-        let (temp_dir, lock_path, mut lock_json) = write_portable_memory_lock("duplicate-entries");
+        let (temp_dir, lock_path, mut lock_json) = write_portable_notes_lock("duplicate-entries");
         let packages = lock_json
             .get_mut("packages")
             .and_then(Value::as_array_mut)
@@ -39737,18 +41798,18 @@ rule start
         let _ = fs::remove_dir_all(&temp_dir);
 
         assert!(
-            error.contains("package_id `package-memory` more than once"),
+            error.contains("package_id `package-notes` more than once"),
             "{error}"
         );
         assert!(
-            error.contains("package name `memory` more than once"),
+            error.contains("package name `notes` more than once"),
             "{error}"
         );
     }
 
     #[test]
     fn package_lock_rejects_unknown_closed_schema_fields() {
-        let (temp_dir, lock_path, mut lock_json) = write_portable_memory_lock("unknown-fields");
+        let (temp_dir, lock_path, mut lock_json) = write_portable_notes_lock("unknown-fields");
         lock_json
             .as_object_mut()
             .expect("lock object")
@@ -39777,7 +41838,7 @@ rule start
 
     #[test]
     fn package_lock_rejects_missing_required_fields() {
-        let (temp_dir, lock_path, mut lock_json) = write_portable_memory_lock("missing-fields");
+        let (temp_dir, lock_path, mut lock_json) = write_portable_notes_lock("missing-fields");
         let package = lock_json
             .get_mut("packages")
             .and_then(Value::as_array_mut)
@@ -39803,7 +41864,7 @@ rule start
 
     #[test]
     fn package_lock_rejects_invalid_field_types_and_hash_shape() {
-        let (temp_dir, lock_path, mut lock_json) = write_portable_memory_lock("invalid-fields");
+        let (temp_dir, lock_path, mut lock_json) = write_portable_notes_lock("invalid-fields");
         let package = lock_json
             .get_mut("packages")
             .and_then(Value::as_array_mut)
@@ -39844,18 +41905,12 @@ rule start
     }
 
     fn package_memory_construct_graph_and_lowered_report_for_test() -> (Value, Value) {
-        let manifest_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
-        let manifest = load_package_manifest(&manifest_path).expect("manifest loads");
-        let lock = LoadedPackageLock {
-            path: manifest_path.with_file_name("construct-graph-test-lock.json"),
-            manifests: vec![manifest],
-        };
-
+        // `std.memory` ships embedded (M5), so the package-backed graph resolves
+        // with no lock at all.
         let source = r#"
 workflow PackageGraph
 
-use memory
+use std.memory
 
 class Task {
   title string
@@ -39869,26 +41924,18 @@ rule start
 "#;
         let compiled = whipplescript_parser::compile_program(source);
         let ir = compiled.ir.expect("source compiles");
-        let registry = lock.registry_for_ir(&ir).expect("registry resolves");
-        let graph = construct_graph_json("package-graph.whip", source, &ir, &registry, Some(&lock));
-        let lowered =
-            lowered_ir_report_json("package-graph.whip", source, &ir, &graph, Some(&lock));
+        let registry =
+            contract_registry_for_ir(None, &ir).expect("embedded std.memory registry resolves");
+        let graph = construct_graph_json("package-graph.whip", source, &ir, &registry, None);
+        let lowered = lowered_ir_report_json("package-graph.whip", source, &ir, &graph, None);
         (graph, lowered)
     }
 
     fn package_memory_dependency_construct_graph_and_lowered_report_for_test() -> (Value, Value) {
-        let manifest_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
-        let manifest = load_package_manifest(&manifest_path).expect("manifest loads");
-        let lock = LoadedPackageLock {
-            path: manifest_path.with_file_name("construct-graph-test-lock.json"),
-            manifests: vec![manifest],
-        };
-
         let source = r#"
 workflow PackageGraph
 
-use memory
+use std.memory
 
 class Task {
   title string
@@ -39906,10 +41953,10 @@ rule start
 "#;
         let compiled = whipplescript_parser::compile_program(source);
         let ir = compiled.ir.expect("source compiles");
-        let registry = lock.registry_for_ir(&ir).expect("registry resolves");
-        let graph = construct_graph_json("package-graph.whip", source, &ir, &registry, Some(&lock));
-        let lowered =
-            lowered_ir_report_json("package-graph.whip", source, &ir, &graph, Some(&lock));
+        let registry =
+            contract_registry_for_ir(None, &ir).expect("embedded std.memory registry resolves");
+        let graph = construct_graph_json("package-graph.whip", source, &ir, &registry, None);
+        let lowered = lowered_ir_report_json("package-graph.whip", source, &ir, &graph, None);
         (graph, lowered)
     }
 
@@ -42554,7 +44601,9 @@ assert count(Item where status == "done") == 1
                 .map(str::len),
             Some(64)
         );
-        assert_ne!(
+        // The graph resolves via the embedded `std.memory` manifest with no lock
+        // at all, so the lock digest is the all-zero no-lock sentinel.
+        assert_eq!(
             graph.get("package_lock_digest").and_then(Value::as_str),
             Some("0000000000000000000000000000000000000000000000000000000000000000")
         );
@@ -42565,11 +44614,11 @@ assert count(Item where status == "done") == 1
             .expect("nodes array");
         assert!(nodes.iter().any(|node| {
             node.get("node_id").and_then(Value::as_str)
-                == Some("contract:memory:memory.query:0.1.0")
+                == Some("contract:std.memory:memory.query:0.1.0")
         }));
         assert!(nodes.iter().any(|node| {
             node.get("node_id").and_then(Value::as_str)
-                == Some("contract:memory:memory.query:0.1.0")
+                == Some("contract:std.memory:memory.query:0.1.0")
                 && node
                     .get("required_capabilities")
                     .and_then(Value::as_array)
@@ -43107,7 +45156,7 @@ assert count(Item where status == "done") == 1
             .expect("node lowerings");
         assert!(node_lowerings.iter().any(|lowering| {
             lowering.get("node_id").and_then(Value::as_str)
-                == Some("contract:memory:memory.query:0.1.0")
+                == Some("contract:std.memory:memory.query:0.1.0")
                 && lowering
                     .get("produced_core_object_refs")
                     .and_then(Value::as_array)
@@ -44041,7 +46090,7 @@ assert count(Item where status == "done") == 1
             .iter_mut()
             .find(|lowering| {
                 lowering.get("node_id").and_then(Value::as_str)
-                    == Some("contract:memory:memory.query:0.1.0")
+                    == Some("contract:std.memory:memory.query:0.1.0")
             })
             .expect("contract lowering");
         contract_lowering
@@ -44070,7 +46119,7 @@ assert count(Item where status == "done") == 1
             .expect("effect core object");
         core_object.as_object_mut().expect("core object").insert(
             "owner_ref".to_owned(),
-            json!("contract:memory:memory.query:0.1.0"),
+            json!("contract:std.memory:memory.query:0.1.0"),
         );
 
         let diagnostics = validate_lowered_ir_report(&lowered, &graph);
@@ -45745,6 +47794,24 @@ rule start
                 .and_then(Value::as_str),
             Some("run")
         );
+        // Q3 fix: the file-store grant carries the store's own policy snapshot so
+        // the harness can intersect the turn grant against the store's authority.
+        assert_eq!(
+            grants[0]
+                .pointer("/store_policy/root")
+                .and_then(Value::as_str),
+            Some(".")
+        );
+        assert_eq!(
+            grants[0].pointer("/store_policy/allow_read"),
+            Some(&json!(["src/**"]))
+        );
+        assert_eq!(
+            grants[0].pointer("/store_policy/allow_write"),
+            Some(&json!([]))
+        );
+        // The non-file `command` grant carries no store policy.
+        assert!(grants[1].get("store_policy").is_none());
     }
 
     #[test]
@@ -46062,6 +48129,92 @@ case classification {
 
         assert_eq!(records.len(), 9);
         check_trace(&records).expect("reconstructed trace conforms");
+        check_local_trace(&events, &records).expect("local trace conforms");
+    }
+
+    #[test]
+    fn reconstructs_and_conforms_capacity_block_then_claim() {
+        // A capacity-contended effect: blocked, then claimed straight from blocked.
+        // This is the store-event shape `whip trace --check` reconstructs for a
+        // `capacity 1` agent's second turn; it must conform.
+        let events = vec![
+            event_view(
+                1,
+                "rule.committed",
+                json!({
+                    "rule": "dispatch",
+                    "facts": [],
+                    "effects": [{"effect_id": "turn", "status": "queued"}],
+                    "dependencies": []
+                }),
+            ),
+            event_view(
+                2,
+                "effect.blocked",
+                json!({
+                    "effect_id": "turn",
+                    "status": "blocked_by_capacity",
+                    "reason": "agent capacity exhausted"
+                }),
+            ),
+            event_view(
+                3,
+                "effect.run_started",
+                json!({"effect_id": "turn", "run_id": "run_turn"}),
+            ),
+            event_view(
+                4,
+                "effect.terminal",
+                json!({"effect_id": "turn", "run_id": "run_turn", "status": "completed"}),
+            ),
+        ];
+
+        let records = reconstruct_trace_records(&events);
+        check_trace(&records).expect("capacity-block-then-claim trace conforms");
+        check_local_trace(&events, &records).expect("local trace conforms");
+    }
+
+    #[test]
+    fn reconstructs_and_conforms_retry_then_reclaim() {
+        // A failed effect re-queued by `whip retry` (effect.retried) and re-run under
+        // a fresh run id. This is the store-event shape `whip trace --check`
+        // reconstructs after an operator retry; it must conform.
+        let events = vec![
+            event_view(
+                1,
+                "rule.committed",
+                json!({
+                    "rule": "dispatch",
+                    "facts": [],
+                    "effects": [{"effect_id": "turn", "status": "queued"}],
+                    "dependencies": []
+                }),
+            ),
+            event_view(
+                2,
+                "effect.run_started",
+                json!({"effect_id": "turn", "run_id": "run_turn_1"}),
+            ),
+            event_view(
+                3,
+                "effect.terminal",
+                json!({"effect_id": "turn", "run_id": "run_turn_1", "status": "failed"}),
+            ),
+            event_view(4, "effect.retried", json!({"effect_id": "turn"})),
+            event_view(
+                5,
+                "effect.run_started",
+                json!({"effect_id": "turn", "run_id": "run_turn_2"}),
+            ),
+            event_view(
+                6,
+                "effect.terminal",
+                json!({"effect_id": "turn", "run_id": "run_turn_2", "status": "completed"}),
+            ),
+        ];
+
+        let records = reconstruct_trace_records(&events);
+        check_trace(&records).expect("retry-then-reclaim trace conforms");
         check_local_trace(&events, &records).expect("local trace conforms");
     }
 
@@ -47244,6 +49397,543 @@ workflow Child {
             "whipplescript-{label}-{}-{stamp}.{ext}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn deploy_plan_resolves_worker_dir_and_flags() {
+        // Explicit flag wins; unknown args are rejected; missing wrangler.toml
+        // is rejected. Use the real in-repo worker dir as the valid target.
+        let repo_worker = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates dir")
+            .join("whipplescript-host-do/worker");
+        let args = vec![
+            "--worker-dir".to_owned(),
+            repo_worker.display().to_string(),
+            "--name".to_owned(),
+            "staging".to_owned(),
+            "--dry-run".to_owned(),
+            "--skip-build".to_owned(),
+        ];
+        let plan = parse_deploy_args(&args, None, Path::new("/nowhere")).expect("plan resolves");
+        assert_eq!(plan.worker_dir, repo_worker);
+        assert_eq!(plan.name.as_deref(), Some("staging"));
+        assert!(plan.dry_run);
+        assert!(plan.skip_build);
+        assert!(!plan.set_secrets);
+
+        let error = parse_deploy_args(&["--bogus".to_owned()], None, Path::new("/nowhere"))
+            .expect_err("unknown arg rejected");
+        assert!(error.contains("unknown deploy argument"), "{error}");
+
+        let error = parse_deploy_args(
+            &["--worker-dir".to_owned(), "/nowhere".to_owned()],
+            None,
+            Path::new("/nowhere"),
+        )
+        .expect_err("non-worker dir rejected");
+        assert!(error.contains("no wrangler.toml"), "{error}");
+
+        // Repo discovery: walking up from inside the repo finds the shell.
+        let discovered = discover_worker_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("worker dir discovered from repo");
+        assert_eq!(discovered, repo_worker);
+    }
+
+    #[test]
+    fn deploy_steps_sequence_matches_plan() {
+        let plan = DeployPlan {
+            worker_dir: PathBuf::from("/w"),
+            name: Some("staging".to_owned()),
+            dry_run: false,
+            skip_build: false,
+            set_secrets: true,
+        };
+        let secrets = vec![("ANTHROPIC_API_KEY", "sk-test".to_owned())];
+        let steps = deploy_steps(&plan, false, &secrets, true);
+        let labels = steps.iter().map(|step| step.label).collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "install worker dependencies",
+                "build wasm kernel",
+                "stage executor binary",
+                "set provider secret",
+                "deploy to Cloudflare",
+            ]
+        );
+        let secret_step = &steps[3];
+        assert_eq!(secret_step.program, "wrangler");
+        assert_eq!(
+            secret_step.args,
+            vec!["secret", "put", "ANTHROPIC_API_KEY", "--name", "staging"]
+        );
+        assert_eq!(secret_step.stdin_value.as_deref(), Some("sk-test"));
+        assert_eq!(
+            steps[4].args,
+            vec!["deploy", "--name", "staging"],
+            "secret value must never appear in deploy argv"
+        );
+
+        // Dry run: no install (node_modules present), no secrets pushed, and
+        // wrangler validates without publishing.
+        let dry = DeployPlan {
+            worker_dir: PathBuf::from("/w"),
+            name: None,
+            dry_run: true,
+            skip_build: false,
+            set_secrets: true,
+        };
+        let steps = deploy_steps(&dry, true, &secrets, false);
+        let labels = steps.iter().map(|step| step.label).collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec!["build wasm kernel", "validate deploy (dry run)"]
+        );
+        assert_eq!(steps[1].args, vec!["deploy", "--dry-run"]);
+
+        // Skip-build: straight to deploy.
+        let quick = DeployPlan {
+            worker_dir: PathBuf::from("/w"),
+            name: None,
+            dry_run: false,
+            skip_build: true,
+            set_secrets: false,
+        };
+        let steps = deploy_steps(&quick, false, &[], true);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].args, vec!["deploy"]);
+    }
+
+    #[test]
+    fn script_manifest_parses_hermetic_flag() {
+        let manifest_path = unique_test_path("manifest-hermetic", "json");
+        let sha = "a".repeat(64);
+        fs::write(
+            &manifest_path,
+            json!({
+                "cached": {"argv": ["sh", "judge.sh"], "sha256": sha, "hermetic": true},
+                "plain": {"argv": ["sh", "other.sh"], "sha256": sha},
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let manifest = ScriptManifest::load(&manifest_path).expect("manifest loads");
+        assert!(manifest.get("cached").expect("cached entry").hermetic);
+        assert!(!manifest.get("plain").expect("plain entry").hermetic);
+
+        fs::write(
+            &manifest_path,
+            json!({"bad": {"argv": ["sh", "x.sh"], "sha256": sha, "hermetic": "yes"}}).to_string(),
+        )
+        .expect("rewrite manifest");
+        let error = ScriptManifest::load(&manifest_path).expect_err("non-bool hermetic rejected");
+        assert!(error.contains("hermetic must be a boolean"), "{error}");
+        let _ = fs::remove_file(&manifest_path);
+    }
+
+    #[test]
+    fn script_manifest_rejects_reserved_and_invalid_keys() {
+        // spec/std-script.md "Capability ids": operator keys must match
+        // [a-z_][a-z0-9_]* and `raw` is reserved for the demoted raw form's
+        // `script.raw` capability id — both are manifest LOAD errors.
+        let manifest_path = unique_test_path("manifest-keys", "json");
+        let sha = "a".repeat(64);
+
+        fs::write(
+            &manifest_path,
+            json!({"raw": {"argv": ["sh", "x.sh"], "sha256": sha}}).to_string(),
+        )
+        .expect("write manifest");
+        let error = ScriptManifest::load(&manifest_path).expect_err("reserved `raw` key rejected");
+        assert!(
+            error.contains("script manifest key `raw` is reserved"),
+            "{error}"
+        );
+
+        fs::write(
+            &manifest_path,
+            json!({"My-Script": {"argv": ["sh", "x.sh"], "sha256": sha}}).to_string(),
+        )
+        .expect("rewrite manifest");
+        let error = ScriptManifest::load(&manifest_path).expect_err("invalid key rejected");
+        assert!(
+            error.contains("script manifest key `My-Script` is invalid")
+                && error.contains("[a-z_][a-z0-9_]*"),
+            "{error}"
+        );
+
+        fs::write(
+            &manifest_path,
+            json!({
+                "backup_repo": {"argv": ["sh", "x.sh"], "sha256": sha},
+                "_v2": {"argv": ["sh", "y.sh"], "sha256": sha},
+                "raw_report9": {"argv": ["sh", "z.sh"], "sha256": sha},
+            })
+            .to_string(),
+        )
+        .expect("rewrite manifest");
+        let manifest = ScriptManifest::load(&manifest_path).expect("valid keys load");
+        assert_eq!(manifest.names(), ["_v2", "backup_repo", "raw_report9"]);
+        let _ = fs::remove_file(&manifest_path);
+    }
+
+    #[test]
+    fn script_manifest_rejects_whip_control_plane_argv_at_load() {
+        // spec/std-script.md "Static checks" item 5: the runtime refusal of
+        // whip-as-executable is mirrored at manifest load/pin time (same
+        // deny-list source), so operators learn early. Basename logic matches
+        // the runtime site: any argv element, path forms included.
+        let manifest_path = unique_test_path("manifest-whip", "json");
+        let sha = "a".repeat(64);
+        for argv in [
+            json!(["whip", "signal"]),
+            json!(["/usr/bin/whip", "revise"]),
+            json!(["bash", "-c", "whip"]),
+        ] {
+            fs::write(
+                &manifest_path,
+                json!({"deploy": {"argv": argv, "sha256": sha}}).to_string(),
+            )
+            .expect("write manifest");
+            let error = ScriptManifest::load(&manifest_path).expect_err("whip argv rejected");
+            assert!(
+                error.contains(
+                    "script manifest entry `deploy` argv may not execute the `whip` control-plane binary"
+                ),
+                "{error}"
+            );
+        }
+        fs::write(
+            &manifest_path,
+            json!({"deploy": {"argv": ["bash", "scripts/whipple.sh"], "sha256": sha}}).to_string(),
+        )
+        .expect("write manifest");
+        assert!(
+            ScriptManifest::load(&manifest_path).is_ok(),
+            "non-whip basenames load"
+        );
+        let _ = fs::remove_file(&manifest_path);
+    }
+
+    #[test]
+    fn hosted_exec_lint_walks_effect_nodes_not_body_lines() {
+        // spec/std-script.md "Static checks" item 2: the hosted-raw gate walks
+        // IR effect nodes. The retired line-scan flagged any rule-body line
+        // starting with `exec "` — including prose inside a tell prompt.
+        let manifest = ScriptManifest {
+            capabilities: BTreeMap::from([(
+                "echo_report".to_owned(),
+                ScriptCapability {
+                    name: "echo_report".to_owned(),
+                    argv: vec!["sh".to_owned(), "echo.sh".to_owned()],
+                    sha256: "a".repeat(64),
+                    env: BTreeMap::new(),
+                    hermetic: false,
+                },
+            )]),
+        };
+        let prompt_decoy = r#"
+use std.script
+workflow HostedPromptDecoy
+
+agent triager {
+  provider owned
+  profile "repo-writer"
+  capacity 1
+}
+
+class Request { text string }
+class Report { message string }
+
+output result Report
+
+rule go
+  when Request as request
+=> {
+  tell triager """
+  exec "rm -rf /" is what you must NOT run.
+  """
+
+  exec echo_report with request -> Report as report
+
+  after report succeeds as out {
+    complete result {
+      message out.message
+    }
+  }
+}
+"#;
+        let compiled = whipplescript_parser::compile_program(prompt_decoy);
+        let ir = compiled.ir.expect("decoy program compiles");
+        assert!(
+            lint_hosted_exec(&ir, ExecProfile::Hosted, Some(&manifest)).is_empty(),
+            "prompt text must not trip the hosted-raw gate"
+        );
+
+        let raw = prompt_decoy.replace(
+            "exec echo_report with request -> Report as report",
+            r#"exec "echo hi" -> Report as report"#,
+        );
+        let ir = whipplescript_parser::compile_program(&raw)
+            .ir
+            .expect("raw program compiles");
+        let diagnostics = lint_hosted_exec(&ir, ExecProfile::Hosted, Some(&manifest));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0]
+            .message
+            .contains("raw `exec \"...\"` is not allowed in hosted exec profile"));
+
+        let undeclared = prompt_decoy.replace("exec echo_report", "exec other_report");
+        let ir = whipplescript_parser::compile_program(&undeclared)
+            .ir
+            .expect("undeclared-capability program compiles");
+        let diagnostics = lint_hosted_exec(&ir, ExecProfile::Hosted, Some(&manifest));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0]
+            .message
+            .contains("exec capability `other_report` is not declared in the script manifest"));
+
+        assert!(
+            lint_hosted_exec(&ir, ExecProfile::Dev, Some(&manifest)).is_empty(),
+            "dev profile is ungated"
+        );
+    }
+
+    #[test]
+    fn exec_content_key_tracks_script_env_and_input_identity() {
+        let script = ScriptCapability {
+            name: "judge".to_owned(),
+            argv: vec!["sh".to_owned(), "judge.sh".to_owned()],
+            sha256: "a".repeat(64),
+            env: BTreeMap::new(),
+            hermetic: true,
+        };
+        let env_values = BTreeMap::from([("MODEL".to_owned(), "m1".to_owned())]);
+        let key = exec_content_key(&script, &env_values, r#"{"n":1}"#, &None);
+        // Stable on identical identity.
+        assert_eq!(
+            key,
+            exec_content_key(&script, &env_values, r#"{"n":1}"#, &None)
+        );
+        // Sensitive to each identity component: stdin, env value, script hash.
+        assert_ne!(
+            key,
+            exec_content_key(&script, &env_values, r#"{"n":2}"#, &None)
+        );
+        let other_env = BTreeMap::from([("MODEL".to_owned(), "m2".to_owned())]);
+        assert_ne!(
+            key,
+            exec_content_key(&script, &other_env, r#"{"n":1}"#, &None)
+        );
+        let mut rehashed = script.clone();
+        rehashed.sha256 = "b".repeat(64);
+        assert_ne!(
+            key,
+            exec_content_key(&rehashed, &env_values, r#"{"n":1}"#, &None)
+        );
+        // Sensitive to the parse contract.
+        assert_ne!(
+            key,
+            exec_content_key(
+                &script,
+                &env_values,
+                r#"{"n":1}"#,
+                &Some(json!({"schema": "S"}))
+            )
+        );
+    }
+
+    #[test]
+    fn cached_exec_result_encode_decode_roundtrip() {
+        for ingested in [
+            None,
+            Some(ExecIngest::Single(json!({"ok": true}))),
+            Some(ExecIngest::Stream(vec![json!(1), json!(2)])),
+        ] {
+            let encoded = encode_cached_exec_result(0, "out", "err", &ingested);
+            let (exit_code, stdout, stderr, decoded) =
+                decode_cached_exec_result(&encoded).expect("decodes");
+            assert_eq!(exit_code, 0);
+            assert_eq!(stdout, "out");
+            assert_eq!(stderr, "err");
+            match (&ingested, &decoded) {
+                (None, None) => {}
+                (Some(ExecIngest::Single(a)), Some(ExecIngest::Single(b))) => assert_eq!(a, b),
+                (Some(ExecIngest::Stream(a)), Some(ExecIngest::Stream(b))) => assert_eq!(a, b),
+                other => panic!("ingested shape changed across roundtrip: {other:?}"),
+            }
+        }
+        assert!(decode_cached_exec_result("not json").is_none());
+        assert!(decode_cached_exec_result(r#"{"exit_code":0}"#).is_none());
+    }
+
+    /// Delta-kernel result cache end-to-end (compute plane P8-1): the second
+    /// exec of a hermetic script capability on identical inputs settles from
+    /// the cache — the script demonstrably does not spawn again, the run is
+    /// marked as a hit, and the recorded entry credits the populating effect.
+    #[test]
+    fn hermetic_capability_exec_served_from_cache_on_second_run() {
+        let store_path = unique_test_path("exec-cache", "sqlite");
+        let program_path = unique_test_path("exec-cache", "whip");
+        let script_path = unique_test_path("exec-cache-script", "sh");
+        let witness_path = unique_test_path("exec-cache-witness", "log");
+
+        // The script appends a witness line per spawn, so "did it actually
+        // run" is observable from the outside.
+        let script_body = format!("echo ran >> {}\necho ok\n", witness_path.display());
+        fs::write(&script_path, &script_body).expect("write script");
+        let script_sha = sha256_hex(script_body.as_bytes());
+        let manifest = ScriptManifest {
+            capabilities: BTreeMap::from([(
+                "judge".to_owned(),
+                ScriptCapability {
+                    name: "judge".to_owned(),
+                    argv: vec!["sh".to_owned(), script_path.display().to_string()],
+                    sha256: script_sha,
+                    env: BTreeMap::new(),
+                    hermetic: true,
+                },
+            )]),
+        };
+
+        let source = "workflow ExecCache {\n}\n";
+        fs::write(&program_path, source).expect("write program");
+        let (source_text, ir) = match compile_source_path_with_root(
+            program_path.to_str().unwrap_or_default(),
+            Some("ExecCache"),
+        ) {
+            Ok(compiled) => compiled,
+            Err(error) => panic!("{}", child_compile_error("ExecCache", error)),
+        };
+        let snapshot = ir.to_snapshot();
+        let mut kernel = RuntimeKernel::new(SqliteStore::open(&store_path).expect("store"));
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &ir.workflow,
+                    source_hash: &stable_hash_hex(&source_text),
+                    ir_hash: &stable_hash_hex(&snapshot),
+                    compiler_version: whipplescript_core::version(),
+                },
+                &ir,
+            )
+            .expect("program version");
+        let instance_id = kernel.create_instance(&version, "{}").expect("instance");
+        register_script_manifest_capabilities(kernel.store(), &manifest, &version.program_id)
+            .expect("register script capabilities");
+        drop(kernel);
+
+        let effect_input = json!({
+            "mode": "capability",
+            "capability": "judge",
+            "stdin": {"n": 1},
+        })
+        .to_string();
+        let effects = [
+            NewEffect {
+                effect_id: "exec-1",
+                kind: "exec.command",
+                target: None,
+                input_json: &effect_input,
+                status: "queued",
+                idempotency_key: "rule=start;effect=exec-1",
+                required_capabilities_json: r#"["script.judge"]"#,
+                profile: None,
+                correlation_id: None,
+                source_span_json: None,
+                timeout_seconds: None,
+            },
+            NewEffect {
+                effect_id: "exec-2",
+                kind: "exec.command",
+                target: None,
+                input_json: &effect_input,
+                status: "queued",
+                idempotency_key: "rule=start;effect=exec-2",
+                required_capabilities_json: r#"["script.judge"]"#,
+                profile: None,
+                correlation_id: None,
+                source_span_json: None,
+                timeout_seconds: None,
+            },
+        ];
+        SqliteStore::open(&store_path)
+            .expect("reopen store for commit")
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+            })
+            .expect("commit exec effects");
+
+        for effect_id in ["exec-1", "exec-2"] {
+            let claimable = ClaimableEffect {
+                effect_id: effect_id.to_owned(),
+                kind: "exec.command".to_owned(),
+                target: None,
+                profile: None,
+                input_json: effect_input.clone(),
+                required_capabilities_json: r#"["script.judge"]"#.to_owned(),
+                declared_profiles_json: "[]".to_owned(),
+            };
+            run_exec_effect(
+                &store_path,
+                &instance_id,
+                &claimable,
+                ExecProfile::Dev,
+                Some(&manifest),
+            )
+            .expect("exec effect settles");
+        }
+
+        let store = SqliteStore::open(&store_path).expect("reopen store");
+        let runs = store.list_runs(&instance_id).expect("runs");
+        let run_for = |effect_id: &str| {
+            runs.iter()
+                .find(|run| run.effect_id == effect_id)
+                .unwrap_or_else(|| panic!("run for {effect_id}"))
+        };
+        let first_meta = json_from_str(&run_for("exec-1").metadata_json);
+        let second_meta = json_from_str(&run_for("exec-2").metadata_json);
+
+        // The script spawned exactly once: the second effect was a cache hit.
+        let witness = fs::read_to_string(&witness_path).expect("witness file exists");
+        assert_eq!(
+            witness.lines().count(),
+            1,
+            "witness: {witness:?} first: {first_meta} second: {second_meta}"
+        );
+        assert_eq!(first_meta["cache"]["hit"], json!(false), "{first_meta}");
+        assert_eq!(second_meta["cache"]["hit"], json!(true), "{second_meta}");
+        assert_eq!(
+            first_meta["cache"]["content_key"],
+            second_meta["cache"]["content_key"]
+        );
+        assert_eq!(first_meta["stdout"], second_meta["stdout"]);
+        assert_eq!(run_for("exec-2").status, "completed");
+
+        // The recorded entry credits the populating effect (provenance).
+        let content_key = first_meta["cache"]["content_key"]
+            .as_str()
+            .expect("content key recorded")
+            .to_owned();
+        let entry = store
+            .lookup_compute_result(&content_key)
+            .expect("cache lookup")
+            .expect("cache entry recorded");
+        assert_eq!(entry.source_effect_id, "exec-1");
+        assert_eq!(entry.effect_kind, "exec.command");
+
+        for path in [&store_path, &program_path, &script_path, &witness_path] {
+            let _ = fs::remove_file(path);
+        }
     }
 
     fn create_runtime_identity_instance(
@@ -49002,6 +51692,7 @@ rule finish_batch
             &effect,
             r#"{"prompt":"review"}"#,
             Some(&claude_config),
+            Some("project"),
         )
         .expect("claude request builds");
 
@@ -49028,6 +51719,14 @@ rule finish_batch
                 .get("cwd")
                 .and_then(Value::as_str),
             Some("/tmp/whip-reviewer")
+        );
+        // The declared `settings` knob rides provider_options (DR-0034 Decision 4).
+        assert_eq!(
+            claude_request
+                .provider_options
+                .get("settings")
+                .and_then(Value::as_str),
+            Some("project")
         );
 
         let pi_config_json = json!({

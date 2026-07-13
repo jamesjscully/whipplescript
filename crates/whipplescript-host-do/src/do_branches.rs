@@ -1,0 +1,875 @@
+//! Durable-object branch tier: the `Branches` + `ContentBlobs` seams over
+//! the DO's SQLite, so the versioned workspace (working sets, merge,
+//! `WorkspaceVcs`) runs on the DO with the SAME store-crate logic as
+//! native — parity by reuse, not reimplementation (untie-substrate
+//! readiness tracker Phase 1; native counterpart
+//! `whipplescript-store/src/branches.rs`).
+//!
+//! Schema and semantics mirror the native store exactly: O(1) pointer
+//! creation, pinned branch points, optimistic head guards, fail-closed
+//! terminal statuses, write-once instance binding. The DO is
+//! single-writer, so the native store's transactions collapse to plain
+//! statement sequences here (the same posture the coordination parity
+//! impl takes). Content blobs share the DO's existing `content_blobs`
+//! table (the one checkpoint manifests already live in), created
+//! defensively for stores that predate it.
+
+use std::collections::BTreeSet;
+
+use whipplescript_store::branches::{
+    AdvanceOutcome, BindOutcome, BranchRow, BranchStatus, Branches, ConflictRow, CreateBranch,
+    CreateBranchOutcome, CutRecord, CutRow, OpBranchDelta, OpRow, RetargetOutcome, StatusOutcome,
+    MAINLINE_BRANCH_ID,
+};
+use whipplescript_store::content::ContentBlobs;
+use whipplescript_store::{StoreError, StoreResult};
+
+use crate::do_store::{
+    as_opt_text, as_text, opt_text, sql_err, stable_hash_hex, text, DoSql, SqlValue,
+};
+
+pub struct DoBranches<S: DoSql> {
+    sql: S,
+}
+
+impl<S: DoSql> DoBranches<S> {
+    pub fn new(sql: S) -> StoreResult<Self> {
+        let store = Self { sql };
+        store.ensure_schema()?;
+        Ok(store)
+    }
+
+    fn ensure_schema(&self) -> StoreResult<()> {
+        for statement in [
+            "CREATE TABLE IF NOT EXISTS branches (
+                branch_id TEXT PRIMARY KEY,
+                name TEXT,
+                parent_branch_id TEXT,
+                branch_point_cut_id TEXT,
+                branch_point_manifest_hash TEXT,
+                head_cut_id TEXT,
+                head_manifest_hash TEXT,
+                adopted_merge_cut_id TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                idempotency_key TEXT
+            )",
+            "CREATE UNIQUE INDEX IF NOT EXISTS branches_idempotency_idx
+                ON branches(idempotency_key)
+                WHERE idempotency_key IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS branches_active_name_idx
+                ON branches(name)
+                WHERE name IS NOT NULL AND status = 'active'",
+            "CREATE INDEX IF NOT EXISTS branches_parent_idx
+                ON branches(parent_branch_id)",
+            "CREATE TABLE IF NOT EXISTS branch_instances (
+                instance_id TEXT PRIMARY KEY,
+                branch_id TEXT NOT NULL,
+                bound_at TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS branch_instances_branch_idx
+                ON branch_instances(branch_id)",
+            "CREATE TABLE IF NOT EXISTS cuts (
+                cut_id TEXT PRIMARY KEY,
+                change_id TEXT NOT NULL,
+                branch_id TEXT NOT NULL,
+                manifest_hash TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS cuts_change_idx ON cuts(change_id)",
+            "CREATE INDEX IF NOT EXISTS cuts_branch_idx ON cuts(branch_id)",
+            "CREATE TABLE IF NOT EXISTS ops (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                op_id TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL,
+                deltas TEXT NOT NULL,
+                origin TEXT,
+                recorded_at TEXT NOT NULL
+            )",
+            "CREATE TABLE IF NOT EXISTS conflicts (
+                conflict_id TEXT PRIMARY KEY,
+                branch_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                base TEXT,
+                ours TEXT,
+                theirs TEXT,
+                ours_label TEXT NOT NULL,
+                theirs_label TEXT NOT NULL,
+                state TEXT NOT NULL,
+                resolution TEXT,
+                recorded_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS conflicts_branch_idx
+                ON conflicts(branch_id, state)",
+            "CREATE TABLE IF NOT EXISTS resolution_memory (
+                triple_key TEXT PRIMARY KEY,
+                resolution TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            )",
+        ] {
+            self.sql.execute(statement, &[]).map_err(sql_err)?;
+        }
+        // Provenance columns arrived with Phase 2 (exactly as native):
+        // stores minted before that gain them in place.
+        for column in ["parent_cut_id", "origin"] {
+            let info = self
+                .sql
+                .query("PRAGMA table_info(cuts)", &[])
+                .map_err(sql_err)?;
+            let present = info.iter().any(|row| {
+                row.get(1)
+                    .map(|value| as_text(value) == column)
+                    .unwrap_or(false)
+            });
+            if !present {
+                self.sql
+                    .execute(&format!("ALTER TABLE cuts ADD COLUMN {column} TEXT"), &[])
+                    .map_err(sql_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    const ROW_COLUMNS: &'static str = "branch_id, name, parent_branch_id, \
+        branch_point_cut_id, branch_point_manifest_hash, head_cut_id, \
+        head_manifest_hash, adopted_merge_cut_id, status, created_at, \
+        updated_at";
+
+    fn decode_row(row: &[SqlValue]) -> BranchRow {
+        BranchRow {
+            branch_id: as_text(&row[0]),
+            name: as_opt_text(&row[1]),
+            parent_branch_id: as_opt_text(&row[2]),
+            branch_point_cut_id: as_opt_text(&row[3]),
+            branch_point_manifest_hash: as_opt_text(&row[4]),
+            head_cut_id: as_opt_text(&row[5]),
+            head_manifest_hash: as_opt_text(&row[6]),
+            adopted_merge_cut_id: as_opt_text(&row[7]),
+            status: BranchStatus::parse(&as_text(&row[8])).unwrap_or(BranchStatus::Active),
+            created_at: as_text(&row[9]),
+            updated_at: as_text(&row[10]),
+        }
+    }
+
+    fn row_by_id(&self, branch_id: &str) -> StoreResult<Option<BranchRow>> {
+        let rows = self
+            .sql
+            .query(
+                &format!(
+                    "SELECT {} FROM branches WHERE branch_id = ?1",
+                    Self::ROW_COLUMNS
+                ),
+                &[text(branch_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| Self::decode_row(row)))
+    }
+}
+
+impl<S: DoSql> Branches for DoBranches<S> {
+    fn ensure_mainline(&mut self, created_at: &str) -> StoreResult<BranchRow> {
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO branches \
+                 (branch_id, name, parent_branch_id, status, created_at, updated_at) \
+                 VALUES (?1, ?1, NULL, 'active', ?2, ?2)",
+                &[text(MAINLINE_BRANCH_ID), text(created_at)],
+            )
+            .map_err(sql_err)?;
+        self.row_by_id(MAINLINE_BRANCH_ID)?
+            .ok_or_else(|| StoreError::Conflict("mainline row missing after insert".to_owned()))
+    }
+
+    fn create_branch(&mut self, request: CreateBranch<'_>) -> StoreResult<CreateBranchOutcome> {
+        if let Some(existing) = self.row_by_id(request.branch_id)? {
+            return Ok(CreateBranchOutcome::Existing(existing));
+        }
+        if let Some(key) = request.idempotency_key {
+            let rows = self
+                .sql
+                .query(
+                    "SELECT branch_id FROM branches WHERE idempotency_key = ?1",
+                    &[text(key)],
+                )
+                .map_err(sql_err)?;
+            if let Some(row) = rows.first() {
+                let existing = self
+                    .row_by_id(&as_text(&row[0]))?
+                    .ok_or_else(|| StoreError::Conflict("row for key missing".to_owned()))?;
+                return Ok(CreateBranchOutcome::Existing(existing));
+            }
+        }
+        let Some(parent) = self.row_by_id(request.parent_branch_id)? else {
+            return Ok(CreateBranchOutcome::ParentMissing);
+        };
+        if parent.status != BranchStatus::Active {
+            return Ok(CreateBranchOutcome::ParentNotActive {
+                status: parent.status,
+            });
+        }
+        if let Some(name) = request.name {
+            let rows = self
+                .sql
+                .query(
+                    "SELECT branch_id FROM branches WHERE name = ?1 AND status = 'active'",
+                    &[text(name)],
+                )
+                .map_err(sql_err)?;
+            if let Some(row) = rows.first() {
+                return Ok(CreateBranchOutcome::NameTaken {
+                    holder_branch_id: as_text(&row[0]),
+                });
+            }
+        }
+        let (point_cut, point_manifest) = match request.at_cut {
+            Some((cut, manifest)) => (Some(cut.to_owned()), Some(manifest.to_owned())),
+            None => (
+                parent.head_cut_id.clone(),
+                parent.head_manifest_hash.clone(),
+            ),
+        };
+        self.sql
+            .execute(
+                "INSERT INTO branches \
+                 (branch_id, name, parent_branch_id, branch_point_cut_id, \
+                  branch_point_manifest_hash, head_cut_id, head_manifest_hash, \
+                  status, created_at, updated_at, idempotency_key) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?5, 'active', ?6, ?6, ?7)",
+                &[
+                    text(request.branch_id),
+                    opt_text(request.name),
+                    text(request.parent_branch_id),
+                    opt_text(point_cut.as_deref()),
+                    opt_text(point_manifest.as_deref()),
+                    text(request.created_at),
+                    opt_text(request.idempotency_key),
+                ],
+            )
+            .map_err(sql_err)?;
+        let row = self
+            .row_by_id(request.branch_id)?
+            .ok_or_else(|| StoreError::Conflict("created row missing".to_owned()))?;
+        Ok(CreateBranchOutcome::Created(row))
+    }
+
+    fn get_branch(&self, branch_id: &str) -> StoreResult<Option<BranchRow>> {
+        self.row_by_id(branch_id)
+    }
+
+    fn list_branches(&self, status: Option<BranchStatus>) -> StoreResult<Vec<BranchRow>> {
+        let rows = match status {
+            Some(status) => self
+                .sql
+                .query(
+                    &format!(
+                        "SELECT {} FROM branches WHERE status = ?1 ORDER BY branch_id",
+                        Self::ROW_COLUMNS
+                    ),
+                    &[text(status.as_str())],
+                )
+                .map_err(sql_err)?,
+            None => self
+                .sql
+                .query(
+                    &format!(
+                        "SELECT {} FROM branches ORDER BY branch_id",
+                        Self::ROW_COLUMNS
+                    ),
+                    &[],
+                )
+                .map_err(sql_err)?,
+        };
+        Ok(rows.iter().map(|row| Self::decode_row(row)).collect())
+    }
+
+    fn list_children(&self, parent_branch_id: &str) -> StoreResult<Vec<BranchRow>> {
+        let rows = self
+            .sql
+            .query(
+                &format!(
+                    "SELECT {} FROM branches WHERE parent_branch_id = ?1 ORDER BY branch_id",
+                    Self::ROW_COLUMNS
+                ),
+                &[text(parent_branch_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|row| Self::decode_row(row)).collect())
+    }
+
+    fn lineage(&self, branch_id: &str) -> StoreResult<Vec<BranchRow>> {
+        let mut rows = Vec::new();
+        let mut cursor = Some(branch_id.to_owned());
+        let mut visited = BTreeSet::new();
+        while let Some(current) = cursor {
+            if !visited.insert(current.clone()) {
+                break;
+            }
+            let Some(row) = self.row_by_id(&current)? else {
+                break;
+            };
+            cursor = row.parent_branch_id.clone();
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    fn retarget_branch(
+        &mut self,
+        branch_id: &str,
+        new_parent_branch_id: &str,
+        at: &str,
+    ) -> StoreResult<RetargetOutcome> {
+        let Some(row) = self.row_by_id(branch_id)? else {
+            return Ok(RetargetOutcome::BranchMissing);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(RetargetOutcome::BranchNotActive { status: row.status });
+        }
+        let Some(parent) = self.row_by_id(new_parent_branch_id)? else {
+            return Ok(RetargetOutcome::ParentMissing);
+        };
+        if parent.status != BranchStatus::Active {
+            return Ok(RetargetOutcome::ParentNotActive {
+                status: parent.status,
+            });
+        }
+        // Parent pointers must stay a tree: refuse if the new parent's
+        // lineage passes through the branch itself (self-parent is the
+        // one-step case). Visited guard bounds the walk even against a
+        // manually corrupted store.
+        let mut cursor = Some(new_parent_branch_id.to_owned());
+        let mut visited = BTreeSet::new();
+        while let Some(current) = cursor {
+            if current == branch_id {
+                return Ok(RetargetOutcome::WouldCycle);
+            }
+            if !visited.insert(current.clone()) {
+                break;
+            }
+            cursor = self
+                .row_by_id(&current)?
+                .and_then(|row| row.parent_branch_id);
+        }
+        self.sql
+            .execute(
+                "UPDATE branches SET parent_branch_id = ?2, updated_at = ?3 WHERE branch_id = ?1",
+                &[text(branch_id), text(new_parent_branch_id), text(at)],
+            )
+            .map_err(sql_err)?;
+        let row = self
+            .row_by_id(branch_id)?
+            .ok_or_else(|| StoreError::Conflict("retargeted row missing".to_owned()))?;
+        Ok(RetargetOutcome::Retargeted(Box::new(row)))
+    }
+
+    fn advance_head(
+        &mut self,
+        branch_id: &str,
+        expected_head_cut_id: Option<&str>,
+        cut_id: &str,
+        manifest_hash: &str,
+        at: &str,
+    ) -> StoreResult<AdvanceOutcome> {
+        let Some(row) = self.row_by_id(branch_id)? else {
+            return Ok(AdvanceOutcome::NotFound);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(AdvanceOutcome::NotActive { status: row.status });
+        }
+        if row.head_cut_id.as_deref() != expected_head_cut_id {
+            return Ok(AdvanceOutcome::Stale {
+                current_head_cut_id: row.head_cut_id,
+            });
+        }
+        self.sql
+            .execute(
+                "UPDATE branches SET head_cut_id = ?2, head_manifest_hash = ?3, \
+                 updated_at = ?4 WHERE branch_id = ?1",
+                &[text(branch_id), text(cut_id), text(manifest_hash), text(at)],
+            )
+            .map_err(sql_err)?;
+        let row = self
+            .row_by_id(branch_id)?
+            .ok_or_else(|| StoreError::Conflict("advanced row missing".to_owned()))?;
+        Ok(AdvanceOutcome::Advanced(Box::new(row)))
+    }
+
+    fn rebase_branch(
+        &mut self,
+        branch_id: &str,
+        expected_head_cut_id: Option<&str>,
+        point_cut_id: &str,
+        point_manifest_hash: &str,
+        head_cut_id: &str,
+        head_manifest_hash: &str,
+        at: &str,
+    ) -> StoreResult<AdvanceOutcome> {
+        let Some(row) = self.row_by_id(branch_id)? else {
+            return Ok(AdvanceOutcome::NotFound);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(AdvanceOutcome::NotActive { status: row.status });
+        }
+        if row.head_cut_id.as_deref() != expected_head_cut_id {
+            return Ok(AdvanceOutcome::Stale {
+                current_head_cut_id: row.head_cut_id,
+            });
+        }
+        self.sql
+            .execute(
+                "UPDATE branches SET branch_point_cut_id = ?2, \
+                 branch_point_manifest_hash = ?3, head_cut_id = ?4, \
+                 head_manifest_hash = ?5, updated_at = ?6 WHERE branch_id = ?1",
+                &[
+                    text(branch_id),
+                    text(point_cut_id),
+                    text(point_manifest_hash),
+                    text(head_cut_id),
+                    text(head_manifest_hash),
+                    text(at),
+                ],
+            )
+            .map_err(sql_err)?;
+        let row = self
+            .row_by_id(branch_id)?
+            .ok_or_else(|| StoreError::Conflict("rebased row missing".to_owned()))?;
+        Ok(AdvanceOutcome::Advanced(Box::new(row)))
+    }
+
+    fn discard_branch(&mut self, branch_id: &str, at: &str) -> StoreResult<StatusOutcome> {
+        let Some(row) = self.row_by_id(branch_id)? else {
+            return Ok(StatusOutcome::NotFound);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(StatusOutcome::InvalidTransition { from: row.status });
+        }
+        self.sql
+            .execute(
+                "UPDATE branches SET status = 'discarded', updated_at = ?2 \
+                 WHERE branch_id = ?1",
+                &[text(branch_id), text(at)],
+            )
+            .map_err(sql_err)?;
+        let row = self
+            .row_by_id(branch_id)?
+            .ok_or_else(|| StoreError::Conflict("discarded row missing".to_owned()))?;
+        Ok(StatusOutcome::Done(Box::new(row)))
+    }
+
+    fn adopt_branch(
+        &mut self,
+        branch_id: &str,
+        merge_cut_id: &str,
+        at: &str,
+    ) -> StoreResult<StatusOutcome> {
+        let Some(row) = self.row_by_id(branch_id)? else {
+            return Ok(StatusOutcome::NotFound);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(StatusOutcome::InvalidTransition { from: row.status });
+        }
+        self.sql
+            .execute(
+                "UPDATE branches SET status = 'adopted', adopted_merge_cut_id = ?2, \
+                 updated_at = ?3 WHERE branch_id = ?1",
+                &[text(branch_id), text(merge_cut_id), text(at)],
+            )
+            .map_err(sql_err)?;
+        let row = self
+            .row_by_id(branch_id)?
+            .ok_or_else(|| StoreError::Conflict("adopted row missing".to_owned()))?;
+        Ok(StatusOutcome::Done(Box::new(row)))
+    }
+
+    fn bind_instance(
+        &mut self,
+        instance_id: &str,
+        branch_id: &str,
+        at: &str,
+    ) -> StoreResult<BindOutcome> {
+        let existing = self
+            .sql
+            .query(
+                "SELECT branch_id FROM branch_instances WHERE instance_id = ?1",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        if let Some(row) = existing.first() {
+            let existing_branch = as_text(&row[0]);
+            return Ok(if existing_branch == branch_id {
+                BindOutcome::Bound
+            } else {
+                BindOutcome::AlreadyBound {
+                    branch_id: existing_branch,
+                }
+            });
+        }
+        let Some(row) = self.row_by_id(branch_id)? else {
+            return Ok(BindOutcome::BranchMissing);
+        };
+        if row.status != BranchStatus::Active {
+            return Ok(BindOutcome::BranchNotActive { status: row.status });
+        }
+        self.sql
+            .execute(
+                "INSERT INTO branch_instances (instance_id, branch_id, bound_at) \
+                 VALUES (?1, ?2, ?3)",
+                &[text(instance_id), text(branch_id), text(at)],
+            )
+            .map_err(sql_err)?;
+        Ok(BindOutcome::Bound)
+    }
+
+    fn instance_branch(&self, instance_id: &str) -> StoreResult<Option<String>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT branch_id FROM branch_instances WHERE instance_id = ?1",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+
+    fn list_bound_instances(&self, branch_id: &str) -> StoreResult<Vec<String>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT instance_id FROM branch_instances \
+                 WHERE branch_id = ?1 ORDER BY instance_id",
+                &[text(branch_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|row| as_text(&row[0])).collect())
+    }
+
+    fn record_cut(&mut self, cut: CutRecord<'_>) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO cuts \
+                 (cut_id, change_id, branch_id, manifest_hash, parent_cut_id, \
+                  origin, recorded_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                &[
+                    text(cut.cut_id),
+                    text(cut.change_id),
+                    text(cut.branch_id),
+                    text(cut.manifest_hash),
+                    opt_text(cut.parent_cut_id),
+                    opt_text(cut.origin),
+                    text(cut.recorded_at),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn cut_change_id(&self, cut_id: &str) -> StoreResult<Option<String>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT change_id FROM cuts WHERE cut_id = ?1",
+                &[text(cut_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+
+    fn get_cut(&self, cut_id: &str) -> StoreResult<Option<CutRow>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT cut_id, change_id, branch_id, manifest_hash, \
+                 parent_cut_id, origin, recorded_at FROM cuts WHERE cut_id = ?1",
+                &[text(cut_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| decode_cut_row(row)))
+    }
+
+    fn list_cuts(&self, branch_id: &str, limit: usize) -> StoreResult<Vec<CutRow>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT cut_id, change_id, branch_id, manifest_hash, \
+                 parent_cut_id, origin, recorded_at FROM cuts \
+                 WHERE branch_id = ?1 ORDER BY rowid DESC LIMIT ?2",
+                &[text(branch_id), SqlValue::Int(limit as i64)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|row| decode_cut_row(row)).collect())
+    }
+
+    fn restore_branch_state(
+        &mut self,
+        branch_id: &str,
+        expected_head_cut_id: Option<&str>,
+        state: &whipplescript_store::branches::OpBranchState,
+        at: &str,
+    ) -> StoreResult<AdvanceOutcome> {
+        let Some(row) = self.row_by_id(branch_id)? else {
+            return Ok(AdvanceOutcome::NotFound);
+        };
+        if row.head_cut_id.as_deref() != expected_head_cut_id {
+            return Ok(AdvanceOutcome::Stale {
+                current_head_cut_id: row.head_cut_id,
+            });
+        }
+        self.sql
+            .execute(
+                "UPDATE branches SET head_cut_id = ?2, head_manifest_hash = ?3, \
+                 branch_point_cut_id = ?4, branch_point_manifest_hash = ?5, \
+                 status = ?6, updated_at = ?7 WHERE branch_id = ?1",
+                &[
+                    text(branch_id),
+                    opt_text(state.head_cut_id.as_deref()),
+                    opt_text(state.head_manifest_hash.as_deref()),
+                    opt_text(state.branch_point_cut_id.as_deref()),
+                    opt_text(state.branch_point_manifest_hash.as_deref()),
+                    text(&state.status),
+                    text(at),
+                ],
+            )
+            .map_err(sql_err)?;
+        let row = self
+            .row_by_id(branch_id)?
+            .ok_or_else(|| StoreError::Conflict("restored row missing".to_owned()))?;
+        Ok(AdvanceOutcome::Advanced(Box::new(row)))
+    }
+
+    fn record_op(
+        &mut self,
+        op_id: &str,
+        kind: &str,
+        deltas: &[OpBranchDelta],
+        origin: Option<&str>,
+        at: &str,
+    ) -> StoreResult<()> {
+        let deltas_json = serde_json::to_string(deltas)
+            .map_err(|error| StoreError::Conflict(format!("op deltas encode: {error}")))?;
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO ops (op_id, kind, deltas, origin, recorded_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    text(op_id),
+                    text(kind),
+                    text(&deltas_json),
+                    opt_text(origin),
+                    text(at),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn list_ops(&self, limit: usize) -> StoreResult<Vec<OpRow>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT seq, op_id, kind, deltas, origin, recorded_at FROM ops \
+                 ORDER BY seq DESC LIMIT ?1",
+                &[SqlValue::Int(limit as i64)],
+            )
+            .map_err(sql_err)?;
+        rows.iter().map(|row| decode_op_row(row)).collect()
+    }
+
+    fn get_op(&self, op_id: &str) -> StoreResult<Option<OpRow>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT seq, op_id, kind, deltas, origin, recorded_at FROM ops \
+                 WHERE op_id = ?1",
+                &[text(op_id)],
+            )
+            .map_err(sql_err)?;
+        rows.first().map(|row| decode_op_row(row)).transpose()
+    }
+
+    fn record_conflict(&mut self, row: &ConflictRow) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "INSERT INTO conflicts (conflict_id, branch_id, path, base, ours, \
+                 theirs, ours_label, theirs_label, state, resolution, recorded_at, \
+                 updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', NULL, ?9, ?9) \
+                 ON CONFLICT(conflict_id) DO UPDATE SET state = 'open', \
+                 resolution = NULL, updated_at = ?9 WHERE state != 'open'",
+                &[
+                    text(&row.conflict_id),
+                    text(&row.branch_id),
+                    text(&row.path),
+                    opt_text(row.base.as_deref()),
+                    opt_text(row.ours.as_deref()),
+                    opt_text(row.theirs.as_deref()),
+                    text(&row.ours_label),
+                    text(&row.theirs_label),
+                    text(&row.recorded_at),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn open_conflicts(&self, branch_id: &str) -> StoreResult<Vec<ConflictRow>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT conflict_id, branch_id, path, base, ours, theirs, \
+                 ours_label, theirs_label, state, resolution, recorded_at, updated_at \
+                 FROM conflicts WHERE branch_id = ?1 AND state = 'open' ORDER BY path",
+                &[text(branch_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|row| decode_conflict_row(row)).collect())
+    }
+
+    fn set_conflict_state(
+        &mut self,
+        conflict_id: &str,
+        state: &str,
+        resolution: Option<&str>,
+        at: &str,
+    ) -> StoreResult<bool> {
+        self.sql
+            .execute(
+                "UPDATE conflicts SET state = ?2, resolution = ?3, updated_at = ?4 \
+                 WHERE conflict_id = ?1",
+                &[
+                    text(conflict_id),
+                    text(state),
+                    opt_text(resolution),
+                    text(at),
+                ],
+            )
+            .map_err(sql_err)?;
+        let rows = self
+            .sql
+            .query(
+                "SELECT 1 FROM conflicts WHERE conflict_id = ?1",
+                &[text(conflict_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(!rows.is_empty())
+    }
+
+    fn resolution_memory(&self, triple_key: &str) -> StoreResult<Option<String>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT resolution FROM resolution_memory WHERE triple_key = ?1",
+                &[text(triple_key)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+
+    fn record_resolution_memory(
+        &mut self,
+        triple_key: &str,
+        resolution: &str,
+        at: &str,
+    ) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO resolution_memory (triple_key, resolution, recorded_at) \
+                 VALUES (?1, ?2, ?3)",
+                &[text(triple_key), text(resolution), text(at)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+}
+
+fn decode_cut_row(row: &[SqlValue]) -> CutRow {
+    CutRow {
+        cut_id: as_text(&row[0]),
+        change_id: as_text(&row[1]),
+        branch_id: as_text(&row[2]),
+        manifest_hash: as_text(&row[3]),
+        parent_cut_id: as_opt_text(&row[4]),
+        origin: as_opt_text(&row[5]),
+        recorded_at: as_text(&row[6]),
+    }
+}
+
+fn decode_conflict_row(row: &[SqlValue]) -> ConflictRow {
+    ConflictRow {
+        conflict_id: as_text(&row[0]),
+        branch_id: as_text(&row[1]),
+        path: as_text(&row[2]),
+        base: as_opt_text(&row[3]),
+        ours: as_opt_text(&row[4]),
+        theirs: as_opt_text(&row[5]),
+        ours_label: as_text(&row[6]),
+        theirs_label: as_text(&row[7]),
+        state: as_text(&row[8]),
+        resolution: as_opt_text(&row[9]),
+        recorded_at: as_text(&row[10]),
+        updated_at: as_text(&row[11]),
+    }
+}
+
+fn decode_op_row(row: &[SqlValue]) -> StoreResult<OpRow> {
+    let deltas_json = as_text(&row[3]);
+    let deltas = serde_json::from_str(&deltas_json)
+        .map_err(|error| StoreError::Conflict(format!("op deltas decode: {error}")))?;
+    Ok(OpRow {
+        seq: match &row[0] {
+            SqlValue::Int(seq) => *seq,
+            _ => 0,
+        },
+        op_id: as_text(&row[1]),
+        kind: as_text(&row[2]),
+        deltas,
+        origin: as_opt_text(&row[4]),
+        recorded_at: as_text(&row[5]),
+    })
+}
+
+/// Content blobs over the DO's `content_blobs` table — the same table
+/// checkpoint manifests live in, so branch manifests and cut manifests
+/// share one blob space (exactly as native).
+pub struct DoContentBlobs<S: DoSql> {
+    sql: S,
+}
+
+impl<S: DoSql> DoContentBlobs<S> {
+    pub fn new(sql: S) -> StoreResult<Self> {
+        // Defensive for stores predating the base schema; matches the
+        // do_store DDL (no created_at column on the DO).
+        sql.execute(
+            "CREATE TABLE IF NOT EXISTS content_blobs (
+                id TEXT PRIMARY KEY,
+                body TEXT NOT NULL,
+                byte_len INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .map_err(sql_err)?;
+        Ok(Self { sql })
+    }
+}
+
+impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
+    fn put(&self, body: &str) -> StoreResult<String> {
+        let id = stable_hash_hex(body);
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+                &[text(&id), text(body), SqlValue::Int(body.len() as i64)],
+            )
+            .map_err(sql_err)?;
+        Ok(id)
+    }
+
+    fn get(&self, id: &str) -> StoreResult<Option<String>> {
+        let rows = self
+            .sql
+            .query("SELECT body FROM content_blobs WHERE id = ?1", &[text(id)])
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+}

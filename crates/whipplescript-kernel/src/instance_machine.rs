@@ -65,6 +65,22 @@ pub trait InstanceDriver {
         effect: &ClaimableEffect,
         incoming: Option<Result<HttpResponse, TransportError>>,
     ) -> Result<EffectStep, StoreError>;
+
+    /// Run the due-time pass at `now` (ISO-8601 UTC): complete due timers,
+    /// expire deadline-passed effects (DR-0033 Phase 6). `now` is injected —
+    /// the driver never reads wall time itself. Default: hosts without time
+    /// semantics do nothing.
+    fn advance_time(&mut self, _now: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// The earliest future wake-up (unix milliseconds) the instance needs
+    /// strictly after `now`, or `None` when nothing is scheduled — pending
+    /// timed effects plus the next clock-source occurrence. The DO shell sets
+    /// its single alarm from this when the instance parks. Default: no wake-up.
+    fn next_due_unix_ms(&mut self, _now: &str) -> Result<Option<i64>, StoreError> {
+        Ok(None)
+    }
 }
 
 /// What a whole instance settles to when the scheduler yields control.

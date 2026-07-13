@@ -261,6 +261,72 @@ impl RuntimeStore for NativeStores {
         self.runtime.register_skill(skill)
     }
 
+    fn register_project_context_doc(
+        &self,
+        position: i64,
+        path: &str,
+        body: &str,
+    ) -> StoreResult<()> {
+        self.runtime
+            .register_project_context_doc(position, path, body)
+    }
+
+    fn list_project_context_docs(&self) -> StoreResult<Vec<ProjectContextDoc>> {
+        self.runtime.list_project_context_docs()
+    }
+
+    fn record_compute_result(
+        &self,
+        registration: ComputeResultRegistration<'_>,
+    ) -> StoreResult<bool> {
+        self.runtime.record_compute_result(registration)
+    }
+
+    fn lookup_compute_result(&self, content_key: &str) -> StoreResult<Option<ComputeCachedResult>> {
+        self.runtime.lookup_compute_result(content_key)
+    }
+
+    fn put_content(&self, body: &str) -> StoreResult<String> {
+        self.runtime.put_content(body)
+    }
+
+    fn get_content(&self, id: &str) -> StoreResult<Option<String>> {
+        self.runtime.get_content(id)
+    }
+
+    fn capture_checkpoint(
+        &mut self,
+        capture: CheckpointCapture<'_>,
+    ) -> StoreResult<CapturedCheckpoint> {
+        self.runtime.capture_checkpoint(capture)
+    }
+
+    fn plan_restore(&self, instance_id: &str, cut_id: &str) -> StoreResult<RestoreDecision> {
+        self.runtime.plan_restore(instance_id, cut_id)
+    }
+
+    fn commit_restore(
+        &mut self,
+        instance_id: &str,
+        restored_to_sequence: i64,
+        cut_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        self.runtime
+            .commit_restore(instance_id, restored_to_sequence, cut_id, idempotency_key)
+    }
+
+    fn register_script_capability(
+        &self,
+        registration: ScriptCapabilityRegistration<'_>,
+    ) -> StoreResult<()> {
+        self.runtime.register_script_capability(registration)
+    }
+
+    fn get_script_capability(&self, name: &str) -> StoreResult<Option<ScriptCapabilityRecord>> {
+        self.runtime.get_script_capability(name)
+    }
+
     fn attach_skill(&self, attachment: SkillAttachment<'_>) -> StoreResult<()> {
         self.runtime.attach_skill(attachment)
     }
@@ -519,6 +585,10 @@ impl RuntimeStore for NativeStores {
 }
 
 impl Coordination for NativeStores {
+    fn ledger_positions(&self) -> StoreResult<Vec<(String, String, i64)>> {
+        self.coord.ledger_positions_impl()
+    }
+
     fn try_acquire_for_owner(
         &mut self,
         owner: &str,
@@ -621,6 +691,10 @@ impl Coordination for NativeStores {
 }
 
 impl WorkItems for NativeStores {
+    fn event_position(&self) -> StoreResult<i64> {
+        WorkItems::event_position(&self.items)
+    }
+
     fn file_item(
         &mut self,
         queue: &str,
@@ -650,6 +724,15 @@ impl WorkItems for NativeStores {
         self.items.claim_item(item_id, claimed_by)
     }
 
+    fn renew_claim(
+        &mut self,
+        item_id: &str,
+        actor: &str,
+        expires: Option<&str>,
+    ) -> StoreResult<RenewOutcome> {
+        self.items.renew_claim(item_id, actor, expires)
+    }
+
     fn release_item(&mut self, item_id: &str) -> StoreResult<bool> {
         self.items.release_item(item_id)
     }
@@ -660,6 +743,10 @@ impl WorkItems for NativeStores {
 
     fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> StoreResult<bool> {
         self.items.finish_item(item_id, summary)
+    }
+
+    fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()> {
+        self.items.add_blocks(from, to)
     }
 }
 

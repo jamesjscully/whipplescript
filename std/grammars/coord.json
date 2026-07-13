@@ -1,0 +1,147 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.coord",
+  "name": "std.coord",
+  "version": "v0",
+  "libraries": [
+    {
+      "id": "std.coord",
+      "version": "v0",
+      "constructs": [
+        {
+          "id": "coord.counter",
+          "construct_family": "declaration_block",
+          "keyword": "counter",
+          "scope": "top_level",
+          "grammar": {
+            "shape": "declaration_block",
+            "keyword": "counter",
+            "clauses": [
+              {
+                "name": "shared",
+                "kind": "flag",
+                "required": false,
+                "list": false,
+                "unknown_hint": "counter fields are `shared`, `key`, `cap`, and `reset`",
+                "missing_summary": "every counter is bounded: declare all three fields"
+              },
+              {
+                "name": "key",
+                "kind": "identifier",
+                "required": true,
+                "list": false,
+                "unknown_hint": "counter fields are `shared`, `key`, `cap`, and `reset`",
+                "missing_summary": "every counter is bounded: declare all three fields"
+              },
+              {
+                "name": "cap",
+                "kind": "scalar",
+                "required": true,
+                "list": false,
+                "unknown_hint": "counter fields are `shared`, `key`, `cap`, and `reset`",
+                "missing_summary": "every counter is bounded: declare all three fields"
+              },
+              {
+                "name": "reset",
+                "kind": "identifier",
+                "required": true,
+                "list": false,
+                "unknown_hint": "counter fields are `shared`, `key`, `cap`, and `reset`",
+                "missing_summary": "every counter is bounded: declare all three fields"
+              }
+            ]
+          }
+        },
+        {
+          "id": "coord.lease",
+          "construct_family": "declaration_block",
+          "keyword": "lease",
+          "scope": "top_level",
+          "grammar": {
+            "shape": "declaration_block",
+            "keyword": "lease",
+            "clauses": [
+              {
+                "name": "shared",
+                "kind": "flag",
+                "required": false,
+                "list": false,
+                "unknown_hint": "lease fields are `shared`, `key`, `slots`, and `ttl`",
+                "missing_summary": "every lease is bounded: declare `key <Type>` and `ttl <duration>`"
+              },
+              {
+                "name": "key",
+                "kind": "identifier",
+                "required": true,
+                "list": false,
+                "unknown_hint": "lease fields are `shared`, `key`, `slots`, and `ttl`",
+                "missing_summary": "every lease is bounded: declare `key <Type>` and `ttl <duration>`"
+              },
+              {
+                "name": "slots",
+                "kind": "scalar",
+                "required": false,
+                "list": false,
+                "unknown_hint": "lease fields are `shared`, `key`, `slots`, and `ttl`",
+                "missing_summary": "every lease is bounded: declare `key <Type>` and `ttl <duration>`"
+              },
+              {
+                "name": "ttl",
+                "kind": "duration",
+                "required": true,
+                "list": false,
+                "unknown_hint": "lease fields are `shared`, `key`, `slots`, and `ttl`",
+                "missing_summary": "every lease is bounded: declare `key <Type>` and `ttl <duration>`"
+              }
+            ]
+          }
+        },
+        {
+          "id": "coord.ledger",
+          "construct_family": "declaration_block",
+          "keyword": "ledger",
+          "scope": "top_level",
+          "grammar": {
+            "shape": "declaration_block",
+            "keyword": "ledger",
+            "clauses": [
+              {
+                "name": "shared",
+                "kind": "flag",
+                "required": false,
+                "list": false,
+                "unknown_hint": "ledger fields are `shared`, `entry`, `partition by`, and `retain`",
+                "missing_summary": "every ledger is bounded and partitioned: declare all three fields"
+              },
+              {
+                "name": "entry",
+                "kind": "identifier",
+                "required": true,
+                "list": false,
+                "unknown_hint": "ledger fields are `shared`, `entry`, `partition by`, and `retain`",
+                "missing_summary": "every ledger is bounded and partitioned: declare all three fields"
+              },
+              {
+                "name": "partition",
+                "kind": "identifier",
+                "connective": "by",
+                "required": true,
+                "list": false,
+                "unknown_hint": "ledger fields are `shared`, `entry`, `partition by`, and `retain`",
+                "missing_summary": "every ledger is bounded and partitioned: declare all three fields"
+              },
+              {
+                "name": "retain",
+                "kind": "duration",
+                "required": true,
+                "list": false,
+                "unknown_hint": "ledger fields are `shared`, `entry`, `partition by`, and `retain`",
+                "missing_summary": "every ledger is bounded and partitioned: declare all three fields"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

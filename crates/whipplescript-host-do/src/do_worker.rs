@@ -20,13 +20,21 @@ use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_loop::{HttpModelClient, ToolExecutor};
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::sansio::{HttpRequest, HttpResponse, TransportError};
-use whipplescript_kernel::{ProgramVersionInput, RuntimeKernel};
+use whipplescript_kernel::{idempotency_key, ProgramVersionInput, RuntimeKernel};
 use whipplescript_parser::IrProgram;
+use whipplescript_store::branches::Branches;
 use whipplescript_store::files::FileStore;
-use whipplescript_store::{ClaimableEffect, NewInstanceAuthority, RuntimeStore, StoreError};
+use whipplescript_store::{
+    CheckpointCapture, ClaimableEffect, NewInstanceAuthority, RestoreDecision, RuntimeStore,
+    StoreError,
+};
 
-use crate::do_instance::{CoerceProviderConfig, DoInstanceDriver};
-use crate::do_store::{DoSql, DoSqliteStore};
+use crate::do_instance::{
+    CoerceProviderConfig, DoInstanceDriver, ExecutorSidecarConfig, TurnContainerConfig,
+};
+use crate::do_store::{DoSql, DoSqlStorage, DoSqliteStore};
+use crate::DoFileStore;
+use std::rc::Rc;
 
 /// What one [`DurableInstance::step`] yields back to the worker shell.
 #[derive(Debug)]
@@ -37,51 +45,39 @@ pub enum DurableStepOutcome {
     /// The instance reached a workflow terminal (absorbing).
     Terminal,
     /// Quiescent but not terminal — parked awaiting external input / an alarm.
-    Parked,
+    /// When the instance holds pending timed effects, `next_due_unix_ms` is
+    /// the earliest wake-up it needs; the shell sets the DO alarm from it
+    /// (DR-0033 Phase 6).
+    Parked { next_due_unix_ms: Option<i64> },
     /// A store error aborted the pass (surfaced, not swallowed).
     Failed(String),
 }
 
-/// A no-op file store for instances whose workflows touch no file effects. A live
-/// worker passes a real `DoFileStore` (small files inline in DO SQLite).
-struct NoFileStore;
-impl FileStore for NoFileStore {
-    fn read_to_string(&self, _path: &std::path::Path) -> std::io::Result<String> {
-        Err(std::io::Error::other(
-            "no file store configured on this instance",
-        ))
-    }
-    fn exists(&self, _path: &std::path::Path) -> bool {
-        false
-    }
-    fn create_dir_all(&self, _path: &std::path::Path) -> std::io::Result<()> {
-        Ok(())
-    }
-    fn write(&self, _path: &std::path::Path, _bytes: &[u8]) -> std::io::Result<()> {
-        Err(std::io::Error::other(
-            "no file store configured on this instance",
-        ))
-    }
-    fn append(&self, _path: &std::path::Path, _bytes: &[u8]) -> std::io::Result<()> {
-        Err(std::io::Error::other(
-            "no file store configured on this instance",
-        ))
-    }
-}
-
-/// A tool executor that errors on any request (turns declaring no tools never hit
-/// it). A live worker passes one that brokers tools to an HTTP sidecar.
-struct NoToolExecutor;
-impl ToolExecutor for NoToolExecutor {
-    fn execute(
-        &self,
-        call: &whipplescript_kernel::harness_loop::ToolCall,
-    ) -> whipplescript_kernel::harness_loop::ToolOutcome {
-        whipplescript_kernel::harness_loop::ToolOutcome {
-            status: whipplescript_kernel::harness_loop::ToolStatus::Error,
-            content: format!("no tool executor configured: {}", call.name),
-        }
-    }
+/// Unix milliseconds → ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`), dependency-free
+/// so it builds for wasm (Howard Hinnant's days-from-civil, inverted). The DO
+/// shell passes `Date.now()`; the store's `strftime`-based clock queries all
+/// consume this shape.
+pub fn unix_ms_to_iso8601(unix_ms: i64) -> String {
+    let secs = unix_ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
+    // civil-from-days (era-based, valid for the whole i64 day range).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 /// The effect seams a live worker injects from its bindings/secrets. All optional
@@ -92,13 +88,30 @@ pub struct DurableEffectPorts {
     pub coerce: Option<CoerceProviderConfig>,
     pub agent_model: Option<Box<dyn HttpModelClient>>,
     pub agent_tools: Option<Box<dyn ToolExecutor>>,
+    /// Executor-sidecar wiring for Class-A exec effects (compute plane P8).
+    pub exec: Option<ExecutorSidecarConfig>,
+    /// Class-B turn-container wiring (agent turns run whole in a container).
+    pub turn: Option<TurnContainerConfig>,
+}
+
+/// One operator-pinned script capability shipped with the deploy (compute
+/// plane P8): the DO-store mirror of a native script-manifest entry. `argv`
+/// must carry the `{script}` placeholder element; `body` must hash to
+/// `sha256` (verified at registration — fail-closed).
+pub struct ScriptCapabilityInput {
+    pub name: String,
+    pub argv: Vec<String>,
+    pub sha256: String,
+    pub env: std::collections::BTreeMap<String, String>,
+    pub hermetic: bool,
+    pub body: String,
 }
 
 /// A workflow instance running on the durable object as a resumable step machine.
 /// Owns the kernel over the DO's SQLite, the compiled program, and the currently
 /// in-flight effect (persisted across `step` calls / evictions).
 pub struct DurableInstance<Sql: DoSql> {
-    kernel: Option<RuntimeKernel<DoSqliteStore<Sql>>>,
+    kernel: Option<RuntimeKernel<DoSqliteStore<Rc<Sql>>>>,
     ir: IrProgram,
     instance_id: String,
     in_flight: Option<ClaimableEffect>,
@@ -106,23 +119,39 @@ pub struct DurableInstance<Sql: DoSql> {
     coerce: Option<CoerceProviderConfig>,
     agent_model: Option<Box<dyn HttpModelClient>>,
     agent_tools: Box<dyn ToolExecutor>,
+    exec: Option<ExecutorSidecarConfig>,
+    turn: Option<TurnContainerConfig>,
 }
 
-impl<Sql: DoSql> DurableInstance<Sql> {
-    /// Compile `program_source`, then create + start a fresh instance in the DO
-    /// store with `input_json` as its input. The worker calls this once when the
-    /// object is first addressed; `step` drives it thereafter.
+// `'static` so the default `DoFileStore` over the shared `Rc<Sql>` can be boxed
+// as `Box<dyn FileStore>` (both real handles — `JsDoSql`, `RusqliteDoSql` — own
+// their storage and are `'static`).
+impl<Sql: DoSql + 'static> DurableInstance<Sql> {
+    /// Compile `program_source`, then get-or-create THE instance in the DO
+    /// store (a Durable Object holds exactly one workflow instance). The first
+    /// call creates + starts it; any later call — an alarm wake-up, a poke, an
+    /// isolate-eviction rehydration — reattaches to the existing durable state
+    /// instead of minting a second instance.
     pub fn create(
         sql: Sql,
         program_source: &str,
         input_json: &str,
         workflow_principal: &str,
         ports: DurableEffectPorts,
+        project_context: &[(String, String)],
+        scripts: &[ScriptCapabilityInput],
     ) -> Result<Self, String> {
         let ir = whipplescript_parser::compile_program(program_source)
             .ir
             .ok_or_else(|| "program did not compile".to_owned())?;
-        let mut kernel = RuntimeKernel::new(DoSqliteStore { sql });
+        // P1: share ONE DoSql handle between the runtime store and the file
+        // plane (both hit the same DO SQLite). `Rc` shares without requiring the
+        // handle to be `Clone` (the test `RusqliteDoSql` wraps a non-`Clone`
+        // `Connection`).
+        let sql = Rc::new(sql);
+        let mut kernel = RuntimeKernel::new(DoSqliteStore {
+            sql: Rc::clone(&sql),
+        });
         let version = kernel
             .create_program_version_for_program(
                 ProgramVersionInput {
@@ -134,45 +163,249 @@ impl<Sql: DoSql> DurableInstance<Sql> {
                 &ir,
             )
             .map_err(|error| format!("{error:?}"))?;
-        let instance_id = kernel
-            .create_instance_with_authority(
-                &version,
-                input_json,
-                NewInstanceAuthority {
-                    workflow_principal,
-                    effective_authority_json: "{}",
-                },
-            )
-            .map_err(|error| format!("{error:?}"))?;
-        kernel
-            .ingest_external_event(
-                &instance_id,
-                "external.started",
-                input_json,
-                Some("started"),
-            )
-            .map_err(|error| format!("{error:?}"))?;
+        // Register deploy-shipped project instructions (context-assembly
+        // Phase 3 item 4) — content-addressed, idempotent by position, read by
+        // the agent turn's store-backed context resolution.
+        for (position, (path, body)) in project_context.iter().enumerate() {
+            kernel
+                .store()
+                .register_project_context_doc(position as i64, path, body)
+                .map_err(|error| format!("{error:?}"))?;
+        }
+        // Register deploy-shipped script capabilities (compute plane P8),
+        // verifying each body against its operator pin — fail-closed, the
+        // same TOCTOU discipline the native manifest loader applies.
+        //
+        // Script hard-off Layer 2, seeding key (a) (spec/std-script.md "Two
+        // layers, both required"): capability rows are seeded only when the
+        // program imports std.script. The DO compiles the program it
+        // registers (above), so the compiled IR IS the registered IR — its
+        // `uses` list is the import key. Deploy-shipped scripts (key b, the
+        // operator authority) stay dormant for a program that never consented
+        // to script execution, and every exec.command effect then blocks at
+        // the store admission gate (blocked_by_capability /
+        // security.script_disabled) before any executor round.
+        let imports_std_script = ir.uses.iter().any(|use_decl| use_decl.name == "std.script");
+        let seedable_scripts = if imports_std_script { scripts } else { &[] };
+        for script in seedable_scripts {
+            let actual = whipplescript_kernel::exec_http::sha256_hex(script.body.as_bytes());
+            if actual != script.sha256 {
+                return Err(format!(
+                    "script capability `{}` hash mismatch: expected {}, got {actual}",
+                    script.name, script.sha256
+                ));
+            }
+            let argv_json = serde_json::to_string(&script.argv)
+                .map_err(|error| format!("script `{}` argv: {error}", script.name))?;
+            let env_json = serde_json::to_string(&script.env)
+                .map_err(|error| format!("script `{}` env: {error}", script.name))?;
+            kernel
+                .store()
+                .register_script_capability(whipplescript_store::ScriptCapabilityRegistration {
+                    name: &script.name,
+                    argv_json: &argv_json,
+                    sha256: &script.sha256,
+                    env_json: &env_json,
+                    hermetic: script.hermetic,
+                    body: &script.body,
+                })
+                .map_err(|error| format!("{error:?}"))?;
+            // The policy gate reuses the standard capability machinery
+            // (spec/script-capabilities.md): each entry registers as
+            // `script.<name>` with a binding, so an exec naming an
+            // unregistered script blocks as blocked_by_capability.
+            let capability = format!("script.{}", script.name);
+            kernel
+                .store()
+                .register_capability_schema(whipplescript_store::CapabilitySchemaRegistration {
+                    capability: &capability,
+                    description: "Run an operator-pinned script capability.",
+                    schema_json: "{}",
+                    registered_by_package_id: None,
+                })
+                .map_err(|error| format!("{error:?}"))?;
+            kernel
+                .store()
+                .bind_capability(whipplescript_store::CapabilityBinding {
+                    binding_id: &format!("binding_script_{}", script.name),
+                    program_id: None,
+                    capability: &capability,
+                    provider: "builtin-script",
+                    config_json: "{}",
+                })
+                .map_err(|error| format!("{error:?}"))?;
+        }
+        let existing = kernel
+            .store()
+            .list_instances()
+            .map_err(|error| format!("{error:?}"))?
+            .into_iter()
+            .next()
+            .map(|instance| instance.instance_id);
+        let instance_id = match existing {
+            Some(instance_id) => instance_id,
+            None => {
+                let instance_id = kernel
+                    .create_instance_with_authority(
+                        &version,
+                        input_json,
+                        NewInstanceAuthority {
+                            workflow_principal,
+                            effective_authority_json: "{}",
+                        },
+                    )
+                    .map_err(|error| format!("{error:?}"))?;
+                kernel
+                    .ingest_external_event(
+                        &instance_id,
+                        "external.started",
+                        input_json,
+                        Some("started"),
+                    )
+                    .map_err(|error| format!("{error:?}"))?;
+                instance_id
+            }
+        };
+        // Per-instance branch dispatch, DO parity (untie-substrate P1): an
+        // instance born on a branch gets the branch working set as its file
+        // surface — the same WorkspaceVcs/BranchFileStore logic as native,
+        // over the DO's own Branches/ContentBlobs seams. The cut seed
+        // derives from (instance, current head): minting a cut moves the
+        // head, so a rehydrated isolate can never reuse a seed that already
+        // produced cuts. An explicit port override still wins; unbound
+        // instances keep the plain DO file plane.
+        let default_files: Box<dyn FileStore> = {
+            let branches = crate::do_branches::DoBranches::new(Rc::clone(&sql))
+                .map_err(|error| format!("branch store unavailable: {error:?}"))?;
+            match branches.instance_branch(&instance_id) {
+                Ok(Some(branch_id)) => {
+                    let head = branches
+                        .get_branch(&branch_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|row| row.head_cut_id)
+                        .unwrap_or_default();
+                    let seed = crate::do_store::stable_hash_hex(&format!("{instance_id}|{head}"));
+                    let content = crate::do_branches::DoContentBlobs::new(Rc::clone(&sql))
+                        .map_err(|error| format!("content blobs unavailable: {error:?}"))?;
+                    let vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+                    Box::new(whipplescript_store::vcs::BranchFileStore::new(
+                        vcs,
+                        &branch_id,
+                        &format!("cut-{seed}"),
+                        &format!("after:{head}"),
+                    ))
+                }
+                _ => Box::new(DoFileStore::new(DoSqlStorage::new(Rc::clone(&sql)))),
+            }
+        };
         Ok(Self {
             kernel: Some(kernel),
             ir,
             instance_id,
             in_flight: None,
-            files: ports.files.unwrap_or_else(|| Box::new(NoFileStore)),
+            // P1: files work by default on the DO — the file plane is intrinsic
+            // to having DO SQLite, so a live instance always gets a real
+            // file surface over the shared handle (an explicit port override,
+            // e.g. a `TieredFileStore`, still wins).
+            files: ports.files.unwrap_or(default_files),
             coerce: ports.coerce,
             agent_model: ports.agent_model,
+            // P4: the DO agent turn gets a real in-isolate tool executor over
+            // the shared DO SQLite by default (the file plane IS the sandbox),
+            // so agent turns can read/write/edit/search files and drive the
+            // tracker with no extra deploy config. An explicit port override
+            // (e.g. an HTTP sidecar broker) still wins.
             agent_tools: ports
                 .agent_tools
-                .unwrap_or_else(|| Box::new(NoToolExecutor)),
+                .unwrap_or_else(|| Box::new(crate::do_tools::DoToolExecutor::new(Rc::clone(&sql)))),
+            exec: ports.exec,
+            turn: ports.turn,
         })
+    }
+
+    /// Bind THIS durable instance to the branch it works on (write-once;
+    /// the operator's DO-side counterpart of `whip dev --branch` /
+    /// `whip branch bind`): records the `branch_instances` row, appends the
+    /// `branch.bound` event so the kernel derives branch-distinct effect
+    /// keys, and swaps the live file surface onto the branch working set
+    /// so effects dispatched after the bind land on the branch.
+    pub fn bind_branch(&mut self, branch_id: &str, at: &str) -> Result<(), String> {
+        use whipplescript_store::branches::BindOutcome;
+        use whipplescript_store::RuntimeStore;
+        let kernel = self
+            .kernel
+            .as_ref()
+            .ok_or_else(|| "instance kernel already consumed".to_owned())?;
+        let sql = Rc::clone(&kernel.store().sql);
+        let mut branches = crate::do_branches::DoBranches::new(Rc::clone(&sql))
+            .map_err(|error| format!("branch store unavailable: {error:?}"))?;
+        match branches
+            .bind_instance(&self.instance_id, branch_id, at)
+            .map_err(|error| format!("bind failed: {error:?}"))?
+        {
+            BindOutcome::Bound => {}
+            BindOutcome::AlreadyBound { branch_id: other } => {
+                return Err(format!("instance is already bound to branch `{other}`"));
+            }
+            BindOutcome::BranchMissing => {
+                return Err(format!("no such branch `{branch_id}`"));
+            }
+            BindOutcome::BranchNotActive { status } => {
+                return Err(format!(
+                    "branch `{branch_id}` is {} — instances cannot be born on a closed line",
+                    status.as_str()
+                ));
+            }
+        }
+        let payload = format!("{{\"branch_id\":\"{branch_id}\"}}");
+        kernel
+            .store()
+            .append_event(whipplescript_store::NewEvent {
+                instance_id: &self.instance_id,
+                event_type: "branch.bound",
+                payload_json: &payload,
+                source: "do",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some(&whipplescript_kernel::idempotency_key(&[
+                    &self.instance_id,
+                    branch_id,
+                    "branch-bind",
+                ])),
+            })
+            .map_err(|error| format!("could not record the binding event: {error:?}"))?;
+        // Swap the live surface: the head is fresh-read, so the cut seed
+        // stays collision-free by the head-moves-on-mint argument.
+        let head = branches
+            .get_branch(branch_id)
+            .ok()
+            .flatten()
+            .and_then(|row| row.head_cut_id)
+            .unwrap_or_default();
+        let seed = crate::do_store::stable_hash_hex(&format!("{}|{head}", self.instance_id));
+        let content = crate::do_branches::DoContentBlobs::new(Rc::clone(&sql))
+            .map_err(|error| format!("content blobs unavailable: {error:?}"))?;
+        let vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+        self.files = Box::new(whipplescript_store::vcs::BranchFileStore::new(
+            vcs,
+            branch_id,
+            &format!("cut-{seed}"),
+            at,
+        ));
+        Ok(())
     }
 
     /// Advance the instance until it next needs an HTTP round or settles. `incoming`
     /// is the response to the request the previous `step` returned (`None` on the
-    /// first call). This is the `InstanceStepMachine` fixpoint with the in-flight
+    /// first call); `now_unix_ms` is the host's clock instant (the DO shell passes
+    /// `Date.now()`) — injected so the core never reads wall time (DR-0033
+    /// Phase 6). This is the `InstanceStepMachine` fixpoint with the in-flight
     /// effect held in `self`.
     pub fn step(
         &mut self,
         incoming: Option<Result<HttpResponse, TransportError>>,
+        now_unix_ms: i64,
     ) -> DurableStepOutcome {
         // Borrow disjoint fields: the driver takes the kernel by value and the effect
         // seams + program by reference, while `in_flight` is threaded separately.
@@ -188,11 +421,14 @@ impl<Sql: DoSql> DurableInstance<Sql> {
             coerce: self.coerce.as_ref(),
             agent_model: self.agent_model.as_deref(),
             agent_tools: self.agent_tools.as_ref(),
+            exec: self.exec.as_ref(),
+            turn: self.turn.as_ref(),
             ir: &self.ir,
             instance_id: &self.instance_id,
         };
 
-        let outcome = drive_fixpoint(&mut driver, &mut self.in_flight, incoming);
+        let now = unix_ms_to_iso8601(now_unix_ms);
+        let outcome = drive_fixpoint(&mut driver, &mut self.in_flight, incoming, &now);
         self.kernel = Some(driver.kernel);
         outcome
     }
@@ -211,6 +447,166 @@ impl<Sql: DoSql> DurableInstance<Sql> {
     pub fn coerce_provider(&self) -> Option<CoerceProvider> {
         self.coerce.as_ref().map(|config| config.provider)
     }
+
+    /// Capture a restorable consistent-cut checkpoint (DO parity P3 — the
+    /// operator-command counterpart to the CLI `whip checkpoint`). Refuses if an
+    /// effect is mid-run.
+    pub fn checkpoint(&mut self, cut_id: &str) -> Result<DoCheckpointReport, String> {
+        let instance_id = self.instance_id.clone();
+        let key = idempotency_key(&[&instance_id, cut_id, "checkpoint"]);
+        let kernel = self.kernel.as_mut().ok_or("instance kernel consumed")?;
+        // Two-plane consistent cut, DO parity: the workspace plane's
+        // monotone high-water positions land in the same pass as the
+        // substance cut (all three surfaces share the one DO SQLite).
+        {
+            use whipplescript_store::coordination::Coordination;
+            use whipplescript_store::items::WorkItems;
+            let ledgers = kernel.store().ledger_positions().unwrap_or_default();
+            let tracker_seq = kernel.store().event_position().unwrap_or(0);
+            let ledger_entries = ledgers
+                .iter()
+                .map(|(owner, ledger, seq)| {
+                    format!("{{\"owner\":\"{owner}\",\"ledger\":\"{ledger}\",\"seq\":{seq}}}")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let payload = format!(
+                "{{\"cut_id\":\"{cut_id}\",\"positions\":{{\"coordination_ledgers\":[{ledger_entries}],\"tracker_event_seq\":{tracker_seq}}}}}"
+            );
+            kernel
+                .store()
+                .append_event(whipplescript_store::NewEvent {
+                    instance_id: &instance_id,
+                    event_type: "plane.positions",
+                    payload_json: &payload,
+                    source: "do",
+                    causation_id: None,
+                    correlation_id: None,
+                    idempotency_key: Some(&idempotency_key(&[
+                        &instance_id,
+                        cut_id,
+                        "plane-positions",
+                    ])),
+                })
+                .map_err(|error| format!("plane positions: {error:?}"))?;
+        }
+        let captured = kernel
+            .store_mut()
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: &instance_id,
+                cut_id,
+                transcript_ref: None,
+                idempotency_key: Some(&key),
+            })
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(DoCheckpointReport {
+            cut_id: captured.cut_id,
+            sequence: captured.sequence,
+            manifest_hash: captured.manifest_hash,
+            file_count: captured.file_count,
+        })
+    }
+
+    /// Restore the three planes to a prior checkpoint (DO parity P3 — the
+    /// operator-command counterpart to the CLI `whip restore`). Same order:
+    /// (1) `plan_restore` — the whole coherence check up front; a refusal mutates
+    /// nothing; (2) auto-checkpoint the current head as `auto-before-<cut>` so
+    /// the restore is itself undoable; (3) apply the full file reconcile — write
+    /// every manifest path back to its cut content, remove post-cut mediated
+    /// files — through this instance's `FileStore` (the DO file plane, P1);
+    /// (4) `commit_restore` so the instance + transcript planes fold to the cut.
+    pub fn restore(&mut self, cut_id: &str) -> Result<DoRestoreReport, String> {
+        let instance_id = self.instance_id.clone();
+        // 1) Plan (read-only). A refusal is returned as an error with no mutation.
+        let plan = {
+            let kernel = self.kernel.as_ref().ok_or("instance kernel consumed")?;
+            match kernel
+                .store()
+                .plan_restore(&instance_id, cut_id)
+                .map_err(|error| format!("{error:?}"))?
+            {
+                RestoreDecision::Ready(plan) => plan,
+                RestoreDecision::Refused { reason } => {
+                    return Err(format!("restore refused: {reason}"))
+                }
+            }
+        };
+        // 2) Auto-checkpoint the current head so this restore is itself undoable.
+        let auto_cut_id = format!("auto-before-{cut_id}");
+        {
+            let auto_key = idempotency_key(&[&instance_id, &auto_cut_id, "checkpoint"]);
+            let kernel = self.kernel.as_mut().ok_or("instance kernel consumed")?;
+            kernel
+                .store_mut()
+                .capture_checkpoint(CheckpointCapture {
+                    instance_id: &instance_id,
+                    cut_id: &auto_cut_id,
+                    transcript_ref: None,
+                    idempotency_key: Some(&auto_key),
+                })
+                .map_err(|error| format!("auto-checkpoint before restore: {error:?}"))?;
+        }
+        // 3) Apply the file reconcile through the DO file plane. Every content
+        //    hash was verified present in step 1, so writes cannot fail for
+        //    missing bytes.
+        for (path, body) in &plan.writes {
+            let target = std::path::Path::new(path);
+            if let Some(parent) = target.parent() {
+                self.files
+                    .create_dir_all(parent)
+                    .map_err(|error| format!("restore: create parent of `{path}`: {error}"))?;
+            }
+            self.files
+                .write(target, body.as_bytes())
+                .map_err(|error| format!("restore: write `{path}`: {error}"))?;
+        }
+        for path in &plan.removes {
+            self.files
+                .remove(std::path::Path::new(path))
+                .map_err(|error| format!("restore: remove `{path}`: {error}"))?;
+        }
+        // 4) Commit: the marker + marker-aware rebuild fold the instance and
+        //    transcript planes to the cut.
+        let commit_key = idempotency_key(&[&instance_id, cut_id, "restore"]);
+        let marker = {
+            let kernel = self.kernel.as_mut().ok_or("instance kernel consumed")?;
+            kernel
+                .store_mut()
+                .commit_restore(
+                    &instance_id,
+                    plan.restored_to_sequence,
+                    cut_id,
+                    Some(&commit_key),
+                )
+                .map_err(|error| format!("commit restore: {error:?}"))?
+        };
+        Ok(DoRestoreReport {
+            cut_id: cut_id.to_owned(),
+            restored_to_sequence: plan.restored_to_sequence,
+            marker_sequence: marker.sequence,
+            files_written: plan.writes.len(),
+            files_removed: plan.removes.len(),
+            auto_checkpoint: auto_cut_id,
+        })
+    }
+}
+
+/// The outcome of a DO checkpoint (P3), for the worker to marshal to JSON.
+pub struct DoCheckpointReport {
+    pub cut_id: String,
+    pub sequence: i64,
+    pub manifest_hash: String,
+    pub file_count: usize,
+}
+
+/// The outcome of a DO restore (P3), for the worker to marshal to JSON.
+pub struct DoRestoreReport {
+    pub cut_id: String,
+    pub restored_to_sequence: i64,
+    pub marker_sequence: i64,
+    pub files_written: usize,
+    pub files_removed: usize,
+    pub auto_checkpoint: String,
 }
 
 /// The `InstanceStepMachine` fixpoint, factored out so it can borrow `in_flight`
@@ -219,6 +615,7 @@ fn drive_fixpoint<D: InstanceDriver>(
     driver: &mut D,
     in_flight: &mut Option<ClaimableEffect>,
     incoming: Option<Result<HttpResponse, TransportError>>,
+    now: &str,
 ) -> DurableStepOutcome {
     // Resume an effect suspended on an HTTP round with the host's response.
     if let Some(effect) = in_flight.take() {
@@ -232,6 +629,13 @@ fn drive_fixpoint<D: InstanceDriver>(
         }
     }
 
+    // The due-time pass first (DR-0033 Phase 6): an alarm-driven re-entry
+    // completes its due timers / expires deadlines before the rule pass, so
+    // the rules see the fired facts this same step.
+    if let Err(error) = driver.advance_time(now) {
+        return DurableStepOutcome::Failed(format!("{error:?}"));
+    }
+
     loop {
         match driver.advance_rules() {
             Ok(true) => return DurableStepOutcome::Terminal,
@@ -240,7 +644,14 @@ fn drive_fixpoint<D: InstanceDriver>(
         }
         let ready = match driver.next_ready_effect() {
             Ok(Some(effect)) => effect,
-            Ok(None) => return DurableStepOutcome::Parked,
+            Ok(None) => {
+                // Parked: surface the earliest pending wake-up so the shell
+                // can set the DO's single alarm.
+                return match driver.next_due_unix_ms(now) {
+                    Ok(next_due_unix_ms) => DurableStepOutcome::Parked { next_due_unix_ms },
+                    Err(error) => DurableStepOutcome::Failed(format!("{error:?}")),
+                };
+            }
             Err(error) => return DurableStepOutcome::Failed(format!("{error:?}")),
         };
         match driver.run_effect(&ready, None) {
@@ -257,6 +668,9 @@ fn drive_fixpoint<D: InstanceDriver>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixed injected clock for deterministic tests (2026-01-01T00:00:00Z).
+    const TEST_NOW_MS: i64 = 1_767_225_600_000;
     use crate::do_store::test_support::store;
 
     /// The worker-shell loop over an effect-free workflow: `create`, then `step`
@@ -274,11 +688,114 @@ mod tests {
             "{}",
             "local/MinimalNoop",
             DurableEffectPorts::default(),
+            &[],
+            &[],
         )
         .expect("create");
         assert!(
-            matches!(instance.step(None), DurableStepOutcome::Terminal),
+            matches!(
+                instance.step(None, TEST_NOW_MS),
+                DurableStepOutcome::Terminal
+            ),
             "the worker drives the instance to its terminal in one step"
+        );
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed")
+        );
+    }
+
+    /// The alarm cycle (DR-0033 Phase 6): a timer workflow PARKS with the
+    /// timer's due instant surfaced as `next_due_unix_ms` (the shell sets the
+    /// DO alarm from it), and the alarm's re-entry `step` — a later injected
+    /// `now` — runs the due-time pass, fires the timer, and completes.
+    #[test]
+    fn timer_workflow_parks_with_next_due_then_alarm_reentry_completes() {
+        let source = "workflow TimerDemo\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             rule go\n  when started\n=> {\n\
+             \x20 timer 2s as pause\n\n\
+             \x20 after pause succeeds {\n    complete result { ok 1 }\n  }\n}\n";
+        let mut instance = DurableInstance::create(
+            store().sql,
+            source,
+            "{}",
+            "local/TimerDemo",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        )
+        .expect("create");
+
+        // First step: the timer is pending and not yet due — the instance
+        // parks and names its wake-up (creation-anchored, so within 2s of the
+        // store's clock; assert presence and sanity, not the exact instant).
+        let parked = instance.step(None, TEST_NOW_MS);
+        let next_due = match parked {
+            DurableStepOutcome::Parked { next_due_unix_ms } => {
+                next_due_unix_ms.expect("a pending timer names its wake-up")
+            }
+            other => panic!("expected a park with a wake-up, got {other:?}"),
+        };
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("running")
+        );
+
+        // The alarm fires: re-enter with a `now` past the due instant. The
+        // due-time pass completes the timer, the rule pass sees it, and the
+        // workflow completes — no external poller involved.
+        let after_due = next_due + 1_000;
+        assert!(
+            matches!(instance.step(None, after_due), DurableStepOutcome::Terminal),
+            "the alarm re-entry fires the timer and completes the workflow"
+        );
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed")
+        );
+    }
+
+    /// Clock sources on the DO (P6 tail): an interval source parks with the
+    /// NEXT occurrence as the wake-up, and the alarm re-entry admits the
+    /// signal fact through the lifted clock pass.
+    #[test]
+    fn clock_source_parks_with_next_tick_and_fires_on_alarm_reentry() {
+        let source = "workflow ClockDemo\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             signal demo.tick {\n  scheduled_at time\n  observed_at time\n  occurrence_id string\n  missed_count int\n}\n\n\
+             source clock as ticker {\n  every 30s\n  missed coalesce\n\n\
+             \x20 observe as tick\n  emit demo.tick {\n    scheduled_at tick.scheduled_at\n    observed_at tick.observed_at\n    occurrence_id tick.occurrence_id\n    missed_count tick.missed_count\n  }\n}\n\n\
+             rule stop_on_tick\n  when demo.tick as tick\n=> {\n  complete result { ok 1 }\n}\n";
+        let mut instance = DurableInstance::create(
+            store().sql,
+            source,
+            "{}",
+            "local/ClockDemo",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        )
+        .expect("create");
+
+        // First step (well before any tick is due relative to the store's
+        // wall-clock created_at): parks, naming the next 30s occurrence.
+        let parked = instance.step(None, TEST_NOW_MS);
+        let next_due = match parked {
+            DurableStepOutcome::Parked { next_due_unix_ms } => {
+                next_due_unix_ms.expect("an interval source names its next tick")
+            }
+            other => panic!("expected a park with a wake-up, got {other:?}"),
+        };
+
+        // The alarm fires: a `now` past the tick admits the signal fact and
+        // the rule finishes the workflow.
+        assert!(
+            matches!(
+                instance.step(None, next_due + 1_000),
+                DurableStepOutcome::Terminal
+            ),
+            "the alarm re-entry admits the clock tick and finishes"
         );
         assert_eq!(
             instance.status().expect("status").as_deref(),
@@ -325,11 +842,11 @@ mod tests {
             ..DurableEffectPorts::default()
         };
         let mut instance =
-            DurableInstance::create(base.sql, source, "{}", "local/CoerceScore", ports)
+            DurableInstance::create(base.sql, source, "{}", "local/CoerceScore", ports, &[], &[])
                 .expect("create");
 
         // First step: the coerce effect suspends on `fetch`.
-        let request = match instance.step(None) {
+        let request = match instance.step(None, TEST_NOW_MS) {
             DurableStepOutcome::NeedsHttp(request) => request,
             other => panic!("expected NeedsHttp, got {other:?}"),
         };
@@ -348,7 +865,7 @@ mod tests {
         };
         assert!(
             matches!(
-                instance.step(Some(Ok(response))),
+                instance.step(Some(Ok(response)), TEST_NOW_MS),
                 DurableStepOutcome::Terminal
             ),
             "the resume settles the coerce and reaches the terminal"
@@ -405,12 +922,12 @@ mod tests {
             ..DurableEffectPorts::default()
         };
         let mut instance =
-            DurableInstance::create(base.sql, source, "{}", "local/AgentDemo", ports)
+            DurableInstance::create(base.sql, source, "{}", "local/AgentDemo", ports, &[], &[])
                 .expect("create");
 
         // First step: the agent turn's first model call suspends on `fetch`, and the
         // request is the real Anthropic messages call the model client built.
-        let request = match instance.step(None) {
+        let request = match instance.step(None, TEST_NOW_MS) {
             DurableStepOutcome::NeedsHttp(request) => request,
             other => panic!("expected NeedsHttp, got {other:?}"),
         };
@@ -437,7 +954,7 @@ mod tests {
         };
         assert!(
             matches!(
-                instance.step(Some(Ok(response))),
+                instance.step(Some(Ok(response)), TEST_NOW_MS),
                 DurableStepOutcome::Terminal
             ),
             "the resume parses the final reply, settles the turn, and reaches the terminal"
@@ -446,5 +963,169 @@ mod tests {
             instance.status().expect("status").as_deref(),
             Some("completed")
         );
+    }
+
+    /// Script hard-off Layer 2, seeding key (a) on the DO (S6d-6,
+    /// spec/std-script.md "Two layers, both required"): deploy-shipped script
+    /// capabilities register only when the program imports std.script. Same
+    /// operator scripts (key b), two programs — the importing one gets the
+    /// `script.<name>` schema/binding rows; the non-importing one (the
+    /// forged-IR analog: `exec` compiles fine outside the CLI check gate)
+    /// gets none, so its exec.command effects block at the DO admission gate.
+    #[test]
+    fn script_capabilities_seed_only_when_the_program_imports_std_script() {
+        let script_body = "read line\necho '{\"verdict\":\"pass\"}'\n";
+        let script_sha = whipplescript_kernel::exec_http::sha256_hex(script_body.as_bytes());
+        let scripts = vec![ScriptCapabilityInput {
+            name: "judge".to_owned(),
+            argv: vec!["sh".to_owned(), "{script}".to_owned()],
+            sha256: script_sha,
+            env: std::collections::BTreeMap::new(),
+            hermetic: false,
+            body: script_body.to_owned(),
+        }];
+        let body = "\n\noutput result Done\n\nclass Done {\n  ok int\n}\n\n\
+             rule go\n  when started\n=> {\n  complete result { ok 1 }\n}\n";
+        let seeded_rows = |source: String| {
+            let instance = DurableInstance::create(
+                store().sql,
+                &source,
+                "{}",
+                "local/SeedProbe",
+                DurableEffectPorts::default(),
+                &[],
+                &scripts,
+            )
+            .expect("create");
+            let kernel = instance.kernel.as_ref().expect("kernel present");
+            kernel
+                .store()
+                .sql
+                .query(
+                    "SELECT 1 FROM capability_bindings WHERE capability = 'script.judge'",
+                    &[],
+                )
+                .expect("bindings query")
+                .len()
+        };
+
+        assert_eq!(
+            seeded_rows(format!("workflow NoConsent{body}")),
+            0,
+            "no import (key a) => the operator scripts stay dormant"
+        );
+        assert_eq!(
+            seeded_rows(format!("use std.script\nworkflow Consent{body}")),
+            1,
+            "import + operator scripts => the capability row is seeded"
+        );
+    }
+}
+
+#[cfg(test)]
+mod branch_dispatch_tests {
+    use super::*;
+    use crate::do_branches::{DoBranches, DoContentBlobs};
+    use crate::do_store::test_support::store;
+    use whipplescript_store::branches::{
+        Branches, CreateBranch, CreateBranchOutcome, MAINLINE_BRANCH_ID,
+    };
+    use whipplescript_store::vcs::WorkspaceVcs;
+
+    const TEST_NOW_MS: i64 = 1_767_225_600_000;
+
+    /// DO parity for per-instance branch dispatch: an instance bound to a
+    /// branch runs its `file.write` effect through the branch working set —
+    /// the content lands as a cut on the branch (readable through the same
+    /// generic `WorkspaceVcs` the native CLI uses), the plain DO file plane
+    /// stays untouched, and the workflow still reaches its terminal.
+    #[test]
+    fn branch_bound_instance_dispatches_file_effects_onto_the_branch() {
+        let sql = Rc::new(store().sql);
+
+        // The branch exists before the instance is born on it.
+        {
+            let mut branches = DoBranches::new(Rc::clone(&sql)).expect("branch store");
+            branches.ensure_mainline("t0").expect("mainline");
+            assert!(matches!(
+                branches
+                    .create_branch(CreateBranch {
+                        branch_id: "draft_a",
+                        name: None,
+                        parent_branch_id: MAINLINE_BRANCH_ID,
+                        at_cut: None,
+                        created_at: "t0",
+                        idempotency_key: None,
+                    })
+                    .expect("create branch"),
+                CreateBranchOutcome::Created(_)
+            ));
+        }
+
+        let source = "workflow BranchDispatch\n\noutput result Result\n\n\
+             class Result {\n  status string\n}\n\n\
+             file store out_files {\n  root \"/ws\"\n}\n\n\
+             rule pick\n  when started\n=> {\n\
+             \x20 write text to out_files at \"note.md\" {\n\
+             \x20   body \"branch body\"\n    mode create\n  } as written\n\n\
+             \x20 after written succeeds as result {\n\
+             \x20   complete result {\n      status \"wrote\"\n    }\n  }\n}\n";
+        let mut instance = DurableInstance::create(
+            Rc::clone(&sql),
+            source,
+            "{}",
+            "local/BranchDispatch",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        )
+        .expect("create");
+        // Born on the branch: bind before any step runs; the live file
+        // surface swaps onto the branch working set.
+        instance.bind_branch("draft_a", "t1").expect("bind");
+        assert!(
+            matches!(
+                instance.step(None, TEST_NOW_MS),
+                DurableStepOutcome::Terminal
+            ),
+            "the branch-dispatched write settles and the instance terminates"
+        );
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed")
+        );
+
+        // The content is a cut on the branch, keyed by the resolved full
+        // path — read back through the same generic VCS the native CLI uses.
+        let vcs = WorkspaceVcs::from_parts(
+            DoBranches::new(Rc::clone(&sql)).expect("branch store"),
+            DoContentBlobs::new(Rc::clone(&sql)).expect("content blobs"),
+        );
+        assert_eq!(
+            vcs.read("draft_a", "/ws/note.md").expect("read").as_deref(),
+            Some("branch body")
+        );
+        // Mainline is isolated until a merge.
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "/ws/note.md").expect("read"),
+            None
+        );
+
+        // The plain DO file plane never saw the write.
+        let plain_rows = sql
+            .query("SELECT COUNT(*) FROM files WHERE path LIKE '%note.md'", &[])
+            .map(|rows| {
+                rows.first()
+                    .map(|row| crate::do_store::as_i64(&row[0]))
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            plain_rows, 0,
+            "a branch-bound instance's file effect must not touch the plain DO file plane"
+        );
+
+        // A rebind to a different branch is refused (write-once birth).
+        assert!(instance.bind_branch("main", "t2").is_err());
     }
 }

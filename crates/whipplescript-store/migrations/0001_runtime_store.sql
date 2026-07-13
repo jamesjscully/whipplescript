@@ -322,6 +322,59 @@ CREATE TABLE profiles (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Project-instruction documents (AGENTS.md / CLAUDE.md) for store-backed
+-- context resolution on hosts without a filesystem (context-assembly Phase 3).
+CREATE TABLE project_context_docs (
+    position INTEGER PRIMARY KEY,
+    path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    body TEXT NOT NULL
+);
+
+-- Delta-kernel result cache (compute plane P8-1): content-keyed memoization
+-- of hermetic exec results, workspace-wide (not instance-scoped). Content key
+-- = script hash + environment hash + input hashes. First writer wins; a key
+-- is immutable once recorded (same key = same canonical result by
+-- construction). Eviction joins the versioned-workspace retention policy.
+CREATE TABLE compute_result_cache (
+    content_key TEXT PRIMARY KEY,
+    effect_kind TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    source_instance_id TEXT NOT NULL,
+    source_effect_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Content-addressed file-history blobs (restorable-context RC-1). Every file
+-- body durably written through the runtime file effect is ALSO captured here,
+-- keyed by the SAME stable content hash the `file.write.completed` fact records,
+-- so a superseded version's bytes survive an overwrite (the live path->bytes
+-- store keeps only the current body). Identical bytes dedupe to one row
+-- (content-addressed). This is the byte-preservation floor a later restore slice
+-- reads through; it shares its shape with the recall content store on purpose.
+-- Captured BEFORE the write's fact commits, so no manifest hash is ever
+-- referenced without its bytes present (restorable-context INV-4 coherence).
+CREATE TABLE content_blobs (
+    id         TEXT PRIMARY KEY,
+    body       TEXT NOT NULL,
+    byte_len   INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Operator-pinned script capabilities (compute plane P8): store-backed mirror
+-- of the filesystem script manifest for hosts without a filesystem. body =
+-- full script text; sha256 = the operator pin verified at registration and
+-- re-verified by the executor before running.
+CREATE TABLE script_capabilities (
+    name TEXT PRIMARY KEY,
+    argv_json TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    env_json TEXT NOT NULL DEFAULT '{}',
+    hermetic INTEGER NOT NULL DEFAULT 0,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE skills (
     skill_id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -375,16 +428,6 @@ INSERT INTO capability_schemas (capability, description, schema_json)
 VALUES
     ('agent.tell', 'Run an agent turn through a provider harness.', '{}'),
     ('schema.coerce', 'Coerce unstructured data into a typed value.', '{}'),
-    ('loft.show', 'Read a Loft issue as JSON.', '{}'),
-    ('loft.claim', 'Claim external work before provider execution.', '{}'),
-    ('loft.renew', 'Renew a local Loft execution lease.', '{}'),
-    ('loft.release', 'Release a local Loft execution lease.', '{}'),
-    ('loft.note', 'Attach a note to a Loft issue.', '{}'),
-    ('loft.transition', 'Transition a Loft issue status.', '{}'),
-    ('loft.evidence', 'Attach structured WhippleScript evidence to Loft.', '{}'),
-    ('loft.resource_intent', 'Declare Loft resource reads and writes for coordination.', '{}'),
-    ('loft.complete', 'Complete a Loft lease and close the issue atomically.', '{}'),
-    ('loft.fail', 'Record Loft lease failure and optionally release the lease.', '{}'),
     ('human.ask', 'Request a human decision.', '{}'),
     ('event.emit', 'Emit an external event.', '{}'),
     ('workflow.invoke', 'Start and observe a child workflow.', '{}'),
@@ -399,16 +442,6 @@ INSERT INTO effect_providers (provider_id, effect_kind, provider, capability)
 VALUES
     ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell'),
     ('provider_coerce_builtin', 'schema.coerce', 'builtin-coerce', 'schema.coerce'),
-    ('provider_loft_show_builtin', 'loft.show', 'builtin-loft', 'loft.show'),
-    ('provider_loft_claim_builtin', 'loft.claim', 'builtin-loft', 'loft.claim'),
-    ('provider_loft_renew_builtin', 'loft.renew', 'builtin-loft', 'loft.renew'),
-    ('provider_loft_release_builtin', 'loft.release', 'builtin-loft', 'loft.release'),
-    ('provider_loft_note_builtin', 'loft.note', 'builtin-loft', 'loft.note'),
-    ('provider_loft_transition_builtin', 'loft.transition', 'builtin-loft', 'loft.transition'),
-    ('provider_loft_evidence_builtin', 'loft.evidence', 'builtin-loft', 'loft.evidence'),
-    ('provider_loft_resource_intent_builtin', 'loft.resource_intent', 'builtin-loft', 'loft.resource_intent'),
-    ('provider_loft_complete_builtin', 'loft.complete', 'builtin-loft', 'loft.complete'),
-    ('provider_loft_fail_builtin', 'loft.fail', 'builtin-loft', 'loft.fail'),
     ('provider_human_ask_builtin', 'human.ask', 'builtin-human-review', 'human.ask'),
     ('provider_event_emit_builtin', 'event.emit', 'builtin-event', 'event.emit'),
     ('provider_workflow_invoke_builtin', 'workflow.invoke', 'builtin-workflow-runtime', 'workflow.invoke'),
@@ -419,7 +452,7 @@ INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_c
 VALUES
     ('profile_permissive', 'permissive', 'Allow all registered capabilities.', 'audit', '["*"]'),
     ('profile_repo_reader', 'repo-reader', 'Allow repository reads and agent turns without writes.', 'enforce', '["agent.tell","repo.read","human.ask","schema.coerce","event.emit","workflow.invoke"]'),
-    ('profile_repo_writer', 'repo-writer', 'Allow repository-writing agent workflows.', 'enforce', '["agent.tell","repo.read","repo.write","command.run","loft.show","loft.claim","loft.renew","loft.release","loft.note","loft.transition","loft.evidence","loft.resource_intent","loft.complete","loft.fail","human.ask","schema.coerce","event.emit","workflow.invoke","capability.call"]'),
+    ('profile_repo_writer', 'repo-writer', 'Allow repository-writing agent workflows.', 'enforce', '["agent.tell","repo.read","repo.write","command.run","human.ask","schema.coerce","event.emit","workflow.invoke","capability.call"]'),
     ('profile_internet_research', 'internet-research', 'Allow networked research workflows.', 'enforce', '["agent.tell","internet.research","human.ask","schema.coerce","event.emit","workflow.invoke"]'),
     ('profile_human_review', 'human-review', 'Allow human review requests, answers, and read-only repository context.', 'enforce', '["human.ask","repo.read","event.emit","workflow.invoke"]');
 
@@ -427,16 +460,6 @@ INSERT INTO capability_bindings (binding_id, program_id, capability, provider)
 VALUES
     ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness'),
     ('binding_coerce_builtin', NULL, 'schema.coerce', 'builtin-coerce'),
-    ('binding_loft_show_builtin', NULL, 'loft.show', 'builtin-loft'),
-    ('binding_loft_claim_builtin', NULL, 'loft.claim', 'builtin-loft'),
-    ('binding_loft_renew_builtin', NULL, 'loft.renew', 'builtin-loft'),
-    ('binding_loft_release_builtin', NULL, 'loft.release', 'builtin-loft'),
-    ('binding_loft_note_builtin', NULL, 'loft.note', 'builtin-loft'),
-    ('binding_loft_transition_builtin', NULL, 'loft.transition', 'builtin-loft'),
-    ('binding_loft_evidence_builtin', NULL, 'loft.evidence', 'builtin-loft'),
-    ('binding_loft_resource_intent_builtin', NULL, 'loft.resource_intent', 'builtin-loft'),
-    ('binding_loft_complete_builtin', NULL, 'loft.complete', 'builtin-loft'),
-    ('binding_loft_fail_builtin', NULL, 'loft.fail', 'builtin-loft'),
     ('binding_human_ask_builtin', NULL, 'human.ask', 'builtin-human-review'),
     ('binding_event_emit_builtin', NULL, 'event.emit', 'builtin-event'),
     ('binding_workflow_invoke_builtin', NULL, 'workflow.invoke', 'builtin-workflow-runtime'),

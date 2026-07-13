@@ -42,9 +42,9 @@ schemas
     review ref<LanguageQualityReview>
     status literal<"reviewed">
 agents
-  agent codex harness=<fallback> provider=codex profile=repo-writer capacity=2 skills=[] capabilities=[] tools=[]
-  agent claude harness=<fallback> provider=claude profile=repo-writer capacity=2 skills=[] capabilities=[] tools=[]
-  agent pi harness=<fallback> provider=pi profile=repo-writer capacity=2 skills=[] capabilities=[] tools=[]
+  agent codex harness=<fallback> provider=codex profile=repo-writer capacity=2 skills=[] capabilities=[] tools=[] class=delegated
+  agent claude harness=<fallback> provider=claude profile=repo-writer capacity=2 skills=[] capabilities=[] tools=[] class=delegated
+  agent pi harness=<fallback> provider=pi profile=repo-writer capacity=2 skills=[] capabilities=[] tools=[] class=delegated
 coerces
   coerce reviewLanguageArtifact(language string, expectedScript string, artifactPath string, turnSummary string) -> ref<LanguageQualityReview>
 assertions

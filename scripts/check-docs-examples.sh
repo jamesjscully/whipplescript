@@ -50,7 +50,7 @@ check_example examples/ralph.whip
 check_example examples/owned-harness-demo.whip
 check_example examples/echo-text-tool.whip
 check_example examples/subworkflow-tool-consumer.whip --package-lock examples/subworkflow-tool-consumer.lock.json --root ConsumerFlow
-check_example examples/openclaw-lite.whip --package-lock examples/openclaw-lite.lock.json
+check_example examples/openclaw-lite.whip
 check_example examples/autoresearch-lite.whip
 check_example examples/gastown-lite.whip
 check_example examples/revision-ticket-v1.whip

@@ -4,15 +4,44 @@ name = "whipplescript-runtime"
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
 
+# Bundle the DO schema as a text module (imported by src/index.ts).
+rules = [{ type = "Text", globs = ["**/*.sql"] }]
+
 # The Durable Object holding one workflow instance. `new_sqlite_classes` gives it
 # the SQLite-backed storage the runtime store is ported to (do_store.rs / DoSql).
 [[durable_objects.bindings]]
 name = "WORKFLOW_INSTANCE"
 class_name = "WorkflowInstance"
 
+# The Class-A executor pool (compute plane P8): `whip executor` containers,
+# each paired 1:1 with an ExecutorContainer DO; the workflow DO routes
+# whip-executor/1 rounds to a getRandom-picked instance. Pool size is the
+# manual knob until platform autoscaling ships.
+[[durable_objects.bindings]]
+name = "EXECUTOR"
+class_name = "ExecutorContainer"
+
+[[containers]]
+class_name = "ExecutorContainer"
+image = "./executor/Dockerfile"
+max_instances = 4
+instance_type = "lite"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["WorkflowInstance"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["ExecutorContainer"]
+
+[vars]
+# Sentinel host for the executor pool: exec NeedsHttp rounds whose URL
+# targets this host are routed to a container stub, not the public network.
+WHIP_EXECUTOR_URL = "http://executor"
+# Sentinel host for Class-B turn containers: agent turns run whole in a
+# per-turn container (idFromName over the turn id) over whip-turn/1.
+WHIP_TURN_URL = "http://turn"
 
 # The wasm module built from the #[wasm_bindgen] surface (crate whipplescript-host-do).
 # `wasm-pack build --target bundler` emits worker/pkg/*; the bundler inlines the .wasm.

@@ -2,6 +2,8 @@
 description "Support triage — SAFE: same job, contexts separated, passes the strict policy"
 workflow SupportTriageSafe
 
+use std.messaging
+
 # Same governance policy, same data sources, same useful work — but restructured
 # so no single rule both reads confidential data and egresses, and untrusted
 # inbound content never reaches a high-integrity store. This passes `whip check`

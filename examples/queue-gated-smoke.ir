@@ -12,7 +12,7 @@ schemas
 trackers
   tracker backlog provider=builtin
 agents
-  agent worker harness=<fallback> provider=codex profile=repo-writer capacity=1 skills=[] capabilities=[] tools=[]
+  agent worker harness=<fallback> provider=codex profile=repo-writer capacity=1 skills=[] capabilities=[] tools=[] class=delegated
 assertions
   assert count(effect kind tracker.claim where status == completed) == 1
     reads

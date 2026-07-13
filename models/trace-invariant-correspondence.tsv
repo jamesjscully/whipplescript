@@ -1,0 +1,27 @@
+# Correspondence between the Rust trace-conformance checker's RICHER invariants
+# (beyond the pure effect-status transition relation covered by
+# effect-lifecycle-transitions.tsv) and the ControlPlaneLifecycle.tla invariants that
+# formalize the same guarantees.
+#
+# This is the TLA half of the trace<->model bridge. It is enforced by
+# scripts/check-trace-model-conformance.sh:
+#   - Rust side: crates/whipplescript-kernel/src/trace.rs test
+#     `richer_invariants_have_bite` builds, for each `key`, a trace that violates the
+#     invariant and asserts check_trace REJECTS it with `violation_substring`. So each
+#     richer invariant is exercised; dropping it from check_trace fails the test.
+#   - TLA side: the script asserts each `tla_invariant` is present in
+#     ControlPlaneLifecycle.tla AND conjoined into `SafetyInvariants` (so Apalache
+#     actually checks it). Removing it from the model fails the gate.
+# A row can only be added/removed by changing all three in lockstep.
+#
+# Columns: key <TAB> violation_substring <TAB> tla_invariant
+#
+key	violation_substring	tla_invariant
+dependency_ordering	before dependency on	NoClaimableEffectHasUnsatisfiedDeps
+run_starts_from_claimed	run started for effect	NoClaimedRunWithoutClaimedEffect
+terminal_from_stale_run	terminal event from stale run	TerminaledRunStaysTerminal
+terminal_not_duplicated	duplicate terminal event	NoDuplicateTerminalRunEvents
+no_claim_while_paused	claimed while instance is paused	NoNewEffectfulWorkWhilePaused
+no_claim_after_cancel	claimed after instance cancellation	NoNewEffectfulWorkAfterTerminalInstance
+blocked_not_from_terminal	blocked from invalid status	BlockedEffectIsNotTerminal
+revision_epoch_advances	did not advance epoch	RevisionEpochMatchesEvents

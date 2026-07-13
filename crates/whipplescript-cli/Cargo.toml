@@ -11,17 +11,21 @@ keywords = ["agents", "automation", "cli", "orchestration", "workflow"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-whipplescript-core = { version = "0.2.0", path = "../whipplescript-core" }
-whipplescript-kernel = { version = "0.2.0", path = "../whipplescript-kernel", default-features = false }
-whipplescript-parser = { version = "0.2.0", path = "../whipplescript-parser" }
-whipplescript-store = { version = "0.2.0", path = "../whipplescript-store" }
+whipplescript-core = { version = "0.4.0", path = "../whipplescript-core" }
+whipplescript-kernel = { version = "0.4.0", path = "../whipplescript-kernel", default-features = false }
+whipplescript-parser = { version = "0.4.0", path = "../whipplescript-parser" }
+whipplescript-store = { version = "0.4.0", path = "../whipplescript-store" }
 regex = "1"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
+# RFC6455 handshake digest for the Class-B turn server (compute plane P8).
+sha1 = "0.10"
 chrono = { version = "0.4.45", default-features = false, features = ["alloc", "std"] }
 chrono-tz = "0.10.4"
 ureq = { version = "2", features = ["json"] }
+url = "2"
+htmd = "0.5"
 
 [features]
 # Codex/Claude delegating providers are optional (DR-0024); the owned harness is

@@ -479,6 +479,8 @@ pub fn empty_ir_program() -> IrProgram {
         harnesses: Vec::new(),
         trackers: Vec::new(),
         channels: Vec::new(),
+        gauges: Vec::new(),
+        campaigns: Vec::new(),
         file_stores: Vec::new(),
         memory_pools: Vec::new(),
         events: Vec::new(),
@@ -994,7 +996,10 @@ pub fn unwrap_optional_type(ty: &IrType) -> Option<&IrType> {
 pub fn lower_rule(
     instance_id: &str,
     program_version: &str,
-    revision_epoch: &str,
+    // The composed revision-axis key component (epoch, joined by the
+    // branch/cut ref once the timeline forked) — see
+    // rule_pass::revision_branch_key. A key part only, never parsed.
+    revision_epoch_key: &str,
     ir: &IrProgram,
     rule: &IrRule,
     context: &RuleContext,
@@ -1125,7 +1130,7 @@ pub fn lower_rule(
         let effect_id = idempotency_key(&[
             instance_id,
             program_version,
-            revision_epoch,
+            revision_epoch_key,
             &rule.name,
             node_id,
             context.identity.as_deref().unwrap_or("started"),
@@ -1334,7 +1339,7 @@ pub fn lower_rule(
             let effect_id = idempotency_key(&[
                 instance_id,
                 program_version,
-                revision_epoch,
+                revision_epoch_key,
                 &rule.name,
                 &after.binding,
                 &after.predicate,
@@ -2073,7 +2078,6 @@ impl ParsedEffect {
     pub fn required_capabilities_json(&self) -> String {
         let mut capabilities = match self.kind.as_str() {
             "schema.coerce" => vec!["schema.coerce".to_owned()],
-            "loft.claim" => vec!["loft.claim".to_owned()],
             "human.ask" => vec!["human.ask".to_owned()],
             "capability.call" => Vec::new(),
             "event.emit" => vec!["event.emit".to_owned()],
@@ -2937,19 +2941,6 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 after: current_after,
             });
             index = next_index;
-        } else if trimmed.starts_with("claim ") && trimmed.contains(" with loft") {
-            effects.push(ParsedEffect {
-                timeout_seconds: parse_timeout_clause_seconds(trimmed),
-                kind: "loft.claim".to_owned(),
-                target: Some("loft".to_owned()),
-                name: Some("claim".to_owned()),
-                binding: binding_after_as(trimmed),
-                args: Vec::new(),
-                prompt: None,
-                prompt_content_type: None,
-                required_capabilities: Vec::new(),
-                after: current_after,
-            });
         } else if trimmed.starts_with("askHuman ") {
             let (prompt, next_index) = parse_prompt_from_lines(&lines, index, trimmed);
             // Typed choices declared in source drive the inbox options.
@@ -3219,7 +3210,7 @@ pub fn parsed_effect_input_json(
     let mut input = match effect.kind.as_str() {
         "agent.tell" => json!({
             "prompt": effect.prompt.as_deref().unwrap_or_default(),
-            "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::AgentTell),
+            "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::AgentTell, &ir.file_stores),
             "turn_skills": effect_turn_skills_json(rule, effect, IrEffectKind::AgentTell),
             "rule": rule.name,
             "bindings": context_bindings_json(context),
@@ -3509,11 +3500,6 @@ pub fn parsed_effect_input_json(
             }
             input
         }
-        "loft.claim" => json!({
-            "action": "claim",
-            "issue": context_bindings_json(context),
-            "rule": rule.name,
-        }),
         "human.ask" => {
             let choices = if effect.args.is_empty() {
                 json!(["accept", "revise", "block"])
@@ -3834,7 +3820,7 @@ pub fn parsed_effect_input_json(
             json!({
                 "target_workflow": effect.target,
                 "input": Value::Object(parse_record_fields(body, context, None, errors)),
-                "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::WorkflowInvoke),
+                "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::WorkflowInvoke, &ir.file_stores),
                 "bindings": context_bindings_json(context),
                 "rule": rule.name,
             })
@@ -3875,6 +3861,7 @@ pub fn effect_access_grants_json(
     rule: &IrRule,
     effect: &ParsedEffect,
     kind: IrEffectKind,
+    file_stores: &[IrFileStore],
 ) -> Value {
     let Some(node) = rule.metadata.effects.iter().find(|node| {
         if node.kind != kind {
@@ -3897,7 +3884,7 @@ pub fn effect_access_grants_json(
         node.access_grants
             .iter()
             .map(|grant| {
-                json!({
+                let mut value = json!({
                     "resource": grant.resource,
                     "operations": grant
                         .operations
@@ -3910,7 +3897,28 @@ pub fn effect_access_grants_json(
                             })
                         })
                         .collect::<Vec<_>>(),
-                })
+                });
+                // Q3 turn-grant ∩ store-policy fix: when the grant names a declared
+                // `file store`, embed that store's own policy snapshot (root + `allow
+                // read/write` globs) so the harness intersects the turn grant against
+                // the store's declared authority — a grant can never widen the store.
+                // Non-file grants (memory, command, …) carry no `store_policy`.
+                if let Some(store) = file_stores
+                    .iter()
+                    .find(|store| store.name == grant.resource)
+                {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert(
+                            "store_policy".to_owned(),
+                            json!({
+                                "root": store.root,
+                                "allow_read": store.read_globs,
+                                "allow_write": store.write_globs,
+                            }),
+                        );
+                    }
+                }
+                value
             })
             .collect(),
     )

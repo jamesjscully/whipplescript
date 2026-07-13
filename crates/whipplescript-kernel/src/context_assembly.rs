@@ -87,6 +87,33 @@ pub struct BundleProvenance {
     pub content_hash: String,
 }
 
+/// One project-instruction document (AGENTS.md / CLAUDE.md): its path (for the
+/// wrapper attribute) and verbatim content. Discovered from the filesystem on
+/// native; resolved content-addressed from the store on the durable object
+/// (context-assembly Phase 3).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectInstruction {
+    pub path: String,
+    pub content: String,
+}
+
+/// Render the `<project_context>` bundle body: each file wrapped verbatim in a
+/// `<project_instructions path="…">` element (pi's exact wrapper). Shared by
+/// the native fs-discovery path and the DO store-resolution path so both hosts
+/// inject byte-identical content.
+pub fn render_project_context(instructions: &[ProjectInstruction]) -> String {
+    let mut body = String::from("<project_context>");
+    for instruction in instructions {
+        body.push_str(&format!(
+            "\n<project_instructions path=\"{}\">\n{}\n</project_instructions>",
+            instruction.path,
+            instruction.content.trim_end()
+        ));
+    }
+    body.push_str("\n</project_context>");
+    body
+}
+
 /// The assembled system prompt plus per-bundle provenance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssembledContext {

@@ -760,7 +760,7 @@ rule record_item
 
     let store = store_path.to_str().expect("utf-8 store path");
     let program = source_path.to_str().expect("utf-8 source path");
-    let dev = run_json(
+    let dev = run_json_with_env(
         bin,
         &[
             "--store",
@@ -773,6 +773,7 @@ rule record_item
             "--until",
             "idle",
         ],
+        &[("WHIPPLESCRIPT_HTTP_SOURCE_ALLOW_PRIVATE", "1")],
     );
     let instance_id = dev
         .get("instance_id")
@@ -1119,6 +1120,264 @@ rule pick
     let _ = fs::remove_file(mv_store);
     let _ = fs::remove_file(mv_src);
     let _ = fs::remove_dir_all(mv_root);
+}
+
+/// Restorable-context RC-1: every file body durably written through the file
+/// effect is ALSO captured content-addressed into the runtime store's history
+/// blob table, keyed by the same `stable_hash_hex` the `file.write.completed`
+/// fact records. The live path->bytes store overwrites in place, so this proves
+/// the sidecar preserves the superseded version: write body X to a path, then
+/// overwrite the SAME path with body Y, and BOTH bodies remain retrievable by
+/// hash — history survived the overwrite. (Later slices restore from these.)
+#[test]
+fn dev_file_write_captures_content_addressed_history_that_survives_overwrite() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+
+    // One store + one root shared across both runs, so the blob table accumulates
+    // (it is workspace-scoped, not instance-scoped). The path is written twice.
+    let store_path = temp_store_path();
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let root = unique_temp_dir("file-history-root");
+
+    let body_x = "history body X";
+    let body_y = "history body Y";
+
+    let run = |body: &str, mode: &str| {
+        let src = temp_workflow_path("file-history");
+        fs::write(
+            &src,
+            format!(
+                r#"
+workflow WriteHistory
+
+output result Result
+
+class Result {{
+  status string
+}}
+
+file store out_files {{
+  root "{}"
+}}
+
+rule pick
+  when started
+=> {{
+  write text to out_files at "note.md" {{
+    body "{body}"
+    mode {mode}
+  }} as written
+  after written succeeds as result {{
+    complete result {{
+      status "wrote"
+    }}
+  }}
+}}
+"#,
+                root.display()
+            ),
+        )
+        .expect("write history source");
+        let dev = run_json(
+            bin,
+            &[
+                "--store",
+                store,
+                "--json",
+                "dev",
+                src.to_str().expect("utf-8 source path"),
+                "--provider",
+                "fixture",
+                "--until",
+                "idle",
+            ],
+        );
+        let instance_id = dev
+            .get("instance_id")
+            .and_then(Value::as_str)
+            .expect("instance id")
+            .to_owned();
+        let status = run_json(bin, &["--store", store, "--json", "status", &instance_id]);
+        assert_eq!(
+            status.pointer("/instance/status").and_then(Value::as_str),
+            Some("completed"),
+            "write drives the workflow to completion: {status}"
+        );
+        let _ = fs::remove_file(src);
+    };
+
+    // 1) First write: body X. 2) Overwrite the SAME path with body Y (mode
+    //    replace requires the file to already exist — it does after run 1).
+    run(body_x, "create");
+    assert_eq!(
+        fs::read_to_string(root.join("note.md")).ok(),
+        Some(body_x.to_owned()),
+        "live store holds the first body"
+    );
+    run(body_y, "replace");
+    assert_eq!(
+        fs::read_to_string(root.join("note.md")).ok(),
+        Some(body_y.to_owned()),
+        "live store now holds the overwriting body (path->bytes unchanged)"
+    );
+
+    // The blob table (same runtime store DB) must hold BOTH versions, keyed by
+    // the same FNV-1a content hash the file.write.completed fact records — so the
+    // superseded body X survived even though the live file is now Y.
+    let store_db = SqliteStore::open(&store_path).expect("reopen runtime store");
+    let hash_x = whipplescript_kernel::rule_lowering::stable_hash_hex(body_x);
+    let hash_y = whipplescript_kernel::rule_lowering::stable_hash_hex(body_y);
+    assert_eq!(
+        store_db.get_content(&hash_x).expect("get X").as_deref(),
+        Some(body_x),
+        "superseded body X survives the overwrite in the history blob store"
+    );
+    assert_eq!(
+        store_db.get_content(&hash_y).expect("get Y").as_deref(),
+        Some(body_y),
+        "the overwriting body Y is captured too"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// RC-5: `whip checkpoint` then `whip restore` round-trips the file plane. A
+/// workflow writes a file; a checkpoint captures the cut; the file is then
+/// tampered on disk; `restore` reverts it to the checkpoint content and reports
+/// the auto-checkpoint that makes the restore itself undoable.
+#[test]
+fn checkpoint_then_restore_reverts_the_file_plane() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let root = unique_temp_dir("restore-root");
+    let note = root.join("note.md");
+
+    // 1) A workflow writes note.md = "V1".
+    let src = temp_workflow_path("restore-write");
+    fs::write(
+        &src,
+        format!(
+            r#"
+workflow RestoreWrite
+
+output result Result
+
+class Result {{
+  status string
+}}
+
+file store out_files {{
+  root "{}"
+}}
+
+rule pick
+  when started
+=> {{
+  write text to out_files at "note.md" {{
+    body "V1"
+    mode create
+  }} as written
+  after written succeeds as result {{
+    complete result {{
+      status "wrote"
+    }}
+  }}
+}}
+"#,
+            root.display()
+        ),
+    )
+    .expect("write source");
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            src.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+    assert_eq!(fs::read_to_string(&note).ok(), Some("V1".to_owned()));
+
+    // 2) Checkpoint the cut.
+    let checkpoint = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "checkpoint",
+            &instance_id,
+            "--cut-id",
+            "cut-1",
+        ],
+    );
+    assert_eq!(
+        checkpoint.get("cut_id").and_then(Value::as_str),
+        Some("cut-1")
+    );
+    assert_eq!(
+        checkpoint.get("file_count").and_then(Value::as_i64),
+        Some(1),
+        "the cut manifest holds note.md: {checkpoint}"
+    );
+    // The two-plane cut: the same pass records the workspace plane's
+    // monotone high-water positions alongside the substance manifest.
+    assert!(
+        checkpoint
+            .pointer("/plane_positions/tracker_event_seq")
+            .and_then(Value::as_i64)
+            .is_some(),
+        "the cut carries workspace-plane positions: {checkpoint}"
+    );
+
+    // 3) Tamper the file on disk (drift away from the cut).
+    fs::write(&note, "TAMPERED").expect("tamper note");
+    assert_eq!(fs::read_to_string(&note).ok(), Some("TAMPERED".to_owned()));
+
+    // 4) Restore to the cut: note.md reverts to V1.
+    let restored = run_json(
+        bin,
+        &["--store", store, "--json", "restore", &instance_id, "cut-1"],
+    );
+    assert_eq!(
+        restored.get("files_written").and_then(Value::as_i64),
+        Some(1),
+        "restore wrote note.md back: {restored}"
+    );
+    assert_eq!(
+        restored.get("auto_checkpoint").and_then(Value::as_str),
+        Some("auto-before-cut-1"),
+        "restore auto-checkpoints the pre-restore head for undo: {restored}"
+    );
+    assert_eq!(
+        fs::read_to_string(&note).ok(),
+        Some("V1".to_owned()),
+        "the file plane reverted to the checkpoint content"
+    );
+
+    // 5) Restoring an unknown cut refuses (non-zero, no mutation).
+    let refused = Command::new(bin)
+        .args(["--store", store, "restore", &instance_id, "no-such-cut"])
+        .output()
+        .expect("restore runs");
+    assert!(!refused.status.success(), "unknown cut refuses");
+
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_dir_all(root);
 }
 
 /// A `file store`'s `allow read [...]` policy narrows which paths a `read` may
@@ -4819,10 +5078,8 @@ fn dev_openclaw_lite_observes_heartbeat_and_files_work() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let example = example_path("openclaw-lite.whip");
-    // openclaw-lite imports the external `memory` package, so check/dev require
-    // the committed lock (its `source.path` resolves `packages/memory.json`
-    // relative to the lock's directory, `examples/`).
-    let lock = example_path("openclaw-lite.lock.json");
+    // openclaw-lite imports `std.memory`, which ships as an embedded std
+    // manifest — no lock is needed.
     let dev = run_json(
         bin,
         &[
@@ -4835,8 +5092,6 @@ fn dev_openclaw_lite_observes_heartbeat_and_files_work() {
             "fixture",
             "--until",
             "idle",
-            "--package-lock",
-            lock.to_str().expect("utf-8 lock path"),
         ],
     );
     let instance_id = dev
@@ -4995,6 +5250,18 @@ fn dev_owned_harness_completes_turn_with_leaf_invariants() {
     assert!(
         context_bundle_rows >= 4,
         "expected one context.bundle evidence row per assembled bundle (>=4), got {context_bundle_rows}"
+    );
+
+    // DR-0034 Decision 5 (D8-2): the Managed side of the evidence fork. An owned turn
+    // is hermetic — it records full `context.bundle` provenance and NEVER a
+    // provider-assembled `context.attestation` (that tag is the Delegated path's).
+    let attestation_rows = evidence
+        .iter()
+        .filter(|item| item.get("kind").and_then(Value::as_str) == Some("context.attestation"))
+        .count();
+    assert_eq!(
+        attestation_rows, 0,
+        "a managed/owned turn must emit no context.attestation rows, got {attestation_rows}"
     );
 
     let _ = fs::remove_file(store_path);
@@ -5455,9 +5722,11 @@ rule start_native_work
         Some("text/plain")
     );
     assert_eq!(
+        // Native-fixture is a Delegated harness, so the evidence also carries the one
+        // `context.attestation` row the D8-2 fork records (DR-0034 Decision 5).
         dev.pointer("/provider_evidence/summary/total")
             .and_then(Value::as_u64),
-        Some(8)
+        Some(9)
     );
     assert_eq!(
         dev.pointer("/provider_evidence/groups/0/kind")
@@ -5598,6 +5867,125 @@ rule start_native_work
             })
             .count(),
         1
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+#[test]
+fn dev_delegated_turn_records_provider_assembled_attestation_not_context_bundles() {
+    // DR-0034 Decision 5 (D8-2): the evidence path forks on the harness class. A
+    // Delegated turn (here: native-fixture, a foreign runtime) does NOT emit the
+    // hermetic `context.bundle` provenance a Managed/owned turn records — WhippleScript
+    // did not assemble that context. It records exactly one `context.attestation` row
+    // tagged `context: provider-assembled` (provider identity, prompt hash, policy
+    // hash) so an auditor can tell from the record which guarantee the turn carries.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("delegated-attestation-fork");
+    fs::write(
+        &source_path,
+        r#"
+workflow DelegatedAttestationFork
+
+agent worker {
+  provider native-fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule start_delegated_work
+  when started
+  when worker is available
+=> {
+  tell worker "delegated context is provider-assembled"
+}
+"#,
+    )
+    .expect("write delegated attestation workflow");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            "native-fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let evidence = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "evidence",
+            instance_id,
+        ],
+    );
+    let evidence = evidence
+        .get("evidence")
+        .and_then(Value::as_array)
+        .expect("evidence array");
+
+    // A Delegated turn fabricates no hermetic provenance.
+    let context_bundle_rows = evidence
+        .iter()
+        .filter(|item| item.get("kind").and_then(Value::as_str) == Some("context.bundle"))
+        .count();
+    assert_eq!(
+        context_bundle_rows, 0,
+        "a delegated turn must emit no context.bundle rows, got {context_bundle_rows}"
+    );
+
+    // It records exactly one attestation, explicitly tagged provider-assembled.
+    let attestations: Vec<&Value> = evidence
+        .iter()
+        .filter(|item| item.get("kind").and_then(Value::as_str) == Some("context.attestation"))
+        .collect();
+    assert_eq!(
+        attestations.len(),
+        1,
+        "a delegated turn must emit exactly one context.attestation row, got {}",
+        attestations.len()
+    );
+    let attestation = attestations[0];
+    let metadata = attestation
+        .get("metadata")
+        .expect("attestation metadata object");
+    assert_eq!(
+        metadata.get("context").and_then(Value::as_str),
+        Some("provider-assembled"),
+        "attestation must be tagged provider-assembled"
+    );
+    assert_eq!(
+        metadata.get("kind").and_then(Value::as_str),
+        Some("native-fixture")
+    );
+    assert!(
+        metadata
+            .get("prompt_hash")
+            .and_then(Value::as_str)
+            .is_some_and(|hash| !hash.is_empty()),
+        "attestation must carry a prompt hash"
+    );
+    assert!(
+        metadata
+            .get("policy_hash")
+            .and_then(Value::as_str)
+            .is_some_and(|hash| !hash.is_empty()),
+        "attestation must carry a tool/permission policy hash"
     );
 
     let _ = fs::remove_file(store_path);
@@ -6615,25 +7003,175 @@ rule grab
     let _ = fs::remove_file(workflow_path);
 }
 
-/// Read the workspace-scoped builtin tracker via `whip --json items` (reads only
-/// `WHIPPLESCRIPT_ITEMS_STORE`, not the run store).
+/// Read the workspace-scoped builtin tracker via `whip --json issue list` (reads
+/// only `WHIPPLESCRIPT_ITEMS_STORE`, not the run store).
 fn tracker_items(bin: &str, items_path: &Path) -> Vec<Value> {
     let output = Command::new(bin)
         .env("WHIPPLESCRIPT_ITEMS_STORE", items_path)
-        .args(["--json", "items"])
+        .args(["--json", "issue", "list"])
         .output()
-        .expect("items runs");
+        .expect("issue list runs");
     assert!(
         output.status.success(),
-        "items failed: {}",
+        "issue list failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let text = String::from_utf8(output.stdout).expect("items stdout is utf-8");
+    let text = String::from_utf8(output.stdout).expect("issue list stdout is utf-8");
     serde_json::from_str::<Value>(&text)
-        .expect("items json")
+        .expect("issue list json")
         .as_array()
-        .expect("items json array")
+        .expect("issue list json array")
         .clone()
+}
+
+fn issue_ok(out: &std::process::Output) {
+    assert!(
+        out.status.success(),
+        "issue command failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn issue_json(out: std::process::Output) -> Value {
+    issue_ok(&out);
+    serde_json::from_slice(&out.stdout).expect("issue json output")
+}
+
+/// T5: the `whip issue` CLI drives the whole A+blockers lifecycle over the real
+/// event-sourced provider (file -> ready -> claim -> renew -> release -> finish),
+/// including CLI-vs-CLI claim contention and non-holder renew rejection.
+#[test]
+fn issue_cli_lifecycle() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let items_path = temp_store_path();
+    let run = |args: &[&str]| -> std::process::Output {
+        Command::new(bin)
+            .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
+            .args(args)
+            .output()
+            .expect("whip issue runs")
+    };
+
+    // file: the mutating command returns the full row (no show round-trip).
+    let filed = issue_json(run(&[
+        "--json",
+        "issue",
+        "new",
+        "--queue",
+        "backlog",
+        "--title",
+        "fix login",
+        "--actor",
+        "agent:a",
+    ]));
+    let id = filed["id"].as_str().expect("filed id").to_owned();
+    assert_eq!(filed["status"], "open");
+    assert_eq!(filed["filed_by"], "agent:a");
+
+    // ready: the fresh open issue projects as ready.
+    let ready = issue_json(run(&["--json", "issue", "ready", "backlog"]));
+    let ready = ready.as_array().expect("ready array");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0]["id"], filed["id"]);
+
+    // claim: full row back, status overlays `in_progress`, claimant = actor.
+    let claimed = issue_json(run(&[
+        "--json", "issue", "claim", &id, "--actor", "agent:a",
+    ]));
+    assert_eq!(claimed["claimed_by"], "agent:a");
+    assert_eq!(claimed["status"], "in_progress");
+
+    // a leased issue is no longer ready.
+    let leased_ready = issue_json(run(&["--json", "issue", "ready", "backlog"]));
+    assert!(leased_ready.as_array().expect("array").is_empty());
+
+    // contention: a second actor cannot claim the held issue.
+    let contended = run(&["issue", "claim", &id, "--actor", "agent:b"]);
+    assert!(!contended.status.success());
+    assert!(String::from_utf8_lossy(&contended.stderr).contains("already claimed by agent:a"));
+
+    // renew: holder heartbeat succeeds; a non-holder is rejected as not-held.
+    issue_ok(&run(&[
+        "--json", "issue", "renew", &id, "--actor", "agent:a",
+    ]));
+    let bad_renew = run(&["issue", "renew", &id, "--actor", "agent:b"]);
+    assert!(!bad_renew.status.success());
+    assert!(String::from_utf8_lossy(&bad_renew.stderr).contains("no active claim"));
+
+    // release: the issue re-projects as ready.
+    issue_ok(&run(&["--json", "issue", "release", &id]));
+    let reready = issue_json(run(&["--json", "issue", "ready", "backlog"]));
+    assert_eq!(reready.as_array().expect("array").len(), 1);
+
+    // finish: durable `closed`, excluded from ready.
+    let finished = issue_json(run(&[
+        "--json",
+        "issue",
+        "finish",
+        &id,
+        "--summary",
+        "done",
+    ]));
+    assert_eq!(finished["status"], "closed");
+    let done_ready = issue_json(run(&["--json", "issue", "ready", "backlog"]));
+    assert!(done_ready.as_array().expect("array").is_empty());
+
+    let _ = fs::remove_file(&items_path);
+}
+
+/// T5: `whip issue dep add <blocked> depends-on <blocker>` records a blocks edge
+/// that gates readiness — the blocked issue is not ready until the blocker
+/// closes.
+#[test]
+fn issue_cli_dep_add_gates_readiness() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let items_path = temp_store_path();
+    let run = |args: &[&str]| -> std::process::Output {
+        Command::new(bin)
+            .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
+            .args(args)
+            .output()
+            .expect("whip issue runs")
+    };
+
+    let blocker = issue_json(run(&[
+        "--json", "issue", "new", "--queue", "backlog", "--title", "blocker",
+    ]));
+    let blocked = issue_json(run(&[
+        "--json", "issue", "new", "--queue", "backlog", "--title", "blocked",
+    ]));
+    let blocker_id = blocker["id"].as_str().expect("blocker id").to_owned();
+    let blocked_id = blocked["id"].as_str().expect("blocked id").to_owned();
+
+    // both issues are ready before the dependency.
+    let before = issue_json(run(&["--json", "issue", "ready", "backlog"]));
+    assert_eq!(before.as_array().expect("array").len(), 2);
+
+    // blocked depends-on blocker => blocker blocks blocked.
+    issue_ok(&run(&[
+        "--json",
+        "issue",
+        "dep",
+        "add",
+        &blocked_id,
+        "depends-on",
+        &blocker_id,
+    ]));
+
+    // now only the blocker is ready; the blocked issue is gated.
+    let gated = issue_json(run(&["--json", "issue", "ready", "backlog"]));
+    let gated = gated.as_array().expect("array");
+    assert_eq!(gated.len(), 1);
+    assert_eq!(gated[0]["id"], blocker["id"]);
+
+    // closing the blocker frees the blocked issue.
+    issue_ok(&run(&["--json", "issue", "finish", &blocker_id]));
+    let freed = issue_json(run(&["--json", "issue", "ready", "backlog"]));
+    let freed = freed.as_array().expect("array");
+    assert_eq!(freed.len(), 1);
+    assert_eq!(freed[0]["id"], blocked["id"]);
+
+    let _ = fs::remove_file(&items_path);
 }
 
 /// Holder-lifetime cleanup of pending human asks on cancel: a cancelled
@@ -7394,13 +7932,12 @@ fn dev_capability_call_fixture_releases_agent_turn_dependency() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let workflow_path = temp_workflow_path("capability-call");
-    let lock_path = temp_workflow_path("capability-call-lock").with_extension("json");
     fs::write(
         &workflow_path,
         r#"
 workflow CapabilityCall
 
-use memory
+use std.memory
 
 class WorkItem {
   title string
@@ -7435,23 +7972,7 @@ rule recall_before_work
 "#,
     )
     .expect("workflow writes");
-    let memory_manifest =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
-    // Portable locks record `source.path` relative to the lock directory, so the
-    // manifest must live under that directory. Co-locate a copy next to the lock.
-    let manifest_copy = temp_workflow_path("capability-call-manifest").with_extension("json");
-    fs::copy(&memory_manifest, &manifest_copy).expect("copy manifest beside lock");
-    run_text(
-        bin,
-        &[
-            "package",
-            "lock",
-            "--output",
-            lock_path.to_str().expect("utf-8 lock path"),
-            manifest_copy.to_str().expect("utf-8 manifest path"),
-        ],
-    );
-
+    // `std.memory` ships embedded — no lock, no `--package-lock`.
     let dev = run_json(
         bin,
         &[
@@ -7464,8 +7985,6 @@ rule recall_before_work
             "fixture",
             "--until",
             "idle",
-            "--package-lock",
-            lock_path.to_str().expect("utf-8 lock path"),
         ],
     );
     let workers = dev
@@ -7506,7 +8025,6 @@ rule recall_before_work
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(workflow_path);
-    let _ = fs::remove_file(lock_path);
 }
 
 /// `learn ... into <pool>` then `recall <pool> ...` round-trips through the
@@ -7522,22 +8040,8 @@ fn memory_roundtrip_recalls_the_learned_item() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/memory-roundtrip.whip");
     let workflow_path = dir.join("wf.whip");
     fs::copy(&workflow_src, &workflow_path).expect("copy roundtrip example");
-    let memory_manifest =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
-    let manifest_copy = dir.join("memory.json");
-    fs::copy(&memory_manifest, &manifest_copy).expect("copy manifest beside lock");
-    let lock_path = dir.join("whip.lock");
-    run_text(
-        bin,
-        &[
-            "package",
-            "lock",
-            "--output",
-            lock_path.to_str().expect("utf-8 lock"),
-            manifest_copy.to_str().expect("utf-8 manifest"),
-        ],
-    );
 
+    // `std.memory` ships embedded, so the round-trip runs with no lock at all.
     let dev = run_json(
         bin,
         &[
@@ -7550,8 +8054,6 @@ fn memory_roundtrip_recalls_the_learned_item() {
             "fixture",
             "--until",
             "idle",
-            "--package-lock",
-            lock_path.to_str().expect("utf-8 lock"),
         ],
     );
     let instance_id = dev
@@ -7619,7 +8121,7 @@ fn memory_roundtrip_recalls_the_learned_item() {
 }
 
 /// M5 embedded-manifest payoff: the same `learn`/`recall` round-trip runs with NO
-/// `--package-lock` and no `whip.lock` anywhere. `memory` ships compiled into the
+/// `--package-lock` and no `whip.lock` anywhere. `std.memory` ships compiled into the
 /// binary, so `check` passes and `dev` executes the real file-backed provider —
 /// the recalled `MemoryContext` still carries the learned item. This is the proof
 /// that the embedded manifest removes the lock requirement for a real package.
@@ -7633,15 +8135,15 @@ fn memory_roundtrip_without_a_lock_uses_the_embedded_manifest() {
     let workflow_path = dir.join("wf.whip");
     fs::copy(&workflow_src, &workflow_path).expect("copy roundtrip example");
 
-    // `check` resolves `use memory` + the `recall`/`learn` constructs from the
-    // embedded manifest — no lock present, no `--package-lock` flag.
+    // `check` resolves `use std.memory` + the `recall`/`learn` constructs from
+    // the embedded manifest — no lock present, no `--package-lock` flag.
     let checked = Command::new(bin)
         .args(["check", workflow_path.to_str().expect("utf-8 workflow")])
         .output()
         .expect("check runs");
     assert!(
         checked.status.success(),
-        "check must pass with no lock via the embedded `memory` manifest\nstdout:\n{}\nstderr:\n{}",
+        "check must pass with no lock via the embedded `std.memory` manifest\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&checked.stdout),
         String::from_utf8_lossy(&checked.stderr)
     );
@@ -7731,7 +8233,7 @@ fn memory_pool_declaration_demo_checks_and_recalls() {
     let workflow_path = dir.join("wf.whip");
     fs::copy(&workflow_src, &workflow_path).expect("copy memory-pool demo");
 
-    // `check` resolves `use memory` from the embedded manifest (no lock) and
+    // `check` resolves `use std.memory` from the embedded manifest (no lock) and
     // renders the declared pool + its context limit in the `.ir` snapshot.
     let checked = Command::new(bin)
         .args(["check", workflow_path.to_str().expect("utf-8 workflow")])
@@ -7829,15 +8331,15 @@ fn memory_curate_dedupes_the_pool_without_a_lock() {
     let workflow_path = dir.join("wf.whip");
     fs::copy(&workflow_src, &workflow_path).expect("copy curate example");
 
-    // `check` resolves `use memory` + the `learn`/`curate`/`recall` constructs from
-    // the embedded manifest — no lock present, no `--package-lock` flag.
+    // `check` resolves `use std.memory` + the `learn`/`curate`/`recall` constructs
+    // from the embedded manifest — no lock present, no `--package-lock` flag.
     let checked = Command::new(bin)
         .args(["check", workflow_path.to_str().expect("utf-8 workflow")])
         .output()
         .expect("check runs");
     assert!(
         checked.status.success(),
-        "check must pass with no lock via the embedded `memory` manifest\nstdout:\n{}\nstderr:\n{}",
+        "check must pass with no lock via the embedded `std.memory` manifest\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&checked.stdout),
         String::from_utf8_lossy(&checked.stderr)
     );
@@ -7960,17 +8462,19 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// Write a `recall`-using `@service` workflow plus a co-located portable
+/// Write a `notes`-using `@service` workflow plus a co-located portable
 /// `whip.lock` (and its manifest copy) into `dir`, returning the workflow path.
-fn write_locked_recall_project(bin: &str, dir: &Path) -> PathBuf {
+/// The `notes` vendor package resolves only through the lock, so these projects
+/// exercise real lock discovery/mechanics.
+fn write_locked_notes_project(bin: &str, dir: &Path) -> PathBuf {
     let workflow_path = dir.join("wf.whip");
     fs::write(
         &workflow_path,
         r#"
 @service
-workflow Recall
+workflow Notes
 
-use memory
+use notes
 
 class WorkItem {
   title string
@@ -7986,7 +8490,7 @@ rule recall_before_work
   when WorkItem as item
   when worker is available
 => {
-  recall project_memory for item as context
+  call notes.query for item as context
 
   after context succeeds {
     tell worker "{{ item.title }}"
@@ -7995,10 +8499,10 @@ rule recall_before_work
 "#,
     )
     .expect("workflow writes");
-    let memory_manifest =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
-    let manifest_copy = dir.join("memory.json");
-    fs::copy(&memory_manifest, &manifest_copy).expect("copy manifest beside lock");
+    let notes_manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
+    let manifest_copy = dir.join("notes.json");
+    fs::copy(&notes_manifest, &manifest_copy).expect("copy manifest beside lock");
     run_text(
         bin,
         &[
@@ -11768,7 +12272,7 @@ fn check_discovers_lock_relative_to_workflow_file() {
     // the workflow file's directory, not just the cwd.
     let neutral_cwd = unique_temp_dir("lock-relative-cwd");
     let project_dir = unique_temp_dir("lock-relative-project");
-    let workflow_path = write_locked_recall_project(bin, &project_dir);
+    let workflow_path = write_locked_notes_project(bin, &project_dir);
 
     let output = Command::new(bin)
         .current_dir(&neutral_cwd)
@@ -11793,7 +12297,7 @@ fn check_lock_away_from_project_root_gives_actionable_hint() {
     // should say so, not just "file not found".
     let bin = env!("CARGO_BIN_EXE_whip");
     let project = unique_temp_dir("lock-hint-project");
-    let workflow = write_locked_recall_project(bin, &project);
+    let workflow = write_locked_notes_project(bin, &project);
     // Copy the generated lock into a sibling dir where `source.path` won't resolve.
     let elsewhere = unique_temp_dir("lock-hint-elsewhere");
     let misplaced = elsewhere.join("whip.lock");
@@ -11828,8 +12332,8 @@ fn check_rejects_sources_implying_different_locks() {
     let neutral_cwd = unique_temp_dir("lock-conflict-cwd");
     let project_a = unique_temp_dir("lock-conflict-a");
     let project_b = unique_temp_dir("lock-conflict-b");
-    let workflow_a = write_locked_recall_project(bin, &project_a);
-    let workflow_b = write_locked_recall_project(bin, &project_b);
+    let workflow_a = write_locked_notes_project(bin, &project_a);
+    let workflow_b = write_locked_notes_project(bin, &project_b);
 
     let output = Command::new(bin)
         .current_dir(&neutral_cwd)
@@ -11877,7 +12381,7 @@ fn check_resolves_embedded_memory_then_coexists_with_discovered_lock() {
 @service
 workflow LockDiscovery
 
-use memory
+use std.memory
 
 class WorkItem {
   title string
@@ -11913,10 +12417,10 @@ rule recall_before_work
     )
     .expect("workflow writes");
 
-    // No `whip.lock` at all: `memory` now ships as an embedded std manifest (M5),
-    // so `use memory` + `recall` resolves from the binary itself — check passes
-    // with no supply chain. (The no-lock guard for genuinely non-embedded packages
-    // is covered by `package_lock_supplies_package_import_registry`.)
+    // No `whip.lock` at all: `memory` ships as the embedded `std.memory` manifest
+    // (M5), so `use std.memory` + `recall` resolves from the binary itself — check
+    // passes with no supply chain. (The no-lock guard for genuinely non-embedded
+    // packages is covered by `package_lock_supplies_package_import_registry`.)
     let absent = Command::new(bin)
         .current_dir(&project_dir)
         .args(["check", "wf.whip"])
@@ -11931,12 +12435,14 @@ rule recall_before_work
 
     // Place a portable `whip.lock` (with its manifest co-located) in the project
     // directory and re-run check WITHOUT `--package-lock`; discovery walks up from
-    // the cwd and finds the lock. The lock and the embedded manifest must coexist
-    // (the lock wins; no duplicate-registration conflict).
-    let memory_manifest =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
-    let manifest_copy = project_dir.join("memory.json");
-    fs::copy(&memory_manifest, &manifest_copy).expect("copy manifest beside lock");
+    // the cwd and finds the lock. A lock can never claim a `std.*` name, so it
+    // supplies the unrelated `notes` package — the discovered lock and the
+    // embedded `std.memory` manifest must coexist (no duplicate-registration
+    // conflict).
+    let notes_manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
+    let manifest_copy = project_dir.join("notes.json");
+    fs::copy(&notes_manifest, &manifest_copy).expect("copy manifest beside lock");
     run_text(
         bin,
         &[
@@ -11983,7 +12489,7 @@ fn tampered_manifest_fails_lock_load_with_stable_kind() {
 @service
 workflow Tamper
 
-use memory
+use notes
 
 class WorkItem {
   title string
@@ -11999,7 +12505,7 @@ rule recall_before_work
   when WorkItem as item
   when worker is available
 => {
-  recall project_memory for item as context
+  call notes.query for item as context
 
   after context succeeds {
     tell worker "{{ item.title }}"
@@ -12008,10 +12514,10 @@ rule recall_before_work
 "#,
     )
     .expect("workflow writes");
-    let memory_manifest =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/memory.json");
-    let manifest_copy = project_dir.join("memory.json");
-    fs::copy(&memory_manifest, &manifest_copy).expect("copy manifest beside lock");
+    let notes_manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
+    let manifest_copy = project_dir.join("notes.json");
+    fs::copy(&notes_manifest, &manifest_copy).expect("copy manifest beside lock");
     run_text(
         bin,
         &[
@@ -12058,6 +12564,47 @@ rule recall_before_work
     );
 
     let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[test]
+fn package_lock_refuses_reserved_std_manifest() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("lock-reserved-std");
+    // A manifest claiming the reserved namespace: rename the notes example.
+    let manifest_json = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json"),
+    )
+    .expect("read notes manifest")
+    .replace("\"name\": \"notes\"", "\"name\": \"std.something\"");
+    let manifest_path = dir.join("std-something.json");
+    fs::write(&manifest_path, manifest_json).expect("write manifest");
+
+    let output = Command::new(bin)
+        .args([
+            "package",
+            "lock",
+            "--output",
+            dir.join("whip.lock").to_str().expect("utf-8 lock"),
+            manifest_path.to_str().expect("utf-8 manifest"),
+        ])
+        .output()
+        .expect("package lock runs");
+    assert!(
+        !output.status.success(),
+        "locking a std.* manifest must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("reserved std namespace")
+            && stderr.contains("cannot be provided by a package lock"),
+        "{stderr}"
+    );
+    assert!(
+        !dir.join("whip.lock").exists(),
+        "no lock file may be written for a refused manifest"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -15534,10 +16081,6 @@ fn check_rejects_bad_effect_payload_arguments() {
         stderr.contains("field `coerce `reviewPayload`.score` expects `int`"),
         "stderr:\n{stderr}"
     );
-    assert!(
-        stderr.contains("field `loft claim.issue` receives incompatible expression type"),
-        "stderr:\n{stderr}"
-    );
 }
 
 #[test]
@@ -17324,10 +17867,12 @@ rule startNativeWork
         Some("text/plain")
     );
     assert_eq!(
+        // Native-fixture is a Delegated harness, so the evidence also carries the one
+        // `context.attestation` row the D8-2 fork records (DR-0034 Decision 5).
         report
             .pointer("/observed/evidence/summary/total")
             .and_then(Value::as_u64),
-        Some(8)
+        Some(9)
     );
     assert_eq!(
         report
@@ -18354,6 +18899,22 @@ fn run_json(bin: &str, args: &[&str]) -> Value {
     serde_json::from_str(&text).expect("valid JSON output")
 }
 
+fn run_json_with_env(bin: &str, args: &[&str], envs: &[(&str, &str)]) -> Value {
+    let mut command = Command::new(bin);
+    command.args(args);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    let output = command.output().expect("command runs");
+    assert!(
+        output.status.success(),
+        "command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("valid JSON output")
+}
+
 fn run_text(bin: &str, args: &[&str]) -> String {
     let output = Command::new(bin).args(args).output().expect("command runs");
     assert!(
@@ -18951,4 +19512,1689 @@ workflow Solo {
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(workflow_path);
+}
+
+/// The versioned workspace end to end through the CLI (`whip branch`):
+/// create a branch off mainline, write on the branch's virtual working
+/// set (copy-on-write — mainline never sees it), merge back (certified
+/// adoption advances mainline and closes the branch as history), and a
+/// divergent same-path pair escalates as structured conflicts with
+/// NOTHING moved — resolution is an ordinary edit, then the merge
+/// adopts. Discard closes a head without deleting its content.
+#[test]
+fn branch_write_merge_conflict_roundtrip() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("branch-vcs");
+    let branches = dir.join("branches.sqlite");
+    let content = dir.join("vcs-content.sqlite");
+    let envs: &[(&str, &str)] = &[
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE",
+            branches.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            content.to_str().expect("utf-8"),
+        ),
+    ];
+    let branch = |args: &[&str]| {
+        let mut full = vec!["--json", "branch"];
+        full.extend_from_slice(args);
+        run_json_with_env(bin, &full, envs)
+    };
+
+    // Seed mainline, branch, diverge.
+    branch(&["write", "main", "notes/a.md", "--body", "base A"]);
+    let created = branch(&["create", "draft_a", "--name", "triage"]);
+    assert_eq!(
+        created
+            .pointer("/created/branch_point_cut_id")
+            .and_then(Value::as_str),
+        branch(&["show", "main"])
+            .get("head_cut_id")
+            .and_then(Value::as_str),
+        "the branch point pins mainline's head at creation"
+    );
+    branch(&["write", "draft_a", "notes/a.md", "--body", "draft A"]);
+
+    // Copy-on-write isolation, both ways.
+    assert_eq!(
+        branch(&["read", "main", "notes/a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("base A")
+    );
+    assert_eq!(
+        branch(&["read", "draft_a", "notes/a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("draft A")
+    );
+
+    // Certified merge: mainline adopts the branch content; the branch is
+    // immutable history.
+    let merged = branch(&["merge", "draft_a"]);
+    assert_eq!(merged.get("into").and_then(Value::as_str), Some("main"));
+    assert_eq!(
+        branch(&["read", "main", "notes/a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("draft A")
+    );
+    assert_eq!(
+        branch(&["show", "draft_a"])
+            .get("status")
+            .and_then(Value::as_str),
+        Some("adopted")
+    );
+
+    // A second branch conflicting with a later mainline edit escalates:
+    // non-zero exit, structured conflicts, nothing moved.
+    branch(&["create", "draft_b"]);
+    branch(&["write", "draft_b", "notes/a.md", "--body", "B version"]);
+    branch(&["write", "main", "notes/a.md", "--body", "main version"]);
+    let conflicted = Command::new(bin)
+        .args(["--json", "branch", "merge", "draft_b"])
+        .envs(
+            envs.iter()
+                .copied()
+                .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        )
+        .output()
+        .expect("merge runs");
+    assert!(
+        !conflicted.status.success(),
+        "a conflicted merge is a non-zero, nothing-moved outcome"
+    );
+    let payload: Value = serde_json::from_slice(&conflicted.stdout).expect("conflict JSON");
+    assert_eq!(
+        payload.pointer("/conflicts/0/path").and_then(Value::as_str),
+        Some("notes/a.md")
+    );
+    assert_eq!(
+        payload
+            .pointer("/conflicts/0/theirs_branch")
+            .and_then(Value::as_str),
+        Some("main")
+    );
+    assert_eq!(
+        branch(&["read", "main", "notes/a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("main version"),
+        "nothing moved on the conflicted merge"
+    );
+    assert_eq!(
+        branch(&["show", "draft_b"])
+            .get("status")
+            .and_then(Value::as_str),
+        Some("active"),
+        "the conflicted branch stays live for resolution"
+    );
+
+    // Resolution is an ordinary authored edit adopted through mainline
+    // (manual override -- plain editing is complete over states); the
+    // branch then agrees and merges clean.
+    branch(&["write", "main", "notes/a.md", "--body", "resolved"]);
+    branch(&["write", "draft_b", "notes/a.md", "--body", "resolved"]);
+    let merged_b = branch(&["merge", "draft_b"]);
+    assert_eq!(merged_b.get("into").and_then(Value::as_str), Some("main"));
+
+    // Discard closes a head; the content stays addressable history.
+    branch(&["create", "draft_c"]);
+    branch(&["write", "draft_c", "scratch.md", "--body", "scratch"]);
+    branch(&["discard", "draft_c"]);
+    assert_eq!(
+        branch(&["show", "draft_c"])
+            .get("status")
+            .and_then(Value::as_str),
+        Some("discarded")
+    );
+    assert_eq!(
+        branch(&["read", "draft_c", "scratch.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("scratch"),
+        "discard closes the head without deleting history"
+    );
+
+    // The listing shows one live mainline; --all shows the history too.
+    let active = branch(&["list"]);
+    assert_eq!(active.as_array().map(Vec::len), Some(1));
+    let all = branch(&["list", "--all"]);
+    assert_eq!(all.as_array().map(Vec::len), Some(4));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// The Phase 2 mapped-operation surface through the CLI: probe previews
+/// a merge without moving anything, status reports ahead/behind + head
+/// hash, cut names the quiescent state, restore re-points to a recorded
+/// cut as a NEW cut, fork pins lineage at a cut, reconcile-list surfaces
+/// pending flow, and the op log records every pointer movement.
+#[test]
+fn branch_probe_status_restore_and_op_log_surface() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("branch-api");
+    let branches = dir.join("branches.sqlite");
+    let content = dir.join("vcs-content.sqlite");
+    let envs: &[(&str, &str)] = &[
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE",
+            branches.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            content.to_str().expect("utf-8"),
+        ),
+    ];
+    let branch = |args: &[&str]| {
+        let mut full = vec!["--json", "branch"];
+        full.extend_from_slice(args);
+        run_json_with_env(bin, &full, envs)
+    };
+
+    branch(&["write", "main", "a.md", "--body", "base"]);
+    branch(&["create", "draft_a"]);
+    branch(&["write", "draft_a", "a.md", "--body", "draft"]);
+
+    // Probe: a clean preview naming the changed path; nothing moves.
+    let probe = branch(&["probe", "draft_a"]);
+    assert_eq!(probe.get("probe").and_then(Value::as_str), Some("clean"));
+    assert_eq!(
+        probe.pointer("/changed_paths/0").and_then(Value::as_str),
+        Some("a.md")
+    );
+    assert_eq!(
+        branch(&["read", "main", "a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("base"),
+        "the probe moved nothing"
+    );
+
+    // Review-grade diff against the branch point: line-level hunks.
+    let diff = branch(&["diff", "draft_a"]);
+    assert_eq!(
+        diff.pointer("/entries/0/path").and_then(Value::as_str),
+        Some("a.md")
+    );
+    assert_eq!(
+        diff.pointer("/entries/0/kind").and_then(Value::as_str),
+        Some("modified")
+    );
+    assert_eq!(
+        diff.pointer("/entries/0/hunks/0/lines/0/tag")
+            .and_then(Value::as_str),
+        Some("removed")
+    );
+    assert_eq!(
+        diff.pointer("/entries/0/hunks/0/lines/0/text")
+            .and_then(Value::as_str),
+        Some("base")
+    );
+    assert_eq!(
+        diff.pointer("/entries/0/hunks/0/lines/1/text")
+            .and_then(Value::as_str),
+        Some("draft")
+    );
+
+    // Status: ahead on a.md, not behind, with head hash plumbing.
+    let status = branch(&["status", "draft_a"]);
+    assert_eq!(
+        status.pointer("/ahead_paths/0").and_then(Value::as_str),
+        Some("a.md")
+    );
+    assert_eq!(status.get("behind").and_then(Value::as_bool), Some(false));
+    assert!(status
+        .pointer("/branch/head_manifest_hash")
+        .and_then(Value::as_str)
+        .is_some());
+
+    // Reconcile-list surfaces the pending divergence.
+    let pending = branch(&["reconcile-list"]);
+    assert_eq!(
+        pending.pointer("/0/branch_id").and_then(Value::as_str),
+        Some("draft_a")
+    );
+    assert_eq!(
+        pending.pointer("/0/ahead_paths").and_then(Value::as_i64),
+        Some(1)
+    );
+
+    // Cut-at-quiescence names the head cut (turn-finalize).
+    let cut = branch(&["cut", "draft_a"]);
+    let named_cut = cut
+        .get("cut_id")
+        .and_then(Value::as_str)
+        .expect("cut id")
+        .to_owned();
+
+    // Advance past the cut, then restore back to it: a NEW cut carrying
+    // the old state — no history rewind.
+    branch(&["write", "draft_a", "a.md", "--body", "later"]);
+    let restored = branch(&["restore", "draft_a", &named_cut]);
+    assert_eq!(
+        restored.get("restored").and_then(Value::as_str),
+        Some("draft_a")
+    );
+    assert_eq!(
+        branch(&["read", "draft_a", "a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("draft"),
+        "restore re-pointed the head to the named cut's state"
+    );
+
+    // Fork with lineage pinned at the named cut.
+    let forked = branch(&[
+        "fork", "fork_1", "--from", "draft_a", "--at-cut", &named_cut,
+    ]);
+    assert_eq!(
+        forked
+            .pointer("/forked/branch_point_cut_id")
+            .and_then(Value::as_str),
+        Some(named_cut.as_str())
+    );
+
+    // The op log recorded every pointer movement, newest first.
+    let ops = branch(&["ops"]);
+    let kinds: Vec<&str> = ops
+        .as_array()
+        .expect("ops array")
+        .iter()
+        .filter_map(|op| op.get("kind").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["create", "restore", "write", "write", "create", "write"],
+        "the op log is the reflog, first-class"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// The interactive VCS surface end to end: the selection algebra
+/// (select / undo with dry-run default + stranding refusal / adopt-only),
+/// structured conflicts with per-item resolution and memory, op-undo of
+/// a selective undo, and the archaeology views (attribution, log,
+/// checkout-free bisect).
+#[test]
+fn branch_selective_verbs_conflicts_and_archaeology() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("branch-selective");
+    let branches = dir.join("branches.sqlite");
+    let content = dir.join("vcs-content.sqlite");
+    let envs: &[(&str, &str)] = &[
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE",
+            branches.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            content.to_str().expect("utf-8"),
+        ),
+    ];
+    let branch = |args: &[&str]| {
+        let mut full = vec!["--json", "branch"];
+        full.extend_from_slice(args);
+        run_json_with_env(bin, &full, envs)
+    };
+    let branch_expect_fail = |args: &[&str]| {
+        let mut full = vec!["--json", "branch"];
+        full.extend_from_slice(args);
+        let out = Command::new(bin)
+            .args(&full)
+            .envs(
+                envs.iter()
+                    .copied()
+                    .map(|(k, v)| (k.to_owned(), v.to_owned())),
+            )
+            .output()
+            .expect("runs");
+        assert!(!out.status.success(), "expected a refusal for {args:?}");
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+
+    branch(&["create", "draft_a"]);
+    branch(&["write", "draft_a", "p1.md", "--body", "e1 out"]);
+    branch(&["write", "draft_a", "p2.md", "--body", "e2 out"]);
+    branch(&["write", "draft_a", "p2.md", "--body", "e3 out"]);
+
+    // The selection surface: two units on p2.md.
+    let selected = branch(&["select", "draft_a", "path(p2.md)"]);
+    assert_eq!(selected.as_array().map(Vec::len), Some(2));
+    let e2_cut = selected
+        .pointer("/0/cut_id")
+        .and_then(Value::as_str)
+        .expect("cut id")
+        .to_owned();
+
+    // Undo is dry-run by default: the plan for the stranding selection
+    // NAMES what it would strand, and nothing moves.
+    let dry = branch(&["undo", "draft_a", &format!("cut({e2_cut})")]);
+    assert_eq!(dry.get("dry_run").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        dry.pointer("/plan/stranded")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    // Applying the stranding selection refuses.
+    let stderr = branch_expect_fail(&["undo", "draft_a", &format!("cut({e2_cut})"), "--apply"]);
+    assert!(stderr.contains("strands"), "got: {stderr}");
+    assert_eq!(
+        branch(&["read", "draft_a", "p2.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("e3 out"),
+        "a refused undo moves nothing"
+    );
+    // The closure repairs it; the apply proposes the counterfactual cut.
+    let undone = branch(&[
+        "undo",
+        "draft_a",
+        &format!("dependents-of(cut({e2_cut}))"),
+        "--apply",
+    ]);
+    assert_eq!(
+        undone.get("undone").and_then(Value::as_str),
+        Some("draft_a")
+    );
+    let read_gone = Command::new(bin)
+        .args(["--json", "branch", "read", "draft_a", "p2.md"])
+        .envs(
+            envs.iter()
+                .copied()
+                .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        )
+        .output()
+        .expect("runs");
+    assert!(!read_gone.status.success(), "p2.md was undone");
+    // Op-undo of the selective undo brings it straight back.
+    let opundo = branch(&["undo-op"]);
+    assert!(opundo.get("undone").is_some());
+    assert_eq!(
+        branch(&["read", "draft_a", "p2.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("e3 out"),
+        "undo-op reverses the selective undo"
+    );
+
+    // Structured conflicts: divergent same-path edits escalate, the
+    // conflict object is recorded with provenance, resolution is
+    // per-item and the branch then merges clean.
+    branch(&["write", "main", "clash.md", "--body", "base"]);
+    branch(&["create", "draft_b"]);
+    branch(&["write", "draft_b", "clash.md", "--body", "ours"]);
+    branch(&["write", "main", "clash.md", "--body", "theirs"]);
+    branch_expect_fail(&["merge", "draft_b"]);
+    let conflicts = branch(&["conflicts", "draft_b"]);
+    assert_eq!(
+        conflicts.pointer("/0/path").and_then(Value::as_str),
+        Some("clash.md")
+    );
+    assert_eq!(
+        conflicts.pointer("/0/theirs_label").and_then(Value::as_str),
+        Some("main")
+    );
+    let resolved = branch(&["resolve", "draft_b", "clash.md", "--body", "ours + theirs"]);
+    assert!(resolved.get("resolution").and_then(Value::as_str).is_some());
+    let merged = branch(&["merge", "draft_b"]);
+    assert_eq!(merged.get("into").and_then(Value::as_str), Some("main"));
+    assert_eq!(
+        branch(&["read", "main", "clash.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("ours + theirs")
+    );
+
+    // Archaeology: attribution names the last writer per path; the log
+    // walks recorded cuts; bisect finds the first bad cut checkout-free.
+    let attribution = branch(&["attribution", "draft_a"]);
+    let p1 = attribution
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row.get("path").and_then(Value::as_str) == Some("p1.md"))
+        .expect("p1 attribution");
+    assert_eq!(
+        p1.get("origin").and_then(Value::as_str),
+        Some("write:p1.md")
+    );
+    let log = branch(&["log", "draft_a"]);
+    assert!(log.as_array().map(Vec::len).unwrap_or(0) >= 4);
+
+    // Bisect over a fresh chain: v1..v4 of quality.md, "bug" enters at v3.
+    branch(&["create", "draft_c"]);
+    branch(&["write", "draft_c", "quality.md", "--body", "v1 fine"]);
+    branch(&["write", "draft_c", "quality.md", "--body", "v2 fine"]);
+    branch(&["write", "draft_c", "quality.md", "--body", "v3 bug"]);
+    branch(&["write", "draft_c", "quality.md", "--body", "v4 bug"]);
+    let chain = branch(&["log", "draft_c"]);
+    let cuts: Vec<&str> = chain
+        .as_array()
+        .expect("cuts")
+        .iter()
+        .filter_map(|cut| cut.get("cut_id").and_then(Value::as_str))
+        .collect();
+    // Newest first: cuts[0]=v4(bad), cuts[3]=v1(good).
+    let verdict = branch(&[
+        "bisect",
+        "draft_c",
+        "--good",
+        cuts[3],
+        "--bad",
+        cuts[0],
+        "--run",
+        "! grep -q bug quality.md",
+    ]);
+    assert_eq!(
+        verdict.get("first_bad_cut").and_then(Value::as_str),
+        Some(cuts[1]),
+        "the v3 cut introduced the bug"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Per-instance effect dispatch onto branch working sets: `whip dev
+/// --branch` binds the instance at birth, so its `file.write` effect
+/// resolves through the branch's COW working set — the real directory
+/// stays untouched, the content lands as a cut on the branch (keyed by
+/// the resolved full path), mainline sees nothing until the branch merges,
+/// and the write settles normally so the workflow completes.
+#[test]
+fn dev_branch_dispatches_file_effects_onto_the_branch_working_set() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let dir = unique_temp_dir("branch-dispatch");
+    let branches = dir.join("branches.sqlite");
+    let content = dir.join("vcs-content.sqlite");
+    let envs: &[(&str, &str)] = &[
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE",
+            branches.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            content.to_str().expect("utf-8"),
+        ),
+    ];
+    let root = dir.join("file-root");
+    fs::create_dir_all(&root).expect("root dir");
+    let note = root.join("note.md");
+
+    let src = temp_workflow_path("branch-dispatch");
+    fs::write(
+        &src,
+        format!(
+            r#"
+workflow BranchDispatch
+
+output result Result
+
+class Result {{
+  status string
+}}
+
+file store out_files {{
+  root "{}"
+}}
+
+rule pick
+  when started
+=> {{
+  write text to out_files at "note.md" {{
+    body "branch body"
+    mode create
+  }} as written
+  after written succeeds as result {{
+    complete result {{
+      status "wrote"
+    }}
+  }}
+}}
+"#,
+            root.display()
+        ),
+    )
+    .expect("write source");
+
+    // The branch must exist before an instance can be born on it.
+    run_json_with_env(bin, &["--json", "branch", "create", "draft_a"], envs);
+
+    let dev = run_json_with_env(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            src.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+            "--branch",
+            "draft_a",
+        ],
+        envs,
+    );
+    assert!(
+        dev.pointer("/workers/0/terminal_events/0").is_some(),
+        "the branch-dispatched write settles and the workflow reaches a terminal: {dev}"
+    );
+
+    // The real directory never saw the write.
+    assert!(
+        !note.exists(),
+        "a branch-bound instance's file effect must not touch the real root"
+    );
+
+    // The branch holds the content, keyed by the resolved full path.
+    let full_path = note.to_string_lossy().into_owned();
+    let on_branch = run_json_with_env(
+        bin,
+        &["--json", "branch", "read", "draft_a", &full_path],
+        envs,
+    );
+    assert_eq!(
+        on_branch.get("body").and_then(Value::as_str),
+        Some("branch body")
+    );
+
+    // Mainline sees nothing until the branch merges — then everything.
+    let on_main = Command::new(bin)
+        .args(["--json", "branch", "read", "main", &full_path])
+        .envs(
+            envs.iter()
+                .copied()
+                .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        )
+        .output()
+        .expect("read runs");
+    assert!(!on_main.status.success(), "mainline is isolated pre-merge");
+    run_json_with_env(bin, &["--json", "branch", "merge", "draft_a"], envs);
+    let merged = run_json_with_env(bin, &["--json", "branch", "read", "main", &full_path], envs);
+    assert_eq!(
+        merged.get("body").and_then(Value::as_str),
+        Some("branch body")
+    );
+
+    // An unbound instance on the same workspace still writes natively.
+    let dev_native = run_json_with_env(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            src.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+        envs,
+    );
+    assert!(
+        dev_native.pointer("/workers/0/terminal_events/0").is_some(),
+        "the unbound run reaches a terminal natively: {dev_native}"
+    );
+    assert_eq!(
+        fs::read_to_string(&note).ok(),
+        Some("branch body".to_owned()),
+        "an unbound instance writes through to the real root"
+    );
+
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// The web tools (accepted 2026-07-07 design notes, built v0.4): `web_fetch`
+/// is exposed only under `with access to web { fetch }` and every fetch runs
+/// through the central guard — a private/metadata address is refused with a
+/// typed blocked-by-policy failure BEFORE any connection exists, so this
+/// e2e is deterministic offline. The refusal is recorded in the turn like
+/// any tool result.
+#[test]
+fn owned_turn_web_fetch_guard_refuses_private_targets() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("web-fetch-guard");
+    let store_path = dir.join("store.sqlite");
+    let store = store_path.to_str().expect("utf-8 store path");
+    let ws = dir.join("workspace");
+    fs::create_dir_all(&ws).expect("workspace");
+    let src = dir.join("web.whip");
+    fs::write(
+        &src,
+        r#"
+workflow WebFetchGuard
+
+output result Done
+
+class Done {
+  note string
+}
+
+agent helper {
+  provider owned
+  profile "repo-reader"
+  capacity 1
+}
+
+rule begin
+  when started
+  when helper is available
+=> {
+  tell helper as turn
+    with access to web {
+      fetch
+    }
+  """
+  Fetch the metadata endpoint.
+  """
+
+  after turn succeeds {
+    complete result { note "done" }
+  }
+}
+"#,
+    )
+    .expect("write workflow");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store,
+            "--json",
+            "dev",
+            src.to_str().expect("utf-8 source path"),
+            "--provider",
+            "owned",
+            "--until",
+            "idle",
+        ])
+        .env(
+            "WHIPPLESCRIPT_OWNED_FIXTURE_TOOL",
+            r#"web_fetch:{"url":"http://169.254.169.254/latest/meta-data/"}"#,
+        )
+        .env("WHIPPLESCRIPT_HARNESS_WORKSPACE", &ws)
+        .output()
+        .expect("dev runs");
+    assert!(
+        output.status.success(),
+        "dev failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let json_start = stdout.find(['{', '[']).expect("json output");
+    let dev: Value = serde_json::from_str(&stdout[json_start..]).expect("dev json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    // The guard refusal is a recorded tool result inside the turn transcript:
+    // typed blocked-by-policy, never a connection.
+    let log = run_json(bin, &["--store", store, "--json", "log", instance_id]);
+    let transcript_text = log
+        .as_array()
+        .expect("event array")
+        .iter()
+        .filter(|event| {
+            event.get("event_type").and_then(Value::as_str)
+                == Some("agent.turn.brokered.transcript")
+        })
+        .map(|event| {
+            event
+                .get("payload")
+                .map(|payload| payload.to_string())
+                .unwrap_or_default()
+        })
+        .collect::<String>();
+    assert!(
+        transcript_text.contains("blocked-by-policy"),
+        "the metadata fetch must be refused by the guard: {transcript_text}"
+    );
+    assert!(
+        transcript_text.contains("never fetchable"),
+        "the refusal names the policy: {transcript_text}"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Store-seam Phase 5: `whip handles` exposes the stable pointers an
+/// external policy authority admits decisions against (event position,
+/// effect ids, workspace cut ids), and `whip checkpoint
+/// --external-positions` records the position PAIR — the authority's own
+/// scope positions and the workspace cut id inside one fenced event — so a
+/// cross-store backup restores both stores to one coherent coordinate.
+#[test]
+fn handles_expose_pointers_and_checkpoint_records_position_pair() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("seam-handles");
+    let store_path = dir.join("store.sqlite");
+    let store = store_path.to_str().expect("utf-8 store path");
+    let branches = dir.join("branches.sqlite");
+    let content = dir.join("vcs-content.sqlite");
+    let root = dir.join("file-root");
+    fs::create_dir_all(&root).expect("root");
+    let envs: &[(&str, &str)] = &[
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE",
+            branches.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            content.to_str().expect("utf-8"),
+        ),
+    ];
+    let src = dir.join("seam.whip");
+    fs::write(
+        &src,
+        format!(
+            r#"
+workflow SeamHandles
+
+output result Result
+
+class Result {{
+  status string
+}}
+
+file store out_files {{
+  root "{}"
+}}
+
+rule pick
+  when started
+=> {{
+  write text to out_files at "note.md" {{
+    body "seam body"
+    mode create
+  }} as written
+  after written succeeds as result {{
+    complete result {{
+      status "wrote"
+    }}
+  }}
+}}
+"#,
+            root.display()
+        ),
+    )
+    .expect("write source");
+
+    run_json_with_env(bin, &["--json", "branch", "create", "seam_line"], envs);
+    let dev = run_json_with_env(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            src.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+            "--branch",
+            "seam_line",
+        ],
+        envs,
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // The position-pair cut: external scope positions ride the same fenced
+    // event as the workspace cut id.
+    let checkpoint = run_json_with_env(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "checkpoint",
+            &instance_id,
+            "--cut-id",
+            "pair_cut_1",
+            "--external-positions",
+            r#"{"gauge_ledger_seq": 42, "scope": "org/acme"}"#,
+        ],
+        envs,
+    );
+    assert_eq!(
+        checkpoint.get("cut_id").and_then(Value::as_str),
+        Some("pair_cut_1")
+    );
+
+    let handles = run_json_with_env(
+        bin,
+        &["--store", store, "--json", "handles", &instance_id],
+        envs,
+    );
+    assert_eq!(
+        handles.get("schema").and_then(Value::as_str),
+        Some("whipplescript.handles.v0")
+    );
+    assert!(
+        handles
+            .pointer("/event_position/sequence")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            > 0
+    );
+    assert!(
+        !handles
+            .get("effects")
+            .and_then(Value::as_array)
+            .expect("effect ids")
+            .is_empty(),
+        "effect ids are referenceable: {handles}"
+    );
+    assert_eq!(
+        handles
+            .pointer("/workspace/branch_id")
+            .and_then(Value::as_str),
+        Some("seam_line")
+    );
+    assert!(
+        handles
+            .pointer("/workspace/head_cut_id")
+            .and_then(Value::as_str)
+            .is_some(),
+        "the branch head cut id is a referenceable handle: {handles}"
+    );
+    assert_eq!(
+        handles
+            .pointer("/position_pair/cut_id")
+            .and_then(Value::as_str),
+        Some("pair_cut_1")
+    );
+    assert_eq!(
+        handles
+            .pointer("/position_pair/external/gauge_ledger_seq")
+            .and_then(Value::as_i64),
+        Some(42),
+        "the external scope positions ride the same fenced event: {handles}"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Phase 3 fork item (chat fork over branches; chat-fork.maude): `whip fork`
+/// births a new instance whose agent thread seeds from the source's
+/// completed turns and whose file surface is a FRESH branch forked at the
+/// source line's head, bound at birth — one quiescent coordinate for both
+/// planes. The fork continues the conversation with the seeded context and
+/// its writes land on its OWN line; the source's thread and branch never
+/// move.
+#[test]
+fn fork_seeds_thread_and_mints_own_branch_line() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("chat-fork");
+    let store_path = dir.join("store.sqlite");
+    let store = store_path.to_str().expect("utf-8 store path");
+    let branches = dir.join("branches.sqlite");
+    let content = dir.join("vcs-content.sqlite");
+    let ws = dir.join("workspace");
+    fs::create_dir_all(&ws).expect("workspace dir");
+    let root = dir.join("file-root");
+    fs::create_dir_all(&root).expect("file root");
+    let envs: &[(&str, &str)] = &[
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE",
+            branches.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            content.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_HARNESS_WORKSPACE",
+            ws.to_str().expect("utf-8"),
+        ),
+    ];
+
+    let src = dir.join("chat.whip");
+    fs::write(
+        &src,
+        format!(
+            r#"
+workflow ChatForkSmoke
+
+signal user.message {{
+  text string
+}}
+
+file store out_files {{
+  root "{}"
+}}
+
+agent helper {{
+  provider owned
+  profile "repo-reader"
+  capacity 1
+  thread continue
+}}
+
+rule greet
+  when started
+  when helper is available
+=> {{
+  tell helper "the codeword is heliotrope"
+  write text to out_files at "note.md" {{
+    body "source turn body"
+    mode create
+  }} as noted
+}}
+
+rule follow_up
+  when user.message as m
+  when helper is available
+=> {{
+  tell helper "what is the codeword?"
+  write text to out_files at "fork-note.md" {{
+    body "written on the fork line"
+    mode create
+  }} as forked_note
+}}
+"#,
+            root.display()
+        ),
+    )
+    .expect("write workflow");
+    let program = src.to_str().expect("utf-8 source path");
+
+    // The source chat instance: born on its own line, one completed turn.
+    run_json_with_env(bin, &["--json", "branch", "create", "chat_main"], envs);
+    let dev = run_json_with_env(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            program,
+            "--provider",
+            "owned",
+            "--until",
+            "idle",
+            "--branch",
+            "chat_main",
+        ],
+        envs,
+    );
+    let source_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("source instance id")
+        .to_owned();
+    let source_head = run_json_with_env(bin, &["--json", "branch", "show", "chat_main"], envs);
+    let source_head_hash = source_head
+        .get("head_manifest_hash")
+        .and_then(Value::as_str)
+        .expect("source head")
+        .to_owned();
+
+    // The fork: thread seeded, fresh branch at the source head, bound at birth.
+    let fork = run_json_with_env(bin, &["--store", store, "--json", "fork", &source_id], envs);
+    let target_id = fork
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("fork instance id")
+        .to_owned();
+    assert_ne!(target_id, source_id);
+    assert_eq!(fork.get("agent").and_then(Value::as_str), Some("helper"));
+    assert!(
+        fork.get("seeded_messages").and_then(Value::as_u64) >= Some(2),
+        "the seed carries the source turn (user + assistant): {fork}"
+    );
+    let fork_branch = fork
+        .pointer("/branch/fork_branch_id")
+        .and_then(Value::as_str)
+        .expect("fork branch id")
+        .to_owned();
+    assert_eq!(
+        fork.pointer("/branch/source_branch_id")
+            .and_then(Value::as_str),
+        Some("chat_main")
+    );
+    let shown = run_json_with_env(bin, &["--json", "branch", "show", &fork_branch], envs);
+    assert_eq!(
+        shown.get("parent_branch_id").and_then(Value::as_str),
+        Some("chat_main")
+    );
+    assert_eq!(
+        shown.get("head_manifest_hash").and_then(Value::as_str),
+        Some(source_head_hash.as_str()),
+        "the fork line starts exactly at the source line's head"
+    );
+    // The fork inherits the source turn's file state through its own line.
+    let note_key = root.join("note.md").to_string_lossy().into_owned();
+    let inherited = run_json_with_env(
+        bin,
+        &["--json", "branch", "read", &fork_branch, &note_key],
+        envs,
+    );
+    assert_eq!(
+        inherited.get("body").and_then(Value::as_str),
+        Some("source turn body")
+    );
+    // The seed event records the conversation and its exact source coordinate.
+    let fork_log = run_json_with_env(bin, &["--store", store, "--json", "log", &target_id], envs);
+    let fork_events = fork_log.as_array().expect("fork event array");
+    let seeded = fork_events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("agent.thread.seeded")
+        })
+        .expect("thread seed event");
+    assert!(
+        seeded
+            .get("payload")
+            .map(|payload| payload.to_string())
+            .unwrap_or_default()
+            .contains("heliotrope"),
+        "the seeded thread carries the source conversation"
+    );
+    assert_eq!(
+        seeded
+            .pointer("/payload/source_instance_id")
+            .and_then(Value::as_str),
+        Some(source_id.as_str())
+    );
+    assert!(fork_events.iter().any(|event| {
+        event.get("event_type").and_then(Value::as_str) == Some("branch.bound")
+            && event.pointer("/payload/branch_id").and_then(Value::as_str)
+                == Some(fork_branch.as_str())
+    }));
+
+    // Drive the fork with a new user message: the turn continues from the
+    // seeded thread and the rule's write lands on the fork's line only.
+    run_json_with_env(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "signal",
+            &target_id,
+            "--name",
+            "user.message",
+            "--data",
+            r#"{"text":"what is the codeword?"}"#,
+            "--program",
+            program,
+        ],
+        envs,
+    );
+    let mut command = Command::new(bin);
+    command.args(["--store", store, "step", &target_id, "--program", program]);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    assert!(command.output().expect("step runs").status.success());
+    let mut worker = Command::new(bin);
+    worker.args([
+        "--store",
+        store,
+        "--json",
+        "worker",
+        &target_id,
+        "--provider",
+        "owned",
+        "--program",
+        program,
+    ]);
+    for (name, value) in envs {
+        worker.env(name, value);
+    }
+    let worker_out = worker.output().expect("worker runs");
+    assert!(
+        worker_out.status.success(),
+        "worker failed: {}",
+        String::from_utf8_lossy(&worker_out.stderr)
+    );
+
+    // The fork's turn saw the seeded conversation (thread continuation
+    // across the fork boundary).
+    let fork_log = run_json_with_env(bin, &["--store", store, "--json", "log", &target_id], envs);
+    let fork_events = fork_log.as_array().expect("fork event array");
+    let transcript = fork_events
+        .iter()
+        .rfind(|event| {
+            event.get("event_type").and_then(Value::as_str)
+                == Some("agent.turn.brokered.transcript")
+        })
+        .expect("fork turn transcript");
+    let transcript_text = transcript
+        .get("payload")
+        .map(|payload| payload.to_string())
+        .unwrap_or_default();
+    assert!(
+        transcript_text.contains("heliotrope"),
+        "the fork's turn ran over the seeded thread: {transcript_text}"
+    );
+    assert_eq!(
+        fork_events
+            .iter()
+            .filter(|event| event.get("event_type").and_then(Value::as_str)
+                == Some("agent.turn.completed"))
+            .count(),
+        1,
+        "the fork completed its own turn"
+    );
+
+    // Divergence: the fork's write is on the fork's line only, never the
+    // source's line, never the real root.
+    let fork_note_key = root.join("fork-note.md").to_string_lossy().into_owned();
+    let on_fork = run_json_with_env(
+        bin,
+        &["--json", "branch", "read", &fork_branch, &fork_note_key],
+        envs,
+    );
+    assert_eq!(
+        on_fork.get("body").and_then(Value::as_str),
+        Some("written on the fork line")
+    );
+    let mut on_source_line = Command::new(bin);
+    on_source_line.args(["--json", "branch", "read", "chat_main", &fork_note_key]);
+    for (name, value) in envs {
+        on_source_line.env(name, value);
+    }
+    assert!(
+        !on_source_line.output().expect("read runs").status.success(),
+        "the fork's write never reaches the source's line"
+    );
+    assert!(
+        !root.join("fork-note.md").exists(),
+        "the fork's write never touches the real root"
+    );
+
+    // The source never moved: same branch head, still exactly one
+    // completed turn on its log.
+    let source_after = run_json_with_env(bin, &["--json", "branch", "show", "chat_main"], envs);
+    assert_eq!(
+        source_after
+            .get("head_manifest_hash")
+            .and_then(Value::as_str),
+        Some(source_head_hash.as_str()),
+        "the source line's head never moves under the fork"
+    );
+    let source_log = run_json_with_env(bin, &["--store", store, "--json", "log", &source_id], envs);
+    assert_eq!(
+        source_log
+            .as_array()
+            .expect("source event array")
+            .iter()
+            .filter(|event| event.get("event_type").and_then(Value::as_str)
+                == Some("agent.turn.completed"))
+            .count(),
+        1,
+        "the source's thread is untouched by the fork's turn"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Materialize-on-exec + import-back: a branch-bound instance's raw exec
+/// runs inside a real scratch directory projected from the branch's
+/// manifest — the command reads a materialized branch file with ordinary
+/// POSIX I/O and writes a new one — and the diff imports back as one
+/// effect-keyed cut: the output lands on the branch, the unchanged input
+/// is not re-recorded, and the scratch directory is cleaned up.
+#[test]
+fn branch_bound_exec_materializes_and_imports_back() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let dir = unique_temp_dir("exec-materialize");
+    let branches = dir.join("branches.sqlite");
+    let content = dir.join("vcs-content.sqlite");
+    let envs: &[(&str, &str)] = &[
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE",
+            branches.to_str().expect("utf-8"),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            content.to_str().expect("utf-8"),
+        ),
+        ("WHIPPLESCRIPT_EXEC_ALLOW", "cat *"),
+    ];
+
+    // Seed the branch with the exec's input file (relative key).
+    run_json_with_env(bin, &["--json", "branch", "create", "draft_a"], envs);
+    run_json_with_env(
+        bin,
+        &[
+            "--json",
+            "branch",
+            "write",
+            "draft_a",
+            "ws/in.md",
+            "--body",
+            "seed-content",
+        ],
+        envs,
+    );
+
+    let src = temp_workflow_path("exec-materialize");
+    fs::write(
+        &src,
+        r#"
+use std.script
+workflow ExecOnBranch
+
+output result Report
+
+class Report {
+  message string
+}
+
+rule go
+  when started
+=> {
+  exec "cat ws/in.md > out.txt" as run
+
+  after run succeeds {
+    complete result {
+      message "done"
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let dev = run_json_with_env(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            src.to_str().expect("utf-8 source path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+            "--branch",
+            "draft_a",
+        ],
+        envs,
+    );
+    assert!(
+        dev.pointer("/workers/0/terminal_events/0").is_some(),
+        "the exec settles and the workflow reaches a terminal: {dev}"
+    );
+
+    // The command read the MATERIALIZED input and its output imported back
+    // onto the branch as a new cut.
+    let out = run_json_with_env(
+        bin,
+        &["--json", "branch", "read", "draft_a", "out.txt"],
+        envs,
+    );
+    assert_eq!(
+        out.get("body").and_then(Value::as_str),
+        Some("seed-content"),
+        "the exec read the projected branch file and its output landed on the branch"
+    );
+    // The unchanged input keeps its single blob and key.
+    let input = run_json_with_env(
+        bin,
+        &["--json", "branch", "read", "draft_a", "ws/in.md"],
+        envs,
+    );
+    assert_eq!(
+        input.get("body").and_then(Value::as_str),
+        Some("seed-content")
+    );
+    // The head cut is the effect-keyed import cut.
+    let row = run_json_with_env(bin, &["--json", "branch", "show", "draft_a"], envs);
+    assert!(
+        row.get("head_cut_id")
+            .and_then(Value::as_str)
+            .is_some_and(|cut| cut.starts_with("cut-exec-")),
+        "the import is one effect-keyed cut: {row}"
+    );
+    // Mainline never saw any of it; merge carries the exec's product over.
+    run_json_with_env(bin, &["--json", "branch", "merge", "draft_a"], envs);
+    let merged = run_json_with_env(bin, &["--json", "branch", "read", "main", "out.txt"], envs);
+    assert_eq!(
+        merged.get("body").and_then(Value::as_str),
+        Some("seed-content")
+    );
+
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Declaration-granularity source merge through the full CLI pipeline:
+/// a branch and mainline both edit ONE `.whip` file. Disjoint rule edits
+/// (branch rewrites `close`; mainline adds an independent audit rule)
+/// certify — the blob-level conflict refines to a merged source carrying
+/// BOTH edits — while interfering edits (branch changes what `triage`
+/// writes; mainline's changed rule reads it) stay an honest conflict.
+#[test]
+fn branch_source_merge_certifies_disjoint_rules_and_refuses_interference() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("source-merge");
+    let envs_owned = [
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE".to_owned(),
+            dir.join("branches.sqlite").to_string_lossy().into_owned(),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE".to_owned(),
+            dir.join("vcs-content.sqlite")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ];
+    let envs: Vec<(&str, &str)> = envs_owned
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let branch = |args: &[&str]| {
+        let mut full = vec!["--json", "branch"];
+        full.extend_from_slice(args);
+        run_json_with_env(bin, &full, &envs)
+    };
+
+    let base = "workflow Demo\n\noutput result Report\n\nclass Report {\n  message string\n}\n\nclass Ticket {\n  status string\n}\n\nrule triage\n  when started\n=> {\n  record Ticket {\n    status \"open\"\n  }\n}\n\nrule close\n  when Ticket as t\n=> {\n  complete result {\n    message \"done\"\n  }\n}\n";
+    branch(&["write", "main", "demo.whip", "--body", base]);
+    branch(&["create", "draft_a"]);
+
+    // Branch rewrites `close`; mainline adds an independent audit rule.
+    let ours = base.replace("message \"done\"", "message \"finished\"");
+    branch(&["write", "draft_a", "demo.whip", "--body", &ours]);
+    let theirs = format!(
+        "{base}\nclass Audit {{\n  note string\n}}\n\nrule log_start\n  when started\n=> {{\n  record Audit {{\n    note \"started\"\n  }}\n}}\n"
+    );
+    branch(&["write", "main", "demo.whip", "--body", &theirs]);
+
+    let merged = branch(&["merge", "draft_a"]);
+    assert_eq!(
+        merged.get("into").and_then(Value::as_str),
+        Some("main"),
+        "disjoint rule edits to one file certify: {merged}"
+    );
+    let source = branch(&["read", "main", "demo.whip"]);
+    let body = source.get("body").and_then(Value::as_str).expect("body");
+    assert!(body.contains("message \"finished\""), "ours' edit survived");
+    assert!(body.contains("rule log_start"), "theirs' rule survived");
+
+    // Interference: draft_b changes what `triage` WRITES while mainline's
+    // current source has `close` READING it — write∩read refuses.
+    branch(&["create", "draft_b"]);
+    let interfering = body.replace("status \"open\"", "status \"reopened\"");
+    branch(&["write", "draft_b", "demo.whip", "--body", &interfering]);
+    let mainline_edit = body.replace("message \"finished\"", "message \"closed out\"");
+    branch(&["write", "main", "demo.whip", "--body", &mainline_edit]);
+    let conflicted = Command::new(bin)
+        .args(["--json", "branch", "merge", "draft_b"])
+        .envs(envs_owned.iter().cloned())
+        .output()
+        .expect("merge runs");
+    assert!(
+        !conflicted.status.success(),
+        "write-meets-read interference across declarations stays an honest conflict"
+    );
+    let payload: Value = serde_json::from_slice(&conflicted.stdout).expect("conflict JSON");
+    assert_eq!(
+        payload.pointer("/conflicts/0/path").and_then(Value::as_str),
+        Some("demo.whip")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// The reconciliation daemon pass (`whip branch reconcile`): a quiescent
+/// branch silently folds mainline's disjoint delta down (its base
+/// re-points at mainline's head), an up-to-date branch reports as such,
+/// and the folded content is readable on the branch.
+#[test]
+fn branch_reconcile_folds_disjoint_mainline_deltas_down() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let dir = unique_temp_dir("reconcile");
+    let envs_owned = [
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE".to_owned(),
+            dir.join("branches.sqlite").to_string_lossy().into_owned(),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE".to_owned(),
+            dir.join("vcs-content.sqlite")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ];
+    let envs: Vec<(&str, &str)> = envs_owned
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let branch = |args: &[&str]| {
+        let mut full = vec!["--store", store, "--json", "branch"];
+        full.extend_from_slice(args);
+        run_json_with_env(bin, &full, &envs)
+    };
+
+    branch(&["write", "main", "a.md", "--body", "A0"]);
+    branch(&["create", "draft_a"]);
+    branch(&["write", "draft_a", "mine.md", "--body", "branch work"]);
+    // Mainline advances on a DISJOINT path after the branch point.
+    branch(&["write", "main", "b.md", "--body", "B1"]);
+
+    let report = branch(&["reconcile"]);
+    let entries = report.as_array().expect("report array");
+    let draft_entry = entries
+        .iter()
+        .find(|entry| entry.get("branch_id").and_then(Value::as_str) == Some("draft_a"))
+        .expect("draft_a reconciled");
+    assert_eq!(
+        draft_entry.get("outcome").and_then(Value::as_str),
+        Some("rebased"),
+        "the quiescent branch folded mainline's disjoint delta: {report}"
+    );
+
+    // The branch now sees mainline's delta AND kept its own divergence.
+    assert_eq!(
+        branch(&["read", "draft_a", "b.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("B1")
+    );
+    assert_eq!(
+        branch(&["read", "draft_a", "mine.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("branch work")
+    );
+    // Its branch point re-pointed at mainline's head: a second pass is
+    // up-to-date.
+    let second = branch(&["reconcile"]);
+    let entry = second
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|entry| entry.get("branch_id").and_then(Value::as_str) == Some("draft_a"))
+        .expect("entry");
+    assert_eq!(
+        entry.get("outcome").and_then(Value::as_str),
+        Some("up_to_date")
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// The workstream tier end to end: members join a stream, `whip branch
+/// reconcile` greedily auto-admits their quiescent work into the shared
+/// line (each member picking up admitted siblings), a colliding
+/// contribution isolates without moving the line, and `whip stream
+/// promote` lands the line's state on mainline while the stream keeps
+/// going.
+#[test]
+fn workstream_members_auto_admit_and_promote() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let dir = unique_temp_dir("workstream");
+    let envs_owned = [
+        (
+            "WHIPPLESCRIPT_BRANCH_STORE".to_owned(),
+            dir.join("branches.sqlite").to_string_lossy().into_owned(),
+        ),
+        (
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE".to_owned(),
+            dir.join("vcs-content.sqlite")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "WHIPPLESCRIPT_WORKSTREAM_STORE".to_owned(),
+            dir.join("workstreams.sqlite")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "WHIPPLESCRIPT_COORDINATION_STORE".to_owned(),
+            dir.join("coordination.sqlite")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ];
+    let envs: Vec<(&str, &str)> = envs_owned
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let whip = |args: &[&str]| {
+        let mut full = vec!["--store", store, "--json"];
+        full.extend_from_slice(args);
+        run_json_with_env(bin, &full, &envs)
+    };
+
+    // A stream with two members.
+    whip(&["stream", "create", "triage", "--name", "triage"]);
+    whip(&["branch", "create", "draft_a"]);
+    whip(&["branch", "create", "draft_b"]);
+    whip(&["stream", "join", "triage", "draft_a"]);
+    whip(&["stream", "join", "triage", "draft_b"]);
+
+    // Disjoint member work auto-admits on reconcile; the second member
+    // picks up the first's admitted work through the line.
+    whip(&["branch", "write", "draft_a", "a.md", "--body", "A work"]);
+    whip(&["branch", "write", "draft_b", "b.md", "--body", "B work"]);
+    let report = whip(&["branch", "reconcile"]);
+    let outcomes: Vec<(&str, &str)> = report
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|entry| {
+            Some((
+                entry.get("branch_id").and_then(Value::as_str)?,
+                entry.get("outcome").and_then(Value::as_str)?,
+            ))
+        })
+        .collect();
+    assert!(
+        outcomes
+            .iter()
+            .filter(|(branch, outcome)| branch.starts_with("draft_") && outcome == &"admitted")
+            .count()
+            == 2,
+        "both quiescent members auto-admitted: {report}"
+    );
+    assert_eq!(
+        whip(&["branch", "read", "line-triage", "a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("A work")
+    );
+    assert_eq!(
+        whip(&["branch", "read", "line-triage", "b.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("B work")
+    );
+    // Greedy convergence: draft_a admitted before b.md landed on the
+    // line; the NEXT tick folds it back down.
+    whip(&["branch", "reconcile"]);
+    assert_eq!(
+        whip(&["branch", "read", "draft_a", "b.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("B work"),
+        "the sibling's admitted work flowed back through the line"
+    );
+
+    // A colliding member isolates: the line keeps the admitted content.
+    whip(&["branch", "create", "draft_c"]);
+    whip(&["stream", "join", "triage", "draft_c"]);
+    whip(&["branch", "write", "draft_c", "a.md", "--body", "C collides"]);
+    let report = whip(&["branch", "reconcile"]);
+    let conflicted = report
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|entry| entry.get("branch_id").and_then(Value::as_str) == Some("draft_c"))
+        .expect("draft_c entry");
+    assert_eq!(
+        conflicted.get("outcome").and_then(Value::as_str),
+        Some("conflicts"),
+        "the colliding contribution isolates: {report}"
+    );
+    assert_eq!(
+        whip(&["branch", "read", "line-triage", "a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("A work"),
+        "a failed contribution never moves the line"
+    );
+
+    // Promotion: the boundary hop lands the line's state on mainline;
+    // the stream survives.
+    let promoted = whip(&["stream", "promote", "triage"]);
+    assert_eq!(promoted.get("into").and_then(Value::as_str), Some("main"));
+    assert_eq!(
+        whip(&["branch", "read", "main", "a.md"])
+            .get("body")
+            .and_then(Value::as_str),
+        Some("A work")
+    );
+    let show = whip(&["stream", "show", "triage"]);
+    assert_eq!(show.get("status").and_then(Value::as_str), Some("active"));
+    assert_eq!(
+        show.get("members").and_then(Value::as_array).map(Vec::len),
+        Some(3)
+    );
+
+    // Archive re-homes the members (their next reconcile targets main).
+    let archived = whip(&["stream", "archive", "triage"]);
+    assert_eq!(
+        archived
+            .get("rehomed_branch_ids")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(3)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_dir_all(dir);
 }

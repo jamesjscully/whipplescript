@@ -1,7 +1,7 @@
 @service
 workflow MemoryCurate
 
-use memory
+use std.memory
 
 class Seed {
   topic string

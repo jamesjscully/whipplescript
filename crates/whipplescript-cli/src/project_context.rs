@@ -17,13 +17,9 @@ const CONTEXT_FILENAMES: &[&str] = &["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLA
 /// Env flag disabling project-instruction injection (pi's `--no-context-files`).
 const DISABLE_ENV: &str = "WHIPPLESCRIPT_NO_CONTEXT_FILES";
 
-/// One discovered project-instruction file: its path (for the wrapper attribute)
-/// and verbatim content.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProjectInstruction {
-    pub path: String,
-    pub content: String,
-}
+// The instruction type + renderer live in the kernel (shared with the DO's
+// store-resolution path — context-assembly Phase 3 item 4).
+pub use whipplescript_kernel::context_assembly::{render_project_context, ProjectInstruction};
 
 /// Discover project-instruction files for a turn rooted at `cwd`.
 ///
@@ -81,21 +77,6 @@ fn discover_project_instructions_inner(
     }
 
     out
-}
-
-/// Render the `<project_context>` bundle body: each file wrapped verbatim in a
-/// `<project_instructions path="…">` element (pi's exact wrapper).
-pub fn render_project_context(instructions: &[ProjectInstruction]) -> String {
-    let mut body = String::from("<project_context>");
-    for instruction in instructions {
-        body.push_str(&format!(
-            "\n<project_instructions path=\"{}\">\n{}\n</project_instructions>",
-            instruction.path,
-            instruction.content.trim_end()
-        ));
-    }
-    body.push_str("\n</project_context>");
-    body
 }
 
 /// The first existing/readable context file in `dir` (by filename precedence).

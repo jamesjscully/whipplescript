@@ -1,2 +1,4 @@
-pkg/
+pkg/*
+!pkg/
+!pkg/whipplescript_host_do_bg.d.ts
 node_modules/

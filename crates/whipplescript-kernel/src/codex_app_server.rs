@@ -41,6 +41,17 @@ impl From<serde_json::Error> for CodexAppServerError {
 pub trait CodexAppServerTransport {
     fn write_line(&mut self, line: &str) -> Result<(), CodexAppServerError>;
     fn read_line(&mut self) -> Result<String, CodexAppServerError>;
+    /// Wait up to `wait` for the next line; `Ok(None)` means the window
+    /// elapsed with the peer still alive (DR-0035 Decision 4 inactivity
+    /// clock). The default keeps blocking semantics for transports without a
+    /// clock (test fakes).
+    fn read_line_timeout(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> Result<Option<String>, CodexAppServerError> {
+        let _ = wait;
+        self.read_line().map(Some)
+    }
 }
 
 pub struct CodexAppServerClient<T> {
@@ -61,6 +72,27 @@ impl<T: CodexAppServerTransport> CodexAppServerClient<T> {
     }
 
     pub fn request(&mut self, method: &str, params: Value) -> Result<Value, CodexAppServerError> {
+        self.request_inner(method, params, None)
+    }
+
+    /// `request` bounded by a wait budget (DR-0035 Decision 4): a peer that
+    /// never answers the JSON-RPC call yields a Timeout error instead of
+    /// blocking the worker thread through turn start.
+    pub fn request_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        wait: std::time::Duration,
+    ) -> Result<Value, CodexAppServerError> {
+        self.request_inner(method, params, Some(wait))
+    }
+
+    fn request_inner(
+        &mut self,
+        method: &str,
+        params: Value,
+        wait: Option<std::time::Duration>,
+    ) -> Result<Value, CodexAppServerError> {
         let id = self.next_id;
         self.next_id += 1;
         let request = json!({
@@ -72,7 +104,14 @@ impl<T: CodexAppServerTransport> CodexAppServerClient<T> {
         .to_string();
         self.transport.write_line(&request)?;
         loop {
-            let line = self.transport.read_line()?;
+            let line = match wait {
+                Some(window) => self.transport.read_line_timeout(window)?.ok_or_else(|| {
+                    CodexAppServerError::Timeout(format!(
+                        "no response to `{method}` within the start budget"
+                    ))
+                })?,
+                None => self.transport.read_line()?,
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -145,22 +184,47 @@ impl<T: CodexAppServerTransport> CodexAppServerClient<T> {
             return serde_json::from_str(&line).map_err(CodexAppServerError::Json);
         }
     }
+
+    /// `read_message` bounded by the inactivity clock: `Ok(None)` means the
+    /// window elapsed without a frame (the peer is alive but silent).
+    pub fn read_message_timeout(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> Result<Option<Value>, CodexAppServerError> {
+        loop {
+            let Some(line) = self.transport.read_line_timeout(wait)? else {
+                return Ok(None);
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            return serde_json::from_str(&line)
+                .map(Some)
+                .map_err(CodexAppServerError::Json);
+        }
+    }
 }
 
 pub struct StdioCodexAppServerTransport {
     _child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    // Lines arrive via a reader thread so reads can carry a timeout
+    // (DR-0035 Decision 4): a blocked pipe no longer pins the worker thread.
+    lines: std::sync::mpsc::Receiver<std::io::Result<String>>,
 }
 
 impl StdioCodexAppServerTransport {
     pub fn spawn(command: &str, args: &[&str]) -> Result<Self, CodexAppServerError> {
-        let mut child = Command::new(command)
+        let mut builder = Command::new(command);
+        builder
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        crate::harness::strip_control_plane_secrets(&mut builder);
+        // Codex is the OpenAI-family backend; it never needs an Anthropic key.
+        crate::harness::strip_env_vars(&mut builder, crate::harness::ANTHROPIC_CREDENTIAL_ENV);
+        let mut child = builder.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| {
             CodexAppServerError::Protocol("app-server process did not expose stdin".to_owned())
         })?;
@@ -170,9 +234,36 @@ impl StdioCodexAppServerTransport {
         Ok(Self {
             _child: child,
             stdin,
-            stdout: BufReader::new(stdout),
+            lines: spawn_line_reader(stdout),
         })
     }
+
+    fn closed_error() -> CodexAppServerError {
+        CodexAppServerError::Timeout("app-server stdout closed before response".to_owned())
+    }
+}
+
+fn spawn_line_reader(stdout: ChildStdout) -> std::sync::mpsc::Receiver<std::io::Result<String>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if sender.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+    receiver
 }
 
 impl CodexAppServerTransport for StdioCodexAppServerTransport {
@@ -184,14 +275,23 @@ impl CodexAppServerTransport for StdioCodexAppServerTransport {
     }
 
     fn read_line(&mut self) -> Result<String, CodexAppServerError> {
-        let mut line = String::new();
-        let bytes = self.stdout.read_line(&mut line)?;
-        if bytes == 0 {
-            return Err(CodexAppServerError::Timeout(
-                "app-server stdout closed before response".to_owned(),
-            ));
+        match self.lines.recv() {
+            Ok(Ok(line)) => Ok(line),
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => Err(Self::closed_error()),
         }
-        Ok(line)
+    }
+
+    fn read_line_timeout(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> Result<Option<String>, CodexAppServerError> {
+        match self.lines.recv_timeout(wait) {
+            Ok(Ok(line)) => Ok(Some(line)),
+            Ok(Err(error)) => Err(error.into()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Self::closed_error()),
+        }
     }
 }
 
@@ -339,9 +439,17 @@ pub struct CodexAppServerAdapter<T> {
     capability: ProviderCapability,
     client: CodexAppServerClient<T>,
     initialized: bool,
+    // The consumed `initialize` reply (DR-0035 Decision 7), shape-only;
+    // attached to the first event's evidence then cleared.
+    initialize_result_shape: Option<Value>,
     thread_id: Option<String>,
     turn_id: Option<String>,
     sequence: u64,
+    // DR-0035 Decision 4: the inactivity wall clock. When no frame arrives
+    // within this window, the adapter synthesizes the TimedOut terminal.
+    inactivity_budget: std::time::Duration,
+    // Idle time accumulated across empty poll slices; reset on every frame.
+    idle_elapsed: std::time::Duration,
 }
 
 impl<T: CodexAppServerTransport> CodexAppServerAdapter<T> {
@@ -355,14 +463,42 @@ impl<T: CodexAppServerTransport> CodexAppServerAdapter<T> {
             capability,
             client,
             initialized: false,
+            initialize_result_shape: None,
             thread_id: None,
             turn_id: None,
             sequence: 0,
+            inactivity_budget: std::time::Duration::from_secs(300),
+            idle_elapsed: std::time::Duration::ZERO,
         }
+    }
+
+    pub fn with_inactivity_budget(mut self, budget: std::time::Duration) -> Self {
+        self.inactivity_budget = budget;
+        self
     }
 
     pub fn into_client(self) -> CodexAppServerClient<T> {
         self.client
+    }
+
+    /// The synthesized inactivity terminal (DR-0035 Decision 4 T2): a silent
+    /// or closed peer still yields exactly one terminal.
+    fn inactivity_timeout_event(&mut self, run_id: &str, reason: &str) -> NativeProviderEvent {
+        self.sequence += 1;
+        NativeProviderEvent {
+            provider_id: self.provider_id.clone(),
+            run_id: run_id.to_owned(),
+            event_kind: NativeProviderEventKind::TimedOut,
+            provider_event_type: "whip.native.inactivity_timeout".to_owned(),
+            provider_session_id: self.thread_id.clone(),
+            provider_turn_id: self.turn_id.clone(),
+            sequence: Some(self.sequence),
+            evidence: json!({
+                "reason": reason,
+                "inactivity_budget_seconds": self.inactivity_budget.as_secs(),
+            }),
+            artifacts: Vec::new(),
+        }
     }
 
     fn ensure_codex_request(
@@ -530,9 +666,14 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
             self.boundary_error(error.code, error.message, false, request.to_json_redacted())
         })?;
 
+        // Turn-start RPCs are bounded by the inactivity budget (DR-0035
+        // Decision 4): a hung app-server fails the start instead of pinning
+        // the worker thread.
+        let budget = self.inactivity_budget;
         if !self.initialized {
-            self.client
-                .request(
+            let initialize_result = self
+                .client
+                .request_timeout(
                     "initialize",
                     json!({
                         "clientInfo": {
@@ -541,14 +682,23 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
                         },
                         "capabilities": {},
                     }),
+                    budget,
                 )
                 .map_err(|error| self.map_error("codex_initialize_failed", error))?;
+            // DR-0035 Decision 7: consume the handshake reply instead of
+            // discarding it — the server's advertised info rides the started
+            // event as evidence (shape-only across the redaction boundary).
+            self.initialize_result_shape = Some(json_shape(&initialize_result));
             self.initialized = true;
         }
 
         let thread_start = self
             .client
-            .request("thread/start", codex_thread_start_params(&request, &policy))
+            .request_timeout(
+                "thread/start",
+                codex_thread_start_params(&request, &policy),
+                budget,
+            )
             .map_err(|error| self.map_error("codex_thread_start_failed", error))?;
         let thread_id = thread_start
             .pointer("/thread/id")
@@ -567,9 +717,10 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
 
         let turn_start = self
             .client
-            .request(
+            .request_timeout(
                 "turn/start",
                 codex_turn_start_params(&request, &policy, &thread_id),
+                budget,
             )
             .map_err(|error| self.map_error("codex_turn_start_failed", error))?;
         let turn_id = turn_start
@@ -596,6 +747,9 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
             provider_turn_id: Some(turn_id),
             sequence: Some(self.next_sequence()),
             evidence: json!({
+                // The consumed initialize reply (DR-0035 Decision 7) rides the
+                // started event once, shape-only.
+                "initialize_result_shape": self.initialize_result_shape.take(),
                 "thread_start_response_shape": json_shape(&thread_start),
                 "turn_start_response_shape": json_shape(&turn_start),
                 "policy": {
@@ -620,8 +774,15 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
         if let Some(message) = self.client.pop_notification() {
             return Ok(self.maybe_event_from_message(run_id, message));
         }
-        match self.client.read_message() {
-            Ok(message) => {
+        // The wait is sliced (DR-0035 Decision 5) so the driver regains control
+        // between slices to act on cancellation requests; the inactivity clock
+        // accumulates across empty slices and fires at the full budget.
+        let slice = self
+            .inactivity_budget
+            .min(std::time::Duration::from_secs(1));
+        match self.client.read_message_timeout(slice) {
+            Ok(Some(message)) => {
+                self.idle_elapsed = std::time::Duration::ZERO;
                 if message.get("id").is_some()
                     && message.get("method").and_then(Value::as_str).is_some()
                 {
@@ -631,7 +792,23 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
                 }
                 Ok(self.maybe_event_from_message(run_id, message))
             }
-            Err(CodexAppServerError::Timeout(_)) => Ok(None),
+            Ok(None) => {
+                self.idle_elapsed += slice;
+                if self.idle_elapsed >= self.inactivity_budget {
+                    self.idle_elapsed = std::time::Duration::ZERO;
+                    // Window elapsed with no frame: the inactivity clock fires.
+                    Ok(Some(self.inactivity_timeout_event(
+                        run_id,
+                        "inactivity_budget_exhausted",
+                    )))
+                } else {
+                    Ok(None)
+                }
+            }
+            // The stream closed with no terminal: same backstop, distinct reason.
+            Err(CodexAppServerError::Timeout(_)) => {
+                Ok(Some(self.inactivity_timeout_event(run_id, "stream_closed")))
+            }
             Err(error) => Err(self.map_error("codex_event_read_failed", error)),
         }
     }
@@ -1418,6 +1595,16 @@ mod tests {
         assert_eq!(event.event_kind, NativeProviderEventKind::Started);
         assert_eq!(event.provider_session_id.as_deref(), Some("thread-1"));
         assert_eq!(event.provider_turn_id.as_deref(), Some("turn-1"));
+        // The consumed initialize reply rides the started event as a shape
+        // (DR-0035 Decision 7) — advertised info recorded, content dropped.
+        assert_eq!(
+            event
+                .evidence
+                .pointer("/initialize_result_shape/type")
+                .and_then(Value::as_str),
+            Some("object")
+        );
+        assert!(!event.evidence.to_string().contains("codex-test"));
 
         let transport = adapter.into_client().into_transport();
         let initialize: Value =

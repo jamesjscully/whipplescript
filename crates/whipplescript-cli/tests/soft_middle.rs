@@ -520,9 +520,10 @@ flow f
     let _ = fs::remove_file(source);
 }
 
-/// 1929 OPTION A: `send via <channel>` (std.messaging) compiles with NO package
-/// lock (the std-library exemption), runs as a `messaging.send` capability.call
-/// under the fixture provider, and the workflow completes on `after sent succeeds`.
+/// `send via <channel>` (std.messaging) compiles with NO package lock — the
+/// embedded `std.messaging` manifest authorizes it via `use std.messaging` —
+/// runs as a `messaging.send` capability.call under the fixture provider, and
+/// the workflow completes on `after sent succeeds`.
 #[test]
 fn send_via_channel_runs_under_fixture_and_completes() {
     let bin = env!("CARGO_BIN_EXE_whip");
@@ -533,6 +534,8 @@ fn send_via_channel_runs_under_fixture_and_completes() {
         r##"
 @service
 workflow Notify
+
+use std.messaging
 
 output result Done
 
@@ -577,7 +580,8 @@ rule notify
     .expect("write source");
 
     let store_str = store.to_str().expect("utf-8");
-    // No `--package-lock`: the std-library exemption must let `send` compile + run.
+    // No `--package-lock`: the embedded `std.messaging` manifest must let
+    // `send` compile + run.
     let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &[]);
     let instance = dev
         .get("instance_id")
@@ -617,7 +621,8 @@ fn send_via_local_channel_delivers_to_local_mailbox() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/messaging-local-demo.whip");
 
     let store_str = store.to_str().expect("utf-8");
-    // No `--package-lock`: the std-library exemption lets `send` compile + run.
+    // No `--package-lock`: the embedded `std.messaging` manifest lets `send`
+    // compile + run.
     let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &[]);
     let instance = dev
         .get("instance_id")
@@ -1504,6 +1509,7 @@ flow plan_ticket
 }
 
 const EXEC_FLOW: &str = r#"
+use std.script
 workflow ExecDemo
 
 output result Ran
@@ -1536,12 +1542,15 @@ rule go
 }
 "#;
 
-/// Ungranted exec commands fail closed; granted ones run and expose
-/// exit_code/stdout to the success branch.
+/// Ungranted exec commands fail closed at STORE ADMISSION (script hard-off
+/// Layer 2, spec/std-script.md): without the allowlist authority `script.raw`
+/// is never seeded, so the effect blocks as blocked_by_capability
+/// (`security.script_disabled`) before any provider run. Granted ones seed,
+/// admit, run, and expose exit_code/stdout to the success branch.
 #[test]
 fn exec_is_gated_by_operator_grants() {
     let bin = env!("CARGO_BIN_EXE_whip");
-    for (grant, expected) in [(None, "failed"), (Some("echo *"), "completed")] {
+    for (grant, expected) in [(None, "running"), (Some("echo *"), "completed")] {
         let store = temp_path("exec-gate", "sqlite");
         let source = temp_path("exec-gate", "whip");
         fs::write(&source, EXEC_FLOW).expect("write source");
@@ -1574,14 +1583,80 @@ fn exec_is_gated_by_operator_grants() {
             .get("instance_id")
             .and_then(Value::as_str)
             .expect("instance id");
+        let store_str = store.to_str().expect("utf-8");
         assert_eq!(
-            instance_status(bin, store.to_str().expect("utf-8"), instance),
+            instance_status(bin, store_str, instance),
             expected,
             "grant={grant:?}"
         );
+        if grant.is_none() {
+            // The block is durable and pre-run: blocked_by_capability with the
+            // hard-off diagnostic id, and the fails branch never fired (no
+            // terminal — a disabled script crosses no exec boundary).
+            let effects = run_json(bin, &["--store", store_str, "--json", "effects", instance]);
+            let exec = effects
+                .as_array()
+                .expect("effects")
+                .iter()
+                .find(|effect| effect.get("kind").and_then(Value::as_str) == Some("exec.command"))
+                .expect("exec effect")
+                .clone();
+            assert_eq!(
+                exec.get("status").and_then(Value::as_str),
+                Some("blocked_by_capability")
+            );
+            assert!(
+                exec.get("policy_block_reason")
+                    .and_then(Value::as_str)
+                    .expect("policy block reason")
+                    .contains("security.script_disabled"),
+                "blocked exec carries the hard-off diagnostic id: {exec}"
+            );
+        }
         let _ = fs::remove_file(store);
         let _ = fs::remove_file(source);
     }
+}
+
+/// The other two-key negative (script hard-off Layer 2): operator authority
+/// alone is not enough. A program that does NOT import std.script — the
+/// forged-IR analog, since `dev` compiles without the check-time gate — never
+/// gets `script.raw` seeded, so its raw exec blocks at store admission even
+/// though the allowlist would have granted the command string.
+#[test]
+fn exec_without_import_blocks_even_with_allowlist() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("exec-noimport", "sqlite");
+    let source = temp_path("exec-noimport", "whip");
+    fs::write(&source, EXEC_FLOW.replace("use std.script\n", "")).expect("write source");
+    let store_str = store.to_str().expect("utf-8");
+    let dev = dev_with_exec_allow(bin, store_str, source.to_str().expect("utf-8"), "echo *");
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    assert_eq!(instance_status(bin, store_str, instance), "running");
+    let effects = run_json(bin, &["--store", store_str, "--json", "effects", instance]);
+    let exec = effects
+        .as_array()
+        .expect("effects")
+        .iter()
+        .find(|effect| effect.get("kind").and_then(Value::as_str) == Some("exec.command"))
+        .expect("exec effect")
+        .clone();
+    assert_eq!(
+        exec.get("status").and_then(Value::as_str),
+        Some("blocked_by_capability")
+    );
+    assert!(
+        exec.get("policy_block_reason")
+            .and_then(Value::as_str)
+            .expect("policy block reason")
+            .contains("security.script_disabled"),
+        "blocked exec carries the hard-off diagnostic id: {exec}"
+    );
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
 }
 
 #[test]
@@ -1701,6 +1776,7 @@ fn hosted_exec_runs_content_pinned_capability_with_json_stdin() {
     fs::write(
         &source,
         r#"
+use std.script
 workflow HostedExec
 
 output result Report
@@ -1816,6 +1892,7 @@ fn hosted_exec_hash_mismatch_fails_before_spawn() {
     fs::write(
         &source,
         r#"
+use std.script
 workflow HostedExecMismatch
 
 output result Report
@@ -2171,6 +2248,7 @@ fn dev_with_exec_allow(bin: &str, store: &str, source: &str, allow: &str) -> Val
 }
 
 const EXEC_PARSE_SINGLE: &str = r#"
+use std.script
 workflow ExecParseSingle
 
 output result Done
@@ -2271,6 +2349,7 @@ fn exec_parse_failure_routes_to_fails_branch() {
 }
 
 const EXEC_PARSE_EACH: &str = r#"
+use std.script
 workflow ExecParseEach
 
 output result Done

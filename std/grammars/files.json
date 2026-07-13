@@ -1,0 +1,50 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.files",
+  "name": "std.files",
+  "version": "v0",
+  "libraries": [
+    {
+      "id": "std.files",
+      "version": "v0",
+      "constructs": [
+        {
+          "id": "files.file_store",
+          "construct_family": "declaration_block",
+          "keyword": "file store",
+          "scope": "top_level",
+          "grammar": {
+            "shape": "declaration_block",
+            "keyword": "file store",
+            "clauses": [
+              {
+                "name": "root",
+                "kind": "scalar",
+                "required": true,
+                "list": false,
+                "unknown_hint": "file store fields are `root`, `allow read [...]`, `allow write [...]`",
+                "missing_summary": "add `root \"<dir>\"` inside the file store block"
+              },
+              {
+                "name": "allow read",
+                "kind": "glob",
+                "required": false,
+                "list": true,
+                "unknown_hint": "file store fields are `root`, `allow read [...]`, `allow write [...]`",
+                "missing_summary": "add `root \"<dir>\"` inside the file store block"
+              },
+              {
+                "name": "allow write",
+                "kind": "glob",
+                "required": false,
+                "list": true,
+                "unknown_hint": "file store fields are `root`, `allow read [...]`, `allow write [...]`",
+                "missing_summary": "add `root \"<dir>\"` inside the file store block"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

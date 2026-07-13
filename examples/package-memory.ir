@@ -4,11 +4,11 @@ source_tags
 source_descriptions
 "Recall package memory before agent work and save context after each turn" workflow PackageMemory
 uses
-  package memory
+  package std.memory
 trackers
   tracker backlog provider=builtin
 agents
-  agent worker harness=<fallback> provider=codex profile=repo-writer capacity=1 skills=[] capabilities=[] tools=[]
+  agent worker harness=<fallback> provider=codex profile=repo-writer capacity=1 skills=[] capabilities=[] tools=[] class=delegated
 rules
   rule recall_before_work
     when backlog has ready issue as issue

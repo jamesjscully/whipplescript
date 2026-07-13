@@ -49,19 +49,26 @@ pub struct ClaudeAgentToolPolicy {
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,
     pub permission_mode: String,
-    pub setting_sources: Vec<String>,
+    /// Ambient-config sources the delegate may read (DR-0034 Decision 4). `None`
+    /// means the provider's own default — the key is omitted from the sidecar
+    /// payload so the SDK applies its native behavior. `Some(vec![])` is the
+    /// explicit `settings none` opt-out.
+    pub setting_sources: Option<Vec<String>>,
     pub mcp_config_ref: Option<String>,
 }
 
 impl ClaudeAgentToolPolicy {
     pub fn to_sidecar_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "allowed_tools": self.allowed_tools,
             "disallowed_tools": self.disallowed_tools,
             "permission_mode": self.permission_mode,
-            "setting_sources": self.setting_sources,
             "mcp_config_ref": self.mcp_config_ref,
-        })
+        });
+        if let Some(sources) = &self.setting_sources {
+            value["setting_sources"] = json!(sources);
+        }
+        value
     }
 }
 
@@ -77,6 +84,7 @@ pub fn build_claude_agent_tool_policy(
     workspace_policy: &str,
     approval_mode: Option<&str>,
     mcp_config_ref: Option<&str>,
+    settings: Option<&str>,
 ) -> Result<ClaudeAgentToolPolicy, ClaudeAgentPolicyError> {
     let Some(profile) = profile else {
         return Err(policy_error(
@@ -156,11 +164,27 @@ pub fn build_claude_agent_tool_policy(
         None => "default",
     }
     .to_owned();
+    // DR-0034 Decision 4: the `settings` knob selects which ambient-config sources
+    // the delegate may read. Unset means the provider default (None — no override),
+    // NOT the crippled empty set. `none` is the explicit opt-out. The parser
+    // validates the value; re-checking here keeps a raw provider_options bypass out.
+    let setting_sources = match settings {
+        None => None,
+        Some("project") => Some(strings(&["project"])),
+        Some("user") => Some(strings(&["user"])),
+        Some("none") => Some(Vec::new()),
+        Some(other) => {
+            return Err(policy_error(
+                "unsupported_settings_source",
+                format!("settings source `{other}` is not supported for Claude"),
+            ));
+        }
+    };
     Ok(ClaudeAgentToolPolicy {
         allowed_tools,
         disallowed_tools,
         permission_mode,
-        setting_sources: Vec::new(),
+        setting_sources,
         mcp_config_ref: mcp_config_ref.map(str::to_owned),
     })
 }
@@ -242,6 +266,17 @@ pub fn summarize_claude_agent_sdk_events(events: &[ClaudeSidecarEvent]) -> Value
 pub trait ClaudeAgentSdkTransport {
     fn write_line(&mut self, line: &str) -> Result<(), ClaudeAgentSdkError>;
     fn read_line(&mut self) -> Result<String, ClaudeAgentSdkError>;
+    /// Wait up to `wait` for the next line; `Ok(None)` means the window
+    /// elapsed with the peer still alive (DR-0035 Decision 4 inactivity
+    /// clock). The default keeps blocking semantics for transports without a
+    /// clock (test fakes).
+    fn read_line_timeout(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> Result<Option<String>, ClaudeAgentSdkError> {
+        let _ = wait;
+        self.read_line().map(Some)
+    }
 }
 
 pub struct ClaudeAgentSdkClient<T> {
@@ -254,6 +289,46 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkClient<T> {
         Self {
             transport,
             events: Vec::new(),
+        }
+    }
+
+    /// The `hello` handshake (DR-0035 Decision 7): returns the sidecar's
+    /// protocol identifier, or `None` for a legacy sidecar that predates the
+    /// verb (it answers `run/error unknown_command`; tolerated as `/1` for one
+    /// release). Run before any turn so a mismatch blocks the binding rather
+    /// than failing mid-turn.
+    pub fn hello(&mut self) -> Result<Option<String>, ClaudeAgentSdkError> {
+        self.transport
+            .write_line(&json!({ "type": "hello" }).to_string())?;
+        loop {
+            // Bounded read: a sidecar that never answers the handshake is
+            // treated as no-answer (liveness stays a start_turn concern), not
+            // a construction hang.
+            let Some(line) = self
+                .transport
+                .read_line_timeout(std::time::Duration::from_secs(10))?
+            else {
+                return Ok(None);
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let message: Value = serde_json::from_str(&line)?;
+            return match message.get("type").and_then(Value::as_str) {
+                Some("hello") => Ok(message
+                    .pointer("/payload/protocol")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)),
+                Some("run/error")
+                    if message.pointer("/payload/code").and_then(Value::as_str)
+                        == Some("unknown_command") =>
+                {
+                    Ok(None)
+                }
+                _ => Err(ClaudeAgentSdkError::Protocol(
+                    "unexpected reply to `hello` handshake".to_owned(),
+                )),
+            };
         }
     }
 
@@ -270,6 +345,7 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkClient<T> {
             &json!({
                 "type": "run/start",
                 "run_id": run_id,
+                "protocol": WHIP_SIDECAR_PROTOCOL,
                 "request": request,
             })
             .to_string(),
@@ -280,22 +356,17 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkClient<T> {
                 continue;
             }
             let message: Value = serde_json::from_str(&line)?;
-            if message.get("run_id").and_then(Value::as_str) != Some(&run_id) {
-                return Err(ClaudeAgentSdkError::Protocol(
-                    "received event for unexpected run id".to_owned(),
-                ));
-            }
-            if message.get("type").and_then(Value::as_str) == Some("run/error") {
-                return Err(ClaudeAgentSdkError::Remote(message));
-            }
-            let event = parse_event(message)?;
-            let terminal = matches!(
-                event.event_type.as_str(),
-                "claude.turn.completed" | "claude.turn.failed" | "claude.turn.cancelled"
-            );
-            self.events.push(event);
-            if terminal {
-                return Ok(self.events.clone());
+            match route_frame(message, &run_id)? {
+                RoutedFrame::Event(event) | RoutedFrame::Misrouted(event) => {
+                    let terminal = matches!(
+                        event.event_type.as_str(),
+                        "claude.turn.completed" | "claude.turn.failed" | "claude.turn.cancelled"
+                    );
+                    self.events.push(event);
+                    if terminal {
+                        return Ok(self.events.clone());
+                    }
+                }
             }
         }
     }
@@ -310,6 +381,7 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkClient<T> {
             &json!({
                 "type": "run/start",
                 "run_id": run_id,
+                "protocol": WHIP_SIDECAR_PROTOCOL,
                 "request": request,
             })
             .to_string(),
@@ -327,15 +399,30 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkClient<T> {
                 continue;
             }
             let message: Value = serde_json::from_str(&line)?;
-            if message.get("run_id").and_then(Value::as_str) != Some(expected_run_id) {
-                return Err(ClaudeAgentSdkError::Protocol(
-                    "received event for unexpected run id".to_owned(),
-                ));
+            return match route_frame(message, expected_run_id)? {
+                RoutedFrame::Event(event) | RoutedFrame::Misrouted(event) => Ok(event),
+            };
+        }
+    }
+
+    /// `read_event` bounded by the inactivity clock: `Ok(None)` means the
+    /// window elapsed without a frame (the peer is alive but silent).
+    pub fn read_event_timeout(
+        &mut self,
+        expected_run_id: &str,
+        wait: std::time::Duration,
+    ) -> Result<Option<ClaudeSidecarEvent>, ClaudeAgentSdkError> {
+        loop {
+            let Some(line) = self.transport.read_line_timeout(wait)? else {
+                return Ok(None);
+            };
+            if line.trim().is_empty() {
+                continue;
             }
-            if message.get("type").and_then(Value::as_str) == Some("run/error") {
-                return Err(ClaudeAgentSdkError::Remote(message));
-            }
-            return parse_event(message);
+            let message: Value = serde_json::from_str(&line)?;
+            return match route_frame(message, expected_run_id)? {
+                RoutedFrame::Event(event) | RoutedFrame::Misrouted(event) => Ok(Some(event)),
+            };
         }
     }
 
@@ -352,6 +439,47 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkClient<T> {
     pub fn into_transport(self) -> T {
         self.transport
     }
+}
+
+/// The synthetic event type a misrouted frame surfaces as (DR-0035 Decision 3
+/// T3). The kernel records `whip.protocol.*` events as protocol-violation
+/// diagnostics, never as lifecycle events.
+pub const MISROUTED_FRAME_EVENT_TYPE: &str = "whip.protocol.misrouted_frame";
+
+/// The whip sidecar dialect version (DR-0035 Decision 7). Sent in `run/start`
+/// and exchanged via the `hello` handshake; a mismatched sidecar blocks the
+/// binding pre-turn (`provider_health`), never mid-turn.
+pub const WHIP_SIDECAR_PROTOCOL: &str = "whip-sidecar/1";
+
+enum RoutedFrame {
+    Event(ClaudeSidecarEvent),
+    Misrouted(ClaudeSidecarEvent),
+}
+
+/// DR-0035 Decision 3 T3 routing. A `run/error` with a null run id is a
+/// channel-level sidecar failure and one with our run id is this run's error —
+/// both surface as `Remote`. Any other frame whose run id does not match is
+/// misrouted: it becomes a synthetic protocol-violation event (identifiers
+/// only, no payload content) instead of aborting the turn.
+fn route_frame(message: Value, expected_run_id: &str) -> Result<RoutedFrame, ClaudeAgentSdkError> {
+    let frame_run_id = message.get("run_id").and_then(Value::as_str);
+    let frame_type = message.get("type").and_then(Value::as_str);
+    if frame_type == Some("run/error")
+        && (frame_run_id.is_none() || frame_run_id == Some(expected_run_id))
+    {
+        return Err(ClaudeAgentSdkError::Remote(message));
+    }
+    if frame_run_id != Some(expected_run_id) {
+        return Ok(RoutedFrame::Misrouted(ClaudeSidecarEvent {
+            event_type: MISROUTED_FRAME_EVENT_TYPE.to_owned(),
+            run_id: expected_run_id.to_owned(),
+            payload: json!({
+                "frame_type": frame_type,
+                "frame_run_id": frame_run_id,
+            }),
+        }));
+    }
+    parse_event(message).map(RoutedFrame::Event)
 }
 
 fn parse_event(message: Value) -> Result<ClaudeSidecarEvent, ClaudeAgentSdkError> {
@@ -380,6 +508,11 @@ pub struct ClaudeAgentSdkAdapter<T> {
     active_run_id: Option<String>,
     provider_session_id: Option<String>,
     sequence: u64,
+    // DR-0035 Decision 4: the inactivity wall clock. When no frame arrives
+    // within this window, the adapter synthesizes the TimedOut terminal.
+    inactivity_budget: std::time::Duration,
+    // Idle time accumulated across empty poll slices; reset on every frame.
+    idle_elapsed: std::time::Duration,
 }
 
 impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkAdapter<T> {
@@ -395,7 +528,14 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkAdapter<T> {
             active_run_id: None,
             provider_session_id: None,
             sequence: 0,
+            inactivity_budget: std::time::Duration::from_secs(300),
+            idle_elapsed: std::time::Duration::ZERO,
         }
+    }
+
+    pub fn with_inactivity_budget(mut self, budget: std::time::Duration) -> Self {
+        self.inactivity_budget = budget;
+        self
     }
 
     pub fn into_client(self) -> ClaudeAgentSdkClient<T> {
@@ -405,6 +545,25 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkAdapter<T> {
     fn next_sequence(&mut self) -> u64 {
         self.sequence += 1;
         self.sequence
+    }
+
+    /// The synthesized inactivity terminal (DR-0035 Decision 4 T2): a silent
+    /// or closed peer still yields exactly one terminal.
+    fn inactivity_timeout_event(&mut self, run_id: &str, reason: &str) -> NativeProviderEvent {
+        NativeProviderEvent {
+            provider_id: self.provider_id.clone(),
+            run_id: run_id.to_owned(),
+            event_kind: NativeProviderEventKind::TimedOut,
+            provider_event_type: "whip.native.inactivity_timeout".to_owned(),
+            provider_session_id: self.provider_session_id.clone(),
+            provider_turn_id: None,
+            sequence: Some(self.next_sequence()),
+            evidence: json!({
+                "reason": reason,
+                "inactivity_budget_seconds": self.inactivity_budget.as_secs(),
+            }),
+            artifacts: Vec::new(),
+        }
     }
 
     fn boundary_error(
@@ -477,6 +636,22 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkAdapter<T> {
     }
 
     fn event_from_sidecar(&mut self, event: ClaudeSidecarEvent) -> Option<NativeProviderEvent> {
+        if event.event_type == MISROUTED_FRAME_EVENT_TYPE {
+            // A misrouted frame surfaces as a non-terminal diagnostic; the
+            // kernel records it as a protocol violation (DR-0035 Decision 3).
+            let run_id = event.run_id.clone();
+            return Some(NativeProviderEvent {
+                provider_id: self.provider_id.clone(),
+                run_id,
+                event_kind: NativeProviderEventKind::Diagnostic,
+                provider_event_type: event.event_type.clone(),
+                provider_session_id: None,
+                provider_turn_id: None,
+                sequence: Some(self.next_sequence()),
+                evidence: json!({ "violation": event.payload }),
+                artifacts: Vec::new(),
+            });
+        }
         let observation = normalize_claude_agent_sdk_event(&event)?;
         let run_id = event.run_id.clone();
         if let Some(session_id) = observation.provider_session_id.as_ref() {
@@ -528,6 +703,10 @@ impl<T: ClaudeAgentSdkTransport> NativeProviderAdapter for ClaudeAgentSdkAdapter
                 .provider_options
                 .get("mcp_config_ref")
                 .and_then(Value::as_str),
+            request
+                .provider_options
+                .get("settings")
+                .and_then(Value::as_str),
         )
         .map_err(|error| {
             self.boundary_error(error.code, error.message, false, request.to_json_redacted())
@@ -538,11 +717,19 @@ impl<T: ClaudeAgentSdkTransport> NativeProviderAdapter for ClaudeAgentSdkAdapter
             .begin_run(sidecar_request)
             .map_err(|error| self.map_error("claude_run_start_failed", error))?;
         self.active_run_id = Some(run_id.clone());
+        let budget = self.inactivity_budget;
         loop {
-            let event = self
-                .client
-                .read_event(&run_id)
-                .map_err(|error| self.map_error("claude_event_read_failed", error))?;
+            let event = match self.client.read_event_timeout(&run_id, budget) {
+                Ok(Some(event)) => event,
+                // A peer silent through the whole start window still yields
+                // exactly one terminal (DR-0035 Decision 4 T2).
+                Ok(None) => {
+                    return Ok(self.inactivity_timeout_event(&run_id, "inactivity_budget_exhausted"))
+                }
+                Err(error) => {
+                    return Err(self.map_error("claude_event_read_failed", error));
+                }
+            };
             if let Some(native) = self.event_from_sidecar(event) {
                 return Ok(native);
             }
@@ -557,9 +744,34 @@ impl<T: ClaudeAgentSdkTransport> NativeProviderAdapter for ClaudeAgentSdkAdapter
             .active_run_id
             .clone()
             .unwrap_or_else(|| run_id.to_owned());
-        match self.client.read_event(&active_run_id) {
-            Ok(event) => Ok(self.event_from_sidecar(event)),
-            Err(ClaudeAgentSdkError::Timeout(_)) => Ok(None),
+        // The wait is sliced (DR-0035 Decision 5) so the driver regains control
+        // between slices to act on cancellation requests; the inactivity clock
+        // accumulates across empty slices and fires at the full budget.
+        let slice = self
+            .inactivity_budget
+            .min(std::time::Duration::from_secs(1));
+        match self.client.read_event_timeout(&active_run_id, slice) {
+            Ok(Some(event)) => {
+                self.idle_elapsed = std::time::Duration::ZERO;
+                Ok(self.event_from_sidecar(event))
+            }
+            Ok(None) => {
+                self.idle_elapsed += slice;
+                if self.idle_elapsed >= self.inactivity_budget {
+                    self.idle_elapsed = std::time::Duration::ZERO;
+                    // Window elapsed with no frame: the inactivity clock fires.
+                    Ok(Some(self.inactivity_timeout_event(
+                        &active_run_id,
+                        "inactivity_budget_exhausted",
+                    )))
+                } else {
+                    Ok(None)
+                }
+            }
+            // The stream closed with no terminal: same backstop, distinct reason.
+            Err(ClaudeAgentSdkError::Timeout(_)) => Ok(Some(
+                self.inactivity_timeout_event(&active_run_id, "stream_closed"),
+            )),
             Err(error) => Err(self.map_error("claude_event_read_failed", error)),
         }
     }
@@ -632,7 +844,11 @@ fn claude_sidecar_request(
         json!(policy.disallowed_tools),
     );
     payload.insert("permission_mode".to_owned(), json!(policy.permission_mode));
-    payload.insert("setting_sources".to_owned(), json!(policy.setting_sources));
+    // Omitted when None so the SDK keeps its own default setting sources
+    // (DR-0034 Decision 4: unset means provider default, not the empty set).
+    if let Some(sources) = policy.setting_sources.as_ref() {
+        payload.insert("setting_sources".to_owned(), json!(sources));
+    }
     if let Some(mcp_config_ref) = policy.mcp_config_ref.as_deref() {
         payload.insert("mcp_config_ref".to_owned(), json!(mcp_config_ref));
     }
@@ -725,17 +941,23 @@ fn json_shape(value: &Value) -> Value {
 pub struct StdioClaudeAgentSdkTransport {
     _child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    // Lines arrive via a reader thread so reads can carry a timeout
+    // (DR-0035 Decision 4): a blocked pipe no longer pins the worker thread.
+    lines: std::sync::mpsc::Receiver<std::io::Result<String>>,
 }
 
 impl StdioClaudeAgentSdkTransport {
     pub fn spawn(command: &str, args: &[&str]) -> Result<Self, ClaudeAgentSdkError> {
-        let mut child = Command::new(command)
+        let mut builder = Command::new(command);
+        builder
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        crate::harness::strip_control_plane_secrets(&mut builder);
+        // The Claude sidecar is the Anthropic-family backend; strip OpenAI keys.
+        crate::harness::strip_env_vars(&mut builder, crate::harness::OPENAI_CREDENTIAL_ENV);
+        let mut child = builder.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| {
             ClaudeAgentSdkError::Protocol("Claude sidecar did not expose stdin".to_owned())
         })?;
@@ -745,9 +967,38 @@ impl StdioClaudeAgentSdkTransport {
         Ok(Self {
             _child: child,
             stdin,
-            stdout: BufReader::new(stdout),
+            lines: spawn_line_reader(stdout),
         })
     }
+
+    fn closed_error() -> ClaudeAgentSdkError {
+        ClaudeAgentSdkError::Timeout(
+            "Claude sidecar stdout closed before terminal event".to_owned(),
+        )
+    }
+}
+
+fn spawn_line_reader(stdout: ChildStdout) -> std::sync::mpsc::Receiver<std::io::Result<String>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if sender.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+    receiver
 }
 
 impl ClaudeAgentSdkTransport for StdioClaudeAgentSdkTransport {
@@ -759,14 +1010,23 @@ impl ClaudeAgentSdkTransport for StdioClaudeAgentSdkTransport {
     }
 
     fn read_line(&mut self) -> Result<String, ClaudeAgentSdkError> {
-        let mut line = String::new();
-        let bytes = self.stdout.read_line(&mut line)?;
-        if bytes == 0 {
-            return Err(ClaudeAgentSdkError::Timeout(
-                "Claude sidecar stdout closed before terminal event".to_owned(),
-            ));
+        match self.lines.recv() {
+            Ok(Ok(line)) => Ok(line),
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => Err(Self::closed_error()),
         }
-        Ok(line)
+    }
+
+    fn read_line_timeout(
+        &mut self,
+        wait: std::time::Duration,
+    ) -> Result<Option<String>, ClaudeAgentSdkError> {
+        match self.lines.recv_timeout(wait) {
+            Ok(Ok(line)) => Ok(Some(line)),
+            Ok(Err(error)) => Err(error.into()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Self::closed_error()),
+        }
     }
 }
 
@@ -894,7 +1154,10 @@ mod tests {
     }
 
     #[test]
-    fn client_rejects_unexpected_run_id() {
+    fn client_misrouted_terminal_never_completes_the_run() {
+        // DR-0035 Decision 3: a terminal frame for ANOTHER run id is misrouted
+        // — it must not terminate this run (it rides as a violation event and
+        // the run keeps waiting for its own terminal).
         let transport = FakeTransport::with_reads(&[
             r#"{"type":"claude.turn.completed","run_id":"run-2","payload":{}}"#,
         ]);
@@ -902,9 +1165,9 @@ mod tests {
 
         let error = client
             .start_run(json!({"run_id":"run-1"}))
-            .expect_err("unexpected run id fails");
+            .expect_err("no own terminal ever arrives");
 
-        assert!(matches!(error, ClaudeAgentSdkError::Protocol(_)));
+        assert!(matches!(error, ClaudeAgentSdkError::Timeout(_)));
     }
 
     #[test]
@@ -931,12 +1194,71 @@ mod tests {
             "read_only",
             None,
             None,
+            None,
         )
         .expect("reader policy maps");
 
         assert_eq!(policy.allowed_tools, strings(&["Glob", "Grep", "Read"]));
         assert_eq!(policy.disallowed_tools, strings(&["Bash", "Edit", "Write"]));
         assert_eq!(policy.permission_mode, "default");
+    }
+
+    #[test]
+    fn policy_unset_settings_means_provider_default_and_omits_sidecar_key() {
+        // DR-0034 Decision 4: unset must be the provider's own default, NOT the
+        // crippled empty set — the key must be absent from the sidecar payload.
+        let policy = build_claude_agent_tool_policy(
+            Some("repo-reader"),
+            &["repo.read".to_owned()],
+            "read_only",
+            None,
+            None,
+            None,
+        )
+        .expect("reader policy maps");
+
+        assert_eq!(policy.setting_sources, None);
+        assert!(policy.to_sidecar_json().get("setting_sources").is_none());
+    }
+
+    #[test]
+    fn policy_maps_settings_sources_and_none_is_explicit_empty() {
+        for (settings, expected) in [
+            ("project", strings(&["project"])),
+            ("user", strings(&["user"])),
+            ("none", Vec::new()),
+        ] {
+            let policy = build_claude_agent_tool_policy(
+                Some("repo-reader"),
+                &["repo.read".to_owned()],
+                "read_only",
+                None,
+                None,
+                Some(settings),
+            )
+            .expect("reader policy maps");
+
+            assert_eq!(policy.setting_sources.as_deref(), Some(expected.as_slice()));
+            assert_eq!(
+                policy.to_sidecar_json().get("setting_sources"),
+                Some(&json!(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn policy_rejects_unknown_settings_source() {
+        let error = build_claude_agent_tool_policy(
+            Some("repo-reader"),
+            &["repo.read".to_owned()],
+            "read_only",
+            None,
+            None,
+            Some("workspace"),
+        )
+        .expect_err("unknown settings source denied");
+
+        assert_eq!(error.code, "unsupported_settings_source");
     }
 
     #[test]
@@ -947,6 +1269,7 @@ mod tests {
             "shared",
             Some("manual"),
             Some("mcp/readonly.json"),
+            None,
         )
         .expect("writer policy maps");
 
@@ -967,6 +1290,7 @@ mod tests {
             "shared",
             Some("manual"),
             None,
+            None,
         )
         .expect_err("reader write denied");
 
@@ -979,6 +1303,7 @@ mod tests {
             Some("repo-writer"),
             &["repo.write".to_owned()],
             "shared",
+            None,
             None,
             None,
         )
@@ -995,6 +1320,7 @@ mod tests {
             "read_only",
             Some("manual"),
             None,
+            None,
         )
         .expect_err("read only workspace denied");
 
@@ -1009,6 +1335,7 @@ mod tests {
             "remote_sandbox",
             Some("manual"),
             None,
+            None,
         )
         .expect_err("remote sandbox requires explicit workspace implementation");
 
@@ -1017,9 +1344,15 @@ mod tests {
 
     #[test]
     fn policy_rejects_missing_profile() {
-        let error =
-            build_claude_agent_tool_policy(None, &["repo.read".to_owned()], "shared", None, None)
-                .expect_err("profile required");
+        let error = build_claude_agent_tool_policy(
+            None,
+            &["repo.read".to_owned()],
+            "shared",
+            None,
+            None,
+            None,
+        )
+        .expect_err("profile required");
 
         assert_eq!(error.code, "missing_profile");
     }
@@ -1172,6 +1505,206 @@ mod tests {
             .expect("terminal event");
         assert_eq!(terminal.event_kind, NativeProviderEventKind::Completed);
         assert!(terminal.event_kind.is_terminal());
+    }
+
+    /// A transport whose peer stays alive but silent once the scripted reads
+    /// are exhausted: `read_line_timeout` reports an empty window instead of a
+    /// closed stream.
+    struct SilentAfterReadsTransport(FakeTransport);
+
+    impl ClaudeAgentSdkTransport for SilentAfterReadsTransport {
+        fn write_line(&mut self, line: &str) -> Result<(), ClaudeAgentSdkError> {
+            self.0.write_line(line)
+        }
+
+        fn read_line(&mut self) -> Result<String, ClaudeAgentSdkError> {
+            self.0.read_line()
+        }
+
+        fn read_line_timeout(
+            &mut self,
+            _wait: std::time::Duration,
+        ) -> Result<Option<String>, ClaudeAgentSdkError> {
+            match self.0.read_line() {
+                Ok(line) => Ok(Some(line)),
+                Err(_) => Ok(None),
+            }
+        }
+    }
+
+    #[test]
+    fn native_adapter_inactivity_synthesizes_timed_out_terminal() {
+        // DR-0035 Decision 4: a peer that stays silent past the inactivity
+        // window yields exactly one synthesized TimedOut terminal.
+        let transport = SilentAfterReadsTransport(FakeTransport::with_reads(&[
+            r#"{"type":"claude.session.started","run_id":"run-1","payload":{"session_id":"session-1"}}"#,
+        ]));
+        let client = ClaudeAgentSdkClient::new(transport);
+        let mut adapter = ClaudeAgentSdkAdapter::new("claude-main", claude_capability(), client)
+            .with_inactivity_budget(std::time::Duration::from_millis(1));
+        adapter
+            .start_turn(native_claude_request())
+            .expect("turn starts");
+
+        let timed_out = adapter
+            .next_event("run-1")
+            .expect("event reads")
+            .expect("inactivity terminal");
+        assert_eq!(timed_out.event_kind, NativeProviderEventKind::TimedOut);
+        assert!(timed_out.event_kind.is_terminal());
+        assert_eq!(
+            timed_out.provider_event_type,
+            "whip.native.inactivity_timeout"
+        );
+        assert_eq!(
+            timed_out.evidence.get("reason").and_then(Value::as_str),
+            Some("inactivity_budget_exhausted")
+        );
+    }
+
+    #[test]
+    fn native_adapter_closed_stream_synthesizes_timed_out_terminal() {
+        // A stream that closes with no terminal gets the same backstop with a
+        // distinct reason.
+        let transport = FakeTransport::with_reads(&[
+            r#"{"type":"claude.session.started","run_id":"run-1","payload":{"session_id":"session-1"}}"#,
+        ]);
+        let client = ClaudeAgentSdkClient::new(transport);
+        let mut adapter = ClaudeAgentSdkAdapter::new("claude-main", claude_capability(), client);
+        adapter
+            .start_turn(native_claude_request())
+            .expect("turn starts");
+
+        let timed_out = adapter
+            .next_event("run-1")
+            .expect("event reads")
+            .expect("stream-closed terminal");
+        assert_eq!(timed_out.event_kind, NativeProviderEventKind::TimedOut);
+        assert_eq!(
+            timed_out.evidence.get("reason").and_then(Value::as_str),
+            Some("stream_closed")
+        );
+    }
+
+    #[test]
+    fn native_adapter_misrouted_frame_is_violation_diagnostic_not_abort() {
+        // DR-0035 Decision 3 T3: a frame for another run id surfaces as a
+        // non-terminal protocol-violation diagnostic; the turn keeps going and
+        // the stray frame's payload never crosses (identifiers only).
+        let transport = FakeTransport::with_reads(&[
+            r#"{"type":"claude.session.started","run_id":"run-1","payload":{"session_id":"session-1"}}"#,
+            r#"{"type":"claude.stream.message","run_id":"run-2","payload":{"content":"stray secret text"}}"#,
+            r#"{"type":"claude.turn.completed","run_id":"run-1","payload":{"session_id":"session-1","subtype":"success"}}"#,
+        ]);
+        let client = ClaudeAgentSdkClient::new(transport);
+        let mut adapter = ClaudeAgentSdkAdapter::new("claude-main", claude_capability(), client);
+        adapter
+            .start_turn(native_claude_request())
+            .expect("turn starts");
+
+        let violation = adapter
+            .next_event("run-1")
+            .expect("event reads")
+            .expect("violation event");
+        assert_eq!(violation.event_kind, NativeProviderEventKind::Diagnostic);
+        assert!(!violation.event_kind.is_terminal());
+        assert_eq!(violation.provider_event_type, MISROUTED_FRAME_EVENT_TYPE);
+        assert_eq!(violation.run_id, "run-1");
+        // The violation payload is whip-constructed from identifiers only —
+        // the stray frame's content never crosses into it.
+        assert_eq!(
+            violation
+                .evidence
+                .pointer("/violation/frame_run_id")
+                .and_then(Value::as_str),
+            Some("run-2")
+        );
+        let raw = violation.evidence.to_string();
+        assert!(!raw.contains("stray secret text"), "{raw}");
+        let rendered = violation.to_json_redacted().to_string();
+        assert!(!rendered.contains("stray secret text"), "{rendered}");
+
+        let terminal = adapter
+            .next_event("run-1")
+            .expect("event reads")
+            .expect("terminal event");
+        assert_eq!(terminal.event_kind, NativeProviderEventKind::Completed);
+    }
+
+    #[test]
+    fn client_hello_exchanges_protocol_and_tolerates_legacy_sidecars() {
+        // DR-0035 Decision 7: the handshake returns the sidecar's protocol.
+        let transport = FakeTransport::with_reads(&[
+            r#"{"type":"hello","run_id":null,"payload":{"protocol":"whip-sidecar/1"}}"#,
+        ]);
+        let mut client = ClaudeAgentSdkClient::new(transport);
+        assert_eq!(
+            client.hello().expect("handshake"),
+            Some(WHIP_SIDECAR_PROTOCOL.to_owned())
+        );
+
+        // A legacy sidecar answers unknown_command — tolerated as `/1`.
+        let transport = FakeTransport::with_reads(&[
+            r#"{"type":"run/error","run_id":null,"payload":{"code":"unknown_command","message":"unknown command hello"}}"#,
+        ]);
+        let mut client = ClaudeAgentSdkClient::new(transport);
+        assert_eq!(client.hello().expect("legacy tolerated"), None);
+    }
+
+    #[test]
+    fn client_run_start_carries_the_protocol_version() {
+        let transport = FakeTransport::with_reads(&[
+            r#"{"type":"claude.turn.completed","run_id":"run-1","payload":{}}"#,
+        ]);
+        let mut client = ClaudeAgentSdkClient::new(transport);
+        client
+            .start_run(json!({"run_id":"run-1"}))
+            .expect("run completes");
+        let frame: Value =
+            serde_json::from_str(&client.into_transport().writes[0]).expect("frame parses");
+        assert_eq!(
+            frame.get("protocol").and_then(Value::as_str),
+            Some(WHIP_SIDECAR_PROTOCOL)
+        );
+    }
+
+    #[test]
+    fn client_routes_null_run_id_error_as_remote_not_protocol_abort() {
+        // DR-0035 Decision 3 T3: the sidecar's pre-run failures carry
+        // `run_id: null`; they must surface as the remote error they are, not
+        // as an unexpected-run-id protocol abort.
+        let transport = FakeTransport::with_reads(&[
+            r#"{"type":"run/error","run_id":null,"payload":{"code":"invalid_json","message":"bad frame"}}"#,
+        ]);
+        let mut client = ClaudeAgentSdkClient::new(transport);
+        let run_id = client
+            .begin_run(json!({"run_id":"run-1"}))
+            .expect("run begins");
+
+        let error = client.read_event(&run_id).expect_err("remote error");
+        assert!(
+            matches!(error, ClaudeAgentSdkError::Remote(message) if message.pointer("/payload/code").and_then(Value::as_str) == Some("invalid_json"))
+        );
+    }
+
+    #[test]
+    fn client_start_run_carries_misrouted_frame_as_violation_event() {
+        // The batch path applies the same tolerant routing: the stray frame
+        // rides along as a violation event and the terminal still lands.
+        let transport = FakeTransport::with_reads(&[
+            r#"{"type":"claude.session.started","run_id":"run-1","payload":{"session_id":"session-1"}}"#,
+            r#"{"type":"claude.stream.message","run_id":"run-9","payload":{"content":"stray"}}"#,
+            r#"{"type":"claude.turn.completed","run_id":"run-1","payload":{"session_id":"session-1","subtype":"success"}}"#,
+        ]);
+        let mut client = ClaudeAgentSdkClient::new(transport);
+
+        let events = client
+            .start_run(json!({"run_id":"run-1"}))
+            .expect("run completes");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1].event_type, MISROUTED_FRAME_EVENT_TYPE);
+        assert_eq!(events[1].run_id, "run-1");
+        assert_eq!(events[2].event_type, "claude.turn.completed");
     }
 
     #[test]

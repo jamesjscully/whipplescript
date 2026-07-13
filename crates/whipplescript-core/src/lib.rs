@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod json;
+
 /// Current implementation stage for the active redesign.
 pub const IMPLEMENTATION_STAGE: &str = "stage-0-skeleton";
 
@@ -38,6 +40,12 @@ pub struct ConstructRegistration {
     pub construct_family: String,
     pub keyword: String,
     pub scope: String,
+    /// The DR-0011 grammar object, when the manifest declares one
+    /// (spec/construct-grammar.md "Two-Shape Meta-Grammar"). `fields` is then
+    /// derived from it (`ConstructGrammar::derive_fields`) rather than read
+    /// from the manifest. `None` for constructs registered without a grammar
+    /// (legacy flat `fields[]` manifests, artifact round-trips).
+    pub grammar: Option<ConstructGrammar>,
     pub fields: Vec<ConstructField>,
     pub requires: Vec<ConstructInterface>,
     pub provides: Vec<ConstructInterface>,
@@ -50,6 +58,167 @@ pub struct ConstructField {
     pub name: String,
     pub kind: String,
     pub required: bool,
+}
+
+/// A DR-0011 grammar object: the single source of the construct's parse shape.
+/// Kept as plain validated strings, matching the rest of the registration data.
+/// Two shapes are manifest-expressible: `effect_operation`
+/// (`CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION`, `<keyword> [<connective>
+/// <slot>]* [{ payload }]? as <binding>`) and `declaration_block`
+/// (`CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK`, an order-free block of named
+/// clauses). The `shape` string discriminates: `clauses` is `Some` exactly for
+/// `declaration_block`, and `slots`/`payload`/`binding`/`target_capability`
+/// carry the `effect_operation` shape (empty/`None`/`"none"`/empty otherwise).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstructGrammar {
+    pub shape: String,
+    pub keyword: String,
+    pub slots: Vec<ConstructGrammarSlot>,
+    /// `None` = no payload block; `Some(fields)` = a `{ ... }` block of named
+    /// expression fields.
+    pub payload: Option<Vec<ConstructGrammarPayloadField>>,
+    /// `required` | `optional` | `none` — the trailing `as <binding>` policy.
+    pub binding: String,
+    pub target_capability: String,
+    /// `Some(clauses)` for a `declaration_block` shape; `None` for
+    /// `effect_operation` (the `shape` string discriminates — the design note
+    /// picked `Option` over a shape enum because `shape` already carries the
+    /// discriminant, for the smaller diff).
+    pub clauses: Option<Vec<ConstructGrammarClause>>,
+}
+
+/// One ordered grammar slot: a named value (`identifier` | `expression`),
+/// optionally introduced by a fixed connective word from
+/// `CONSTRUCT_GRAMMAR_CONNECTIVES`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstructGrammarSlot {
+    pub name: String,
+    pub kind: String,
+    pub connective: Option<String>,
+}
+
+/// One field inside the optional payload block: a named expression, required
+/// or not.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstructGrammarPayloadField {
+    pub name: String,
+    pub kind: String,
+    pub required: bool,
+}
+
+/// One clause of a `declaration_block` grammar: a named value (the `name` may
+/// be multi-word), a `kind` from `CONSTRUCT_GRAMMAR_CLAUSE_KINDS`, whether it
+/// is `required`, whether it takes a `list` of values, and an optional
+/// introducing connective from `CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES`. A `flag`
+/// clause carries no value: it is never a `list` and never has a `connective`
+/// (DR-0011 amendment, mirrored in `build.rs`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstructGrammarClause {
+    pub name: String,
+    pub kind: String,
+    pub required: bool,
+    pub list: bool,
+    pub connective: Option<String>,
+}
+
+pub const CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION: &str = "effect_operation";
+pub const CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK: &str = "declaration_block";
+pub const CONSTRUCT_GRAMMAR_CONNECTIVES: &[&str] = &["from", "for", "into", "to", "via"];
+pub const CONSTRUCT_GRAMMAR_SLOT_KINDS: &[&str] = &["identifier", "expression"];
+pub const CONSTRUCT_GRAMMAR_BINDING_MODES: &[&str] = &["required", "optional", "none"];
+/// `declaration_block` clause value kinds (DR-0011 Shape 1, mirrors
+/// `build.rs`'s `CLAUSE_KINDS`).
+pub const CONSTRUCT_GRAMMAR_CLAUSE_KINDS: &[&str] = &[
+    "identifier",
+    "expression",
+    "duration",
+    "glob",
+    "schema",
+    "scalar",
+    "flag",
+];
+/// `declaration_block` clause connectives: the Shape 2 slot connectives plus
+/// `by` (ledger `partition by`). Mirrors `build.rs`'s `CLAUSE_CONNECTIVES`.
+pub const CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES: &[&str] =
+    &["from", "for", "into", "to", "via", "by"];
+
+impl ConstructGrammar {
+    /// Derive the flat `fields[]` view downstream consumers read.
+    ///
+    /// For a `declaration_block` shape, each clause becomes one field: a `flag`
+    /// clause maps to an optional `boolean` field (a flag carries no value, so
+    /// it is never required); a `list` clause flattens into the `list` field
+    /// kind (carrying the clause's own required flag); any other clause maps its
+    /// value kind through `field_kind_for_clause_kind` with the clause's
+    /// required flag. A declaration_block has no trailing `as <binding>`, so no
+    /// binding field is appended.
+    ///
+    /// For an `effect_operation` shape: the ordered slots (always required),
+    /// then the payload fields with their own required flags, then — unless the
+    /// binding mode is `none` — the trailing binding as an identifier field
+    /// named `binding` (required when the mode is `required`).
+    pub fn derive_fields(&self) -> Vec<ConstructField> {
+        if let Some(clauses) = &self.clauses {
+            return clauses
+                .iter()
+                .map(|clause| {
+                    let (kind, required) = if clause.kind == "flag" {
+                        ("boolean".to_owned(), false)
+                    } else if clause.list {
+                        ("list".to_owned(), clause.required)
+                    } else {
+                        (
+                            field_kind_for_clause_kind(&clause.kind).to_owned(),
+                            clause.required,
+                        )
+                    };
+                    ConstructField {
+                        name: clause.name.clone(),
+                        kind,
+                        required,
+                    }
+                })
+                .collect();
+        }
+        let mut fields = Vec::new();
+        for slot in &self.slots {
+            fields.push(ConstructField {
+                name: slot.name.clone(),
+                kind: slot.kind.clone(),
+                required: true,
+            });
+        }
+        for field in self.payload.iter().flatten() {
+            fields.push(ConstructField {
+                name: field.name.clone(),
+                kind: field.kind.clone(),
+                required: field.required,
+            });
+        }
+        if self.binding != "none" {
+            fields.push(ConstructField {
+                name: "binding".to_owned(),
+                kind: "identifier".to_owned(),
+                required: self.binding == "required",
+            });
+        }
+        fields
+    }
+}
+
+/// Map a `declaration_block` clause value kind (`CONSTRUCT_GRAMMAR_CLAUSE_KINDS`
+/// minus `flag`, and excluding the list case which flattens to `list`) onto the
+/// platform `ConstructField` kind vocabulary (`PLATFORM_CONSTRUCT_CATALOG
+/// .field_kinds`): a `glob`/`scalar` is a `string`, a `schema` is a `type_ref`;
+/// `identifier`/`expression`/`duration` pass through. An unknown kind passes
+/// through unchanged so the field-kind validator reports it rather than this
+/// mapping silently coercing it.
+fn field_kind_for_clause_kind(kind: &str) -> &str {
+    match kind {
+        "glob" | "scalar" => "string",
+        "schema" => "type_ref",
+        other => other,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -564,21 +733,54 @@ pub const PLATFORM_CONSTRUCT_CATALOG: PlatformConstructCatalog = PlatformConstru
             library_id: "std.tracker",
             construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION,
             scope: CONSTRUCT_SCOPE_RULE_BODY,
-            lowering_target: CONSTRUCT_LOWERING_CAPABILITY_CALL,
+            lowering_target: CONSTRUCT_LOWERING_TYPED_EFFECT_CALL,
         },
         PlatformReservedKeywordPrivilege {
             keyword: "renew",
             library_id: "std.tracker",
             construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION,
             scope: CONSTRUCT_SCOPE_RULE_BODY,
-            lowering_target: CONSTRUCT_LOWERING_CAPABILITY_CALL,
+            lowering_target: CONSTRUCT_LOWERING_TYPED_EFFECT_CALL,
         },
         PlatformReservedKeywordPrivilege {
             keyword: "release",
             library_id: "std.tracker",
             construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION,
             scope: CONSTRUCT_SCOPE_RULE_BODY,
-            lowering_target: CONSTRUCT_LOWERING_CAPABILITY_CALL,
+            lowering_target: CONSTRUCT_LOWERING_TYPED_EFFECT_CALL,
+        },
+        // The migrating declaration-family keywords (DR-0011 decl-migration):
+        // each is a platform-reserved word whose top-level `declaration_block`
+        // construct the platform's own std grammar library is authorized to
+        // provide. These lower to `metadata_only` (no capability, no runtime
+        // authority), so the authorization is purely syntactic.
+        PlatformReservedKeywordPrivilege {
+            keyword: "tracker",
+            library_id: "std.tracker",
+            construct_family: CONSTRUCT_FAMILY_DECLARATION_BLOCK,
+            scope: "top_level",
+            lowering_target: CONSTRUCT_LOWERING_METADATA_ONLY,
+        },
+        PlatformReservedKeywordPrivilege {
+            keyword: "counter",
+            library_id: "std.coord",
+            construct_family: CONSTRUCT_FAMILY_DECLARATION_BLOCK,
+            scope: "top_level",
+            lowering_target: CONSTRUCT_LOWERING_METADATA_ONLY,
+        },
+        PlatformReservedKeywordPrivilege {
+            keyword: "lease",
+            library_id: "std.coord",
+            construct_family: CONSTRUCT_FAMILY_DECLARATION_BLOCK,
+            scope: "top_level",
+            lowering_target: CONSTRUCT_LOWERING_METADATA_ONLY,
+        },
+        PlatformReservedKeywordPrivilege {
+            keyword: "ledger",
+            library_id: "std.coord",
+            construct_family: CONSTRUCT_FAMILY_DECLARATION_BLOCK,
+            scope: "top_level",
+            lowering_target: CONSTRUCT_LOWERING_METADATA_ONLY,
         },
     ],
 };
@@ -622,12 +824,13 @@ pub struct ContractRegistryDiagnostic {
 // --- Embedded standard-package manifest data (M5) -----------------------------
 //
 // std packages ship as data compiled into the binary rather than as scattered
-// per-package builtin functions. This is the first entry (std.messaging `send`);
-// the parser's `contract_registry` and the CLI both source std definitions from
-// here, so there is one source of truth. Each `std_*` function returns the same
-// `ConstructRegistration` / `EffectContract` the parser previously hand-rolled,
-// so the move is behaviour-preserving. Later slices relocate the remaining std
-// libraries here and drive `use std.*` authority from the same data.
+// per-package builtin functions. The `std_*` functions below are the reference
+// data for `std.messaging` (`send`): the shipped registration now comes from the
+// embedded `std/manifests/messaging.json` manifest (S6d-3), and a CLI guard
+// test asserts the manifest transcribes these functions field-for-field so the
+// two can never drift while both exist. The schema strings are the JSON-fragment
+// form the package-manifest validator accepts (named schema references are not
+// manifest-expressible).
 
 /// The `messaging.send` capability id — the target of the `send` construct and
 /// the id of its `capability.call` effect contract.
@@ -638,10 +841,45 @@ pub fn std_messaging_send_construct() -> ConstructRegistration {
     ConstructRegistration {
         id: MESSAGING_SEND_CAPABILITY.to_owned(),
         library_id: "std.messaging".to_owned(),
-        version: "v0".to_owned(),
+        version: "0.1.0".to_owned(),
         construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION.to_owned(),
         keyword: "send".to_owned(),
         scope: CONSTRUCT_SCOPE_RULE_BODY.to_owned(),
+        // The DR-0011 grammar: `send via <channel> { text <expr> [markdown
+        // <expr>] [thread_id <expr>] } as <binding>`. This is the reference
+        // value the embedded manifest's `grammar` object must transcribe.
+        grammar: Some(ConstructGrammar {
+            shape: CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION.to_owned(),
+            keyword: "send".to_owned(),
+            slots: vec![ConstructGrammarSlot {
+                name: "channel".to_owned(),
+                kind: "identifier".to_owned(),
+                connective: Some("via".to_owned()),
+            }],
+            payload: Some(vec![
+                ConstructGrammarPayloadField {
+                    name: "text".to_owned(),
+                    kind: "expression".to_owned(),
+                    required: true,
+                },
+                ConstructGrammarPayloadField {
+                    name: "markdown".to_owned(),
+                    kind: "expression".to_owned(),
+                    required: false,
+                },
+                ConstructGrammarPayloadField {
+                    name: "thread_id".to_owned(),
+                    kind: "expression".to_owned(),
+                    required: false,
+                },
+            ]),
+            binding: "required".to_owned(),
+            target_capability: MESSAGING_SEND_CAPABILITY.to_owned(),
+            clauses: None,
+        }),
+        // The grammar-derived flat view (slots, payload fields, binding) —
+        // written out explicitly so the transcription guard compares two
+        // independent spellings.
         fields: vec![
             ConstructField {
                 name: "channel".to_owned(),
@@ -653,6 +891,21 @@ pub fn std_messaging_send_construct() -> ConstructRegistration {
                 kind: "expression".to_owned(),
                 required: true,
             },
+            ConstructField {
+                name: "markdown".to_owned(),
+                kind: "expression".to_owned(),
+                required: false,
+            },
+            ConstructField {
+                name: "thread_id".to_owned(),
+                kind: "expression".to_owned(),
+                required: false,
+            },
+            ConstructField {
+                name: "binding".to_owned(),
+                kind: "identifier".to_owned(),
+                required: true,
+            },
         ],
         requires: vec![ConstructInterface {
             kind: CONSTRUCT_INTERFACE_CAPABILITY.to_owned(),
@@ -661,7 +914,15 @@ pub fn std_messaging_send_construct() -> ConstructRegistration {
             phase: CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME.to_owned(),
             cardinality: CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE.to_owned(),
         }],
-        provides: Vec::new(),
+        // `capability_call` lowering requires a provided EffectHandle; the
+        // type_ref names the built-in receipt class a `send … as r` binding sees.
+        provides: vec![ConstructInterface {
+            kind: CONSTRUCT_INTERFACE_EFFECT_HANDLE.to_owned(),
+            name: None,
+            type_ref: Some("MessageSendReceipt".to_owned()),
+            phase: CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME.to_owned(),
+            cardinality: CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE.to_owned(),
+        }],
         lowering_target: CONSTRUCT_LOWERING_CAPABILITY_CALL.to_owned(),
         target_capability: Some(MESSAGING_SEND_CAPABILITY.to_owned()),
     }
@@ -673,11 +934,17 @@ pub fn std_messaging_send_effect_contract() -> EffectContract {
     EffectContract {
         id: MESSAGING_SEND_CAPABILITY.to_owned(),
         library_id: "std.messaging".to_owned(),
-        version: "v0".to_owned(),
+        version: "0.1.0".to_owned(),
         effect_kind: "capability.call".to_owned(),
         source_forms: vec!["send".to_owned()],
-        input_schema: Some("messaging.send.input".to_owned()),
-        output_schema: Some("MessageSendReceipt".to_owned()),
+        // JSON-fragment schemas (the package-manifest-expressible form; keys
+        // serialize sorted). The output fragment is the `MessageSendReceipt`
+        // built-in class shape; the construct's provided EffectHandle carries
+        // the class name.
+        input_schema: Some(r#"{"channel":"string","text":"string"}"#.to_owned()),
+        output_schema: Some(
+            r#"{"channel":"string","delivered":"bool","provider_message_id":"string"}"#.to_owned(),
+        ),
         required_capabilities: vec![MESSAGING_SEND_CAPABILITY.to_owned()],
         provider_kinds: vec!["messaging".to_owned()],
         projected_facts: vec!["effect.output".to_owned()],
@@ -1123,6 +1390,80 @@ mod tests {
     }
 
     #[test]
+    fn derive_fields_maps_declaration_block_clauses() {
+        // A declaration_block grammar with a flag, a connective-introduced
+        // value clause, and a list clause. Each clause becomes exactly one
+        // field; there is no trailing binding field.
+        let grammar = ConstructGrammar {
+            shape: CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK.to_owned(),
+            keyword: "ledger".to_owned(),
+            slots: Vec::new(),
+            payload: None,
+            binding: "none".to_owned(),
+            target_capability: String::new(),
+            clauses: Some(vec![
+                ConstructGrammarClause {
+                    name: "shared".to_owned(),
+                    kind: "flag".to_owned(),
+                    required: false,
+                    list: false,
+                    connective: None,
+                },
+                ConstructGrammarClause {
+                    name: "partition".to_owned(),
+                    kind: "identifier".to_owned(),
+                    required: true,
+                    list: false,
+                    connective: Some("by".to_owned()),
+                },
+                ConstructGrammarClause {
+                    name: "allow read".to_owned(),
+                    kind: "glob".to_owned(),
+                    required: false,
+                    list: true,
+                    connective: None,
+                },
+            ]),
+        };
+
+        let fields = grammar.derive_fields();
+        assert_eq!(
+            fields,
+            vec![
+                // A flag maps to an optional boolean (it carries no value).
+                ConstructField {
+                    name: "shared".to_owned(),
+                    kind: "boolean".to_owned(),
+                    required: false,
+                },
+                // A value clause maps its kind through the field vocabulary and
+                // keeps its own required flag; the connective is not a field.
+                ConstructField {
+                    name: "partition".to_owned(),
+                    kind: "identifier".to_owned(),
+                    required: true,
+                },
+                // A list clause flattens into the `list` field kind.
+                ConstructField {
+                    name: "allow read".to_owned(),
+                    kind: "list".to_owned(),
+                    required: false,
+                },
+            ]
+        );
+
+        // Bite: every derived kind is in the platform field-kind vocabulary, so
+        // the manifest consistency check accepts a grammar-only construct.
+        for field in &fields {
+            assert!(
+                PLATFORM_CONSTRUCT_CATALOG.contains_field_kind(&field.kind),
+                "derived field kind `{}` must be a platform field kind",
+                field.kind
+            );
+        }
+    }
+
+    #[test]
     fn severity_round_trips_the_canonical_set() {
         assert_eq!(Severity::ALL.len(), 4);
         for severity in Severity::ALL {
@@ -1239,6 +1580,18 @@ mod tests {
 
         assert!(PLATFORM_CONSTRUCT_CATALOG.contains_reserved_keyword("claim"));
         assert!(PLATFORM_CONSTRUCT_CATALOG.contains_reserved_keyword("lease"));
+        // Tracker verbs are typed dedicated effect kinds, so their reserved-keyword
+        // privilege authorizes `typed_effect_call` (not `capability_call`, which is
+        // for plain request/response). The old `capability_call` privilege is gone.
+        assert!(PLATFORM_CONSTRUCT_CATALOG
+            .reserved_keyword_privilege(
+                "std.tracker",
+                "claim",
+                CONSTRUCT_FAMILY_EFFECT_OPERATION,
+                CONSTRUCT_SCOPE_RULE_BODY,
+                CONSTRUCT_LOWERING_TYPED_EFFECT_CALL,
+            )
+            .is_some());
         assert!(PLATFORM_CONSTRUCT_CATALOG
             .reserved_keyword_privilege(
                 "std.tracker",
@@ -1247,14 +1600,14 @@ mod tests {
                 CONSTRUCT_SCOPE_RULE_BODY,
                 CONSTRUCT_LOWERING_CAPABILITY_CALL,
             )
-            .is_some());
+            .is_none());
         assert!(PLATFORM_CONSTRUCT_CATALOG
             .reserved_keyword_privilege(
                 "memory",
                 "claim",
                 CONSTRUCT_FAMILY_EFFECT_OPERATION,
                 CONSTRUCT_SCOPE_RULE_BODY,
-                CONSTRUCT_LOWERING_CAPABILITY_CALL,
+                CONSTRUCT_LOWERING_TYPED_EFFECT_CALL,
             )
             .is_none());
     }
@@ -1275,6 +1628,7 @@ mod tests {
                     construct_family: "declaration_block".to_owned(),
                     keyword: "coerce".to_owned(),
                     scope: "top_level".to_owned(),
+                    grammar: None,
                     fields: vec![ConstructField {
                         name: "name".to_owned(),
                         kind: "identifier".to_owned(),
@@ -1292,6 +1646,7 @@ mod tests {
                     construct_family: String::new(),
                     keyword: "coerce".to_owned(),
                     scope: "top_level".to_owned(),
+                    grammar: None,
                     fields: vec![
                         ConstructField {
                             name: "name".to_owned(),

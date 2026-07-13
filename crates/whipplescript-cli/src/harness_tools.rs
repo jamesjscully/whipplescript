@@ -7,9 +7,9 @@
 //! loop drives; tool calls are stream events (evidence), never durable effects
 //! (DR-0024, spec/owned-harness-loop-contract.md).
 //!
-//! Slice 1 keeps the search/list tools std-only and deliberately simple
-//! (substring grep, glob `find`, plain `ls`); gitignore-awareness and regex are
-//! later refinements. `bash` and the budget/lease envelope are later slices.
+//! The search/list tools stay deliberately simple (regex `grep` with a literal
+//! fallback, glob `find`, plain `ls`); gitignore-awareness is a later
+//! refinement. `bash` and the budget/lease envelope are later slices.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,6 +30,7 @@ use whipplescript_kernel::{BrokeredTurnContext, RuntimeKernel};
 use whipplescript_parser::IrWorkflowContractKind;
 use whipplescript_store::content::ContentStore;
 use whipplescript_store::coordination::{AcquireOutcome, CoordinationStore};
+use whipplescript_store::files::{FileStore, NativeFileStore};
 use whipplescript_store::items::WorkItemStore;
 use whipplescript_store::{
     RegisteredProfilePolicy, SqliteStore, StoreError, StoreResult, StoredEvent,
@@ -48,8 +49,11 @@ pub const TOOL_RECALL: &str = "recall";
 pub const TOOL_LIST_TODOS: &str = "list_todos";
 pub const TOOL_ADD_TODO: &str = "add_todo";
 pub const TOOL_UPDATE_TODO: &str = "update_todo";
+pub const TOOL_WEB_SEARCH: &str = "web_search";
+pub const TOOL_WEB_FETCH: &str = "web_fetch";
 
 const TRACKER_RESOURCE: &str = "tracker";
+const WEB_RESOURCE: &str = "web";
 
 /// Default wall-clock cap for a single `bash` command, in seconds.
 const BASH_DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -105,9 +109,16 @@ pub fn tracker_tool_specs() -> Vec<ToolSpec> {
 const DEFAULT_MAX_BYTES: usize = 50_000;
 /// Bound on files visited by `find`/`grep` so a huge tree cannot stall a turn.
 const MAX_FILES_WALKED: usize = 5_000;
+/// Default line window for `read` when no explicit `limit` is given
+/// (pi-conformance §1: line-based head truncation with continuation notices).
+const DEFAULT_READ_LINE_LIMIT: usize = 2_000;
+/// Cap on a single emitted `grep` line (pi-conformance §1).
+const GREP_MAX_LINE_CHARS: usize = 500;
+/// How many leading bytes of a file are sniffed for a NUL byte to refuse
+/// reading binary content as text (pi-conformance §1 binary guard).
+const BINARY_SNIFF_BYTES: usize = 8_192;
 
-#[cfg(test)]
-fn file_tool_specs_for_profile(profile: Option<&str>) -> Vec<ToolSpec> {
+pub(crate) fn file_tool_specs_for_profile(profile: Option<&str>) -> Vec<ToolSpec> {
     let policy = HarnessProfilePolicy::for_profile(profile);
     file_tool_specs_for_policy(&policy)
 }
@@ -116,7 +127,9 @@ fn file_tool_specs_for_policy(policy: &HarnessProfilePolicy) -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: TOOL_READ.into(),
-            description: "Read a file's text. Optional 1-based line offset and limit.".into(),
+            description: "Read a file's text. Optional 1-based line offset and limit; a long \
+                          file is windowed with a continuation notice."
+                .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -169,13 +182,16 @@ fn file_tool_specs_for_policy(policy: &HarnessProfilePolicy) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: TOOL_GREP.into(),
-            description: "Search file contents for a substring; returns path:line:text.".into(),
+            description: "Search file contents for a regex (invalid patterns fall back to a \
+                          literal substring); returns path:line:text."
+                .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string" },
+                    "pattern": { "type": "string", "description": "regex; an invalid regex is searched literally" },
                     "path": { "type": "string", "description": "subdir to search, default root" },
                     "ignoreCase": { "type": "boolean" },
+                    "context": { "type": "integer", "description": "lines of context before/after each match, default 0" },
                     "limit": { "type": "integer" }
                 },
                 "required": ["pattern"],
@@ -251,8 +267,8 @@ fn file_tool_specs_for_turn(
     policy: &HarnessProfilePolicy,
     access: &TurnToolAccess,
 ) -> Vec<ToolSpec> {
-    let read_files = access.file.read_globs.is_some();
-    let write_files = access.file.write_globs.is_some();
+    let read_files = access.file.grants_read();
+    let write_files = access.file.grants_write();
     file_tool_specs_for_policy(policy)
         .into_iter()
         .filter(|spec| match spec.name.as_str() {
@@ -263,6 +279,52 @@ fn file_tool_specs_for_turn(
             _ => true,
         })
         .collect()
+}
+
+/// The web tools ride the `with access to web { search fetch }` grant only
+/// (per the accepted design notes): search is provider-resolved at call
+/// time, fetch is structurally GET-only behind the central guard.
+fn web_tool_specs_for_turn(access: &TurnToolAccess) -> Vec<ToolSpec> {
+    let mut specs = Vec::new();
+    if access.web_search {
+        specs.push(ToolSpec {
+            name: TOOL_WEB_SEARCH.into(),
+            description: "Search the web. Returns ranked results (title, url, snippet, \
+                          published) — data, not fetched pages; use web_fetch to read one."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "allowed_domains": { "type": "array", "items": { "type": "string" } },
+                    "blocked_domains": { "type": "array", "items": { "type": "string" } },
+                    "freshness": { "type": "string", "description": "pd|pw|pm|py or a provider date filter" },
+                    "count": { "type": "integer", "description": "max results, capped at 20" }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        });
+    }
+    if access.web_fetch {
+        specs.push(ToolSpec {
+            name: TOOL_WEB_FETCH.into(),
+            description: "Fetch one URL (GET only). HTML is converted to markdown; binary \
+                          content returns a metadata line. Private-network and metadata \
+                          addresses are never fetchable."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" },
+                    "max_bytes": { "type": "integer", "description": "response byte cap (policy-bounded)" }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }),
+        });
+    }
+    specs
 }
 
 fn tracker_tool_specs_for_turn(
@@ -306,7 +368,10 @@ pub struct WorkflowToolEntry {
 /// `file store` path policy (no absolute/`..` escape; optional read/write globs).
 pub struct FileToolExecutor {
     root: PathBuf,
-    file_policy: Option<FileToolPolicy>,
+    /// `None` = direct/test executor with no policy (workspace root, any path
+    /// inside it). `Some(scopes)` = a turn/store policy is installed; an empty
+    /// `Some` denies all file tools (no store granted this turn).
+    file_policy: Option<Vec<FileStoreScope>>,
     bash_allow: Vec<String>,
     profile_policy: HarnessProfilePolicy,
     tracker_queue: Option<String>,
@@ -315,6 +380,10 @@ pub struct FileToolExecutor {
     /// `None` means no turn-access policy was installed (direct/test executor);
     /// `Some(false)` is the live owned-turn default-deny command policy.
     command_run_granted: Option<bool>,
+    /// The web egress doors are default-deny even for direct executor use:
+    /// the tools reach the network, so only an explicit grant opens them.
+    web_search_granted: bool,
+    web_fetch_granted: bool,
     /// `None` preserves direct/test executor behavior; live owned turns install
     /// `Some` so tracker mutations are bound to `with access to tracker { ... }`.
     tracker_access: Option<TurnTrackerAccess>,
@@ -343,27 +412,45 @@ pub struct FileToolExecutor {
     content_store_path: Option<PathBuf>,
 }
 
+/// One granted file store's turn scope (Q3 turn-grant ∩ store-policy fix). Carries
+/// both the turn grant's globs (what the turn asked for) and the store's own
+/// declared `allow` globs (the policy ceiling). A path is authorized only if it is
+/// inside the store `root` AND matches both glob sets — the turn grant can never
+/// widen the store policy. Paths resolve against the STORE root, not the workspace.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct FileToolPolicy {
+struct FileStoreScope {
     store_name: String,
-    read_globs: Option<Vec<String>>,
-    write_globs: Option<Vec<String>>,
+    /// Store root, workspace-relative and normalized (`""` = the workspace root).
+    root: String,
+    /// Turn-grant read globs (store-root-relative). `None` = read not granted this
+    /// turn; `Some(empty)` = granted with no glob restriction (any path in root).
+    grant_read: Option<Vec<String>>,
+    grant_write: Option<Vec<String>>,
+    /// The store's declared `allow read`/`allow write` globs (the ceiling the grant
+    /// is intersected against). Empty = any path inside the root.
+    store_read: Vec<String>,
+    store_write: Vec<String>,
 }
 
+/// The per-turn file authority: one scope per granted `file store`. Deny = empty.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TurnFileAccess {
-    store_name: String,
-    read_globs: Option<Vec<String>>,
-    write_globs: Option<Vec<String>>,
+    scopes: Vec<FileStoreScope>,
 }
 
 impl TurnFileAccess {
     fn deny_all() -> Self {
-        Self {
-            store_name: "turn_access".to_owned(),
-            read_globs: None,
-            write_globs: None,
-        }
+        Self { scopes: Vec::new() }
+    }
+
+    /// Any granted store exposes a read tool (the model-facing tool gate).
+    fn grants_read(&self) -> bool {
+        self.scopes.iter().any(|scope| scope.grant_read.is_some())
+    }
+
+    /// Any granted store exposes a write tool.
+    fn grants_write(&self) -> bool {
+        self.scopes.iter().any(|scope| scope.grant_write.is_some())
     }
 }
 
@@ -373,6 +460,10 @@ struct TurnToolAccess {
     file_resources: Vec<String>,
     command_run: bool,
     tracker: TurnTrackerAccess,
+    /// `with access to web { search }` — the web-search egress door.
+    web_search: bool,
+    /// `with access to web { fetch }` — the GET-only fetch egress door.
+    web_fetch: bool,
 }
 
 impl TurnToolAccess {
@@ -382,6 +473,8 @@ impl TurnToolAccess {
             file_resources: Vec::new(),
             command_run: false,
             tracker: TurnTrackerAccess::deny_all(),
+            web_search: false,
+            web_fetch: false,
         }
     }
 }
@@ -677,6 +770,8 @@ impl FileToolExecutor {
             holder: "agent".to_string(),
             max_bytes: DEFAULT_MAX_BYTES,
             command_run_granted: None,
+            web_search_granted: false,
+            web_fetch_granted: false,
             tracker_access: None,
             workflow_tools: Vec::new(),
             store_path: None,
@@ -745,33 +840,33 @@ impl FileToolExecutor {
         allow_read: Vec<String>,
         allow_write: Vec<String>,
     ) -> Self {
-        self.file_policy = Some(FileToolPolicy {
+        // A store-only policy (no turn narrowing): the grant is unrestricted
+        // (`Some(empty)` = any inside root) and the store `allow` globs are the
+        // ceiling. Rooted at the workspace (`""`).
+        self.file_policy = Some(vec![FileStoreScope {
             store_name: store_name.into(),
-            read_globs: Some(allow_read),
-            write_globs: Some(allow_write),
-        });
+            root: String::new(),
+            grant_read: Some(Vec::new()),
+            grant_write: Some(Vec::new()),
+            store_read: allow_read,
+            store_write: allow_write,
+        }]);
         self
     }
 
     #[cfg(test)]
     fn with_turn_file_access(mut self, access: TurnFileAccess) -> Self {
-        self.file_policy = Some(FileToolPolicy {
-            store_name: access.store_name,
-            read_globs: access.read_globs,
-            write_globs: access.write_globs,
-        });
+        self.file_policy = Some(access.scopes);
         self.command_run_granted = Some(false);
         self.tracker_access = Some(TurnTrackerAccess::deny_all());
         self
     }
 
     fn with_turn_tool_access(mut self, access: TurnToolAccess) -> Self {
-        self.file_policy = Some(FileToolPolicy {
-            store_name: access.file.store_name,
-            read_globs: access.file.read_globs,
-            write_globs: access.file.write_globs,
-        });
+        self.file_policy = Some(access.file.scopes);
         self.command_run_granted = Some(access.command_run);
+        self.web_search_granted = access.web_search;
+        self.web_fetch_granted = access.web_fetch;
         self.tracker_access = Some(access.tracker);
         self
     }
@@ -800,21 +895,72 @@ impl FileToolExecutor {
                 self.profile_policy.profile_name()
             ));
         }
-        let Some(policy) = &self.file_policy else {
-            return crate::file_path_policy_error(path, "workspace", &[], op);
+        let Some(scopes) = &self.file_policy else {
+            return crate::file_path_policy_error(path, "workspace", &[], op)
+                .or_else(|| self.native_path_policy_error(path, "workspace", op));
         };
-        let globs = if op == "write" {
-            policy.write_globs.as_ref()
-        } else {
-            policy.read_globs.as_ref()
-        };
-        match globs {
-            Some(globs) => crate::file_path_policy_error(path, &policy.store_name, globs, op),
-            None => Some(format!(
-                "file {op} is not granted for store `{}` in this turn",
-                policy.store_name
-            )),
+        if scopes.is_empty() {
+            return Some(format!("file {op} is not granted for this turn"));
         }
+        // Absolute / `..` paths escape any store root and are refused before routing.
+        if Path::new(path).is_absolute()
+            || Path::new(path)
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Some(format!("path `{path}` escapes the store root"));
+        }
+        let is_write = op == "write";
+        // Route to the granted store whose root contains the path (longest match).
+        let Some(scope) = scopes
+            .iter()
+            .filter(|scope| store_root_contains(&scope.root, path))
+            .max_by_key(|scope| scope.root.len())
+        else {
+            return Some(format!(
+                "path `{path}` is outside every file store granted to this turn"
+            ));
+        };
+        let grant_globs = if is_write {
+            &scope.grant_write
+        } else {
+            &scope.grant_read
+        };
+        let Some(grant_globs) = grant_globs else {
+            return Some(format!(
+                "file {op} is not granted for store `{}` in this turn",
+                scope.store_name
+            ));
+        };
+        // Resolve the path against the STORE root (not the workspace): strip the
+        // root prefix so both the turn grant globs and the store `allow` globs —
+        // which are store-root-relative — apply in the same coordinate space.
+        let relative = store_relative_path(&scope.root, path);
+        // Turn-grant ceiling: the path must match the grant globs (empty = any).
+        if !grant_globs.is_empty()
+            && !grant_globs
+                .iter()
+                .any(|glob| crate::glob_match(glob, &relative))
+        {
+            return Some(format!(
+                "path `{path}` is not in the turn grant for store `{}` (`{op}`)",
+                scope.store_name
+            ));
+        }
+        // Store-policy ceiling (the Q3 fix): intersect with the store's own `allow`
+        // globs — empty = any inside root. A turn grant cannot widen the store.
+        let store_globs = if is_write {
+            &scope.store_write
+        } else {
+            &scope.store_read
+        };
+        crate::file_path_policy_error(&relative, &scope.store_name, store_globs, op)
+            .or_else(|| self.native_path_policy_error(path, &scope.store_name, op))
+    }
+
+    fn native_path_policy_error(&self, path: &str, store_name: &str, op: &str) -> Option<String> {
+        let files = NativeFileStore;
+        files.path_policy_error(&self.root, Path::new(path), store_name, op)
     }
 
     /// Override the bash allow-list (test/programmatic use).
@@ -831,6 +977,8 @@ impl FileToolExecutor {
             TOOL_ADD_TODO => self.add_todo(args),
             TOOL_UPDATE_TODO => self.update_todo(args),
             TOOL_BASH => self.bash(args),
+            TOOL_WEB_SEARCH => self.web_search(args),
+            TOOL_WEB_FETCH => self.web_fetch(args),
             TOOL_READ => self.read(args),
             TOOL_WRITE => self.write(args),
             TOOL_EDIT => self.edit(args),
@@ -942,17 +1090,22 @@ impl FileToolExecutor {
         if let Some(body) = self.skill_bodies.get(path) {
             let offset = usize_arg(args, "offset");
             let limit = usize_arg(args, "limit");
-            // Full content; `execute` applies the single capture-time cap.
-            return Ok(slice_lines(body, offset, limit));
+            // Same line window as a filesystem read; `execute` applies the single
+            // capture-time byte cap afterwards.
+            return read_line_window(body, offset, limit);
         }
         if let Some(reason) = self.policy(path, "read") {
             return Err(reason);
         }
-        let content = std::fs::read_to_string(self.root.join(path))
-            .map_err(|e| format!("read of `{path}` failed: {e}"))?;
+        let full = self.root.join(path);
+        refuse_binary_read(path, &full)?;
+        let content =
+            std::fs::read_to_string(&full).map_err(|e| format!("read of `{path}` failed: {e}"))?;
         let offset = usize_arg(args, "offset");
         let limit = usize_arg(args, "limit");
-        Ok(slice_lines(&content, offset, limit))
+        // Line window + continuation notices (pi-conformance §1); the 50KB byte
+        // cap + recall footer in `execute` still applies after the window.
+        read_line_window(&content, offset, limit)
     }
 
     fn write(&self, args: &Value) -> Result<String, String> {
@@ -978,17 +1131,33 @@ impl FileToolExecutor {
         if let Some(reason) = self.policy(path, "write") {
             return Err(reason);
         }
-        let edits = args
-            .get("edits")
-            .and_then(Value::as_array)
+        let edits_value = edits_argument(args)?;
+        let edits = edits_value
+            .as_array()
             .ok_or_else(|| "`edits` must be an array".to_string())?;
         let full = self.root.join(path);
         let mut content =
             std::fs::read_to_string(&full).map_err(|e| format!("read of `{path}` failed: {e}"))?;
+        // A UTF-8 BOM is invisible in the model's view of the file (read strips
+        // nothing, but the model never types one): strip it before matching so an
+        // edit anchored at the file start applies, and restore it on write so the
+        // file keeps its encoding marker (pi-conformance §1).
+        const BOM: &str = "\u{feff}";
+        let had_bom = content.starts_with(BOM);
+        if had_bom {
+            content = content[BOM.len()..].to_string();
+        }
+        // Regions already rewritten, in current-content coordinates (with the edit
+        // index that produced them). A later edit whose match intersects one is
+        // editing an earlier edit's output — almost always a model mistake.
+        let mut replaced: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
         let mut applied = 0usize;
         for (index, edit) in edits.iter().enumerate() {
             let old = str_arg(edit, "oldText")?;
             let new = str_arg(edit, "newText")?;
+            if old.is_empty() {
+                return Err(format!("edit {index}: oldText must not be empty"));
+            }
             let matches = content.matches(old).count();
             if matches == 0 {
                 return Err(format!("edit {index}: oldText not found in `{path}`"));
@@ -998,10 +1167,36 @@ impl FileToolExecutor {
                     "edit {index}: oldText matches {matches} times in `{path}`; make it unique"
                 ));
             }
-            content = content.replacen(old, new, 1);
+            let start = content
+                .find(old)
+                .ok_or_else(|| format!("edit {index}: oldText not found in `{path}`"))?;
+            let end = start + old.len();
+            for (earlier, region) in &replaced {
+                if start < region.end && region.start < end {
+                    return Err(format!(
+                        "edit {earlier} and edit {index} overlap in `{path}`; merge them \
+                         into one edit or target disjoint regions"
+                    ));
+                }
+            }
+            content.replace_range(start..end, new);
+            // Shift the recorded regions that sit after the splice point.
+            let delta = new.len() as isize - old.len() as isize;
+            for (_, region) in replaced.iter_mut() {
+                if region.start >= end {
+                    region.start = (region.start as isize + delta) as usize;
+                    region.end = (region.end as isize + delta) as usize;
+                }
+            }
+            replaced.push((index, start..start + new.len()));
             applied += 1;
         }
-        std::fs::write(&full, &content).map_err(|e| format!("write of `{path}` failed: {e}"))?;
+        let output = if had_bom {
+            format!("{BOM}{content}")
+        } else {
+            content
+        };
+        std::fs::write(&full, &output).map_err(|e| format!("write of `{path}` failed: {e}"))?;
         Ok(format!("applied {applied} edit(s) to {path}"))
     }
 
@@ -1062,33 +1257,45 @@ impl FileToolExecutor {
             .get("ignoreCase")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let needle = if ignore_case {
-            pattern.to_lowercase()
-        } else {
-            pattern.to_string()
-        };
         let limit = usize_arg(args, "limit").unwrap_or(100);
+        let context = usize_arg(args, "context").unwrap_or(0);
+        let matcher = GrepMatcher::new(pattern, ignore_case);
         let mut hits: Vec<String> = Vec::new();
+        let mut matches_found = 0usize;
         let root = self.root.clone();
         let mut walked = 0usize;
         walk(&root, &root.join(base), &mut walked, &mut |rel| {
-            if hits.len() >= limit {
+            if matches_found >= limit {
                 return;
             }
             let Ok(content) = std::fs::read_to_string(root.join(rel)) else {
                 return;
             };
-            for (lineno, line) in content.lines().enumerate() {
-                let haystack = if ignore_case {
-                    line.to_lowercase()
+            let lines: Vec<&str> = content.lines().collect();
+            // Match pass first so a context line that is itself a match keeps
+            // the match (`:`) format even past the match limit.
+            let matched: Vec<bool> = lines.iter().map(|line| matcher.is_match(line)).collect();
+            // The match limit counts matches; context lines ride along free.
+            // Overlapping context windows are merged (each line emitted once).
+            let mut emit: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+            for (index, &hit) in matched.iter().enumerate() {
+                if !hit {
+                    continue;
+                }
+                if matches_found >= limit {
+                    break;
+                }
+                matches_found += 1;
+                let from = index.saturating_sub(context);
+                let to = (index + context).min(lines.len().saturating_sub(1));
+                emit.extend(from..=to);
+            }
+            for index in emit {
+                let line = cap_grep_line(lines[index]);
+                if matched[index] {
+                    hits.push(format!("{rel}:{}:{line}", index + 1));
                 } else {
-                    line.to_string()
-                };
-                if haystack.contains(&needle) {
-                    hits.push(format!("{rel}:{}:{line}", lineno + 1));
-                    if hits.len() >= limit {
-                        break;
-                    }
+                    hits.push(format!("{rel}-{}-{line}", index + 1));
                 }
             }
         });
@@ -1102,6 +1309,85 @@ impl FileToolExecutor {
     /// Run a shell command in the workspace. Default-deny: the command must match
     /// an allow-list prefix or it is refused (the sandbox boundary). Output is
     /// combined stdout+stderr, truncated; a non-zero exit is an error result.
+    /// `web_search` (accepted design note): provider resolved at call time —
+    /// Brave when a key is configured, else the provider-mediated floor, else
+    /// an honest "configure a search provider" failure. The query is egress;
+    /// results are low-integrity ingress.
+    fn web_search(&self, args: &Value) -> Result<String, String> {
+        if !self.web_search_granted {
+            return Err(
+                "web_search is not granted for this turn (`with access to web { search }` required)"
+                    .to_owned(),
+            );
+        }
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .filter(|query| !query.trim().is_empty())
+            .ok_or_else(|| "web_search needs a non-empty `query`".to_owned())?;
+        let provider =
+            crate::web_tools::resolve_search_provider().map_err(|error| error.to_tool_message())?;
+        let domains = |key: &str| -> Vec<String> {
+            args.get(key)
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let search_query = crate::web_tools::SearchQuery {
+            query: query.to_owned(),
+            allowed_domains: domains("allowed_domains"),
+            blocked_domains: domains("blocked_domains"),
+            freshness: args
+                .get("freshness")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            count: args
+                .get("count")
+                .and_then(Value::as_u64)
+                .unwrap_or(10)
+                .clamp(1, 20) as usize,
+        };
+        let results = provider
+            .search(&search_query)
+            .map_err(|error| error.to_tool_message())?;
+        Ok(crate::web_tools::results_to_tool_json(
+            &results,
+            provider.tag(),
+        ))
+    }
+
+    /// `web_fetch` (accepted design note): structurally GET-only — the only
+    /// egress is the URL string — behind the central guard (resolve-then-check,
+    /// pinned connection, redirect re-entry, unconditional private/metadata
+    /// denial). HTML converts to markdown for context economy.
+    fn web_fetch(&self, args: &Value) -> Result<String, String> {
+        if !self.web_fetch_granted {
+            return Err(
+                "web_fetch is not granted for this turn (`with access to web { fetch }` required)"
+                    .to_owned(),
+            );
+        }
+        let url = args
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.trim().is_empty())
+            .ok_or_else(|| "web_fetch needs a non-empty `url`".to_owned())?;
+        let mut policy = crate::web_tools::FetchPolicy::default();
+        if let Some(max_bytes) = args.get("max_bytes").and_then(Value::as_u64) {
+            // The caller may narrow the byte cap, never widen past policy.
+            policy.max_bytes = (max_bytes as usize).min(policy.max_bytes).max(1);
+        }
+        crate::web_tools::web_fetch(url, &policy)
+            .map(|outcome| outcome.to_tool_json())
+            .map_err(|error| error.to_tool_message())
+    }
+
     fn bash(&self, args: &Value) -> Result<String, String> {
         let command = str_arg(args, "command")?;
         if !self.profile_policy.bash {
@@ -1849,6 +2135,152 @@ fn usize_arg(args: &Value, key: &str) -> Option<usize> {
         .map(|value| value as usize)
 }
 
+/// Resolve the `edits` argument with pi's tolerance (pi-conformance §1): a real
+/// array, an array double-encoded as a JSON string (some models serialize the
+/// nested value), or the legacy single-edit shape with top-level
+/// `oldText`/`newText` strings.
+fn edits_argument(args: &Value) -> Result<Value, String> {
+    match args.get("edits") {
+        Some(Value::Array(items)) => Ok(Value::Array(items.clone())),
+        Some(Value::String(raw)) => {
+            let parsed: Value = serde_json::from_str(raw)
+                .map_err(|e| format!("`edits` is a string but not valid JSON: {e}"))?;
+            if parsed.is_array() {
+                Ok(parsed)
+            } else {
+                Err("`edits` must be an array".to_string())
+            }
+        }
+        Some(_) => Err("`edits` must be an array".to_string()),
+        None => match (
+            optional_str_arg(args, "oldText"),
+            optional_str_arg(args, "newText"),
+        ) {
+            (Some(old), Some(new)) => Ok(json!([{ "oldText": old, "newText": new }])),
+            _ => Err("`edits` must be an array".to_string()),
+        },
+    }
+}
+
+/// Pattern matcher for `grep`: a real regex when the pattern compiles, else a
+/// literal substring. An invalid regex is deliberately NOT an error — pi users
+/// paste literal code fragments (`foo(`, `a[0]`) as patterns and expect a
+/// lenient literal search, so compile failure degrades to substring matching.
+enum GrepMatcher {
+    Regex(regex::Regex),
+    Literal { needle: String, ignore_case: bool },
+}
+
+impl GrepMatcher {
+    fn new(pattern: &str, ignore_case: bool) -> Self {
+        match regex::RegexBuilder::new(pattern)
+            .case_insensitive(ignore_case)
+            .build()
+        {
+            Ok(re) => GrepMatcher::Regex(re),
+            Err(_) => GrepMatcher::Literal {
+                needle: if ignore_case {
+                    pattern.to_lowercase()
+                } else {
+                    pattern.to_string()
+                },
+                ignore_case,
+            },
+        }
+    }
+
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            GrepMatcher::Regex(re) => re.is_match(line),
+            GrepMatcher::Literal {
+                needle,
+                ignore_case,
+            } => {
+                if *ignore_case {
+                    line.to_lowercase().contains(needle)
+                } else {
+                    line.contains(needle)
+                }
+            }
+        }
+    }
+}
+
+/// Cap a single grep output line at [`GREP_MAX_LINE_CHARS`] characters
+/// (char-boundary safe), marking the cut.
+fn cap_grep_line(line: &str) -> String {
+    match line.char_indices().nth(GREP_MAX_LINE_CHARS) {
+        Some((byte_index, _)) => format!("{}... [truncated]", &line[..byte_index]),
+        None => line.to_string(),
+    }
+}
+
+/// Sniff the leading [`BINARY_SNIFF_BYTES`] bytes for a NUL and refuse the read
+/// when one is found (pi-conformance §1 binary guard): text files virtually
+/// never contain NUL, so this catches images/archives/executables with a clean
+/// error before `read_to_string` surfaces a raw UTF-8 failure.
+fn refuse_binary_read(path: &str, full: &Path) -> Result<(), String> {
+    use std::io::Read as _;
+    let mut file =
+        std::fs::File::open(full).map_err(|e| format!("read of `{path}` failed: {e}"))?;
+    let mut head = [0u8; BINARY_SNIFF_BYTES];
+    let mut filled = 0usize;
+    while filled < head.len() {
+        match file.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("read of `{path}` failed: {e}")),
+        }
+    }
+    if head[..filled].contains(&0) {
+        return Err(format!("cannot read binary file `{path}` as text"));
+    }
+    Ok(())
+}
+
+/// Apply the `read` line window (pi-conformance §1): a 1-based `offset`, an
+/// explicit `limit`, or the default [`DEFAULT_READ_LINE_LIMIT`]-line window.
+/// Head truncation appends a continuation notice carrying the next offset; an
+/// offset past the end of the file is an error.
+fn read_line_window(
+    content: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<String, String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    if let Some(requested) = offset {
+        if requested > total {
+            return Err(format!(
+                "Offset {requested} is beyond end of file ({total} lines total)"
+            ));
+        }
+    }
+    let start = offset.unwrap_or(1).max(1) - 1;
+    let window = limit.unwrap_or(DEFAULT_READ_LINE_LIMIT);
+    let end = (start + window).min(total);
+    let mut out = lines[start..end].join("\n");
+    let remaining = total - end;
+    if remaining > 0 {
+        if limit.is_some() {
+            // The caller's explicit limit stopped early.
+            out.push_str(&format!(
+                "\n[{remaining} more lines in file. Use offset={} to continue.]",
+                end + 1
+            ));
+        } else {
+            // The default window head-truncated the file.
+            out.push_str(&format!(
+                "\n[Showing lines {}-{end} of {total}. Use offset={} to continue.]",
+                start + 1,
+                end + 1
+            ));
+        }
+    }
+    Ok(out)
+}
+
 /// Apply a 1-based line offset and a line limit to file content.
 fn slice_lines(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
     if offset.is_none() && limit.is_none() {
@@ -1900,6 +2332,16 @@ fn middle_truncate(text: &str, max_bytes: usize) -> String {
 /// Recursively walk `dir` (under `root`), invoking `visit` with each file's
 /// root-relative slash path. Bounded by [`MAX_FILES_WALKED`].
 fn walk(root: &Path, dir: &Path, walked: &mut usize, visit: &mut dyn FnMut(&str)) {
+    let canonical_root = match root.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    let Ok(canonical_dir) = dir.canonicalize() else {
+        return;
+    };
+    if !canonical_dir.starts_with(&canonical_root) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1908,6 +2350,12 @@ fn walk(root: &Path, dir: &Path, walked: &mut usize, visit: &mut dyn FnMut(&str)
     for path in children {
         if *walked >= MAX_FILES_WALKED {
             return;
+        }
+        let Ok(canonical_path) = path.canonicalize() else {
+            continue;
+        };
+        if !canonical_path.starts_with(&canonical_root) {
+            continue;
         }
         if path.is_dir() {
             walk(root, &path, walked, visit);
@@ -2402,6 +2850,69 @@ pub fn owned_workspace_root() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
+/// Normalize a `file store` root to a `/`-joined path prefix with no leading `./`
+/// or trailing `/`. `"."`, `"./"`, and `""` all normalize to `""` (workspace root).
+fn normalize_store_root(root: &str) -> String {
+    root.trim()
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Whether the (normalized) store `root` contains the workspace-relative `path`.
+/// The empty root (workspace root) contains everything.
+fn store_root_contains(root: &str, path: &str) -> bool {
+    root.is_empty() || path == root || path.starts_with(&format!("{root}/"))
+}
+
+/// The `path` re-expressed relative to the store `root` (the prefix stripped), so
+/// store-root-relative globs apply. Callers guarantee `store_root_contains` first.
+fn store_relative_path(root: &str, path: &str) -> String {
+    if root.is_empty() {
+        return path.to_owned();
+    }
+    if path == root {
+        return String::new();
+    }
+    path.strip_prefix(&format!("{root}/"))
+        .unwrap_or(path)
+        .to_owned()
+}
+
+/// Extract a `Vec<String>` from an optional JSON array of strings (empty otherwise).
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The store-policy snapshot lowering embeds next to a file-store grant (Q3): the
+/// store `root` (normalized) and its declared `allow read`/`allow write` globs.
+/// Absent (hand-built payloads, non-file grants) = workspace root, no ceiling.
+fn parse_store_policy(grant: &Value) -> (String, Vec<String>, Vec<String>) {
+    let Some(policy) = grant.get("store_policy") else {
+        return (String::new(), Vec::new(), Vec::new());
+    };
+    let root = policy
+        .get("root")
+        .and_then(Value::as_str)
+        .map(normalize_store_root)
+        .unwrap_or_default();
+    (
+        root,
+        string_array(policy.get("allow_read")),
+        string_array(policy.get("allow_write")),
+    )
+}
+
 fn merge_grant_globs(slot: &mut Option<Vec<String>>, globs: Vec<String>) {
     match slot {
         None => *slot = Some(globs),
@@ -2498,11 +3009,12 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
     if grants.is_empty() {
         return Ok(TurnToolAccess::deny_all());
     }
-    let mut store_names = Vec::<String>::new();
-    let mut read_globs = None;
-    let mut write_globs = None;
+    let mut scopes = Vec::<FileStoreScope>::new();
+    let mut file_resources = Vec::<String>::new();
     let mut command_run = false;
     let mut tracker = TurnTrackerAccess::deny_all();
+    let mut web_search = false;
+    let mut web_fetch = false;
     for (grant_index, grant) in grants.iter().enumerate() {
         let resource = grant
             .get("resource")
@@ -2513,6 +3025,9 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
             .get("operations")
             .and_then(Value::as_array)
             .ok_or_else(|| format!("access_grants[{grant_index}].operations must be an array"))?;
+        // This grant's own read/write globs (before the store-policy intersection).
+        let mut grant_read: Option<Vec<String>> = None;
+        let mut grant_write: Option<Vec<String>> = None;
         let mut has_file_operation = false;
         for operation in operations {
             let operation_name = operation
@@ -2523,13 +3038,15 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
             match operation_name {
                 "read" | "import" if resource != TRACKER_RESOURCE => {
                     has_file_operation = true;
-                    merge_grant_globs(&mut read_globs, globs)
+                    merge_grant_globs(&mut grant_read, globs)
                 }
                 "write" | "export" if resource != TRACKER_RESOURCE => {
                     has_file_operation = true;
-                    merge_grant_globs(&mut write_globs, globs)
+                    merge_grant_globs(&mut grant_write, globs)
                 }
                 "run" if resource == "command" => command_run = true,
+                "search" if resource == WEB_RESOURCE => web_search = true,
+                "fetch" if resource == WEB_RESOURCE => web_fetch = true,
                 "file" | "add" if resource == TRACKER_RESOURCE => tracker.file = true,
                 "claim" if resource == TRACKER_RESOURCE => tracker.claim = true,
                 "finish" | "complete" | "close" if resource == TRACKER_RESOURCE => {
@@ -2541,24 +3058,50 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
                 _ => {}
             }
         }
-        if has_file_operation && !store_names.iter().any(|existing| existing == resource) {
-            store_names.push(resource.to_owned());
+        if !has_file_operation {
+            continue;
+        }
+        if !file_resources.iter().any(|existing| existing == resource) {
+            file_resources.push(resource.to_owned());
+        }
+        let (root, store_read, store_write) = parse_store_policy(grant);
+        // One scope per store. Repeated `with access to <store>` grants on the same
+        // store merge their globs; the store policy snapshot is identical across them.
+        match scopes.iter_mut().find(|scope| scope.store_name == resource) {
+            Some(existing) => {
+                if let Some(globs) = grant_read {
+                    merge_grant_globs(&mut existing.grant_read, globs);
+                }
+                if let Some(globs) = grant_write {
+                    merge_grant_globs(&mut existing.grant_write, globs);
+                }
+                if existing.root.is_empty() {
+                    existing.root = root;
+                }
+                if existing.store_read.is_empty() {
+                    existing.store_read = store_read;
+                }
+                if existing.store_write.is_empty() {
+                    existing.store_write = store_write;
+                }
+            }
+            None => scopes.push(FileStoreScope {
+                store_name: resource.to_owned(),
+                root,
+                grant_read,
+                grant_write,
+                store_read,
+                store_write,
+            }),
         }
     }
-    let store_name = match store_names.as_slice() {
-        [only] => only.clone(),
-        [] => "turn_access".to_owned(),
-        _ => "turn_access".to_owned(),
-    };
     Ok(TurnToolAccess {
-        file: TurnFileAccess {
-            store_name,
-            read_globs,
-            write_globs,
-        },
-        file_resources: store_names,
+        file: TurnFileAccess { scopes },
+        file_resources,
         command_run,
         tracker,
+        web_search,
+        web_fetch,
     })
 }
 
@@ -2575,6 +3118,11 @@ fn enforce_turn_access_governance(access: &TurnToolAccess) -> Result<(), String>
             }
             if access.tracker.mutates() {
                 resources.push(TRACKER_RESOURCE.to_owned());
+            }
+            // The web tools are egress doors (query/URL leave the workspace):
+            // a governed envelope must govern the `web` resource.
+            if access.web_search || access.web_fetch {
+                resources.push(WEB_RESOURCE.to_owned());
             }
             let missing = resources
                 .into_iter()
@@ -2633,6 +3181,97 @@ struct HarnessModelConfig {
     base_url: String,
     max_tokens: u64,
     timeout: Duration,
+}
+
+/// Auth relocation (untie research note §2, tracker Phase 4): the policy
+/// channel may hand whip RESOLVED credentials inside provider profiles.
+/// `WHIPPLESCRIPT_PROVIDER_PROFILES` names a host-written JSON file mapping
+/// profile name → `{ provider, model, api_key | api_key_env, base_url?,
+/// max_tokens?, timeout_secs? }`; the agent's declared profile is looked up
+/// first, then `"default"`. When an entry matches, the HOST owns auth — whip
+/// performs no credential acquisition of its own. Whip's standalone resolver
+/// (env / `whip auth` store / codex OAuth) is the FALLBACK, consulted only
+/// when this channel yields nothing. A configured-but-broken channel fails
+/// the turn honestly instead of silently falling back.
+fn host_resolved_profile_config(
+    profile: Option<&str>,
+) -> Result<Option<HarnessModelConfig>, String> {
+    let Some(path) = std::env::var_os("WHIPPLESCRIPT_PROVIDER_PROFILES") else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        format!("WHIPPLESCRIPT_PROVIDER_PROFILES is set but unreadable: {error}")
+    })?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("provider profiles file is not valid JSON: {error}"))?;
+    profile_config_from_value(&value, profile)
+}
+
+/// The pure half of [`host_resolved_profile_config`]: select and validate the
+/// profile entry from the host-written document.
+fn profile_config_from_value(
+    value: &Value,
+    profile: Option<&str>,
+) -> Result<Option<HarnessModelConfig>, String> {
+    let (name, entry) = match profile
+        .and_then(|name| value.get(name).map(|entry| (name, entry)))
+        .or_else(|| value.get("default").map(|entry| ("default", entry)))
+    {
+        Some(found) => found,
+        None => return Ok(None),
+    };
+    let provider = match entry.get("provider").and_then(Value::as_str) {
+        Some("openai") => CoerceProvider::OpenAi,
+        Some("anthropic") => CoerceProvider::Anthropic,
+        Some(other) => {
+            return Err(format!(
+                "provider profile `{name}` names unknown provider `{other}` (expected `openai` or `anthropic`)"
+            ));
+        }
+        None => {
+            return Err(format!("provider profile `{name}` needs a `provider`"));
+        }
+    };
+    let api_key = entry
+        .get("api_key")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            entry
+                .get("api_key_env")
+                .and_then(Value::as_str)
+                .and_then(|env_name| std::env::var(env_name).ok())
+                .filter(|key| !key.is_empty())
+        });
+    let Some(api_key) = api_key else {
+        return Err(format!(
+            "provider profile `{name}` carries no resolvable credential (`api_key` or `api_key_env`)"
+        ));
+    };
+    let Some(model) = entry.get("model").and_then(Value::as_str) else {
+        return Err(format!("provider profile `{name}` needs a `model`"));
+    };
+    Ok(Some(HarnessModelConfig {
+        provider,
+        api_key,
+        model: model.to_owned(),
+        base_url: entry
+            .get("base_url")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| provider.default_base_url().to_string()),
+        max_tokens: entry
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(4096),
+        timeout: Duration::from_secs(
+            entry
+                .get("timeout_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(120),
+        ),
+    }))
 }
 
 /// Resolve the live model client config. `Ok(None)` means run the credential-free
@@ -2718,8 +3357,13 @@ pub fn run_owned_agent_turn(
     let is_work_unit_root = work_unit_root.is_none();
     let work_unit = work_unit_root.unwrap_or(instance_id);
     // Resolve the model client before taking the workspace lease, so a config
-    // error never leaks a held lease.
-    let model_config = resolve_harness_model_config().map_err(StoreError::Conflict)?;
+    // error never leaks a held lease. Host-resolved provider profiles (the
+    // policy channel, Phase 4 auth relocation) take precedence; whip's own
+    // env/stored/oauth resolver is the standalone fallback.
+    let model_config = match host_resolved_profile_config(profile).map_err(StoreError::Conflict)? {
+        Some(config) => Some(config),
+        None => resolve_harness_model_config().map_err(StoreError::Conflict)?,
+    };
     // Discover `@tool` sub-workflows (DR-0025) up front: a non-convergent tool
     // fails the turn at setup, before the lease, so it never leaks a lease. Two
     // sources: the agent's in-program `tools [...]` grant (the curation surface)
@@ -2758,6 +3402,8 @@ pub fn run_owned_agent_turn(
         .with_turn_tool_access(turn_tool_access.clone())
         .with_resolved_profile_policy(profile_policy.clone());
     let mut tools = file_tool_specs_for_turn(&profile_policy, &turn_tool_access);
+    // Web tools (accepted 2026-07-07 design notes): granted-only egress doors.
+    tools.extend(web_tool_specs_for_turn(&turn_tool_access));
     // Tracker tools (slice 4): offered only when a tracker queue is configured.
     if let Some(queue) = std::env::var("WHIPPLESCRIPT_HARNESS_TRACKER")
         .ok()
@@ -2982,6 +3628,77 @@ mod tests {
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Phase 4 auth relocation: host-resolved provider profiles select by the
+    /// agent's declared profile (then `default`), carry resolved credentials,
+    /// and fail honestly when configured but incomplete — whip's own resolver
+    /// is only the fallback when the channel yields nothing.
+    #[test]
+    fn host_resolved_profiles_select_validate_and_fail_honestly() {
+        let document = serde_json::json!({
+            "repo-writer": {
+                "provider": "anthropic",
+                "model": "claude-sonnet-5",
+                "api_key": "host-resolved-key",
+                "max_tokens": 2048,
+            },
+            "default": {
+                "provider": "openai",
+                "model": "gpt-fallback",
+                "api_key": "default-key",
+            },
+        });
+        // The declared profile wins over `default`.
+        let config = profile_config_from_value(&document, Some("repo-writer"))
+            .expect("valid entry")
+            .expect("profile entry");
+        assert!(matches!(config.provider, CoerceProvider::Anthropic));
+        assert_eq!(config.api_key, "host-resolved-key");
+        assert_eq!(config.model, "claude-sonnet-5");
+        assert_eq!(config.max_tokens, 2048);
+        assert_eq!(
+            config.base_url,
+            CoerceProvider::Anthropic.default_base_url()
+        );
+        // An undeclared profile falls to `default`.
+        let fallback = profile_config_from_value(&document, Some("unlisted"))
+            .expect("valid entry")
+            .expect("default entry");
+        assert_eq!(fallback.api_key, "default-key");
+        // No matching entry at all -> the channel yields nothing (the caller
+        // falls back to whip's standalone resolver).
+        let empty = serde_json::json!({ "other": { "provider": "openai" } });
+        assert!(profile_config_from_value(&empty, Some("repo-writer"))
+            .expect("no entry is not an error")
+            .is_none());
+        // Configured-but-broken entries fail honestly instead of silently
+        // falling back: missing credential, missing model, unknown provider.
+        for broken in [
+            serde_json::json!({ "default": { "provider": "anthropic", "model": "m" } }),
+            serde_json::json!({ "default": { "provider": "anthropic", "api_key": "k" } }),
+            serde_json::json!({ "default": { "provider": "martian", "model": "m", "api_key": "k" } }),
+        ] {
+            assert!(
+                profile_config_from_value(&broken, None).is_err(),
+                "{broken}"
+            );
+        }
+        // `api_key_env` resolves through the named environment variable.
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("WHIP_TEST_PROFILE_KEY_4B", "env-carried-key");
+        let via_env = serde_json::json!({
+            "default": {
+                "provider": "openai",
+                "model": "gpt",
+                "api_key_env": "WHIP_TEST_PROFILE_KEY_4B",
+            }
+        });
+        let resolved = profile_config_from_value(&via_env, None)
+            .expect("valid")
+            .expect("entry");
+        assert_eq!(resolved.api_key, "env-carried-key");
+        std::env::remove_var("WHIP_TEST_PROFILE_KEY_4B");
+    }
+
     fn temp_root() -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3123,7 +3840,12 @@ mod tests {
             json!({ "path": "big.txt", "content": big.clone() }),
         ));
 
-        let r = exec.execute(&call(TOOL_READ, json!({ "path": "big.txt" })));
+        // An explicit limit covering the whole file bypasses the default line
+        // window, so the byte cap (+ capture) is what bounds the output here.
+        let r = exec.execute(&call(
+            TOOL_READ,
+            json!({ "path": "big.txt", "limit": 9000 }),
+        ));
         assert_eq!(r.status, ToolStatus::Ok);
         assert!(
             r.content.len() <= DEFAULT_MAX_BYTES + 512,
@@ -3247,6 +3969,277 @@ mod tests {
     }
 
     #[test]
+    fn read_default_window_truncates_with_continuation_notice() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        let content: String = (1..=2100).map(|i| format!("line {i}\n")).collect();
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "long.txt", "content": content }),
+        ));
+        let r = exec.execute(&call(TOOL_READ, json!({ "path": "long.txt" })));
+        assert_eq!(r.status, ToolStatus::Ok);
+        assert!(r.content.starts_with("line 1\n"));
+        assert!(r.content.contains("line 2000"));
+        assert!(!r.content.contains("line 2001\n"), "window is 2000 lines");
+        assert!(r
+            .content
+            .ends_with("\n[Showing lines 1-2000 of 2100. Use offset=2001 to continue.]"));
+        // Continuing from the notice's offset yields the tail with no notice.
+        let rest = exec.execute(&call(
+            TOOL_READ,
+            json!({ "path": "long.txt", "offset": 2001 }),
+        ));
+        assert_eq!(rest.status, ToolStatus::Ok);
+        assert!(rest.content.starts_with("line 2001\n"));
+        assert!(rest.content.ends_with("line 2100"));
+        assert!(!rest.content.contains("[Showing lines"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_explicit_limit_reports_remaining_lines() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        let content: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "l.txt", "content": content }),
+        ));
+        let r = exec.execute(&call(TOOL_READ, json!({ "path": "l.txt", "limit": 5 })));
+        assert_eq!(r.status, ToolStatus::Ok);
+        assert!(r.content.starts_with("line 1\n"));
+        assert!(r
+            .content
+            .ends_with("line 5\n[95 more lines in file. Use offset=6 to continue.]"));
+        // offset + limit reaching EOF exactly carries no notice.
+        let tail = exec.execute(&call(
+            TOOL_READ,
+            json!({ "path": "l.txt", "offset": 96, "limit": 5 }),
+        ));
+        assert_eq!(tail.content, "line 96\nline 97\nline 98\nline 99\nline 100");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_offset_beyond_eof_is_an_error() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "s.txt", "content": "one\ntwo\nthree\n" }),
+        ));
+        let r = exec.execute(&call(TOOL_READ, json!({ "path": "s.txt", "offset": 7 })));
+        assert_eq!(r.status, ToolStatus::Error);
+        assert_eq!(r.content, "Offset 7 is beyond end of file (3 lines total)");
+        // The last line is still addressable.
+        let last = exec.execute(&call(TOOL_READ, json!({ "path": "s.txt", "offset": 3 })));
+        assert_eq!(last.status, ToolStatus::Ok);
+        assert_eq!(last.content, "three");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_refuses_a_binary_file() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        std::fs::write(root.join("blob.bin"), b"PNG\x00\x01\x02 not text")
+            .expect("write binary fixture");
+        let r = exec.execute(&call(TOOL_READ, json!({ "path": "blob.bin" })));
+        assert_eq!(r.status, ToolStatus::Error);
+        assert_eq!(r.content, "cannot read binary file `blob.bin` as text");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn grep_matches_regex_patterns() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "src/a.rs", "content": "fn main() {}\nlet x = 1;\nFN SHOUT() {}" }),
+        ));
+        let g = exec.execute(&call(TOOL_GREP, json!({ "pattern": "fn \\w+\\(" })));
+        assert_eq!(g.status, ToolStatus::Ok);
+        assert!(g.content.contains("src/a.rs:1:fn main() {}"));
+        assert!(!g.content.contains("SHOUT"));
+        // ignoreCase applies to the compiled regex too.
+        let ci = exec.execute(&call(
+            TOOL_GREP,
+            json!({ "pattern": "fn \\w+\\(", "ignoreCase": true }),
+        ));
+        assert!(ci.content.contains("src/a.rs:3:FN SHOUT() {}"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn grep_invalid_regex_falls_back_to_literal_substring() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "a.rs", "content": "call main(x)\nother line" }),
+        ));
+        // `main(` is an invalid regex (unclosed group); pi leniency treats it as
+        // a literal substring instead of erroring.
+        let g = exec.execute(&call(TOOL_GREP, json!({ "pattern": "main(" })));
+        assert_eq!(g.status, ToolStatus::Ok);
+        assert_eq!(g.content, "a.rs:1:call main(x)");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn grep_context_lines_carry_dash_format() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "c.txt", "content": "one\ntwo\nMATCH\nfour\nfive" }),
+        ));
+        let g = exec.execute(&call(
+            TOOL_GREP,
+            json!({ "pattern": "MATCH", "context": 1 }),
+        ));
+        assert_eq!(g.status, ToolStatus::Ok);
+        assert_eq!(g.content, "c.txt-2-two\nc.txt:3:MATCH\nc.txt-4-four");
+        // Overlapping context windows merge: adjacent matches emit each line once.
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "c.txt", "content": "one\nMATCH a\nMATCH b\nfour" }),
+        ));
+        let merged = exec.execute(&call(
+            TOOL_GREP,
+            json!({ "pattern": "MATCH", "context": 1 }),
+        ));
+        assert_eq!(
+            merged.content,
+            "c.txt-1-one\nc.txt:2:MATCH a\nc.txt:3:MATCH b\nc.txt-4-four"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn grep_caps_long_lines() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        let long_line = format!("needle {}", "x".repeat(700));
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "wide.txt", "content": long_line }),
+        ));
+        let g = exec.execute(&call(TOOL_GREP, json!({ "pattern": "needle" })));
+        assert_eq!(g.status, ToolStatus::Ok);
+        assert!(g.content.ends_with("... [truncated]"));
+        // path:line: prefix + 500 kept chars + the marker; the 700-char tail is cut.
+        assert!(!g.content.contains(&"x".repeat(600)));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn edit_accepts_edits_as_a_json_encoded_string() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "f.txt", "content": "abc" }),
+        ));
+        // Some models double-encode the nested array; tolerated.
+        let r = exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "f.txt", "edits": "[{\"oldText\": \"abc\", \"newText\": \"xyz\"}]" }),
+        ));
+        assert_eq!(r.status, ToolStatus::Ok);
+        let read = exec.execute(&call(TOOL_READ, json!({ "path": "f.txt" })));
+        assert_eq!(read.content, "xyz");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn edit_accepts_legacy_top_level_old_new_text() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "f.txt", "content": "abc" }),
+        ));
+        let r = exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "f.txt", "oldText": "abc", "newText": "xyz" }),
+        ));
+        assert_eq!(r.status, ToolStatus::Ok);
+        let read = exec.execute(&call(TOOL_READ, json!({ "path": "f.txt" })));
+        assert_eq!(read.content, "xyz");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn edit_preserves_a_leading_bom() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        std::fs::write(root.join("bom.txt"), "\u{feff}hello world").expect("write BOM fixture");
+        let r = exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "bom.txt", "edits": [{ "oldText": "hello world", "newText": "goodbye" }] }),
+        ));
+        assert_eq!(r.status, ToolStatus::Ok);
+        let raw = std::fs::read_to_string(root.join("bom.txt")).expect("read BOM fixture back");
+        assert_eq!(raw, "\u{feff}goodbye", "BOM restored on write");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn edit_overlapping_edits_are_rejected() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "f.txt", "content": "alpha beta gamma" }),
+        ));
+        // Edit 1's match falls inside the region edit 0 rewrote.
+        let r = exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "f.txt", "edits": [
+                { "oldText": "alpha beta", "newText": "alpha beta" },
+                { "oldText": "beta gamma", "newText": "BETA gamma" }
+            ] }),
+        ));
+        assert_eq!(r.status, ToolStatus::Error);
+        assert_eq!(
+            r.content,
+            "edit 0 and edit 1 overlap in `f.txt`; merge them into one edit or target disjoint regions"
+        );
+        // Disjoint edits still apply even when an earlier edit shifts offsets.
+        let ok = exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "f.txt", "edits": [
+                { "oldText": "alpha", "newText": "a-much-longer-alpha" },
+                { "oldText": "gamma", "newText": "GAMMA" }
+            ] }),
+        ));
+        assert_eq!(ok.status, ToolStatus::Ok);
+        let read = exec.execute(&call(TOOL_READ, json!({ "path": "f.txt" })));
+        assert_eq!(read.content, "a-much-longer-alpha beta GAMMA");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn edit_empty_oldtext_is_rejected() {
+        let root = temp_root();
+        let exec = FileToolExecutor::new(&root);
+        exec.execute(&call(
+            TOOL_WRITE,
+            json!({ "path": "f.txt", "content": "abc" }),
+        ));
+        let r = exec.execute(&call(
+            TOOL_EDIT,
+            json!({ "path": "f.txt", "edits": [{ "oldText": "", "newText": "x" }] }),
+        ));
+        assert_eq!(r.status, ToolStatus::Error);
+        assert_eq!(r.content, "edit 0: oldText must not be empty");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn path_escape_is_refused() {
         let root = temp_root();
         let exec = FileToolExecutor::new(&root);
@@ -3359,6 +4352,167 @@ mod tests {
         assert_eq!(read_blocked.status, ToolStatus::Error);
         assert_eq!(write_allowed.status, ToolStatus::Ok);
         assert_eq!(write_blocked.status, ToolStatus::Error);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // --- Q3 turn-grant ∩ store-policy intersection (spec/std-files.md slice F1) ---
+
+    /// The core security property: a turn grant ALONE does not authorize a file op
+    /// the store policy denies. The grant is `read ["**"]` (matches everything) but
+    /// the store's own `allow read` is `["logs/*"]`; reading `secret.txt` must be
+    /// denied by the store clamp even though the grant glob would match it. This is
+    /// non-vacuous — `glob_match("**", "secret.txt")` is asserted true, so without
+    /// the store intersection the read would be allowed.
+    #[test]
+    fn turn_grant_alone_does_not_widen_the_store_policy() {
+        // The grant glob `**` matches the denied path; only the store clamp stops it.
+        assert!(crate::glob_match("**", "secret.txt"));
+
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("logs")).expect("logs dir");
+        std::fs::write(root.join("logs/app.log"), "entry").expect("seed log");
+        std::fs::write(root.join("secret.txt"), "top secret").expect("seed secret");
+        let input = json!({
+            "access_grants": [
+                {
+                    "resource": "project_files",
+                    "operations": [
+                        {"operation": "read", "globs": ["**"]}
+                    ],
+                    "store_policy": {
+                        "root": ".",
+                        "allow_read": ["logs/*"],
+                        "allow_write": []
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let access = turn_file_access_from_input(&input).expect("parse grants");
+        let exec = FileToolExecutor::new(&root).with_turn_file_access(access);
+
+        let in_policy = exec.execute(&call(TOOL_READ, json!({ "path": "logs/app.log" })));
+        let clamped = exec.execute(&call(TOOL_READ, json!({ "path": "secret.txt" })));
+
+        assert_eq!(
+            in_policy.status,
+            ToolStatus::Ok,
+            "store-allowed read passes"
+        );
+        assert_eq!(
+            clamped.status,
+            ToolStatus::Error,
+            "grant `**` cannot widen the store's `allow read [\"logs/*\"]`"
+        );
+        assert!(
+            clamped.content.contains("allow read"),
+            "denied by the store policy, not the grant: {}",
+            clamped.content
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A path outside the store `root` is denied even when the grant glob would
+    /// match it — paths resolve against the STORE root, not the workspace root.
+    #[test]
+    fn path_outside_store_root_is_denied() {
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("data")).expect("data dir");
+        std::fs::write(root.join("data/in.txt"), "ok").expect("seed in-root");
+        std::fs::write(root.join("secret.txt"), "outside").expect("seed outside");
+        let input = json!({
+            "access_grants": [
+                {
+                    "resource": "data_store",
+                    "operations": [
+                        {"operation": "read", "globs": ["**"]}
+                    ],
+                    "store_policy": {
+                        "root": "data",
+                        "allow_read": [],
+                        "allow_write": []
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let access = turn_file_access_from_input(&input).expect("parse grants");
+        let exec = FileToolExecutor::new(&root).with_turn_file_access(access);
+
+        let in_root = exec.execute(&call(TOOL_READ, json!({ "path": "data/in.txt" })));
+        let outside = exec.execute(&call(TOOL_READ, json!({ "path": "secret.txt" })));
+
+        assert_eq!(
+            in_root.status,
+            ToolStatus::Ok,
+            "path inside store root passes"
+        );
+        assert_eq!(
+            outside.status,
+            ToolStatus::Error,
+            "path outside the store root is denied despite grant `**`"
+        );
+        assert!(
+            outside.content.contains("outside every file store"),
+            "denied for being outside the store root: {}",
+            outside.content
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A two-store grant yields two DISTINCT scopes: a path in store A's root routes
+    /// to A's scope and is NOT authorized by store B's (read-only-absent) grant.
+    #[test]
+    fn two_store_grant_exposes_distinct_scopes() {
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("a")).expect("a dir");
+        std::fs::create_dir_all(root.join("b")).expect("b dir");
+        std::fs::write(root.join("a/in.txt"), "a").expect("seed a");
+        std::fs::write(root.join("b/in.txt"), "b").expect("seed b");
+        let input = json!({
+            "access_grants": [
+                {
+                    "resource": "a_store",
+                    "operations": [
+                        {"operation": "read", "globs": ["**"]}
+                    ],
+                    "store_policy": { "root": "a", "allow_read": [], "allow_write": [] }
+                },
+                {
+                    "resource": "b_store",
+                    "operations": [
+                        {"operation": "write", "globs": ["**"]}
+                    ],
+                    "store_policy": { "root": "b", "allow_read": [], "allow_write": [] }
+                }
+            ]
+        })
+        .to_string();
+        let access = turn_file_access_from_input(&input).expect("parse grants");
+        let exec = FileToolExecutor::new(&root).with_turn_file_access(access);
+
+        // `a` grants read; `b` grants only write. A read of `b/in.txt` routes to the
+        // `b_store` scope, which has no read grant — B's write grant does not leak.
+        let read_a = exec.execute(&call(TOOL_READ, json!({ "path": "a/in.txt" })));
+        let read_b = exec.execute(&call(TOOL_READ, json!({ "path": "b/in.txt" })));
+
+        assert_eq!(
+            read_a.status,
+            ToolStatus::Ok,
+            "read in store A's scope passes"
+        );
+        assert_eq!(
+            read_b.status,
+            ToolStatus::Error,
+            "read routes to store B's scope, which grants no read"
+        );
+        assert!(
+            read_b
+                .content
+                .contains("read is not granted for store `b_store`"),
+            "distinct per-store scope: {}",
+            read_b.content
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -1,12 +1,27 @@
 //! Durable SQLite store for event logs, facts, effects, and evidence.
 
+pub mod branches;
+pub mod bundle;
+pub mod chunking;
 pub mod content;
 pub mod coordination;
+pub mod diff;
 pub mod files;
+pub mod improve;
 pub mod items;
+pub mod materialize;
+pub mod merge;
 #[cfg(feature = "native")]
 pub mod native_stores;
+pub mod reconcile;
+pub mod selection;
 pub mod skill_frontmatter;
+pub mod stat_cache;
+pub mod text_merge;
+pub mod vcs;
+pub mod working_set;
+pub mod workspace_api;
+pub mod workstreams;
 
 use std::result;
 #[cfg(feature = "native")]
@@ -69,6 +84,68 @@ pub struct SqliteStore {
 pub struct StoredEvent {
     pub event_id: String,
     pub sequence: i64,
+}
+
+/// Restorable-context RC-3: a request to capture a consistent-cut checkpoint of
+/// an instance at a quiescent point. The three planes the cut binds are the
+/// agent transcript position (`transcript_ref`), the instance event-log
+/// sequence (captured as the checkpoint event's own sequence), and the
+/// file-store manifest hash (folded from `file.write.completed` facts at the
+/// cut). Models `checkpointReq(cutId)` in models/maude/restorable-context.maude.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointCapture<'a> {
+    pub instance_id: &'a str,
+    /// Caller-supplied stable identifier for this cut (surfaces to `whip
+    /// restore <cut_id>`).
+    pub cut_id: &'a str,
+    /// The transcript position at the cut — the owned-harness `checkpoint`
+    /// callback's step marker (Plane 1). `None` when the instance has no
+    /// brokered transcript yet.
+    pub transcript_ref: Option<&'a str>,
+    /// Idempotency key so a re-requested capture of the same cut is absorbed
+    /// rather than duplicated.
+    pub idempotency_key: Option<&'a str>,
+}
+
+/// Restorable-context RC-3: the recorded consistent cut. `sequence` is the
+/// checkpoint event's own event-log index — the single cut coordinate that
+/// `rebuild_projections_to` (Plane 2) and `load_brokered_transcript_at`
+/// (Plane 1) key off. Models `cut(cutId, tPos, seqN, mHash)`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedCheckpoint {
+    pub cut_id: String,
+    pub event_id: String,
+    pub sequence: i64,
+    pub manifest_hash: String,
+    pub file_count: usize,
+}
+
+/// Restorable-context RC-4c: the outcome of PLANNING a restore. `plan_restore`
+/// is read-only and performs the whole coherence check up front (models the
+/// `restore-apply` vs `restore-refuse` split in
+/// models/maude/restorable-context.maude): either every referenced content hash
+/// is present and a `Ready` plan is returned, or a required hash is missing /
+/// the cut is unknown and the restore is `Refused` with no mutation. The caller
+/// applies the file ops through the file store, then calls `commit_restore`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RestoreDecision {
+    Ready(RestorePlan),
+    Refused { reason: String },
+}
+
+/// The file + coordinate plan for a coherent restore. `writes` and `removes`
+/// are the FULL reconcile of the mediated file plane to the cut manifest:
+/// every manifest path is rewritten to its cut content, and every mediated path
+/// present now but absent from the cut is removed. `restored_to_sequence` is the
+/// cut coordinate the `context.restored` marker will carry (RC-4b), rewinding
+/// the instance and transcript planes to the same point.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestorePlan {
+    pub cut_id: String,
+    pub restored_to_sequence: i64,
+    pub transcript_ref: Option<String>,
+    pub writes: std::collections::BTreeMap<String, String>,
+    pub removes: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -329,6 +406,74 @@ pub struct CapabilityBinding<'a> {
     pub capability: &'a str,
     pub provider: &'a str,
     pub config_json: &'a str,
+}
+
+/// One project-instruction document (AGENTS.md / CLAUDE.md) registered for the
+/// durable object's store-backed context resolution (context-assembly Phase 3
+/// item 4). `position` is the injection order (root-most first, nearest-cwd
+/// last); `content_hash` is the body's hash so it is content-addressed and
+/// replay-stable, mirroring skills.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectContextDoc {
+    pub position: i64,
+    pub path: String,
+    pub content_hash: String,
+    pub body: String,
+}
+
+/// One recorded delta-kernel result (compute plane P8-1): the cached outcome
+/// of a hermetic Class-A invocation, keyed by its content key (script hash +
+/// environment hash + input hashes). Workspace-wide — not instance-scoped —
+/// so a validator/judge on untouched inputs never runs twice. The source ids
+/// record provenance (which run populated the entry).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeCachedResult {
+    pub content_key: String,
+    pub effect_kind: String,
+    pub result_json: String,
+    pub source_instance_id: String,
+    pub source_effect_id: String,
+    pub created_at: String,
+}
+
+/// Registration input for one delta-kernel cache entry. Insertion is
+/// first-writer-wins (`INSERT OR IGNORE`): a content key is immutable once
+/// recorded, which is what makes served-from-cache results canonical.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ComputeResultRegistration<'a> {
+    pub content_key: &'a str,
+    pub effect_kind: &'a str,
+    pub result_json: &'a str,
+    pub source_instance_id: &'a str,
+    pub source_effect_id: &'a str,
+}
+
+/// One operator-pinned script capability registered in the store (compute
+/// plane P8): the store-backed mirror of the native filesystem script
+/// manifest, for hosts with no filesystem (the DO builds `whip-executor/1`
+/// requests from these rows). `body` is the full script text; `sha256` is
+/// the operator's pin — the host layer verifies body-vs-pin at registration
+/// and the executor re-verifies before running (the TOCTOU discipline).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScriptCapabilityRecord {
+    pub name: String,
+    pub argv_json: String,
+    pub sha256: String,
+    pub env_json: String,
+    pub hermetic: bool,
+    pub body: String,
+}
+
+/// Registration input for one script capability (`INSERT OR REPLACE`: a
+/// re-pin is an explicit operator act, same as the native manifest).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScriptCapabilityRegistration<'a> {
+    pub name: &'a str,
+    pub argv_json: &'a str,
+    pub sha256: &'a str,
+    pub env_json: &'a str,
+    pub hermetic: bool,
+    pub body: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2471,7 +2616,8 @@ impl SqliteStore {
                 candidate.profile,
                 candidate.input_json,
                 candidate.required_capabilities,
-                COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]')
+                COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'),
+                candidate.created_by_event_id
             FROM effects AS candidate
             LEFT JOIN instances ON instances.instance_id = candidate.instance_id
             LEFT JOIN program_versions AS active_versions
@@ -2512,18 +2658,32 @@ impl SqliteStore {
         )?;
         let effects = statement
             .query_map([instance_id], |row| {
-                Ok(ClaimableEffect {
-                    effect_id: row.get(0)?,
-                    kind: row.get(1)?,
-                    target: row.get(2)?,
-                    profile: row.get(3)?,
-                    input_json: row.get(4)?,
-                    required_capabilities_json: row.get(5)?,
-                    declared_profiles_json: row.get(6)?,
-                })
+                Ok((
+                    ClaimableEffect {
+                        effect_id: row.get(0)?,
+                        kind: row.get(1)?,
+                        target: row.get(2)?,
+                        profile: row.get(3)?,
+                        input_json: row.get(4)?,
+                        required_capabilities_json: row.get(5)?,
+                        declared_profiles_json: row.get(6)?,
+                    },
+                    row.get::<_, Option<String>>(7)?,
+                ))
             })?
             .collect::<result::Result<Vec<_>, _>>()
             .map_err(StoreError::from)?;
+        // RC-4b on the effects plane: orphaned-segment PENDING effects are
+        // never handed to a worker after a restore.
+        let live = live_event_ids_on(&self.connection, instance_id)?;
+        let effects: Vec<ClaimableEffect> = effects
+            .into_iter()
+            .filter(|(_, created_by)| match (&live, created_by) {
+                (Some(live), Some(event_id)) => live.contains(event_id),
+                _ => true,
+            })
+            .map(|(effect, _)| effect)
+            .collect();
         let mut claimable = Vec::new();
         for effect in effects {
             if policy_block_on(&self.connection, instance_id, &effect.effect_id)?.is_some() {
@@ -2944,6 +3104,166 @@ impl SqliteStore {
             Some(row) => Ok(Some(row.get::<_, String>(0)?)),
             None => Ok(None),
         }
+    }
+
+    /// Register (or replace) one project-instruction document at `position`
+    /// (context-assembly Phase 3 item 4). Content-addressed like skills: the
+    /// stored hash is the body's hash.
+    pub fn register_project_context_doc(
+        &self,
+        position: i64,
+        path: &str,
+        body: &str,
+    ) -> StoreResult<()> {
+        let content_hash = stable_hash_hex(body);
+        self.connection.execute(
+            "INSERT OR REPLACE INTO project_context_docs (position, path, content_hash, body) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![position, path, content_hash, body],
+        )?;
+        Ok(())
+    }
+
+    /// The registered project-instruction documents in injection order.
+    pub fn list_project_context_docs(&self) -> StoreResult<Vec<ProjectContextDoc>> {
+        let mut statement = self.connection.prepare(
+            "SELECT position, path, content_hash, body FROM project_context_docs \
+             ORDER BY position",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ProjectContextDoc {
+                position: row.get(0)?,
+                path: row.get(1)?,
+                content_hash: row.get(2)?,
+                body: row.get(3)?,
+            })
+        })?;
+        rows.collect::<result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Register (or re-pin) one script capability (compute plane P8). The
+    /// caller is responsible for verifying `body` hashes to `sha256` before
+    /// registering; the store records what it is given.
+    pub fn register_script_capability(
+        &self,
+        registration: ScriptCapabilityRegistration<'_>,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO script_capabilities \
+             (name, argv_json, sha256, env_json, hermetic, body) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                registration.name,
+                registration.argv_json,
+                registration.sha256,
+                registration.env_json,
+                registration.hermetic,
+                registration.body,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Look up one registered script capability by name (compute plane P8).
+    pub fn get_script_capability(&self, name: &str) -> StoreResult<Option<ScriptCapabilityRecord>> {
+        self.connection
+            .query_row(
+                "SELECT name, argv_json, sha256, env_json, hermetic, body \
+                 FROM script_capabilities WHERE name = ?1",
+                params![name],
+                |row| {
+                    Ok(ScriptCapabilityRecord {
+                        name: row.get(0)?,
+                        argv_json: row.get(1)?,
+                        sha256: row.get(2)?,
+                        env_json: row.get(3)?,
+                        hermetic: row.get::<_, i64>(4)? != 0,
+                        body: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Record one delta-kernel result under its content key (compute plane
+    /// P8-1). First-writer-wins: returns `true` when this call inserted the
+    /// entry, `false` when the key was already recorded (the existing entry is
+    /// canonical and left untouched).
+    pub fn record_compute_result(
+        &self,
+        registration: ComputeResultRegistration<'_>,
+    ) -> StoreResult<bool> {
+        let inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO compute_result_cache \
+             (content_key, effect_kind, result_json, source_instance_id, source_effect_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                registration.content_key,
+                registration.effect_kind,
+                registration.result_json,
+                registration.source_instance_id,
+                registration.source_effect_id,
+            ],
+        )?;
+        Ok(inserted > 0)
+    }
+
+    /// Look up a delta-kernel result by content key (compute plane P8-1).
+    pub fn lookup_compute_result(
+        &self,
+        content_key: &str,
+    ) -> StoreResult<Option<ComputeCachedResult>> {
+        self.connection
+            .query_row(
+                "SELECT content_key, effect_kind, result_json, source_instance_id, \
+                 source_effect_id, created_at FROM compute_result_cache WHERE content_key = ?1",
+                params![content_key],
+                |row| {
+                    Ok(ComputeCachedResult {
+                        content_key: row.get(0)?,
+                        effect_kind: row.get(1)?,
+                        result_json: row.get(2)?,
+                        source_instance_id: row.get(3)?,
+                        source_effect_id: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Capture `body` content-addressed into the file-history blob table
+    /// (restorable-context RC-1), returning its content id — the SAME
+    /// `stable_hash_hex` the `file.write.completed` fact records. Idempotent:
+    /// identical bytes dedupe to one row (`INSERT OR IGNORE`), so overwriting a
+    /// file with new bytes preserves BOTH the old and new versions by hash. The
+    /// blob lives in the same database as the write's fact, and is captured
+    /// before that fact commits, so no manifest hash is ever referenced without
+    /// its bytes present (restorable-context INV-4 coherence).
+    pub fn put_content(&self, body: &str) -> StoreResult<String> {
+        let id = stable_hash_hex(body);
+        self.connection.execute(
+            "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+            params![id, body, body.len() as i64],
+        )?;
+        Ok(id)
+    }
+
+    /// Read the full stored bytes for a file-history content id, or `None` if the
+    /// blob store never held it. The restore write-back slice (RC-4) reads through
+    /// this to reconstruct a superseded file body.
+    pub fn get_content(&self, id: &str) -> StoreResult<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT body FROM content_blobs WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?)
     }
 
     pub fn list_skills(&self) -> StoreResult<Vec<SkillView>> {
@@ -4149,7 +4469,8 @@ impl SqliteStore {
                     WHERE request.instance_id = effects.instance_id
                       AND request.effect_id = effects.effect_id
                       AND request.status = 'requested'
-                ) AS cancel_requested
+                ) AS cancel_requested,
+                effects.created_by_event_id
             FROM effects
             LEFT JOIN instances ON instances.instance_id = effects.instance_id
             LEFT JOIN program_versions AS active_versions
@@ -4162,24 +4483,39 @@ impl SqliteStore {
         )?;
         let rows = statement
             .query_map([instance_id], |row| {
-                Ok(EffectView {
-                    effect_id: row.get(0)?,
-                    kind: row.get(1)?,
-                    target: row.get(2)?,
-                    input_json: row.get(3)?,
-                    status: row.get(4)?,
-                    created_by_rule: row.get(5)?,
-                    program_version_id: row.get(6)?,
-                    revision_epoch: row.get(7)?,
-                    profile: row.get(8)?,
-                    required_capabilities_json: row.get(9)?,
-                    policy_block_reason: row.get(10)?,
-                    policy_block_category: row.get(11)?,
-                    declared_profiles_json: row.get(12)?,
-                    cancel_requested: row.get(13)?,
-                })
+                Ok((
+                    EffectView {
+                        effect_id: row.get(0)?,
+                        kind: row.get(1)?,
+                        target: row.get(2)?,
+                        input_json: row.get(3)?,
+                        status: row.get(4)?,
+                        created_by_rule: row.get(5)?,
+                        program_version_id: row.get(6)?,
+                        revision_epoch: row.get(7)?,
+                        profile: row.get(8)?,
+                        required_capabilities_json: row.get(9)?,
+                        policy_block_reason: row.get(10)?,
+                        policy_block_category: row.get(11)?,
+                        declared_profiles_json: row.get(12)?,
+                        cancel_requested: row.get(13)?,
+                    },
+                    row.get::<_, Option<String>>(14)?,
+                ))
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
+        // RC-4b on the effects plane: after a restore, the orphaned
+        // segment's effects are invisible — the restored timeline
+        // re-offers the rules instead of adopting orphaned outcomes.
+        let live = live_event_ids_on(&self.connection, instance_id)?;
+        let rows = rows
+            .into_iter()
+            .filter(|(_, created_by)| match (&live, created_by) {
+                (Some(live), Some(event_id)) => live.contains(event_id),
+                _ => true,
+            })
+            .map(|(view, _)| view)
+            .collect();
         Ok(rows)
     }
 
@@ -5120,6 +5456,33 @@ impl SqliteStore {
     }
 
     pub fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {
+        self.rebuild_projections_impl(instance_id, None)
+    }
+
+    /// RC-2 Delta A: bounded projection replay. Reconstructs the instance's
+    /// projection tables AS OF event `up_to_sequence` — every persisted event
+    /// with `sequence <= up_to_sequence` is applied, none after. `N` is
+    /// INCLUSIVE (the event at the named sequence is itself replayed). Same
+    /// single `Immediate` transaction as the unbounded rebuild; the only
+    /// difference is the `WHERE sequence <= N` cut on the replayed event set.
+    ///
+    /// `up_to_sequence` is the single cut coordinate: the SAME per-instance
+    /// event sequence that `load_brokered_transcript_at` (Plane 1) and the file
+    /// manifest (`file.write.completed` facts ≤ N) key off, so one N names one
+    /// consistent point across all three planes.
+    pub fn rebuild_projections_to(
+        &mut self,
+        instance_id: &str,
+        up_to_sequence: i64,
+    ) -> StoreResult<()> {
+        self.rebuild_projections_impl(instance_id, Some(up_to_sequence))
+    }
+
+    fn rebuild_projections_impl(
+        &mut self,
+        instance_id: &str,
+        up_to_sequence: Option<i64>,
+    ) -> StoreResult<()> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -5164,10 +5527,22 @@ impl SqliteStore {
         tx.execute("DELETE FROM effects WHERE instance_id = ?1", [instance_id])?;
         tx.execute("DELETE FROM facts WHERE instance_id = ?1", [instance_id])?;
 
-        let events = {
-            let mut statement = tx.prepare(
+        let fetched = {
+            // RC-2 Delta A: when a bound is present, cut the replayed event set
+            // at `sequence <= N` (INCLUSIVE). `N` is an i64 so interpolation is
+            // injection-safe; when unbounded the clause is empty, leaving the
+            // full-replay query semantically identical to before.
+            //
+            // RC-4b: `context.restored` markers are fetched alongside the state
+            // events (and `sequence` is selected) so the fold below can honor
+            // them. A marker is not itself replayed; it rewinds the live set.
+            let bound_clause = match up_to_sequence {
+                Some(n) => format!("  AND sequence <= {n}\n"),
+                None => String::new(),
+            };
+            let mut statement = tx.prepare(&format!(
                 r#"
-                SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source
+                SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source, sequence
                 FROM events
                 WHERE instance_id = ?1
                   AND event_type IN (
@@ -5181,11 +5556,12 @@ impl SqliteStore {
                       'effect.terminal',
                       'effect.cancelled',
                       'effect.cancellation_requested',
-                      'lease.expired'
+                      'lease.expired',
+                      'context.restored'
                   )
-                ORDER BY sequence
-                "#,
-            )?;
+                {bound_clause}ORDER BY sequence
+                "#
+            ))?;
             let rows = statement
                 .query_map([instance_id], |row| {
                     Ok((
@@ -5195,13 +5571,43 @@ impl SqliteStore {
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
                     ))
                 })?
                 .collect::<result::Result<Vec<_>, _>>()?;
             rows
         };
 
-        for (event_id, event_type, payload_json, idempotency_key, causation_id, source) in events {
+        // RC-4b: the restore-marker replay fold (models/maude/restore-replay.maude).
+        // Walk the log ascending; a `context.restored` marker rewinds the live
+        // set to its target sequence, dropping every event that a later restore
+        // orphaned so an abandoned branch is never re-applied. With no markers
+        // present, `events` is exactly the ordered state-event set as before, so
+        // the rebuild is byte-identical for instances that were never restored.
+        let events = {
+            let mut live: Vec<ReplayRow> = Vec::new();
+            for entry in fetched {
+                if entry.1 == "context.restored" {
+                    if let Some(target) = restore_marker_target(&entry.2) {
+                        live.retain(|folded| folded.6 <= target);
+                    }
+                } else {
+                    live.push(entry);
+                }
+            }
+            live
+        };
+
+        for (
+            event_id,
+            event_type,
+            payload_json,
+            idempotency_key,
+            causation_id,
+            source,
+            _sequence,
+        ) in events
+        {
             match event_type.as_str() {
                 "rule.committed" => replay_rule_commit(&tx, instance_id, &event_id, &payload_json)?,
                 "fact.derived" => {
@@ -5263,6 +5669,196 @@ impl SqliteStore {
 
         tx.commit()?;
         Ok(())
+    }
+
+    /// Restorable-context RC-3: capture a consistent-cut checkpoint at a
+    /// quiescent point. In ONE `Immediate` transaction this (1) refuses unless
+    /// the instance is quiescent — no effect mid-run (INV-2 no-in-flight
+    /// straddle); (2) folds the file-store manifest from every
+    /// `file.write.completed` fact so far, latest-write-wins per path; (3)
+    /// stores that manifest content-addressed BEFORE the cut references its
+    /// hash, in the same transaction, so no committed cut names a manifest hash
+    /// absent from the blob store (INV-4 coherence); and (4) appends the
+    /// `context.checkpoint` event as the cut carrier. The event's own `sequence`
+    /// is the single cut coordinate that `rebuild_projections_to` (Plane 2) and
+    /// `load_brokered_transcript_at` (Plane 1) key off, binding all three planes
+    /// to one point. Models the `checkpoint` rule in
+    /// models/maude/restorable-context.maude.
+    pub fn capture_checkpoint(
+        &mut self,
+        capture: CheckpointCapture<'_>,
+    ) -> StoreResult<CapturedCheckpoint> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let running: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM effects WHERE instance_id = ?1 AND status = 'running'",
+            [capture.instance_id],
+            |row| row.get(0),
+        )?;
+        if running > 0 {
+            return Err(StoreError::Conflict(format!(
+                "checkpoint requires a quiescent instance; {running} effect(s) still running"
+            )));
+        }
+        // RC-4c: fold the manifest from the LIVE fact.derived payloads (the
+        // restore-marker fold applied), so a checkpoint taken after a restore
+        // reflects the reconciled file plane, never an abandoned-branch write.
+        let fact_payloads = live_fact_payloads_on(&tx, capture.instance_id, None)?;
+        let (manifest_json, manifest) = fold_file_manifest(&fact_payloads)?;
+        let manifest_hash = stable_hash_hex(&manifest_json);
+        tx.execute(
+            "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+            params![manifest_hash, manifest_json, manifest_json.len() as i64],
+        )?;
+        let payload = json!({
+            "cut_id": capture.cut_id,
+            "transcript_ref": capture.transcript_ref,
+            "manifest_hash": manifest_hash,
+            "manifest": manifest,
+            "file_count": manifest.len(),
+        })
+        .to_string();
+        let event = append_event_on(
+            &tx,
+            NewEvent {
+                instance_id: capture.instance_id,
+                event_type: "context.checkpoint",
+                payload_json: &payload,
+                source: "restorable-context",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: capture.idempotency_key,
+            },
+        )?;
+        tx.commit()?;
+        Ok(CapturedCheckpoint {
+            cut_id: capture.cut_id.to_owned(),
+            event_id: event.event_id,
+            sequence: event.sequence,
+            manifest_hash,
+            file_count: manifest.len(),
+        })
+    }
+
+    /// Restorable-context RC-4c: PLAN a restore to the cut `cut_id` (read-only).
+    /// Resolves the checkpoint by cut id, reads its manifest, and performs the
+    /// whole coherence check up front (model `restore-apply` vs `restore-refuse`):
+    /// an unknown cut, a missing manifest blob, or ANY dangling content hash
+    /// yields `Refused` with no mutation. Otherwise returns a `Ready` plan whose
+    /// `writes` restore every manifest path to its cut content and whose
+    /// `removes` are the mediated paths present now but absent from the cut (the
+    /// full reconcile to the model's "file plane = exactly the manifest"). The
+    /// caller applies the file ops through the file store, then `commit_restore`.
+    /// Both the current file plane and the cut manifest are folded marker-aware
+    /// (RC-4c), so a prior restore's abandoned writes never enter the diff.
+    pub fn plan_restore(&self, instance_id: &str, cut_id: &str) -> StoreResult<RestoreDecision> {
+        let checkpoint = {
+            let mut statement = self.connection.prepare(
+                r#"
+                SELECT payload_json, sequence
+                FROM events
+                WHERE instance_id = ?1 AND event_type = 'context.checkpoint'
+                ORDER BY sequence DESC
+                "#,
+            )?;
+            let rows: Vec<(String, i64)> = statement
+                .query_map([instance_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<result::Result<Vec<_>, _>>()?;
+            rows.into_iter().find_map(|(payload_json, sequence)| {
+                let payload: Value = serde_json::from_str(&payload_json).ok()?;
+                (payload.get("cut_id").and_then(Value::as_str) == Some(cut_id))
+                    .then_some((payload, sequence))
+            })
+        };
+        let Some((payload, restored_to_sequence)) = checkpoint else {
+            return Ok(RestoreDecision::Refused {
+                reason: format!("no checkpoint with cut id `{cut_id}`"),
+            });
+        };
+        let manifest_hash = payload
+            .get("manifest_hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let transcript_ref = payload
+            .get("transcript_ref")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let Some(manifest_body) = self.get_content(&manifest_hash)? else {
+            return Ok(RestoreDecision::Refused {
+                reason: format!("manifest blob `{manifest_hash}` missing for cut `{cut_id}`"),
+            });
+        };
+        let cut_manifest: BTreeMap<String, String> = serde_json::from_str(&manifest_body)?;
+        // INV-4 coherence: every referenced content hash must be present, up
+        // front, before any mutation. A single dangling hash refuses the whole
+        // restore.
+        let mut writes: BTreeMap<String, String> = BTreeMap::new();
+        for (path, content_hash) in &cut_manifest {
+            match self.get_content(content_hash)? {
+                Some(body) => {
+                    writes.insert(path.clone(), body);
+                }
+                None => {
+                    return Ok(RestoreDecision::Refused {
+                        reason: format!(
+                            "content `{content_hash}` for `{path}` missing (dangling manifest)"
+                        ),
+                    });
+                }
+            }
+        }
+        // Full reconcile: mediated paths live now but absent from the cut are
+        // removed so the file plane equals exactly the cut manifest.
+        let current_payloads = live_fact_payloads_on(&self.connection, instance_id, None)?;
+        let (_, current_manifest) = fold_file_manifest(&current_payloads)?;
+        let removes: Vec<String> = current_manifest
+            .keys()
+            .filter(|path| !cut_manifest.contains_key(*path))
+            .cloned()
+            .collect();
+        Ok(RestoreDecision::Ready(RestorePlan {
+            cut_id: cut_id.to_owned(),
+            restored_to_sequence,
+            transcript_ref,
+            writes,
+            removes,
+        }))
+    }
+
+    /// Restorable-context RC-4c: COMMIT a restore. Appends the `context.restored`
+    /// marker carrying the cut coordinate, then rebuilds projections (marker-aware,
+    /// RC-4b) so the instance plane lands exactly at the cut and every later read
+    /// (rebuild, transcript, manifest) folds past the abandoned branch. Call
+    /// AFTER the caller has applied the plan's file ops and auto-checkpointed the
+    /// pre-restore head (so the restore is itself undoable). The marker is
+    /// appended before the rebuild so the unbounded rebuild folds it immediately.
+    pub fn commit_restore(
+        &mut self,
+        instance_id: &str,
+        restored_to_sequence: i64,
+        cut_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        let payload = json!({
+            "cut_id": cut_id,
+            "restored_to_sequence": restored_to_sequence,
+        })
+        .to_string();
+        let marker = self.append_event(NewEvent {
+            instance_id,
+            event_type: "context.restored",
+            payload_json: &payload,
+            source: "restorable-context",
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key,
+        })?;
+        self.rebuild_projections(instance_id)?;
+        Ok(marker)
     }
 
     pub fn table_exists(&self, table: &str) -> StoreResult<bool> {
@@ -5388,6 +5984,53 @@ pub trait RuntimeStore {
     ) -> StoreResult<Option<RegisteredProfilePolicy>>;
     fn bind_capability(&self, binding: CapabilityBinding<'_>) -> StoreResult<()>;
     fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()>;
+    fn register_project_context_doc(
+        &self,
+        position: i64,
+        path: &str,
+        body: &str,
+    ) -> StoreResult<()>;
+    fn list_project_context_docs(&self) -> StoreResult<Vec<ProjectContextDoc>>;
+    fn record_compute_result(
+        &self,
+        registration: ComputeResultRegistration<'_>,
+    ) -> StoreResult<bool>;
+    fn lookup_compute_result(&self, content_key: &str) -> StoreResult<Option<ComputeCachedResult>>;
+    /// Capture a file body content-addressed into the file-history blob store
+    /// (restorable-context RC-1), returning its content id (`stable_hash_hex`).
+    /// Idempotent — identical bytes dedupe — so an overwrite preserves both the
+    /// superseded and the new body by hash. Captured in the same store as the
+    /// write's fact and before that fact commits (INV-4 coherence).
+    fn put_content(&self, body: &str) -> StoreResult<String>;
+    /// Read a captured file body back by content id, or `None` if never held.
+    fn get_content(&self, id: &str) -> StoreResult<Option<String>>;
+    /// Restorable-context RC-3: capture a consistent-cut checkpoint at a
+    /// quiescent point, binding the three planes to one cut coordinate (the
+    /// checkpoint event's sequence). Refuses if the instance is not quiescent
+    /// (INV-2) and stores the file manifest content-addressed before the cut
+    /// references it (INV-4). See the inherent method for the full contract.
+    fn capture_checkpoint(
+        &mut self,
+        capture: CheckpointCapture<'_>,
+    ) -> StoreResult<CapturedCheckpoint>;
+    /// Restorable-context RC-4c: plan a restore to `cut_id` (read-only, coherence
+    /// check up front; `Refused` on unknown cut / dangling manifest). See the
+    /// inherent method for the full contract.
+    fn plan_restore(&self, instance_id: &str, cut_id: &str) -> StoreResult<RestoreDecision>;
+    /// Restorable-context RC-4c: commit a restore — append the `context.restored`
+    /// marker and rebuild marker-aware so the instance plane lands at the cut.
+    fn commit_restore(
+        &mut self,
+        instance_id: &str,
+        restored_to_sequence: i64,
+        cut_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent>;
+    fn register_script_capability(
+        &self,
+        registration: ScriptCapabilityRegistration<'_>,
+    ) -> StoreResult<()>;
+    fn get_script_capability(&self, name: &str) -> StoreResult<Option<ScriptCapabilityRecord>>;
     fn attach_skill(&self, attachment: SkillAttachment<'_>) -> StoreResult<()>;
     fn list_skills(&self) -> StoreResult<Vec<SkillView>>;
     fn list_skill_attachments(
@@ -5651,6 +6294,76 @@ impl RuntimeStore for SqliteStore {
     fn bind_capability(&self, binding: CapabilityBinding<'_>) -> StoreResult<()> {
         self.bind_capability(binding)
     }
+    fn register_project_context_doc(
+        &self,
+        position: i64,
+        path: &str,
+        body: &str,
+    ) -> StoreResult<()> {
+        SqliteStore::register_project_context_doc(self, position, path, body)
+    }
+
+    fn list_project_context_docs(&self) -> StoreResult<Vec<ProjectContextDoc>> {
+        SqliteStore::list_project_context_docs(self)
+    }
+
+    fn record_compute_result(
+        &self,
+        registration: ComputeResultRegistration<'_>,
+    ) -> StoreResult<bool> {
+        SqliteStore::record_compute_result(self, registration)
+    }
+
+    fn lookup_compute_result(&self, content_key: &str) -> StoreResult<Option<ComputeCachedResult>> {
+        SqliteStore::lookup_compute_result(self, content_key)
+    }
+
+    fn put_content(&self, body: &str) -> StoreResult<String> {
+        SqliteStore::put_content(self, body)
+    }
+
+    fn get_content(&self, id: &str) -> StoreResult<Option<String>> {
+        SqliteStore::get_content(self, id)
+    }
+
+    fn capture_checkpoint(
+        &mut self,
+        capture: CheckpointCapture<'_>,
+    ) -> StoreResult<CapturedCheckpoint> {
+        SqliteStore::capture_checkpoint(self, capture)
+    }
+
+    fn plan_restore(&self, instance_id: &str, cut_id: &str) -> StoreResult<RestoreDecision> {
+        SqliteStore::plan_restore(self, instance_id, cut_id)
+    }
+
+    fn commit_restore(
+        &mut self,
+        instance_id: &str,
+        restored_to_sequence: i64,
+        cut_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<StoredEvent> {
+        SqliteStore::commit_restore(
+            self,
+            instance_id,
+            restored_to_sequence,
+            cut_id,
+            idempotency_key,
+        )
+    }
+
+    fn register_script_capability(
+        &self,
+        registration: ScriptCapabilityRegistration<'_>,
+    ) -> StoreResult<()> {
+        SqliteStore::register_script_capability(self, registration)
+    }
+
+    fn get_script_capability(&self, name: &str) -> StoreResult<Option<ScriptCapabilityRecord>> {
+        SqliteStore::get_script_capability(self, name)
+    }
+
     fn register_skill(&self, skill: SkillRegistration<'_>) -> StoreResult<()> {
         self.register_skill(skill)
     }
@@ -5949,6 +6662,163 @@ fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceView
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
     })
+}
+
+#[cfg(feature = "native")]
+/// Restorable-context RC-3: fold the file-store manifest at a cut from the
+/// sequence-ordered `fact.derived` event payloads of an instance. Only
+/// `file.write.completed` facts contribute; the RC-1 write value they carry
+/// lives at `payload.value.value` (the outer `value` is the fact body, the
+/// inner is the write descriptor `{store, path, ..., content_hash}`). Later
+/// writes to the same path supersede earlier ones (latest-wins), so the folded
+/// map is the file-plane state as of the cut. Returned as a `BTreeMap` (sorted
+/// by path) and its deterministic JSON serialization, so two cuts over the same
+/// file state hash identically. Backend-agnostic — native and DO both fold the
+/// same way after their own ordered SELECT.
+fn fold_file_manifest(fact_payloads: &[String]) -> StoreResult<(String, BTreeMap<String, String>)> {
+    let mut manifest: BTreeMap<String, String> = BTreeMap::new();
+    for payload_json in fact_payloads {
+        let payload: Value = serde_json::from_str(payload_json)?;
+        if payload.get("name").and_then(Value::as_str) != Some("file.write.completed") {
+            continue;
+        }
+        let descriptor = payload.get("value").and_then(|fact| fact.get("value"));
+        // Prefer the full resolved path (RC-5) so restore is self-contained and
+        // writes back to the exact location; fall back to the relative `path`
+        // for facts recorded before RC-5 (and synthetic test facts).
+        let path = descriptor
+            .and_then(|value| value.get("full_path").or_else(|| value.get("path")))
+            .and_then(Value::as_str);
+        let content_hash = descriptor
+            .and_then(|value| value.get("content_hash"))
+            .and_then(Value::as_str);
+        if let (Some(path), Some(content_hash)) = (path, content_hash) {
+            manifest.insert(path.to_owned(), content_hash.to_owned());
+        }
+    }
+    let manifest_json = serde_json::to_string(&manifest)?;
+    Ok((manifest_json, manifest))
+}
+
+/// Restorable-context RC-4c: the LIVE `fact.derived` payloads for an instance,
+/// with the restore-marker fold already applied (RC-4b) so abandoned-branch
+/// facts are excluded. Used to fold the file manifest at a cut (`capture_checkpoint`)
+/// and the current file plane (`plan_restore`) so both see the same
+/// marker-aware file state. `up_to_sequence` bounds the read (INCLUSIVE) for a
+/// point-in-time fold; `None` reads to the current head.
+#[cfg(feature = "native")]
+fn live_fact_payloads_on(
+    connection: &Connection,
+    instance_id: &str,
+    up_to_sequence: Option<i64>,
+) -> StoreResult<Vec<String>> {
+    let bound_clause = match up_to_sequence {
+        Some(n) => format!("  AND sequence <= {n}\n"),
+        None => String::new(),
+    };
+    let mut statement = connection.prepare(&format!(
+        r#"
+        SELECT event_type, payload_json, sequence
+        FROM events
+        WHERE instance_id = ?1 AND event_type IN ('fact.derived', 'context.restored')
+        {bound_clause}ORDER BY sequence
+        "#
+    ))?;
+    let rows: Vec<(String, String, i64)> = {
+        let mapped = statement
+            .query_map([instance_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<result::Result<Vec<_>, _>>()?;
+        mapped
+    };
+    let mut live: Vec<(String, i64)> = Vec::new();
+    for (event_type, payload_json, sequence) in rows {
+        if event_type == "context.restored" {
+            if let Some(target) = restore_marker_target(&payload_json) {
+                live.retain(|(_, seq)| *seq <= target);
+            }
+        } else {
+            live.push((payload_json, sequence));
+        }
+    }
+    Ok(live.into_iter().map(|(payload, _)| payload).collect())
+}
+
+/// A fetched replayable event row for the restore-marker fold (RC-4b):
+/// (event_id, event_type, payload_json, idempotency_key, causation_id, source,
+/// sequence).
+#[cfg(feature = "native")]
+type ReplayRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    i64,
+);
+
+/// Restorable-context RC-4b: the target sequence a `context.restored` marker
+/// rewinds the replay to (`restored_to_sequence`). `None` for a malformed
+/// marker, in which case the fold applies no rewind (retains all live events)
+/// rather than corrupting the projection.
+#[cfg(feature = "native")]
+/// The restore-marker fold over the EFFECTS plane: the set of event ids
+/// that survive every `context.restored` marker (RC-4b applied to the
+/// third plane — an effect is live iff its creating event is). `None`
+/// when no marker exists, so the un-restored fast path filters nothing.
+/// Closes the discovered gap where a re-executed suffix silently adopted
+/// the orphaned segment's effect rows instead of re-offering the rules
+/// (the visibility half; branch-distinct keys are the dedup half).
+#[cfg(feature = "native")]
+fn live_event_ids_on(
+    connection: &Connection,
+    instance_id: &str,
+) -> StoreResult<Option<std::collections::BTreeSet<String>>> {
+    let mut statement = connection.prepare(
+        "SELECT event_id, sequence, event_type, payload_json FROM events \
+         WHERE instance_id = ?1 ORDER BY sequence",
+    )?;
+    let rows = statement
+        .query_map([instance_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<result::Result<Vec<_>, _>>()?;
+    let mut saw_marker = false;
+    let mut live: Vec<(String, i64)> = Vec::new();
+    for (event_id, sequence, event_type, payload_json) in rows {
+        if event_type == "context.restored" {
+            saw_marker = true;
+            if let Some(target) = restore_marker_target(&payload_json) {
+                live.retain(|(_, seq)| *seq <= target);
+            }
+        }
+        live.push((event_id, sequence));
+    }
+    if !saw_marker {
+        return Ok(None);
+    }
+    Ok(Some(
+        live.into_iter().map(|(event_id, _)| event_id).collect(),
+    ))
+}
+
+#[cfg(feature = "native")]
+fn restore_marker_target(payload_json: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(payload_json)
+        .ok()?
+        .get("restored_to_sequence")
+        .and_then(Value::as_i64)
 }
 
 #[cfg(feature = "native")]
@@ -6555,8 +7425,32 @@ fn policy_block_on(
     }
 
     if effect.kind == "exec.command" {
-        let capabilities = explicit_required_capabilities(&effect)?;
-        return policy_block_for_capabilities(connection, &effect, &capabilities);
+        // Script hard-off Layer 2 (spec/std-script.md "Hard-off semantics"):
+        // EVERY exec.command effect requires a bound `script.*` capability.
+        // The capability form carries its `script.<name>` requirement from
+        // lowering; the raw form carries none and is held to `script.raw`.
+        // The requirement is derived HERE, at the admission gate, so a forged
+        // effect row that strips its requirements gains nothing — and the
+        // rows only exist when both seeding keys turned (the program imports
+        // std.script AND the operator-plane authority exists).
+        let mut capabilities = explicit_required_capabilities(&effect)?;
+        if !capabilities
+            .iter()
+            .any(|capability| capability.starts_with("script."))
+        {
+            capabilities.push("script.raw".to_owned());
+        }
+        let block = policy_block_for_capabilities(connection, &effect, &capabilities)?;
+        // A script-capability block IS the "scripts are disabled" state:
+        // surface the hard-off diagnostic id with the blocked reason, before
+        // any provider run.
+        return Ok(block.map(|block| match block.status {
+            "blocked_by_capability" => PolicyBlock {
+                status: block.status,
+                reason: format!("security.script_disabled: {}", block.reason),
+            },
+            _ => block,
+        }));
     }
 
     if effect.kind == "capability.call" {
@@ -9701,9 +10595,102 @@ mod tests {
             "skill_attachments",
             "capability_bindings",
             "inbox_items",
+            "compute_result_cache",
+            "content_blobs",
         ] {
             assert!(store.table_exists(table).expect("table lookup"), "{table}");
         }
+    }
+
+    /// Delta-kernel result cache (compute plane P8-1): a recorded content key
+    /// is served back on lookup, and insertion is first-writer-wins — the
+    /// existing entry stays canonical, mirroring the Maude model's
+    /// at-most-one-run-per-key invariant (compute-result-cache.maude I1).
+    #[test]
+    fn compute_result_cache_roundtrip_and_first_writer_wins() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        assert_eq!(
+            store
+                .lookup_compute_result("key-1")
+                .expect("lookup on empty cache"),
+            None
+        );
+
+        let inserted = store
+            .record_compute_result(ComputeResultRegistration {
+                content_key: "key-1",
+                effect_kind: "exec.command",
+                result_json: r#"{"exit_code":0,"stdout":"first"}"#,
+                source_instance_id: "instance-a",
+                source_effect_id: "effect-1",
+            })
+            .expect("first record");
+        assert!(inserted, "first writer inserts");
+
+        let replay = store
+            .record_compute_result(ComputeResultRegistration {
+                content_key: "key-1",
+                effect_kind: "exec.command",
+                result_json: r#"{"exit_code":0,"stdout":"second"}"#,
+                source_instance_id: "instance-b",
+                source_effect_id: "effect-2",
+            })
+            .expect("second record");
+        assert!(!replay, "second writer is ignored");
+
+        let hit = store
+            .lookup_compute_result("key-1")
+            .expect("lookup")
+            .expect("entry exists");
+        assert_eq!(hit.result_json, r#"{"exit_code":0,"stdout":"first"}"#);
+        assert_eq!(hit.source_instance_id, "instance-a");
+        assert_eq!(hit.source_effect_id, "effect-1");
+        assert_eq!(hit.effect_kind, "exec.command");
+        assert_eq!(
+            store.lookup_compute_result("key-2").expect("other key"),
+            None
+        );
+    }
+
+    /// Restorable-context RC-1: the file-history blob seam is content-addressed,
+    /// dedups, and — the load-bearing property — a superseded body SURVIVES being
+    /// overwritten. Capturing body Y after body X leaves BOTH retrievable by hash,
+    /// which is exactly what a later restore slice reads through. The returned id
+    /// is the same `stable_hash_hex` the `file.write.completed` fact records, so a
+    /// manifest hash always resolves to its bytes (INV-4 coherence).
+    #[test]
+    fn content_blob_seam_dedups_and_preserves_superseded_bodies() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+
+        assert_eq!(
+            store.get_content("deadbeef").expect("get on empty store"),
+            None
+        );
+
+        // First write of a path: body X is captured, retrievable by its hash.
+        let id_x = store.put_content("body X").expect("capture X");
+        assert_eq!(id_x, stable_hash_hex("body X"), "id is the content hash");
+        assert_eq!(
+            store.get_content(&id_x).expect("get X").as_deref(),
+            Some("body X")
+        );
+
+        // Overwriting the path with body Y captures Y WITHOUT losing X — history
+        // survives the overwrite (the whole point of RC-1).
+        let id_y = store.put_content("body Y").expect("capture Y");
+        assert_ne!(id_x, id_y);
+        assert_eq!(
+            store.get_content(&id_x).expect("get X after Y").as_deref(),
+            Some("body X")
+        );
+        assert_eq!(
+            store.get_content(&id_y).expect("get Y").as_deref(),
+            Some("body Y")
+        );
+
+        // Writing the same bytes again dedups to one row / one id.
+        let id_x_again = store.put_content("body X").expect("recapture X");
+        assert_eq!(id_x, id_x_again, "identical bytes dedupe to one id");
     }
 
     #[cfg(unix)]
@@ -9890,12 +10877,107 @@ mod tests {
         assert_eq!(row_count(&store, "instances"), 1);
     }
 
+    /// RC-4b on the EFFECTS plane: after a `context.restored` marker, the
+    /// orphaned segment's effect rows vanish from both read paths — the
+    /// restored timeline re-offers the rules instead of silently adopting
+    /// orphaned outcomes, and the worker is never handed an orphaned
+    /// pending effect. Work committed before the cut, and NEW work after
+    /// the marker, stay live.
+    #[test]
+    fn restore_fold_hides_orphaned_effects_from_reads_and_claims() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        // Live segment: seq 1 commits eff-keep.
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "keep",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("eff-keep", "tracker.claim", "keep-key")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-keep"),
+            })
+            .expect("commit keep");
+        // Orphaned-to-be segment: seq 2 commits eff-orphan.
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "orphan",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("eff-orphan", "tracker.claim", "orphan-key")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-orphan"),
+            })
+            .expect("commit orphan");
+        assert_eq!(store.list_effects("instance-a").expect("list").len(), 2);
+
+        // Restore to seq 1: the marker orphans the second commit.
+        store
+            .append_event(NewEvent {
+                instance_id: "instance-a",
+                event_type: "context.restored",
+                payload_json: r#"{"cut_id":"cut-1","restored_to_sequence":1}"#,
+                source: "test",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some("restore-1"),
+            })
+            .expect("marker");
+        let visible = store.list_effects("instance-a").expect("list");
+        assert_eq!(
+            visible
+                .iter()
+                .map(|effect| effect.effect_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eff-keep"],
+            "the orphaned segment's effect is invisible after the fold"
+        );
+        let claimable = store.claimable_effects("instance-a").expect("claimable");
+        assert_eq!(
+            claimable
+                .iter()
+                .map(|effect| effect.effect_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eff-keep"],
+            "the worker is never handed an orphaned pending effect"
+        );
+
+        // New work on the restored timeline stays live.
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "resume",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("eff-resume", "tracker.claim", "resume-key")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-resume"),
+            })
+            .expect("commit resume");
+        let visible = store.list_effects("instance-a").expect("list");
+        assert_eq!(
+            visible
+                .iter()
+                .map(|effect| effect.effect_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eff-keep", "eff-resume"],
+            "post-restore work is live alongside the pre-cut segment"
+        );
+    }
+
     #[test]
     fn rule_commit_persists_event_fact_effect_and_dependency_atomically() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let facts = [test_fact("fact-ready", "issue", "issue-1")];
         let effects = [
-            test_effect("claim", "loft.claim", "rule=start;effect=claim"),
+            test_effect("claim", "tracker.claim", "rule=start;effect=claim"),
             test_effect("tell", "agent.tell", "rule=start;effect=tell"),
         ];
         let dependencies = [NewEffectDependency {
@@ -9989,7 +11071,7 @@ mod tests {
     fn failed_rule_commit_rolls_back_partial_writes() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let effects = [
-            test_effect("same-effect", "loft.claim", "rule=bad;effect=one"),
+            test_effect("same-effect", "tracker.claim", "rule=bad;effect=one"),
             test_effect("same-effect", "agent.tell", "rule=bad;effect=two"),
         ];
         let result = store.commit_rule(RuleCommit {
@@ -10136,7 +11218,7 @@ mod tests {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let facts = [test_fact("fact-ready", "issue", "issue-1")];
         let effects = [
-            test_effect("claim", "loft.claim", "rule=start;effect=claim"),
+            test_effect("claim", "tracker.claim", "rule=start;effect=claim"),
             test_effect("tell", "agent.tell", "rule=start;effect=tell"),
         ];
         let dependencies = [NewEffectDependency {
@@ -10554,7 +11636,7 @@ mod tests {
     fn scheduler_claims_only_dependency_satisfied_effects() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let effects = [
-            test_effect("claim", "loft.claim", "rule=start;effect=claim"),
+            test_effect("claim", "tracker.claim", "rule=start;effect=claim"),
             NewEffect {
                 timeout_seconds: None,
                 effect_id: "tell",
@@ -10706,7 +11788,7 @@ mod tests {
     fn start_run_rejects_blocked_dependency_without_partial_event() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let effects = [
-            test_effect("claim", "loft.claim", "rule=start;effect=claim"),
+            test_effect("claim", "tracker.claim", "rule=start;effect=claim"),
             NewEffect {
                 timeout_seconds: None,
                 effect_id: "tell",
@@ -12474,6 +13556,512 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_projections_to_reconstructs_instance_state_as_of_sequence() {
+        // RC-2 Delta A: bounded replay reflects instance state AS OF event N —
+        // an effect committed AFTER N is absent; one at/before N is present.
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("BoundedReplay", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        let effect_exists = |store: &SqliteStore, effect_id: &str| -> bool {
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM effects WHERE effect_id = ?1",
+                    [effect_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("effect count")
+                > 0
+        };
+
+        // Commit effect A, then effect B at a strictly later event sequence.
+        let commit_a = store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "rule-a",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("effect-a", "agent.tell", "bounded-key-a")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-bounded-a"),
+            })
+            .expect("effect A commits");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "rule-b",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("effect-b", "agent.tell", "bounded-key-b")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-bounded-b"),
+            })
+            .expect("effect B commits");
+
+        // Cut AT effect A's commit sequence: A is in, B (later) is out.
+        store
+            .rebuild_projections_to(&instance.instance_id, commit_a.sequence)
+            .expect("bounded projections rebuild");
+        assert!(
+            effect_exists(&store, "effect-a"),
+            "effect A (<= N) present after bounded rebuild"
+        );
+        assert!(
+            !effect_exists(&store, "effect-b"),
+            "effect B (> N) absent after bounded rebuild"
+        );
+
+        // Unbounded rebuild restores the full current state (both effects).
+        store
+            .rebuild_projections(&instance.instance_id)
+            .expect("unbounded projections rebuild");
+        assert!(
+            effect_exists(&store, "effect-a"),
+            "effect A present in full"
+        );
+        assert!(
+            effect_exists(&store, "effect-b"),
+            "effect B present in full"
+        );
+    }
+
+    #[test]
+    fn rebuild_projections_honors_restore_marker_excluding_the_abandoned_branch() {
+        // RC-4b: an unbounded rebuild folds `context.restored` markers — an
+        // effect committed AFTER the cut but BEFORE the marker is abandoned and
+        // never re-applied, while post-restore work survives. This is the
+        // append-only-log coherence the model proves
+        // (models/maude/restore-replay.maude).
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("RestoreFold", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        let effect_exists = |store: &SqliteStore, effect_id: &str| -> bool {
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM effects WHERE effect_id = ?1",
+                    [effect_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("effect count")
+                > 0
+        };
+
+        // Effect A at the cut, then effect B (the branch to abandon).
+        let commit_a = store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "rule-a",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("effect-a", "agent.tell", "restore-key-a")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-restore-a"),
+            })
+            .expect("effect A commits");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "rule-b",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("effect-b", "agent.tell", "restore-key-b")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-restore-b"),
+            })
+            .expect("effect B commits");
+
+        // A restore marker rewinding to A's sequence: B (later) is abandoned.
+        let marker_payload = json!({ "restored_to_sequence": commit_a.sequence }).to_string();
+        store
+            .append_event(NewEvent {
+                instance_id: &instance.instance_id,
+                event_type: "context.restored",
+                payload_json: &marker_payload,
+                source: "restorable-context",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some("restore-marker-1"),
+            })
+            .expect("restore marker appends");
+
+        // Post-restore work: effect C, committed after the marker, stays live.
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "rule-c",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("effect-c", "agent.tell", "restore-key-c")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-restore-c"),
+            })
+            .expect("effect C commits");
+
+        store
+            .rebuild_projections(&instance.instance_id)
+            .expect("marker-aware rebuild");
+        assert!(
+            effect_exists(&store, "effect-a"),
+            "effect A (<= cut) survives the restore"
+        );
+        assert!(
+            !effect_exists(&store, "effect-b"),
+            "effect B (abandoned branch) is excluded by the marker"
+        );
+        assert!(
+            effect_exists(&store, "effect-c"),
+            "effect C (post-restore work) stays live"
+        );
+    }
+
+    #[test]
+    fn capture_checkpoint_folds_manifest_and_records_cut_at_quiescence() {
+        // RC-3: at a quiescent point, capture folds the file manifest from the
+        // file.write.completed facts (latest-write-wins per path), stores it
+        // content-addressed (INV-4: hash present), and records the
+        // context.checkpoint cut carrier whose sequence is the cut coordinate.
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Checkpoint", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        // Helper: derive a file.write.completed fact for `path` -> `content_hash`
+        // in the RC-1 payload shape (write descriptor nested at value.value).
+        let write_fact = |store: &mut SqliteStore, key: &str, path: &str, content_hash: &str| {
+            let value_json = json!({
+                "effect_id": key,
+                "run_id": format!("run-{key}"),
+                "status": "completed",
+                "value": { "store": "workspace", "path": path, "content_hash": content_hash },
+            })
+            .to_string();
+            store
+                .derive_fact(DerivedFact {
+                    instance_id: &instance.instance_id,
+                    fact: NewFact {
+                        fact_id: key,
+                        name: "file.write.completed",
+                        key,
+                        value_json: &value_json,
+                        schema_id: None,
+                        provenance_class: "derived",
+                        correlation_id: None,
+                        source_span_json: None,
+                    },
+                    source: "kernel",
+                    causation_id: None,
+                    idempotency_key: Some(key),
+                })
+                .expect("file.write.completed fact derives")
+        };
+
+        write_fact(&mut store, "w-a1", "a.txt", "hash-a1");
+        write_fact(&mut store, "w-b1", "b.txt", "hash-b1");
+        // Overwrite a.txt: the later write must supersede the earlier hash.
+        let last = write_fact(&mut store, "w-a2", "a.txt", "hash-a2");
+
+        let checkpoint = store
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: &instance.instance_id,
+                cut_id: "cut-1",
+                transcript_ref: Some("step-7"),
+                idempotency_key: Some("checkpoint-cut-1"),
+            })
+            .expect("checkpoint captures at quiescence");
+
+        assert_eq!(checkpoint.cut_id, "cut-1");
+        assert_eq!(
+            checkpoint.file_count, 2,
+            "two distinct paths in the manifest"
+        );
+        assert!(
+            checkpoint.sequence > last.sequence,
+            "checkpoint event is the latest sequence (the cut coordinate)"
+        );
+
+        // INV-4: the manifest hash the cut names is present in the blob store,
+        // and it is exactly the latest-wins path->hash map.
+        let manifest_body = store
+            .get_content(&checkpoint.manifest_hash)
+            .expect("manifest blob read")
+            .expect("manifest blob present");
+        let manifest: BTreeMap<String, String> =
+            serde_json::from_str(&manifest_body).expect("manifest parses");
+        assert_eq!(manifest.get("a.txt").map(String::as_str), Some("hash-a2"));
+        assert_eq!(manifest.get("b.txt").map(String::as_str), Some("hash-b1"));
+
+        // The cut carrier is a context.checkpoint event at the returned sequence.
+        let event_type: String = store
+            .connection
+            .query_row(
+                "SELECT event_type FROM events WHERE instance_id = ?1 AND sequence = ?2",
+                params![instance.instance_id, checkpoint.sequence],
+                |row| row.get(0),
+            )
+            .expect("checkpoint event row");
+        assert_eq!(event_type, "context.checkpoint");
+
+        // The cut carrier is NOT a state-changing event: replaying to its own
+        // sequence reproduces the same manifest fold (it is a no-op for the fold).
+        store
+            .rebuild_projections_to(&instance.instance_id, checkpoint.sequence)
+            .expect("bounded replay to the cut");
+        assert!(
+            store
+                .fact_exists(&instance.instance_id, "file.write.completed")
+                .expect("fact exists check"),
+            "file.write.completed facts survive replay to the cut"
+        );
+    }
+
+    #[test]
+    fn capture_checkpoint_refuses_when_an_effect_is_in_flight() {
+        // RC-3 INV-2 (no-in-flight straddle): a checkpoint is only a consistent
+        // cut at a quiescent point. With an effect mid-run, capture refuses.
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("CheckpointBusy", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[test_effect("tell", "agent.tell", "checkpoint-busy-key")],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-checkpoint-busy"),
+            })
+            .expect("effect commits");
+        store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                run_id: "run-busy",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-busy",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("run starts (effect now running)");
+
+        let refused = store.capture_checkpoint(CheckpointCapture {
+            instance_id: &instance.instance_id,
+            cut_id: "cut-busy",
+            transcript_ref: None,
+            idempotency_key: None,
+        });
+        assert!(
+            matches!(refused, Err(StoreError::Conflict(_))),
+            "checkpoint refuses while an effect is running, got {refused:?}"
+        );
+    }
+
+    // RC-4c helper: record a mediated file write — put the body content-addressed
+    // (so `plan_restore` can read it back) and derive the matching
+    // file.write.completed fact with `content_hash = stable_hash_hex(body)`.
+    #[cfg(test)]
+    fn record_file_write(
+        store: &mut SqliteStore,
+        instance_id: &str,
+        key: &str,
+        path: &str,
+        body: &str,
+    ) {
+        let content_hash = store.put_content(body).expect("blob captures");
+        let value_json = json!({
+            "effect_id": key,
+            "run_id": format!("run-{key}"),
+            "status": "completed",
+            "value": { "store": "workspace", "path": path, "content_hash": content_hash },
+        })
+        .to_string();
+        store
+            .derive_fact(DerivedFact {
+                instance_id,
+                fact: NewFact {
+                    fact_id: key,
+                    name: "file.write.completed",
+                    key,
+                    value_json: &value_json,
+                    schema_id: None,
+                    provenance_class: "derived",
+                    correlation_id: None,
+                    source_span_json: None,
+                },
+                source: "kernel",
+                causation_id: None,
+                idempotency_key: Some(key),
+            })
+            .expect("file.write.completed fact derives");
+    }
+
+    #[test]
+    fn plan_restore_reconciles_files_and_commit_restore_rewinds_the_planes() {
+        // RC-4c: plan_restore returns the full reconcile (write manifest paths
+        // to cut content, remove post-cut mediated files) and commit_restore's
+        // marker rewinds the file plane so a later checkpoint hashes to the cut.
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("RestorePlan", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let id = &instance.instance_id;
+
+        // File plane at the cut: a.txt=A1, b.txt=B1.
+        record_file_write(&mut store, id, "w-a1", "a.txt", "A1");
+        record_file_write(&mut store, id, "w-b1", "b.txt", "B1");
+        let cut = store
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: id,
+                cut_id: "cut-1",
+                transcript_ref: Some("step-3"),
+                idempotency_key: Some("checkpoint-cut-1"),
+            })
+            .expect("checkpoint captures");
+
+        // Post-cut work: overwrite a.txt, create c.txt.
+        record_file_write(&mut store, id, "w-a2", "a.txt", "A2");
+        record_file_write(&mut store, id, "w-c1", "c.txt", "C1");
+
+        let plan = match store.plan_restore(id, "cut-1").expect("plan resolves") {
+            RestoreDecision::Ready(plan) => plan,
+            RestoreDecision::Refused { reason } => panic!("unexpected refusal: {reason}"),
+        };
+        assert_eq!(plan.restored_to_sequence, cut.sequence);
+        assert_eq!(plan.transcript_ref.as_deref(), Some("step-3"));
+        // writes restore every manifest path to its CUT content (a.txt back to A1).
+        assert_eq!(plan.writes.get("a.txt").map(String::as_str), Some("A1"));
+        assert_eq!(plan.writes.get("b.txt").map(String::as_str), Some("B1"));
+        assert_eq!(plan.writes.len(), 2);
+        // removes = mediated paths present now but absent from the cut (c.txt).
+        assert_eq!(plan.removes, vec!["c.txt".to_owned()]);
+
+        // Commit the restore: the marker rewinds the file plane so a fresh
+        // checkpoint of the (marker-folded) manifest hashes to the cut manifest.
+        store
+            .commit_restore(id, plan.restored_to_sequence, "cut-1", Some("restore-1"))
+            .expect("restore commits");
+        let after = store
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: id,
+                cut_id: "cut-after",
+                transcript_ref: None,
+                idempotency_key: Some("checkpoint-after"),
+            })
+            .expect("post-restore checkpoint");
+        assert_eq!(
+            after.manifest_hash, cut.manifest_hash,
+            "the file plane rewound to the cut (a.txt=A2 and c.txt abandoned)"
+        );
+        assert_eq!(after.file_count, 2);
+    }
+
+    #[test]
+    fn plan_restore_refuses_unknown_cut_and_dangling_manifest() {
+        // RC-4c INV-4: an unknown cut or a missing referenced blob refuses the
+        // whole restore, with no mutation.
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("RestoreRefuse", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let id = &instance.instance_id;
+
+        assert!(
+            matches!(
+                store.plan_restore(id, "nope").expect("plan resolves"),
+                RestoreDecision::Refused { .. }
+            ),
+            "unknown cut refuses"
+        );
+
+        record_file_write(&mut store, id, "w-a1", "a.txt", "A1");
+        let content_hash = stable_hash_hex("A1");
+        store
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: id,
+                cut_id: "cut-1",
+                transcript_ref: None,
+                idempotency_key: Some("checkpoint-cut-1"),
+            })
+            .expect("checkpoint captures");
+        // Evict the referenced content blob: the manifest is now dangling.
+        store
+            .connection
+            .execute(
+                "DELETE FROM content_blobs WHERE id = ?1",
+                [content_hash.as_str()],
+            )
+            .expect("evict blob");
+        assert!(
+            matches!(
+                store.plan_restore(id, "cut-1").expect("plan resolves"),
+                RestoreDecision::Refused { .. }
+            ),
+            "dangling manifest refuses (INV-4 coherence)"
+        );
+    }
+
+    #[test]
     fn replay_reconstructs_terminal_runs_leases_and_resolved_cancel_requests() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let version = store
@@ -13659,6 +15247,202 @@ mod tests {
         );
     }
 
+    /// Script hard-off Layer 2, forged-IR fixture (spec/std-script.md,
+    /// models/maude/script-capability-seeding.maude): a program registered
+    /// DIRECTLY against the store — the path that bypasses the check-time
+    /// gate, exactly what forged IR does — commits a raw exec.command effect
+    /// carrying no capability requirement. The admission gate holds the raw
+    /// form to `script.raw`; nothing seeded it (no import + no operator
+    /// authority ever turned the two keys), so the effect blocks as
+    /// blocked_by_capability with the `security.script_disabled` id, is never
+    /// claimable, and no run row exists.
+    #[test]
+    fn raw_exec_without_seeded_script_capability_blocks_at_admission() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Forged", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let effects = [NewEffect {
+            effect_id: "raw-exec",
+            kind: "exec.command",
+            target: None,
+            input_json: r#"{"mode":"raw","command":"echo forged"}"#,
+            profile: None,
+            required_capabilities_json: "[]",
+            ..test_effect("raw-exec", "exec.command", "rule=go;effect=raw-exec")
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "go",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-go"),
+            })
+            .expect("rule commits");
+
+        assert!(
+            store
+                .claimable_effects(&instance.instance_id)
+                .expect("claimable list")
+                .is_empty(),
+            "an unseeded exec effect must not be claimable"
+        );
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "raw-exec",
+                run_id: "run-raw-exec",
+                provider: "exec",
+                worker_id: "whip-exec",
+                lease_id: "lease-raw-exec",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("admission blocks the run");
+        assert!(
+            matches!(&blocked, StoreError::PolicyBlocked { reason, .. }
+                if reason.contains("security.script_disabled") && reason.contains("script.raw")),
+            "got {blocked:?}"
+        );
+        assert_eq!(effect_status(&store, "raw-exec"), "blocked_by_capability");
+        assert_eq!(row_count(&store, "runs"), 0, "no provider run was started");
+    }
+
+    /// The capability form of the same property: an exec.command effect
+    /// carrying `script.<name>` blocks at admission when the row was never
+    /// seeded (unregistered manifest entry, or seeding keys never turned).
+    #[test]
+    fn capability_exec_with_unseeded_script_capability_blocks_at_admission() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Forged", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let effects = [NewEffect {
+            effect_id: "cap-exec",
+            kind: "exec.command",
+            target: None,
+            input_json: r#"{"mode":"capability","capability":"judge"}"#,
+            profile: None,
+            required_capabilities_json: r#"["script.judge"]"#,
+            ..test_effect("cap-exec", "exec.command", "rule=go;effect=cap-exec")
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "go",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-go"),
+            })
+            .expect("rule commits");
+
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "cap-exec",
+                run_id: "run-cap-exec",
+                provider: "exec",
+                worker_id: "whip-exec",
+                lease_id: "lease-cap-exec",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("admission blocks the run");
+        assert!(
+            matches!(&blocked, StoreError::PolicyBlocked { reason, .. }
+                if reason.contains("security.script_disabled") && reason.contains("script.judge")),
+            "got {blocked:?}"
+        );
+        assert_eq!(effect_status(&store, "cap-exec"), "blocked_by_capability");
+        assert_eq!(row_count(&store, "runs"), 0, "no provider run was started");
+    }
+
+    /// The positive half: once the two-key seed happened (capability schema +
+    /// per-program binding for `script.raw`), the same raw exec effect is
+    /// admitted — the gate reads the seeded rows, nothing else.
+    #[test]
+    fn raw_exec_with_seeded_script_raw_capability_is_claimable() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Granted", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        store
+            .register_capability_schema(CapabilitySchemaRegistration {
+                capability: "script.raw",
+                description: "raw exec behind the operator allowlist",
+                schema_json: "{}",
+                registered_by_package_id: None,
+            })
+            .expect("schema registers");
+        store
+            .bind_capability(CapabilityBinding {
+                binding_id: "binding-script-raw",
+                program_id: Some(&version.program_id),
+                capability: "script.raw",
+                provider: "builtin-script",
+                config_json: "{}",
+            })
+            .expect("binding registers");
+        let effects = [NewEffect {
+            effect_id: "raw-exec",
+            kind: "exec.command",
+            target: None,
+            input_json: r#"{"mode":"raw","command":"echo granted"}"#,
+            profile: None,
+            required_capabilities_json: "[]",
+            ..test_effect("raw-exec", "exec.command", "rule=go;effect=raw-exec")
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "go",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-go"),
+            })
+            .expect("rule commits");
+
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable list");
+        assert_eq!(claimable.len(), 1);
+        assert_eq!(claimable[0].effect_id, "raw-exec");
+    }
+
     #[test]
     fn profile_mismatch_blocks_effect_before_provider_run() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
@@ -14150,9 +15934,9 @@ mod tests {
             })
             .expect("instance creates");
         let package_id = store
-            .register_package_manifest(include_str!("../../../examples/packages/memory.json"))
+            .register_package_manifest(include_str!("../../../std/manifests/memory.json"))
             .expect("package manifest loads");
-        assert_eq!(package_id, "package-memory");
+        assert_eq!(package_id, "std.memory");
 
         let effects = [NewEffect {
             timeout_seconds: None,
@@ -14222,54 +16006,54 @@ mod tests {
             .expect("instance creates");
         store
             .register_skill(SkillRegistration {
-                skill_id: "skill-loft-user",
-                name: "loft-user",
+                skill_id: "skill-repo-user",
+                name: "repo-user",
                 version: "1.0.0",
-                source: "# Loft User\nUse Loft carefully.\n",
-                source_path: "skills/loft-user/SKILL.md",
-                body: "# Loft User\nUse Loft carefully.\n",
-                description: "Loft workflow instructions",
-                required_capabilities_json: r#"["loft.claim"]"#,
+                source: "# Repo User\nUse Repo carefully.\n",
+                source_path: "skills/repo-user/SKILL.md",
+                body: "# Repo User\nUse Repo carefully.\n",
+                description: "Repo workflow instructions",
+                required_capabilities_json: r#"["tracker.claim"]"#,
                 metadata_json: r#"{"package":"core"}"#,
             })
             .expect("skill registers");
         store
             .attach_skill(SkillAttachment {
-                attachment_id: "attach-program-loft",
+                attachment_id: "attach-program-repo",
                 scope_type: "program",
                 scope_id: &version.program_id,
-                skill_name: "loft-user",
+                skill_name: "repo-user",
             })
             .expect("program skill attaches");
         store
             .attach_skill(SkillAttachment {
-                attachment_id: "attach-agent-loft",
+                attachment_id: "attach-agent-repo",
                 scope_type: "agent",
                 scope_id: "Ralph/worker",
-                skill_name: "loft-user",
+                skill_name: "repo-user",
             })
             .expect("agent skill attaches");
         store
             .attach_skill(SkillAttachment {
-                attachment_id: "attach-run-loft",
+                attachment_id: "attach-run-repo",
                 scope_type: "run",
                 scope_id: "run-tell",
-                skill_name: "loft-user",
+                skill_name: "repo-user",
             })
             .expect("run skill attaches");
 
         let skills = store.list_skills().expect("skills list");
         assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "loft-user");
+        assert_eq!(skills[0].name, "repo-user");
         assert_eq!(skills[0].version, "1.0.0");
-        assert_eq!(skills[0].source_path, "skills/loft-user/SKILL.md");
+        assert_eq!(skills[0].source_path, "skills/repo-user/SKILL.md");
         assert!(skills[0].content_hash.len() >= 16);
 
         let program_attachments = store
             .list_skill_attachments("program", &version.program_id)
             .expect("program attachments load");
         assert_eq!(program_attachments.len(), 1);
-        assert_eq!(program_attachments[0].skill.name, "loft-user");
+        assert_eq!(program_attachments[0].skill.name, "repo-user");
         let agent_attachments = store
             .list_skill_attachments("agent", "Ralph/worker")
             .expect("agent attachments load");
@@ -14284,7 +16068,7 @@ mod tests {
                 instance_id: &instance.instance_id,
                 run_id: "run-tell",
                 effect_id: "tell",
-                skill_names: &["loft-user"],
+                skill_names: &["repo-user"],
                 idempotency_key: Some("skills-run-tell"),
             })
             .expect("skill evidence records");
@@ -14296,13 +16080,13 @@ mod tests {
         assert_eq!(evidence[0].kind, "skills.injected");
         assert!(evidence[0]
             .metadata_json
-            .contains("skills/loft-user/SKILL.md"));
+            .contains("skills/repo-user/SKILL.md"));
         assert!(evidence[0].metadata_json.contains("content_hash"));
         assert!(evidence[0]
             .summary
             .as_deref()
             .expect("summary")
-            .contains("loft-user@1.0.0"));
+            .contains("repo-user@1.0.0"));
     }
 
     #[test]

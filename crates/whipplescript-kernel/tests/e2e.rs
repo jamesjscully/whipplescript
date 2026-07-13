@@ -4,10 +4,8 @@ use whipplescript_kernel::{
     coerce::{CoerceRequest, FakeCoerceClient},
     harness::MockAgentHarness,
     idempotency_key,
-    loft::{FakeLoftClient, LoftAction, LoftEffectRequest},
     trace::check_trace,
-    AgentTurnExecution, CoerceExecution, HumanAskExecution, LoftEffectExecution,
-    ProgramVersionInput, RuntimeKernel,
+    AgentTurnExecution, CoerceExecution, HumanAskExecution, ProgramVersionInput, RuntimeKernel,
 };
 use whipplescript_parser::compile_program;
 use whipplescript_store::{
@@ -54,146 +52,6 @@ fn e2e_compiles_and_runs_minimal_workflow() {
     assert!(facts
         .iter()
         .any(|fact| fact.name == "StartupSeen" && fact.value_json.contains("observed")));
-}
-
-#[test]
-fn e2e_loft_claim_success_runs_agent_after_claim() {
-    let source = include_str!("../../../examples/queue-worker-with-review.whip");
-    let (mut kernel, instance_id) = kernel_from_source("QueueWorkerWithReview", source);
-    let effects = [
-        effect("claim", "loft.claim", r#"{"issue_id":"iss_abc"}"#),
-        effect("tell", "agent.tell", r#"{"prompt":"implement"}"#),
-    ];
-    let dependencies = [dependency("dep-claim-tell", "claim", "succeeds", "tell")];
-    kernel
-        .commit_rule(RuleCommit {
-            instance_id: &instance_id,
-            rule: "start_ready_issue",
-            trigger_event_id: None,
-            facts: &[],
-            consumed_fact_ids: &[],
-            effects: &effects,
-            dependencies: &dependencies,
-            terminal: None,
-            idempotency_key: Some("commit-start-ready-issue"),
-        })
-        .expect("start rule commits");
-
-    let request = loft_claim_request("iss_abc", "cmd-claim");
-    kernel
-        .run_loft_effect(
-            LoftEffectExecution {
-                instance_id: &instance_id,
-                effect_id: "claim",
-                run_id: "run-claim",
-                provider: "fake-loft",
-                worker_id: "worker-1",
-                lease_id: "lease-claim",
-                lease_expires_at: "2030-01-01T00:00:00Z",
-                request: &request,
-            },
-            &FakeLoftClient::succeeds(
-                r#"{"lease_id":"lea_abc","issue":{"id":"iss_abc","state_token":"ok"},"expires_at":"2030-01-01T00:00:00Z"}"#,
-            ),
-        )
-        .expect("claim succeeds");
-
-    kernel
-        .run_agent_turn(
-            AgentTurnExecution {
-                instance_id: &instance_id,
-                effect_id: "tell",
-                run_id: "run-tell",
-                provider: "mock-agent",
-                worker_id: "worker-1",
-                lease_id: "lease-tell",
-                lease_expires_at: "2030-01-01T00:00:00Z",
-                agent: "worker",
-                profile: Some("repo-writer"),
-                input_json: r#"{"prompt":"implement"}"#,
-                skill_names: &[],
-            },
-            &MockAgentHarness::completed("implemented"),
-        )
-        .expect("agent turn runs after claim");
-
-    assert_e2e_trace("loft-claim-success", &kernel);
-    let store = kernel.into_store();
-    let events = store.list_events(&instance_id).expect("events list");
-    let claim_terminal = event_sequence(&events, "effect.terminal", "claim");
-    let tell_started = event_sequence(&events, "effect.run_started", "tell");
-    assert!(claim_terminal < tell_started);
-    let facts = store.list_facts(&instance_id).expect("facts list");
-    assert!(facts.iter().any(|fact| fact.name == "loft.claim.succeeded"));
-    assert!(facts.iter().any(|fact| fact.name == "agent.turn.completed"));
-}
-
-#[test]
-fn e2e_loft_claim_failure_routes_to_human_review() {
-    let source = include_str!("../../../examples/queue-worker-with-review.whip");
-    let (mut kernel, instance_id) = kernel_from_source("QueueWorkerWithReview", source);
-    let effects = [
-        effect("claim", "loft.claim", r#"{"issue_id":"iss_busy"}"#),
-        effect("review", "human.ask", r#"{"prompt":"claim failed"}"#),
-    ];
-    let dependencies = [dependency("dep-claim-review", "claim", "fails", "review")];
-    kernel
-        .commit_rule(RuleCommit {
-            instance_id: &instance_id,
-            rule: "start_ready_issue",
-            trigger_event_id: None,
-            facts: &[],
-            consumed_fact_ids: &[],
-            effects: &effects,
-            dependencies: &dependencies,
-            terminal: None,
-            idempotency_key: Some("commit-claim-failure"),
-        })
-        .expect("claim failure rule commits");
-
-    let request = loft_claim_request("iss_busy", "cmd-claim-busy");
-    kernel
-        .run_loft_effect(
-            LoftEffectExecution {
-                instance_id: &instance_id,
-                effect_id: "claim",
-                run_id: "run-claim",
-                provider: "fake-loft",
-                worker_id: "worker-1",
-                lease_id: "lease-claim",
-                lease_expires_at: "2030-01-01T00:00:00Z",
-                request: &request,
-            },
-            &FakeLoftClient::fails("issue already leased"),
-        )
-        .expect("claim failure records");
-
-    kernel
-        .run_human_ask(HumanAskExecution {
-            instance_id: &instance_id,
-            effect_id: "review",
-            run_id: "run-review",
-            provider: "builtin-human-review",
-            worker_id: "worker-1",
-            lease_id: "lease-review",
-            lease_expires_at: "2030-01-01T00:00:00Z",
-            inbox_item_id: "inbox-review",
-            prompt: "Claim failed; inspect the issue.",
-            choices_json: r#"["retry","block"]"#,
-            freeform_allowed: true,
-            severity: "warning",
-            related_effects_json: r#"["claim"]"#,
-            related_artifacts_json: "[]",
-        })
-        .expect("human review requested");
-
-    assert_e2e_trace("loft-claim-failure", &kernel);
-    let store = kernel.into_store();
-    let facts = store.list_facts(&instance_id).expect("facts list");
-    assert!(facts.iter().any(|fact| fact.name == "loft.claim.failed"));
-    assert!(facts.iter().any(|fact| fact.name == "human.ask.created"));
-    let inbox = store.list_inbox_items(None).expect("inbox list");
-    assert_eq!(inbox.len(), 1);
 }
 
 #[test]
@@ -434,10 +292,41 @@ fn e2e_lease_expiry_and_retry_recover_effects() {
         })
         .expect("effect retries");
 
+    // Re-run the retried effect to completion. This exercises the recovery
+    // transition `failed -> queued -> claimed -> running -> completed`; before the
+    // trace model learned about `EffectRetried`, this second claim tripped a
+    // "claimed from ... status Failed" conformance violation.
+    kernel
+        .start_run(RunStart {
+            instance_id: &instance_id,
+            effect_id: "tell",
+            run_id: "run-tell-3",
+            provider: "mock-agent",
+            worker_id: "worker-1",
+            lease_id: "lease-tell-3",
+            lease_expires_at: "2030-01-04T00:00:00Z",
+            metadata_json: "{}",
+        })
+        .expect("third run starts after retry");
+    kernel
+        .complete_run(EffectCompletion {
+            instance_id: &instance_id,
+            effect_id: "tell",
+            run_id: "run-tell-3",
+            provider: "mock-agent",
+            worker_id: "worker-1",
+            status: "ignored",
+            exit_code: Some(0),
+            summary: Some("succeeded on retry"),
+            metadata_json: "{}",
+            idempotency_key: Some("complete-run-tell-3"),
+        })
+        .expect("third run completes");
+
     assert_e2e_trace("lease-retry", &kernel);
     let store = kernel.into_store();
     let effects = store.list_effects(&instance_id).expect("effects list");
-    assert_eq!(effects[0].status, "queued");
+    assert_eq!(effects[0].status, "completed");
 }
 
 #[test]
@@ -758,7 +647,7 @@ fn e2e_repeated_dependency_claimability_stress() {
         let source = include_str!("../../../examples/queue-worker-with-review.whip");
         let (mut kernel, instance_id) = kernel_from_source("QueueWorkerWithReview", source);
         let effects = [
-            effect("claim", "loft.claim", r#"{"issue_id":"iss_stress"}"#),
+            effect("claim", "event.emit", r#"{"issue_id":"iss_stress"}"#),
             effect("tell", "agent.tell", r#"{"prompt":"implement"}"#),
         ];
         let dependencies = [dependency("dep-claim-tell", "claim", "succeeds", "tell")];
@@ -786,7 +675,7 @@ fn e2e_repeated_dependency_claimability_stress() {
                 instance_id: &instance_id,
                 effect_id: "claim",
                 run_id: "run-claim",
-                provider: "fake-loft",
+                provider: "fixture",
                 worker_id: "worker-1",
                 lease_id: "lease-claim",
                 lease_expires_at: "2030-01-01T00:00:00Z",
@@ -798,7 +687,7 @@ fn e2e_repeated_dependency_claimability_stress() {
                 instance_id: &instance_id,
                 effect_id: "claim",
                 run_id: "run-claim",
-                provider: "fake-loft",
+                provider: "fixture",
                 worker_id: "worker-1",
                 status: "ignored",
                 exit_code: Some(0),
@@ -1336,29 +1225,6 @@ fn dependency<'a>(
     }
 }
 
-fn loft_claim_request(issue_id: &str, command_id: &str) -> LoftEffectRequest {
-    LoftEffectRequest {
-        action: LoftAction::Claim,
-        issue_id: issue_id.to_owned(),
-        lease_id: None,
-        claim_ready: false,
-        issue_version: None,
-        actor: Some("agent-a".to_owned()),
-        lease_duration_seconds: Some(1800),
-        command_id: command_id.to_owned(),
-        note: None,
-        target_status: None,
-        evidence_json: None,
-        evidence_kind: None,
-        evidence_artifact: None,
-        evidence_data_path: None,
-        resource_intent_json: None,
-        release_after_failure: false,
-        expect_heads: Vec::new(),
-        metadata_json: "{}".to_owned(),
-    }
-}
-
 fn coerce_request() -> CoerceRequest {
     CoerceRequest {
         function_name: "classifyMessage".to_owned(),
@@ -1368,18 +1234,6 @@ fn coerce_request() -> CoerceRequest {
         input_schema_hash: "input-schema".to_owned(),
         output_schema_hash: "output-schema".to_owned(),
     }
-}
-
-fn event_sequence(
-    events: &[whipplescript_store::EventView],
-    event_type: &str,
-    effect_id: &str,
-) -> i64 {
-    events
-        .iter()
-        .find(|event| event.event_type == event_type && event.payload_json.contains(effect_id))
-        .map(|event| event.sequence)
-        .expect("event exists")
 }
 
 fn assert_e2e_trace(name: &str, kernel: &RuntimeKernel) {

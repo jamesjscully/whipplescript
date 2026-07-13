@@ -83,6 +83,12 @@ pub struct Envelope {
     /// the role is the agent's authority ceiling (D3). An identity with no party
     /// entry is the public bottom (fail-closed). Empty = no per-user scoping declared.
     party_of: BTreeMap<String, String>,
+    /// Dynamic per-turn guarantees governance requires each turn to evaluate
+    /// (DR-0036 §2): `(name, paths)` where `writes_within:<scope>` carries the
+    /// scope's path globs and flag guarantees (`no_reads_beyond_grant`,
+    /// `no_tainted_reads:<class>`) carry none. The report cites each as held,
+    /// violated, or not-evaluated — never silently omitted.
+    guarantees: Vec<(String, Vec<String>)>,
     /// Package capabilities admitted by the product authority for this epoch.
     capabilities: BTreeSet<String>,
     /// Exact, credential-free provider identities admitted by handle.
@@ -134,6 +140,28 @@ impl Envelope {
         let mut internal_workflows = BTreeSet::new();
         let mut address_of = BTreeMap::new();
         let mut party_of = BTreeMap::new();
+        let mut guarantees: Vec<(String, Vec<String>)> = Vec::new();
+        // Dynamic guarantee declarations (DR-0036 §2), round-tripped through the
+        // signed artifact.
+        if let Some(items) = value.get("guarantees").and_then(|g| g.as_array()) {
+            for item in items {
+                let Some(name) = item.get("name").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let paths = item
+                    .get("paths")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|paths| {
+                        paths
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                guarantees.push((name.to_owned(), paths));
+            }
+        }
         let capabilities = value
             .get("capabilities")
             .and_then(serde_json::Value::as_array)
@@ -268,6 +296,7 @@ impl Envelope {
             internal_workflows,
             address_of,
             party_of,
+            guarantees,
             capabilities,
             provider_bindings,
             placements,
@@ -291,6 +320,7 @@ impl Envelope {
         let mut internal_workflows = BTreeSet::new();
         let mut address_of: BTreeMap<String, String> = BTreeMap::new();
         let mut party_of: BTreeMap<String, String> = BTreeMap::new();
+        let mut guarantees: Vec<(String, Vec<String>)> = Vec::new();
         for (index, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -320,6 +350,18 @@ impl Envelope {
                 } else {
                     endorse.push(pair);
                 }
+                continue;
+            }
+            // `guarantee <name> [<glob>...]` declares a dynamic per-turn guarantee
+            // (DR-0036 §2); `writes_within:<scope>` carries the scope's path globs.
+            if tokens.first().copied() == Some("guarantee") {
+                let Some(name) = tokens.get(1) else {
+                    return Err(format!("line {}: guarantee needs a name", index + 1));
+                };
+                guarantees.push((
+                    (*name).to_owned(),
+                    tokens[2..].iter().map(|tok| (*tok).to_owned()).collect(),
+                ));
                 continue;
             }
             match tokens.first().copied() {
@@ -419,6 +461,7 @@ impl Envelope {
             internal_workflows,
             address_of,
             party_of,
+            guarantees,
             capabilities: BTreeSet::new(),
             provider_bindings: BTreeMap::new(),
             placements: BTreeMap::new(),
@@ -475,18 +518,44 @@ impl Envelope {
             .iter()
             .map(|(identity, role)| (identity.clone(), serde_json::Value::String(role.clone())))
             .collect();
-        serde_json::json!({
+        let mut canonical = serde_json::json!({
             "resources": resources,
             "bindings": bindings,
             "parties": parties,
             "delegations": delegations,
             "declassifications": declassifications,
             "endorsements": endorsements,
-            "capabilities": self.capabilities,
-            "provider_bindings": self.provider_bindings,
-            "placements": self.placements,
-        })
-        .to_string()
+        });
+        // Dynamic guarantee declarations (DR-0036 §2), sorted for a stable hash.
+        // Emitted only when declared, so envelopes predating the feature keep
+        // their signed hashes.
+        if !self.guarantees.is_empty() {
+            let mut declared = self.guarantees.clone();
+            declared.sort();
+            canonical["guarantees"] = serde_json::Value::Array(
+                declared
+                    .iter()
+                    .map(|(name, paths)| serde_json::json!({ "name": name, "paths": paths }))
+                    .collect(),
+            );
+        }
+        // Typed host governance policy (SUB-4): same emit-when-declared rule as
+        // guarantees, so envelopes carrying no policy keep their signed hashes.
+        if !self.capabilities.is_empty() {
+            canonical["capabilities"] = serde_json::json!(self.capabilities);
+        }
+        if !self.provider_bindings.is_empty() {
+            canonical["provider_bindings"] = serde_json::json!(self.provider_bindings);
+        }
+        if !self.placements.is_empty() {
+            canonical["placements"] = serde_json::json!(self.placements);
+        }
+        canonical.to_string()
+    }
+
+    /// The dynamic per-turn guarantees governance declared (DR-0036 §2).
+    pub fn declared_guarantees(&self) -> &[(String, Vec<String>)] {
+        &self.guarantees
     }
 
     /// The reader-authority SET of a resource; the empty set (`public`, the bottom)
@@ -631,6 +700,15 @@ impl Envelope {
         base_url: &str,
         placement_handle: &str,
     ) -> bool {
+        // An envelope with no typed provider/placement policy (the DSL surface,
+        // or one signed before SUB-4) has not constrained providers: the check
+        // engages once the authority declares any binding or placement, and
+        // only then refuses unmatched tuples (progressive rigor, not a
+        // precondition — clearance/principal admission still gates the model
+        // regardless).
+        if self.provider_bindings.is_empty() && self.placements.is_empty() {
+            return true;
+        }
         let Some(binding) = self.provider_bindings.get(binding_handle) else {
             return false;
         };
@@ -1094,6 +1172,12 @@ impl VerifiedEnvelope {
     /// handle->address bindings.
     pub fn governs(&self, resource: &str) -> bool {
         self.envelope.governs(resource)
+    }
+
+    /// The dynamic per-turn guarantees this policy requires each turn to
+    /// evaluate (DR-0036 §2).
+    pub fn declared_guarantees(&self) -> &[(String, Vec<String>)] {
+        self.envelope.declared_guarantees()
     }
 
     /// Whether every capability in a pinned package was admitted by this epoch.
@@ -1843,7 +1927,45 @@ pub fn check_with_envelope_imports(
             };
             for tool_name in &agent.tools {
                 if let Some(tool) = imports.iter().find(|t| &t.workflow == tool_name) {
-                    tool_result_reads.extend(result_dependency_reads(tool));
+                    let reads = result_dependency_reads(tool);
+                    // DR-0027 provider-as-principal: an imported tool's
+                    // result is streamed back to the model at runtime
+                    // (host_runtime `ChatMessage::ToolResults` re-enters the
+                    // turn), so a tool that reads confidential data, called
+                    // by an agent whose provider is not cleared for it,
+                    // egresses that data to the uncleared model exactly like
+                    // the tell's own read grants. The provider-egress check
+                    // in the effects loop only inspects `effect.access_grants`
+                    // and never sees these tool result reads, so check them
+                    // against the provider here.
+                    if let Some(provider) = agent.provider.as_deref() {
+                        for resource in &reads {
+                            if envelope.leaks(resource, provider) {
+                                diagnostics.push(Diagnostic {
+                                    span: effect.span,
+                                    message: format!(
+                                        "provider-egress violation in rule `{rule}`: agent \
+                                         `{agent}` may call tool `{tool}` which reads `{resource}` \
+                                         (readable by {rr}), but the agent's provider `{provider}` \
+                                         (clearance {pr}) is not cleared, so the tool result \
+                                         egresses to an uncleared model",
+                                        rule = rule.name,
+                                        agent = agent_name,
+                                        tool = tool_name,
+                                        rr = envelope.reader_label(resource),
+                                        pr = envelope.reader_label(provider),
+                                    ),
+                                    suggestion: Some(format!(
+                                        "bind `{agent_name}` to a provider cleared for \
+                                         `{resource}`, or declassify before the tool result \
+                                         reaches the turn"
+                                    )),
+                                    related: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                    tool_result_reads.extend(reads);
                 }
             }
         }
@@ -3529,6 +3651,98 @@ rule use
         assert!(!check_with_envelope_imports(&consumer, &verified, &[])
             .iter()
             .any(|d| d.message.contains("secret")));
+    }
+
+    #[test]
+    fn imported_tool_result_egress_to_uncleared_provider_is_flagged() {
+        // DR-0027 provider-as-principal: a tool that reads confidential data
+        // is called by an agent whose model provider is NOT cleared for it.
+        // The tool's result streams back to the model at runtime, so the
+        // confidential data egresses to the uncleared provider. The turn
+        // itself completes only a literal, so the earlier access_grants-based
+        // provider check never sees the tool read — this new check must.
+        let tool = compile_program(
+            r#"@tool
+workflow Fetcher {
+  input request Req
+  output result R
+  class Req { id string }
+  class R { data string }
+  file store secret { root "./secret"  allow read ["**"] }
+  rule fetch
+    when Req as request
+  => {
+    read text from secret at "in.txt" as loaded
+    after loaded succeeds as v {
+      complete result { data v.content }
+    }
+  }
+}
+"#,
+        )
+        .ir
+        .expect("tool compiles");
+        let consumer = compile_program(
+            r#"@service
+workflow Consumer
+
+output result R2
+class R2 { ok bool }
+class Req { id string  status "open" }
+
+agent worker { provider fixture  profile "p"  capacity 1  tools [Fetcher] }
+
+table seed as Req [ { id "T1"  status "open" } ]
+
+rule use
+  when Req as request where request.status == "open"
+  when worker is available
+=> {
+  tell worker as turn "go"
+  after turn succeeds as outcome {
+    complete result { ok true }
+  }
+}
+"#,
+        )
+        .ir
+        .expect("consumer compiles");
+
+        // Provider UNCLEARED (public) for the Operator-labeled secret: the
+        // tool-result egress to the model must be flagged by the new check.
+        let uncleared = VerifiedEnvelope::for_test(
+            Envelope::from_dsl(
+                "grant file_store secret -> file:/srv/secret readable by Operator\n\
+                 grant provider fixture -> selfhost:llama readable by public\n",
+            )
+            .expect("valid"),
+        );
+        let flagged =
+            check_with_envelope_imports(&consumer, &uncleared, std::slice::from_ref(&tool));
+        assert!(
+            flagged
+                .iter()
+                .any(|d| d.message.contains("may call tool `Fetcher`")
+                    && d.message.contains("uncleared model")),
+            "an uncleared provider receiving a confidential tool result must be flagged: {:?}",
+            flagged.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // Provider CLEARED (Operator): the tool-result egress is legitimate,
+        // so the new check must stay silent (no false positive).
+        let cleared = VerifiedEnvelope::for_test(
+            Envelope::from_dsl(
+                "grant file_store secret -> file:/srv/secret readable by Operator\n\
+                 grant provider fixture -> selfhost:llama readable by Operator\n",
+            )
+            .expect("valid"),
+        );
+        assert!(
+            !check_with_envelope_imports(&consumer, &cleared, std::slice::from_ref(&tool))
+                .iter()
+                .any(|d| d.message.contains("may call tool")),
+            "a cleared provider must not raise the tool-result egress diagnostic"
+        );
     }
 
     #[test]

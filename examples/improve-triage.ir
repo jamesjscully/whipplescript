@@ -1,0 +1,26 @@
+workflow ImproveTriage
+source_tags
+@service workflow ImproveTriage
+workflow_contracts
+  input ticket ref<Ticket>
+schemas
+  class Ticket
+    id string
+    title string
+  class Assessment
+    ticket string
+    priority string
+gauges
+  gauge priority_correct judge=exec:python3 ./judge_priority.py expect=chance:ok>=0.9
+  gauge ticket_echoed judge=exec:python3 ./judge_echo.py
+  gauge triage_cost judge=exec:python3 ./cost_model.py inputs=priority_correct,std.latency
+campaigns
+  campaign release_tuning ascend=priority_correct reach=std.latency<=800ms guard=triage_cost:within:5%
+rules
+  rule triage
+    when Ticket as ticket
+    reads
+      schema:Ticket
+    writes
+      schema:Assessment
+    body_hash 95436c25cba01fde

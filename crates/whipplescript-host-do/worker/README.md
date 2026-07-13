@@ -19,6 +19,14 @@ needs a Cloudflare account and:
 
 ## Deploy steps
 
+**One command:** `whip deploy` (compute plane P8) runs the whole sequence
+below — dependency install, wasm build, optional provider secrets
+(`--set-secrets` forwards `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` from the local
+environment), and the wrangler deploy. `--dry-run` validates the bundle
+without publishing; `--worker-dir`/`WHIPPLESCRIPT_WORKER_DIR` point it at
+this directory when running outside the repo. The manual steps, for
+reference:
+
 1. **Build the wasm module** (from the `#[wasm_bindgen]` surface):
    ```
    npm install

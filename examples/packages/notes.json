@@ -1,0 +1,67 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "package-notes",
+  "name": "notes",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "notes",
+      "version": "0.1.0",
+      "effect_contracts": [
+        {
+          "id": "notes.query",
+          "effect_kind": "capability.call",
+          "source_forms": ["call notes.query"],
+          "input_schema": {
+            "query": "string"
+          },
+          "output_schema": {
+            "items": ["json"],
+            "count": "int"
+          },
+          "required_capabilities": ["notes.query"],
+          "provider_kinds": ["notes-provider"],
+          "validation": "runtime_boundary"
+        }
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "notes.query",
+      "description": "Query the notes package.",
+      "schema": {
+        "input": {
+          "query": "string"
+        }
+      }
+    }
+  ],
+  "providers": [
+    {
+      "id": "provider-notes-query",
+      "provider_kind": "notes-provider",
+      "capability": "notes.query",
+      "config": {}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "profile-notes-user",
+      "name": "notes-user",
+      "description": "Allow notes package queries.",
+      "enforcement_mode": "enforce",
+      "allowed_capabilities": ["notes.query"],
+      "config": {}
+    }
+  ],
+  "bindings": [
+    {
+      "id": "binding-notes-query-global",
+      "program_id": null,
+      "capability": "notes.query",
+      "provider": "notes-provider",
+      "config": {}
+    }
+  ]
+}

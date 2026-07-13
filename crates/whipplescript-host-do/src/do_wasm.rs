@@ -23,9 +23,11 @@ use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_model::MessagesApiClient;
 use whipplescript_kernel::sansio::{HttpResponse, TransportError};
 
-use crate::do_instance::CoerceProviderConfig;
+use crate::do_instance::{CoerceProviderConfig, ExecutorSidecarConfig, TurnContainerConfig};
 use crate::do_store::DoSql;
-use crate::do_worker::{DurableEffectPorts, DurableInstance, DurableStepOutcome};
+use crate::do_worker::{
+    DurableEffectPorts, DurableInstance, DurableStepOutcome, ScriptCapabilityInput,
+};
 
 #[wasm_bindgen]
 extern "C" {
@@ -146,7 +148,10 @@ fn outcome_to_json(outcome: &DurableStepOutcome) -> String {
             },
         }),
         DurableStepOutcome::Terminal => serde_json::json!({ "kind": "terminal" }),
-        DurableStepOutcome::Parked => serde_json::json!({ "kind": "parked" }),
+        DurableStepOutcome::Parked { next_due_unix_ms } => serde_json::json!({
+            "kind": "parked",
+            "next_due_unix_ms": next_due_unix_ms,
+        }),
         DurableStepOutcome::Failed(message) => {
             serde_json::json!({ "kind": "failed", "message": message })
         }
@@ -213,6 +218,100 @@ fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
     ))
 }
 
+/// Parse the executor-sidecar config JSON (compute plane P8).
+fn parse_exec_config(json: &str) -> Result<ExecutorSidecarConfig, String> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    let base_url = value
+        .get("base_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("exec config needs base_url")?
+        .to_owned();
+    let env_values = match value.get("env") {
+        None | Some(serde_json::Value::Null) => std::collections::BTreeMap::new(),
+        Some(env) => serde_json::from_value(env.clone())
+            .map_err(|error| format!("exec config env must map names to strings: {error}"))?,
+    };
+    Ok(ExecutorSidecarConfig {
+        base_url,
+        env_values,
+        environment_epoch: value
+            .get("environment_epoch")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("do-v0")
+            .to_owned(),
+        timeout_ms: value.get("timeout_ms").and_then(serde_json::Value::as_u64),
+        auth_token: value
+            .get("auth_token")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+/// Parse the deploy-shipped script capabilities (compute plane P8).
+fn parse_scripts(json: &str) -> Result<Vec<ScriptCapabilityInput>, String> {
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(json).map_err(|error| error.to_string())?;
+    entries
+        .into_iter()
+        .map(|entry| {
+            let field = |name: &str| {
+                entry
+                    .get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            };
+            let name = field("name").ok_or("script entry needs name")?;
+            let argv: Vec<String> = serde_json::from_value(
+                entry
+                    .get("argv")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .map_err(|error| format!("script `{name}` argv must be a string array: {error}"))?;
+            let env = match entry.get("env") {
+                None | Some(serde_json::Value::Null) => std::collections::BTreeMap::new(),
+                Some(env) => serde_json::from_value(env.clone())
+                    .map_err(|error| format!("script `{name}` env: {error}"))?,
+            };
+            Ok(ScriptCapabilityInput {
+                sha256: field("sha256").ok_or(format!("script `{name}` needs sha256"))?,
+                body: field("body").ok_or(format!("script `{name}` needs body"))?,
+                hermetic: entry
+                    .get("hermetic")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                name,
+                argv,
+                env,
+            })
+        })
+        .collect()
+}
+
+/// Parse the Class-B turn-container config JSON (compute plane P8).
+fn parse_turn_config(json: &str) -> Result<TurnContainerConfig, String> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    Ok(TurnContainerConfig {
+        base_url: value
+            .get("base_url")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("turn config needs base_url")?
+            .to_owned(),
+        provider: value
+            .get("provider")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"provider": "fixture"})),
+        max_steps: value
+            .get("max_steps")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(30),
+        auth_token: value
+            .get("auth_token")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
 /// The durable-object instance as the Worker shell sees it.
 #[wasm_bindgen]
 pub struct WasmDurableInstance {
@@ -228,6 +327,13 @@ impl WasmDurableInstance {
     /// `coerce_config_json` for `coerce` effects, `agent_config_json` for the
     /// (multi-round) `agent.tell` turn. A live agent turn with tools also needs a
     /// tool executor over an HTTP sidecar (the remaining async-tool seam).
+    /// Two further optional args wire the Class-A compute plane (P8):
+    /// `exec_config_json` = `{"base_url", "env"?: {NAME: value}, "environment_epoch"?,
+    /// "timeout_ms"?}` pointing at the executor sidecar; `scripts_json` = an
+    /// array of `{"name", "argv": [.., "{script}", ..], "sha256", "env"?,
+    /// "hermetic"?, "body"}` script capabilities registered into the DO store
+    /// (each body verified against its pin, fail-closed).
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         bridge: DoSqlBridge,
         program: &str,
@@ -235,7 +341,25 @@ impl WasmDurableInstance {
         principal: &str,
         coerce_config_json: Option<String>,
         agent_config_json: Option<String>,
+        project_context_json: Option<String>,
+        exec_config_json: Option<String>,
+        scripts_json: Option<String>,
+        turn_config_json: Option<String>,
     ) -> Result<WasmDurableInstance, JsValue> {
+        // Deploy-shipped project instructions: `[{"path": ..., "content": ...}]`
+        // in injection order (context-assembly Phase 3 item 4).
+        let project_context: Vec<(String, String)> = match project_context_json {
+            Some(json) => serde_json::from_str::<Vec<serde_json::Value>>(&json)
+                .map_err(|error| JsValue::from_str(&error.to_string()))?
+                .into_iter()
+                .filter_map(|doc| {
+                    let path = doc.get("path")?.as_str()?.to_owned();
+                    let content = doc.get("content")?.as_str()?.to_owned();
+                    Some((path, content))
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         let coerce = match coerce_config_json {
             Some(json) => Some(parse_coerce_config(&json).map_err(|e| JsValue::from_str(&e))?),
             None => None,
@@ -247,6 +371,18 @@ impl WasmDurableInstance {
                 )),
                 None => None,
             };
+        let exec = match exec_config_json {
+            Some(json) => Some(parse_exec_config(&json).map_err(|e| JsValue::from_str(&e))?),
+            None => None,
+        };
+        let scripts = match scripts_json {
+            Some(json) => parse_scripts(&json).map_err(|e| JsValue::from_str(&e))?,
+            None => Vec::new(),
+        };
+        let turn = match turn_config_json {
+            Some(json) => Some(parse_turn_config(&json).map_err(|e| JsValue::from_str(&e))?),
+            None => None,
+        };
         let inner = DurableInstance::create(
             JsDoSql { bridge },
             program,
@@ -255,8 +391,12 @@ impl WasmDurableInstance {
             DurableEffectPorts {
                 coerce,
                 agent_model,
+                exec,
+                turn,
                 ..DurableEffectPorts::default()
             },
+            &project_context,
+            &scripts,
         )
         .map_err(|error| JsValue::from_str(&error))?;
         Ok(Self { inner })
@@ -264,10 +404,19 @@ impl WasmDurableInstance {
 
     /// Advance the instance one HTTP round. Pass `undefined`/`null` on the first
     /// call, then the previous `needs_http` request's `fetch` result as JSON.
+    /// `now_unix_ms` is the host's clock (`Date.now()`), injected so the core
+    /// never reads wall time (DR-0033 Phase 6 — timers/deadlines resolve
+    /// against it, and `parked.next_due_unix_ms` names the next wake-up).
     /// Returns the next `DurableStepOutcome` as JSON.
-    pub fn step(&mut self, response_json: Option<String>) -> Result<String, JsValue> {
+    pub fn step(
+        &mut self,
+        response_json: Option<String>,
+        now_unix_ms: f64,
+    ) -> Result<String, JsValue> {
         let incoming = parse_incoming(response_json)?;
-        Ok(outcome_to_json(&self.inner.step(incoming)))
+        Ok(outcome_to_json(
+            &self.inner.step(incoming, now_unix_ms as i64),
+        ))
     }
 
     /// The instance's durable status (`"running"` / `"completed"` / …).
@@ -276,5 +425,41 @@ impl WasmDurableInstance {
             .status()
             .map(|status| status.unwrap_or_default())
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))
+    }
+
+    /// Capture a restorable checkpoint (P3 — the DO operator command). Returns
+    /// the checkpoint report as JSON, or a JS error if the instance is not
+    /// quiescent.
+    pub fn checkpoint(&mut self, cut_id: &str) -> Result<String, JsValue> {
+        let report = self
+            .inner
+            .checkpoint(cut_id)
+            .map_err(|error| JsValue::from_str(&error))?;
+        Ok(serde_json::json!({
+            "cut_id": report.cut_id,
+            "sequence": report.sequence,
+            "manifest_hash": report.manifest_hash,
+            "file_count": report.file_count,
+        })
+        .to_string())
+    }
+
+    /// Restore the three planes to a prior checkpoint (P3 — the DO operator
+    /// command). Returns the restore report as JSON, or a JS error on refusal /
+    /// failure (a refusal mutates nothing).
+    pub fn restore(&mut self, cut_id: &str) -> Result<String, JsValue> {
+        let report = self
+            .inner
+            .restore(cut_id)
+            .map_err(|error| JsValue::from_str(&error))?;
+        Ok(serde_json::json!({
+            "cut_id": report.cut_id,
+            "restored_to_sequence": report.restored_to_sequence,
+            "marker_sequence": report.marker_sequence,
+            "files_written": report.files_written,
+            "files_removed": report.files_removed,
+            "auto_checkpoint": report.auto_checkpoint,
+        })
+        .to_string())
     }
 }

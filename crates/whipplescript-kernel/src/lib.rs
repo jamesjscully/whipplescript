@@ -10,18 +10,21 @@ pub mod coerce_native;
 pub mod context_assembly;
 pub mod effect_config;
 pub mod effect_handlers;
+pub mod exec_http;
 pub mod harness;
 pub mod harness_loop;
 pub mod harness_model;
 pub mod instance_machine;
-pub mod loft;
 pub mod lowering;
 pub mod native_lifecycle;
+pub mod package_registry;
 pub mod pi_rpc;
 pub mod provider;
 pub mod rule_lowering;
 pub mod rule_pass;
 pub mod sansio;
+pub mod source_merge;
+pub mod time_pass;
 pub mod trace;
 
 use artifact_manifest::{
@@ -32,11 +35,10 @@ use coerce::{CoerceClient, CoerceRequest, CoerceResult, CoerceStatus};
 use harness::{
     AgentHarness, AgentTurnRequest, ProviderFailure, ProviderRunResult, ProviderRunStatus,
 };
-use loft::{LoftAction, LoftClient, LoftEffectRequest, LoftEffectResult, LoftEffectStatus};
 use native_lifecycle::{AgentTurnLifecycleKind, NativeAgentTurnObservation};
 use provider::{
-    NativeProviderAdapter, NativeProviderArtifactRef, NativeProviderEvent, NativeProviderEventKind,
-    NativeProviderTurnRequest,
+    NativeProviderAdapter, NativeProviderArtifactRef, NativeProviderCancellation,
+    NativeProviderEvent, NativeProviderEventKind, NativeProviderTurnRequest,
 };
 use serde_json::{json, Value};
 use trace::{DependencyEdge, EffectStatus, TraceEvent, TraceRecord};
@@ -121,18 +123,6 @@ pub struct CoerceExecution<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LoftEffectExecution<'a> {
-    pub instance_id: &'a str,
-    pub effect_id: &'a str,
-    pub run_id: &'a str,
-    pub provider: &'a str,
-    pub worker_id: &'a str,
-    pub lease_id: &'a str,
-    pub lease_expires_at: &'a str,
-    pub request: &'a LoftEffectRequest,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HumanAskExecution<'a> {
     pub instance_id: &'a str,
     pub effect_id: &'a str,
@@ -165,13 +155,6 @@ pub fn idempotency_key(parts: &[&str]) -> String {
         input.push(';');
     }
     format!("key_{:016x}", stable_hash(&input))
-}
-
-fn restore_marker_target_of(payload_json: &str) -> Option<i64> {
-    serde_json::from_str::<Value>(payload_json)
-        .ok()?
-        .get("restored_to_sequence")
-        .and_then(Value::as_i64)
 }
 
 /// Identifies the effect a brokered turn settles. The owned harness runner uses
@@ -268,6 +251,18 @@ fn merge_numeric_json(acc: Value, next: Value) -> Value {
         (_, next) => next,
     }
 }
+
+/// Restorable-context RC-4c: the target sequence a `context.restored` marker
+/// rewinds to (`restored_to_sequence`), for the marker-aware transcript fold.
+/// Mirrors the store-side `restore_marker_target`; `None` for a malformed marker
+/// so the fold applies no rewind rather than dropping live transcripts.
+fn restore_marker_target_of(payload_json: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(payload_json)
+        .ok()?
+        .get("restored_to_sequence")
+        .and_then(Value::as_i64)
+}
+
 impl<S: RuntimeStore> RuntimeKernel<S> {
     pub fn new(store: S) -> Self {
         Self {
@@ -896,13 +891,70 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         instance_id: &str,
         effect_id: &str,
     ) -> Vec<crate::harness_loop::ChatMessage> {
+        self.load_brokered_transcript_bounded(instance_id, effect_id, None)
+    }
+
+    /// RC-2 Delta B: load the brokered-turn transcript for an effect as it was
+    /// AT a prior cut — the latest transcript checkpoint whose event-log
+    /// `sequence <= up_to_sequence` (INCLUSIVE), rather than the newest one.
+    ///
+    /// Keyed off the per-instance event-log `sequence` (NOT the per-effect
+    /// `step` index) deliberately: `sequence` is the single monotonic
+    /// per-instance coordinate that also cuts the instance projection plane
+    /// (`rebuild_projections_to`) and the file manifest. `step` only orders
+    /// transcripts within one effect and would not let a single cut coordinate
+    /// N address all three planes at once. Because each transcript checkpoint is
+    /// appended in step order and `sequence` is monotonic, "latest with
+    /// `sequence <= N`" is exactly the transcript position that was current at
+    /// the cut. Empty when no checkpoint exists at or before N.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn load_brokered_transcript_at(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+        up_to_sequence: i64,
+    ) -> Vec<crate::harness_loop::ChatMessage> {
+        self.load_brokered_transcript_bounded(instance_id, effect_id, Some(up_to_sequence))
+    }
+
+    fn load_brokered_transcript_bounded(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+        up_to_sequence: Option<i64>,
+    ) -> Vec<crate::harness_loop::ChatMessage> {
         let Ok(events) = self.store.list_events(instance_id) else {
             return Vec::new();
         };
-        let latest = events.iter().rev().find(|event| {
-            if event.event_type != "agent.turn.brokered.transcript" {
-                return false;
+        // RC-4c: the transcript plane rewinds with the other two. Walk the log
+        // ascending (`list_events` is ordered by `sequence`), folding
+        // `context.restored` markers (models/maude/restore-replay.maude): a
+        // marker drops every transcript checkpoint it orphaned, so after a
+        // restore the newest LIVE transcript is the one that was current at the
+        // cut, not an abandoned-branch turn. With no markers the live list is
+        // every transcript in order, so latest/bounded reads are unchanged.
+        //
+        // RC-2 Delta B: `up_to_sequence` bounds the fold INCLUSIVE; because the
+        // list is ascending we can stop at the first event past the bound.
+        // `None` = unbounded (latest), the resume/crash-recovery behavior.
+        let mut live: Vec<&EventView> = Vec::new();
+        for event in &events {
+            if let Some(n) = up_to_sequence {
+                if event.sequence > n {
+                    break;
+                }
             }
+            match event.event_type.as_str() {
+                "context.restored" => {
+                    if let Some(target) = restore_marker_target_of(&event.payload_json) {
+                        live.retain(|folded| folded.sequence <= target);
+                    }
+                }
+                "agent.turn.brokered.transcript" => live.push(event),
+                _ => {}
+            }
+        }
+        let latest = live.iter().rev().find(|event| {
             serde_json::from_str::<Value>(&event.payload_json)
                 .ok()
                 .and_then(|payload| {
@@ -1481,7 +1533,10 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
     }
 
     pub fn retry_effect(&mut self, retry: RetryEffect<'_>) -> StoreResult<StoredEvent> {
-        self.store.retry_effect(retry)
+        let effect_id = retry.effect_id.to_owned();
+        let event = self.store.retry_effect(retry)?;
+        self.emit(TraceEvent::EffectRetried { effect_id });
+        Ok(event)
     }
 
     pub fn run_agent_turn(
@@ -1692,6 +1747,15 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             ])),
         })?;
 
+        // Pre-start cancellation needs no branch here: `store.start_run`
+        // (called above, before any provider work) transactionally refuses to
+        // start a run while a cancellation request is open — the delegated
+        // path shares the owned harness's pre-launch protection at the store
+        // layer (DR-0035 Decision 5 residual, verified closed).
+        // Captured before the request moves into the adapter: the depth the
+        // program authorized for this turn, used for driver-initiated
+        // cancellation (DR-0035 Decision 5).
+        let cancellation_depth = request.cancellation_depth;
         let started = match adapter.start_turn(request) {
             Ok(event) => event,
             Err(error) => {
@@ -1720,16 +1784,91 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             );
         }
 
-        for index in 0..max_events {
+        // Two-clock liveness (DR-0035 Decision 4): `max_events` bounds
+        // DELIVERED frames only — an empty poll no longer consumes budget. The
+        // wall-clock inactivity bound lives in the adapters (which synthesize
+        // their own TimedOut terminal); the idle-poll ceiling here is only a
+        // backstop against an adapter that spins on `Ok(None)` without ever
+        // blocking, and it resets on every delivered frame.
+        // The idle ceiling is deliberately generous: real adapters block on
+        // their wall clock and synthesize their own TimedOut instead of
+        // returning empty polls, so this only stops a non-blocking adapter
+        // from spinning forever.
+        let idle_poll_ceiling = max_events.max(1024);
+        let mut delivered = 0usize;
+        let mut idle_polls = 0usize;
+        let mut cancel_attempted = false;
+        while delivered < max_events && idle_polls < idle_poll_ceiling {
+            // Cancellation plumb-through (DR-0035 Decision 5): an open durable
+            // cancellation request reaches the running delegate. The ack is a
+            // non-terminal Diagnostic; the run still ends with exactly one
+            // terminal (normally `cancelled`, else the inactivity backstop).
+            if !cancel_attempted
+                && self.store.effect_has_open_cancellation_request(
+                    execution.instance_id,
+                    execution.effect_id,
+                )?
+            {
+                cancel_attempted = true;
+                match adapter.cancel_turn(NativeProviderCancellation {
+                    run_id: execution.run_id.to_owned(),
+                    provider_session_id: None,
+                    provider_turn_id: None,
+                    requested_depth: cancellation_depth,
+                    reason: "effect_cancellation_requested".to_owned(),
+                }) {
+                    Ok(ack) => {
+                        latest_evidence = self.record_native_provider_event(
+                            execution,
+                            &ack,
+                            "native-provider-cancel-ack",
+                        )?;
+                        if ack.event_kind.is_terminal() {
+                            return self.complete_native_agent_turn(
+                                execution,
+                                &ack,
+                                &latest_evidence,
+                                run_metadata_json,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        // A refused cancel is evidence, not a turn failure —
+                        // the run keeps draining toward its own terminal.
+                        let refused = NativeProviderEvent {
+                            provider_id: execution.provider.to_owned(),
+                            run_id: execution.run_id.to_owned(),
+                            event_kind: NativeProviderEventKind::Diagnostic,
+                            provider_event_type: "whip.native.cancel_failed".to_owned(),
+                            provider_session_id: None,
+                            provider_turn_id: None,
+                            sequence: None,
+                            evidence: json!({ "boundary_error": error.to_json_redacted() }),
+                            artifacts: Vec::new(),
+                        };
+                        self.record_native_provider_event(
+                            execution,
+                            &refused,
+                            "native-provider-cancel-failed",
+                        )?;
+                    }
+                }
+            }
             let event = match adapter.next_event(execution.run_id) {
-                Ok(Some(event)) => event,
-                Ok(None) => continue,
+                Ok(Some(event)) => {
+                    idle_polls = 0;
+                    event
+                }
+                Ok(None) => {
+                    idle_polls += 1;
+                    continue;
+                }
                 Err(error) => {
                     let failed = native_boundary_error_event(execution, error);
                     latest_evidence = self.record_native_provider_event(
                         execution,
                         &failed,
-                        &format!("native-provider-boundary-event-{index}"),
+                        &format!("native-provider-boundary-event-{delivered}"),
                     )?;
                     return self.complete_native_agent_turn(
                         execution,
@@ -1742,8 +1881,9 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             latest_evidence = self.record_native_provider_event(
                 execution,
                 &event,
-                &format!("native-provider-event-{index}"),
+                &format!("native-provider-event-{delivered}"),
             )?;
+            delivered += 1;
             if event.event_kind.is_terminal() {
                 return self.complete_native_agent_turn(
                     execution,
@@ -1762,7 +1902,11 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             provider_session_id: None,
             provider_turn_id: None,
             sequence: None,
-            evidence: json!({"max_events": max_events}),
+            evidence: json!({
+                "max_events": max_events,
+                "delivered": delivered,
+                "idle_polls": idle_polls,
+            }),
             artifacts: Vec::new(),
         };
         latest_evidence =
@@ -2167,74 +2311,6 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         Ok(event)
     }
 
-    pub fn run_loft_effect(
-        &mut self,
-        execution: LoftEffectExecution<'_>,
-        client: &dyn LoftClient,
-    ) -> StoreResult<StoredEvent> {
-        self.start_run(RunStart {
-            instance_id: execution.instance_id,
-            effect_id: execution.effect_id,
-            run_id: execution.run_id,
-            provider: execution.provider,
-            worker_id: execution.worker_id,
-            lease_id: execution.lease_id,
-            lease_expires_at: execution.lease_expires_at,
-            metadata_json: "{}",
-        })?;
-
-        let result = client.execute(execution.request);
-        let evidence = self.record_loft_result(execution, &result)?;
-        let metadata_json = loft_metadata(&result);
-        let safe_summary = redacted_provider_summary(&result.summary);
-        self.emit_provider_diagnostic(
-            execution.run_id,
-            execution.effect_id,
-            execution.provider,
-            loft_effect_status(&result.status),
-            &safe_summary,
-            &metadata_json,
-        );
-        let completion = EffectCompletion {
-            instance_id: execution.instance_id,
-            effect_id: execution.effect_id,
-            run_id: execution.run_id,
-            provider: execution.provider,
-            worker_id: execution.worker_id,
-            status: loft_status(&result.status),
-            exit_code: loft_exit_code(&result.status),
-            summary: Some(&safe_summary),
-            metadata_json: &metadata_json,
-            idempotency_key: Some(&idempotency_key(&[
-                execution.instance_id,
-                execution.run_id,
-                "loft-terminal",
-            ])),
-        };
-        let diagnostic_code = loft_fact_name(execution.request.action, &result.status);
-        let diagnostic = self.provider_terminal_diagnostic(
-            execution.instance_id,
-            execution.effect_id,
-            execution.run_id,
-            execution.provider,
-            loft_effect_status(&result.status),
-            &result.summary,
-            Some(&diagnostic_code),
-            &metadata_json,
-            &evidence,
-        );
-
-        let event = match result.status {
-            LoftEffectStatus::Succeeded => self.complete_run(completion)?,
-            LoftEffectStatus::Failed => self.fail_run_with_diagnostic(completion, diagnostic)?,
-            LoftEffectStatus::TimedOut => {
-                self.timeout_run_with_diagnostic(completion, diagnostic)?
-            }
-        };
-        self.append_loft_fact(execution, &result)?;
-        Ok(event)
-    }
-
     pub fn run_human_ask(&mut self, execution: HumanAskExecution<'_>) -> StoreResult<StoredEvent> {
         self.start_run(RunStart {
             instance_id: execution.instance_id,
@@ -2352,128 +2428,6 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 key: execution.inbox_item_id,
                 value_json: &value,
                 schema_id: Some("HumanAsk"),
-                provenance_class: "effect",
-                correlation_id: Some(execution.effect_id),
-                source_span_json: None,
-            },
-            source: "kernel",
-            causation_id: Some(execution.run_id),
-            idempotency_key: Some(&fact_key),
-        })?;
-        Ok(())
-    }
-
-    fn record_loft_result(
-        &self,
-        execution: LoftEffectExecution<'_>,
-        result: &LoftEffectResult,
-    ) -> StoreResult<ProviderEvidence> {
-        let metadata = json!({
-            "effect_id": execution.effect_id,
-            "action": execution.request.action.effect_kind(),
-            "issue_id": execution.request.issue_id,
-            "lease_id": execution.request.lease_id,
-            "claim_ready": execution.request.claim_ready,
-            "issue_version": execution.request.issue_version,
-            "actor": execution.request.actor,
-            "lease_duration_seconds": execution.request.lease_duration_seconds,
-            "command_id": execution.request.command_id,
-            "note": execution.request.note.as_deref().map(redacted_text_metadata),
-            "target_status": execution.request.target_status,
-            "evidence": execution.request.evidence_json.as_deref().map(json_payload_summary),
-            "evidence_kind": execution.request.evidence_kind,
-            "evidence_artifact": execution.request.evidence_artifact,
-            "evidence_data_path": execution.request.evidence_data_path,
-            "resource_intent": execution.request.resource_intent_json.as_deref().map(json_payload_summary),
-            "release_after_failure": execution.request.release_after_failure,
-            "expect_heads": execution.request.expect_heads,
-            "request_metadata": json_payload_summary(&execution.request.metadata_json),
-            "value": result.value_json.as_deref().map(json_payload_summary),
-            "error": result_error_payload(result.error_json.as_deref()),
-            "transcript": redacted_text_metadata(&result.transcript),
-        })
-        .to_string();
-        let evidence_id = self.store.record_evidence(EvidenceRecord {
-            instance_id: execution.instance_id,
-            kind: &format!("{}.provider", execution.request.action.effect_kind()),
-            subject_type: "run",
-            subject_id: execution.run_id,
-            causation_id: Some(execution.effect_id),
-            correlation_id: Some(&idempotency_key(&[
-                execution.instance_id,
-                execution.run_id,
-                "loft-provider",
-            ])),
-            summary: Some(&redacted_provider_summary(&result.summary)),
-            metadata_json: &metadata,
-        })?;
-        Ok(ProviderEvidence {
-            evidence_id: Some(evidence_id),
-            artifact_ids: Vec::new(),
-        })
-    }
-
-    fn append_loft_fact(
-        &mut self,
-        execution: LoftEffectExecution<'_>,
-        result: &LoftEffectResult,
-    ) -> StoreResult<()> {
-        let status = loft_status(&result.status);
-        let fact_name = loft_fact_name(execution.request.action, &result.status);
-        let succeeded = matches!(result.status, LoftEffectStatus::Succeeded);
-        let summary = redacted_provider_summary(&result.summary);
-        // DR-0032: failure `value` is the EffectError base; success keeps the op
-        // output.
-        let value_field = if succeeded {
-            result_value_payload(true, result.value_json.as_deref())
-        } else {
-            // DR-0032 + redaction (D4): loft is provider-backed, so the raw
-            // `error_json` is confidential. The base `reason` is the already-redacted
-            // summary, not the raw-error-derived text (which would leak into the fact).
-            Some(effect_failure_base(
-                execution.request.action.effect_kind(),
-                &summary,
-                &summary,
-                execution.effect_id,
-                execution.run_id,
-            ))
-        };
-        let value = json!({
-            "effect_id": execution.effect_id,
-            "run_id": execution.run_id,
-            "action": execution.request.action.effect_kind(),
-            "issue_id": execution.request.issue_id,
-            "lease_id": execution.request.lease_id,
-            "command_id": execution.request.command_id,
-            "status": status,
-            "value": value_field,
-            "error": result_error_payload(result.error_json.as_deref()),
-            "summary": summary,
-        })
-        .to_string();
-        self.store.append_event(NewEvent {
-            instance_id: execution.instance_id,
-            event_type: &fact_name,
-            payload_json: &value,
-            source: "kernel",
-            causation_id: Some(execution.run_id),
-            correlation_id: Some(execution.effect_id),
-            idempotency_key: Some(&idempotency_key(&[
-                execution.instance_id,
-                execution.run_id,
-                "loft-event",
-            ])),
-        })?;
-        let fact_id = idempotency_key(&[execution.instance_id, "loft", execution.run_id]);
-        let fact_key = idempotency_key(&[execution.instance_id, execution.run_id, "loft-fact"]);
-        self.store.derive_fact(DerivedFact {
-            instance_id: execution.instance_id,
-            fact: NewFact {
-                fact_id: &fact_id,
-                name: &fact_name,
-                key: execution.run_id,
-                value_json: &value,
-                schema_id: loft_schema(execution.request.action, &result.status),
                 provenance_class: "effect",
                 correlation_id: Some(execution.effect_id),
                 source_span_json: None,
@@ -2606,6 +2560,27 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         event: &NativeProviderEvent,
         occurrence_key: &str,
     ) -> StoreResult<ProviderEvidence> {
+        // DR-0035 Decision 3 (T1/T3): protocol violations are recorded as
+        // diagnostics, never as lifecycle events. Explicit violations are
+        // adapter-surfaced `whip.protocol.*` frames (e.g. misrouted run ids);
+        // implicit ones are frames arriving after this run's terminal was
+        // admitted — exactly-one-terminal means they must never reopen the run
+        // or add lifecycle observations.
+        let violation_reason = if event.provider_event_type.starts_with("whip.protocol.") {
+            Some("adapter_surfaced")
+        } else if self
+            .store
+            .list_runs(execution.instance_id)?
+            .iter()
+            .any(|run| run.run_id == execution.run_id && run.status != "running")
+        {
+            Some("post_terminal")
+        } else {
+            None
+        };
+        if let Some(reason) = violation_reason {
+            return self.record_protocol_violation(execution, event, occurrence_key, reason);
+        }
         let artifact_ids = event
             .artifacts
             .iter()
@@ -2656,6 +2631,49 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         Ok(ProviderEvidence {
             evidence_id: Some(evidence_id),
             artifact_ids,
+        })
+    }
+
+    /// DR-0035 Decision 3: a protocol-violating frame lands as evidence only —
+    /// no lifecycle observation, no artifacts, and the run's terminal state is
+    /// untouched, so a violating peer can never reopen or double-terminate a
+    /// run.
+    fn record_protocol_violation(
+        &mut self,
+        execution: AgentTurnExecution<'_>,
+        event: &NativeProviderEvent,
+        occurrence_key: &str,
+        reason: &str,
+    ) -> StoreResult<ProviderEvidence> {
+        let metadata = json!({
+            "effect_id": execution.effect_id,
+            "agent": execution.agent,
+            "provider": execution.provider,
+            "reason": reason,
+            "native_event": event.to_json_redacted(),
+            // The adapter-constructed violation detail (frame type + run id) is
+            // identifiers-only by construction, so it may cross verbatim where
+            // the generic evidence shape would erase it.
+            "violation": event.evidence.get("violation").cloned().unwrap_or(Value::Null),
+        })
+        .to_string();
+        let evidence_id = self.store.record_evidence(EvidenceRecord {
+            instance_id: execution.instance_id,
+            kind: "agent.turn.protocol_violation",
+            subject_type: "run",
+            subject_id: execution.run_id,
+            causation_id: Some(execution.effect_id),
+            correlation_id: Some(occurrence_key),
+            summary: Some(&format!(
+                "protocol violation ({reason}): {} frame from {}",
+                event.event_kind.as_str(),
+                event.provider_event_type
+            )),
+            metadata_json: &metadata,
+        })?;
+        Ok(ProviderEvidence {
+            evidence_id: Some(evidence_id),
+            artifact_ids: Vec::new(),
         })
     }
 
@@ -2807,6 +2825,45 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             evidence_id: Some(evidence_id),
             artifact_ids,
         })
+    }
+
+    /// Record the delegated-harness context attestation (DR-0034 Decision 5, D8-2).
+    /// The evidence path forks on the harness class. A **Delegated** turn's context is
+    /// assembled by the foreign runtime (codex/claude/command sidecar), so
+    /// WhippleScript does NOT fabricate `context.bundle` provenance rows for a context
+    /// it did not build. Instead it records ONE `context.attestation` row explicitly
+    /// tagged `context: provider-assembled` — provider identity + kind, the prompt
+    /// hash, and a hash of the tool/permission policy the envelope imposed — so an
+    /// auditor can tell from the record alone which guarantee the turn carries. The
+    /// shared `agent.turn.<status>` terminal is still emitted by the dispatched
+    /// executor (only the provenance depth differs). **Managed** turns never call this;
+    /// they emit their full hermetic `context.bundle` provenance instead.
+    pub fn record_delegated_context_attestation(
+        &self,
+        execution: AgentTurnExecution<'_>,
+        kind: &str,
+        policy_json: &str,
+    ) -> StoreResult<()> {
+        let metadata = json!({
+            "context": "provider-assembled",
+            "provider": execution.provider,
+            "kind": kind,
+            "prompt_hash": stable_hash_hex(execution.input_json),
+            "profile": execution.profile,
+            "policy_hash": stable_hash_hex(policy_json),
+        })
+        .to_string();
+        self.store.record_evidence(EvidenceRecord {
+            instance_id: execution.instance_id,
+            kind: "context.attestation",
+            subject_type: "run",
+            subject_id: execution.run_id,
+            causation_id: None,
+            correlation_id: Some(execution.effect_id),
+            summary: Some("provider-assembled context"),
+            metadata_json: &metadata,
+        })?;
+        Ok(())
     }
 
     fn append_agent_turn_event_and_fact(
@@ -4218,87 +4275,6 @@ fn coerce_metadata(result: &CoerceResult) -> String {
     .to_string()
 }
 
-fn loft_status(status: &LoftEffectStatus) -> &'static str {
-    match status {
-        LoftEffectStatus::Succeeded => "completed",
-        LoftEffectStatus::Failed => "failed",
-        LoftEffectStatus::TimedOut => "timed_out",
-    }
-}
-
-fn loft_effect_status(status: &LoftEffectStatus) -> EffectStatus {
-    match status {
-        LoftEffectStatus::Succeeded => EffectStatus::Completed,
-        LoftEffectStatus::Failed => EffectStatus::Failed,
-        LoftEffectStatus::TimedOut => EffectStatus::TimedOut,
-    }
-}
-
-fn loft_exit_code(status: &LoftEffectStatus) -> Option<i64> {
-    match status {
-        LoftEffectStatus::Succeeded => Some(0),
-        LoftEffectStatus::Failed => Some(1),
-        LoftEffectStatus::TimedOut => None,
-    }
-}
-
-fn loft_metadata(result: &LoftEffectResult) -> String {
-    json!({
-        "value": result.value_json.as_deref().map(json_payload_summary),
-        "error": result_error_payload(result.error_json.as_deref()),
-        "transcript": redacted_text_metadata(&result.transcript),
-    })
-    .to_string()
-}
-
-fn loft_fact_name(action: LoftAction, status: &LoftEffectStatus) -> String {
-    let suffix = match status {
-        LoftEffectStatus::Succeeded => "succeeded",
-        LoftEffectStatus::Failed => "failed",
-        LoftEffectStatus::TimedOut => "timed_out",
-    };
-    format!("{}.{}", action.effect_kind(), suffix)
-}
-
-fn loft_schema(action: LoftAction, status: &LoftEffectStatus) -> Option<&'static str> {
-    match (action, status) {
-        (LoftAction::Show, LoftEffectStatus::Succeeded) => Some("LoftShowSucceeded"),
-        (LoftAction::Show, LoftEffectStatus::Failed) => Some("LoftShowFailed"),
-        (LoftAction::Show, LoftEffectStatus::TimedOut) => Some("LoftShowTimedOut"),
-        (LoftAction::Claim, LoftEffectStatus::Succeeded) => Some("LoftClaimSucceeded"),
-        (LoftAction::Claim, LoftEffectStatus::Failed) => Some("LoftClaimFailed"),
-        (LoftAction::Claim, LoftEffectStatus::TimedOut) => Some("LoftClaimTimedOut"),
-        (LoftAction::Renew, LoftEffectStatus::Succeeded) => Some("LoftRenewSucceeded"),
-        (LoftAction::Renew, LoftEffectStatus::Failed) => Some("LoftRenewFailed"),
-        (LoftAction::Renew, LoftEffectStatus::TimedOut) => Some("LoftRenewTimedOut"),
-        (LoftAction::Release, LoftEffectStatus::Succeeded) => Some("LoftReleaseSucceeded"),
-        (LoftAction::Release, LoftEffectStatus::Failed) => Some("LoftReleaseFailed"),
-        (LoftAction::Release, LoftEffectStatus::TimedOut) => Some("LoftReleaseTimedOut"),
-        (LoftAction::Note, LoftEffectStatus::Succeeded) => Some("LoftNoteSucceeded"),
-        (LoftAction::Note, LoftEffectStatus::Failed) => Some("LoftNoteFailed"),
-        (LoftAction::Note, LoftEffectStatus::TimedOut) => Some("LoftNoteTimedOut"),
-        (LoftAction::Transition, LoftEffectStatus::Succeeded) => Some("LoftTransitionSucceeded"),
-        (LoftAction::Transition, LoftEffectStatus::Failed) => Some("LoftTransitionFailed"),
-        (LoftAction::Transition, LoftEffectStatus::TimedOut) => Some("LoftTransitionTimedOut"),
-        (LoftAction::Evidence, LoftEffectStatus::Succeeded) => Some("LoftEvidenceSucceeded"),
-        (LoftAction::Evidence, LoftEffectStatus::Failed) => Some("LoftEvidenceFailed"),
-        (LoftAction::Evidence, LoftEffectStatus::TimedOut) => Some("LoftEvidenceTimedOut"),
-        (LoftAction::ResourceIntent, LoftEffectStatus::Succeeded) => {
-            Some("LoftResourceIntentSucceeded")
-        }
-        (LoftAction::ResourceIntent, LoftEffectStatus::Failed) => Some("LoftResourceIntentFailed"),
-        (LoftAction::ResourceIntent, LoftEffectStatus::TimedOut) => {
-            Some("LoftResourceIntentTimedOut")
-        }
-        (LoftAction::Complete, LoftEffectStatus::Succeeded) => Some("LoftCompleteSucceeded"),
-        (LoftAction::Complete, LoftEffectStatus::Failed) => Some("LoftCompleteFailed"),
-        (LoftAction::Complete, LoftEffectStatus::TimedOut) => Some("LoftCompleteTimedOut"),
-        (LoftAction::Fail, LoftEffectStatus::Succeeded) => Some("LoftFailSucceeded"),
-        (LoftAction::Fail, LoftEffectStatus::Failed) => Some("LoftFailFailed"),
-        (LoftAction::Fail, LoftEffectStatus::TimedOut) => Some("LoftFailTimedOut"),
-    }
-}
-
 fn json_from_str(source: &str) -> Value {
     serde_json::from_str(source).unwrap_or_else(|_| Value::String(source.to_owned()))
 }
@@ -4329,8 +4305,11 @@ mod tests {
         ClaudeCodeAgentHarness, CodexAgentHarness, CommandLaunchPlan, MockAgentHarness,
         PiStyleAgentHarness,
     };
-    use loft::{FakeLoftClient, LoftAction, LoftEffectRequest};
     use native_lifecycle::{normalize_pi_rpc_event, AgentTurnLifecycleKind};
+    use provider::{
+        builtin_provider_capabilities, AdapterSurface, CancellationDepth,
+        NativeProviderBoundaryError, NativeProviderCancellation, ProviderCapability, ProviderKind,
+    };
     use std::{fs, path::PathBuf, process::Command};
     use trace::check_trace;
     use whipplescript_parser::compile_program;
@@ -4556,6 +4535,305 @@ rule noop
             .count();
         assert_eq!(activation_records, 1);
         check_trace(kernel.trace()).expect("revision trace remains conformant");
+    }
+
+    #[test]
+    fn load_brokered_transcript_at_addresses_a_non_latest_checkpoint() {
+        // RC-2 Delta B: given a cut coordinate N (an event-log sequence), the
+        // transcript loads at the checkpoint that was CURRENT at N — the latest
+        // `agent.turn.brokered.transcript` with sequence <= N — not the newest.
+        // The unbounded latest-load is unchanged.
+        let compiled = compile_program(
+            r#"
+workflow TranscriptCut
+
+rule noop
+  when started
+=> {
+}
+"#,
+        );
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let program = compiled.ir.expect("program compiles");
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &program.workflow,
+                    source_hash: "source-1",
+                    ir_hash: "ir-1",
+                    compiler_version: "test",
+                },
+                &program,
+            )
+            .expect("version creates");
+        let instance_id = kernel.create_instance(&version, "{}").expect("instance");
+
+        let effect_id = "eff-transcript";
+        // Append three transcript checkpoints (steps 0..2) at increasing
+        // sequences, each carrying a distinct user message so the loaded
+        // checkpoint is identifiable.
+        let mut step_sequences = Vec::new();
+        for step in 0..3 {
+            let messages = vec![crate::harness_loop::ChatMessage::user_text(format!(
+                "step-{step}"
+            ))];
+            let payload = json!({
+                "effect_id": effect_id,
+                "messages": crate::harness_loop::chat_messages_to_json(&messages),
+            })
+            .to_string();
+            let key = idempotency_key(&[&instance_id, effect_id, "transcript", &step.to_string()]);
+            let stored = kernel
+                .store
+                .append_event(whipplescript_store::NewEvent {
+                    instance_id: &instance_id,
+                    event_type: "agent.turn.brokered.transcript",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: None,
+                    correlation_id: Some(effect_id),
+                    idempotency_key: Some(&key),
+                })
+                .expect("transcript event appends");
+            step_sequences.push(stored.sequence);
+        }
+
+        let text_of = |messages: &[crate::harness_loop::ChatMessage]| -> String {
+            match messages.first().expect("one message") {
+                crate::harness_loop::ChatMessage::User { text, .. } => text.clone(),
+                other => panic!("expected user message, got {other:?}"),
+            }
+        };
+
+        // Cut AT step 1's sequence: load the step-1 checkpoint, not step-2.
+        let at_mid = kernel.load_brokered_transcript_at(&instance_id, effect_id, step_sequences[1]);
+        assert_eq!(text_of(&at_mid), "step-1", "cut at N loads the step <= N");
+
+        // A cut BETWEEN step 1 and step 2 still resolves to step 1.
+        let between =
+            kernel.load_brokered_transcript_at(&instance_id, effect_id, step_sequences[2] - 1);
+        assert_eq!(
+            text_of(&between),
+            "step-1",
+            "cut below step-2 stays at step-1"
+        );
+
+        // The unbounded latest-load is unchanged — it returns the newest (step 2).
+        let latest = kernel.load_brokered_transcript(&instance_id, effect_id);
+        assert_eq!(
+            text_of(&latest),
+            "step-2",
+            "unbounded load returns the latest"
+        );
+
+        // A cut before any checkpoint yields an empty transcript.
+        let before =
+            kernel.load_brokered_transcript_at(&instance_id, effect_id, step_sequences[0] - 1);
+        assert!(
+            before.is_empty(),
+            "cut before the first checkpoint is empty"
+        );
+    }
+
+    #[test]
+    fn load_brokered_transcript_rewinds_past_a_restore_marker() {
+        // RC-4c: the transcript plane rewinds with the other planes. After a
+        // `context.restored` marker to step-1's sequence, the unbounded latest
+        // load returns step-1 (step-2 is abandoned), and a post-restore
+        // checkpoint (step-3) becomes the new latest.
+        let compiled = compile_program(
+            r#"
+workflow TranscriptRestore
+
+rule noop
+  when started
+=> {
+}
+"#,
+        );
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let program = compiled.ir.expect("program compiles");
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &program.workflow,
+                    source_hash: "source-1",
+                    ir_hash: "ir-1",
+                    compiler_version: "test",
+                },
+                &program,
+            )
+            .expect("version creates");
+        let instance_id = kernel.create_instance(&version, "{}").expect("instance");
+        let effect_id = "eff-transcript";
+
+        let append_transcript = |kernel: &mut RuntimeKernel<SqliteStore>, step: i64| -> i64 {
+            let messages = vec![crate::harness_loop::ChatMessage::user_text(format!(
+                "step-{step}"
+            ))];
+            let payload = json!({
+                "effect_id": effect_id,
+                "messages": crate::harness_loop::chat_messages_to_json(&messages),
+            })
+            .to_string();
+            let key = idempotency_key(&[&instance_id, effect_id, "transcript", &step.to_string()]);
+            kernel
+                .store
+                .append_event(whipplescript_store::NewEvent {
+                    instance_id: &instance_id,
+                    event_type: "agent.turn.brokered.transcript",
+                    payload_json: &payload,
+                    source: "kernel",
+                    causation_id: None,
+                    correlation_id: Some(effect_id),
+                    idempotency_key: Some(&key),
+                })
+                .expect("transcript appends")
+                .sequence
+        };
+        let text_of = |messages: &[crate::harness_loop::ChatMessage]| -> String {
+            match messages.first().expect("one message") {
+                crate::harness_loop::ChatMessage::User { text, .. } => text.clone(),
+                other => panic!("expected user message, got {other:?}"),
+            }
+        };
+
+        let step0 = append_transcript(&mut kernel, 0);
+        append_transcript(&mut kernel, 1);
+        // Before any restore, the latest is step-1.
+        assert_eq!(
+            text_of(&kernel.load_brokered_transcript(&instance_id, effect_id)),
+            "step-1"
+        );
+
+        // Restore to step-0's sequence: step-1 is abandoned.
+        let marker_payload = json!({ "restored_to_sequence": step0 }).to_string();
+        kernel
+            .store
+            .append_event(whipplescript_store::NewEvent {
+                instance_id: &instance_id,
+                event_type: "context.restored",
+                payload_json: &marker_payload,
+                source: "restorable-context",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some("restore-marker-1"),
+            })
+            .expect("marker appends");
+        assert_eq!(
+            text_of(&kernel.load_brokered_transcript(&instance_id, effect_id)),
+            "step-0",
+            "the latest live transcript rewinds past the abandoned step-1"
+        );
+
+        // Post-restore work (step-3) is live and becomes the new latest.
+        append_transcript(&mut kernel, 3);
+        assert_eq!(
+            text_of(&kernel.load_brokered_transcript(&instance_id, effect_id)),
+            "step-3",
+            "post-restore transcript is live"
+        );
+    }
+
+    #[test]
+    fn delegated_context_attestation_is_tagged_provider_assembled() {
+        // DR-0034 Decision 5 (D8-2): the kernel-owned attestation contract. A
+        // Delegated turn records ONE `context.attestation` row tagged
+        // `context: provider-assembled`, carrying provider identity/kind plus the
+        // prompt and policy hashes — never the hermetic `context.bundle` provenance.
+        let compiled = compile_program(
+            r#"
+workflow AttestationContract
+
+agent worker {
+  provider native-fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule noop
+  when started
+=> {
+}
+"#,
+        );
+        let program = compiled.ir.expect("program compiles");
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version_for_program(
+                ProgramVersionInput {
+                    program_name: &program.workflow,
+                    source_hash: "source-1",
+                    ir_hash: "ir-1",
+                    compiler_version: "test",
+                },
+                &program,
+            )
+            .expect("version creates");
+        let instance_id = kernel
+            .create_instance(&version, "{}")
+            .expect("instance creates");
+
+        let execution = AgentTurnExecution {
+            instance_id: &instance_id,
+            effect_id: "eff-1",
+            run_id: "run-1",
+            provider: "native-fixture",
+            worker_id: "whip-worker",
+            lease_id: "lease-1",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            agent: "worker",
+            profile: Some("repo-writer"),
+            input_json: r#"{"message":"delegated context is provider-assembled"}"#,
+            skill_names: &[],
+        };
+        kernel
+            .record_delegated_context_attestation(execution, "native-fixture", r#"["agent.tell"]"#)
+            .expect("attestation records");
+
+        let evidence = kernel
+            .store()
+            .list_evidence(&instance_id)
+            .expect("evidence lists");
+        let attestations = evidence
+            .iter()
+            .filter(|row| row.kind == "context.attestation")
+            .collect::<Vec<_>>();
+        assert_eq!(attestations.len(), 1, "exactly one attestation row");
+        assert!(
+            !evidence.iter().any(|row| row.kind == "context.bundle"),
+            "a delegated turn fabricates no context.bundle provenance"
+        );
+        let metadata: Value =
+            serde_json::from_str(&attestations[0].metadata_json).expect("attestation metadata");
+        assert_eq!(
+            metadata.get("context").and_then(Value::as_str),
+            Some("provider-assembled")
+        );
+        assert_eq!(
+            metadata.get("kind").and_then(Value::as_str),
+            Some("native-fixture")
+        );
+        assert_eq!(
+            metadata.get("profile").and_then(Value::as_str),
+            Some("repo-writer")
+        );
+        // The prompt and policy hashes are present, non-empty, and distinct.
+        let prompt_hash = metadata
+            .get("prompt_hash")
+            .and_then(Value::as_str)
+            .expect("prompt hash");
+        let policy_hash = metadata
+            .get("policy_hash")
+            .and_then(Value::as_str)
+            .expect("policy hash");
+        assert!(!prompt_hash.is_empty() && !policy_hash.is_empty());
+        assert_ne!(prompt_hash, policy_hash);
     }
 
     #[test]
@@ -5537,14 +5815,14 @@ rule wait
         let store = SqliteStore::open_in_memory().expect("store opens");
         store
             .register_skill(SkillRegistration {
-                skill_id: "skill-loft-user",
-                name: "loft-user",
+                skill_id: "skill-repo-user",
+                name: "repo-user",
                 version: "1.0.0",
-                source: "# Loft User\n",
-                source_path: "skills/loft-user/SKILL.md",
-                body: "# Loft User\nUse Loft carefully.\n",
-                description: "Loft instructions",
-                required_capabilities_json: r#"["loft.claim"]"#,
+                source: "# Repo User\n",
+                source_path: "skills/repo-user/SKILL.md",
+                body: "# Repo User\nUse the repo carefully.\n",
+                description: "Repo instructions",
+                required_capabilities_json: r#"["repo.write"]"#,
                 metadata_json: "{}",
             })
             .expect("skill registers");
@@ -5609,7 +5887,7 @@ rule wait
                     agent: "worker",
                     profile: Some("repo-writer"),
                     input_json: r#"{"prompt":"go"}"#,
-                    skill_names: &["loft-user"],
+                    skill_names: &["repo-user"],
                 },
                 &MockAgentHarness::completed("done"),
                 &run_metadata_json,
@@ -5634,7 +5912,7 @@ rule wait
         assert!(evidence
             .iter()
             .any(|evidence| evidence.kind == "skills.injected"
-                && evidence.metadata_json.contains("loft-user")));
+                && evidence.metadata_json.contains("repo-user")));
         let provider_evidence = evidence
             .iter()
             .find(|evidence| evidence.kind == "agent.turn.provider")
@@ -6614,8 +6892,11 @@ rule wait
         );
     }
 
-    fn start_running_agent_turn_without_evidence() -> (RuntimeKernel, String) {
-        let store = SqliteStore::open_in_memory().expect("store opens");
+    fn kernel_with_queued_agent_tell() -> (RuntimeKernel, String) {
+        kernel_with_queued_agent_tell_on(SqliteStore::open_in_memory().expect("store opens"))
+    }
+
+    fn kernel_with_queued_agent_tell_on(store: SqliteStore) -> (RuntimeKernel, String) {
         let mut kernel = RuntimeKernel::new(store);
         let version = kernel
             .create_program_version(ProgramVersionInput {
@@ -6653,6 +6934,11 @@ rule wait
                 idempotency_key: Some("commit-start-uncertain"),
             })
             .expect("rule commits");
+        (kernel, instance_id)
+    }
+
+    fn start_running_agent_turn_without_evidence() -> (RuntimeKernel, String) {
+        let (mut kernel, instance_id) = kernel_with_queued_agent_tell();
         kernel
             .start_run(RunStart {
                 instance_id: &instance_id,
@@ -6666,6 +6952,484 @@ rule wait
             })
             .expect("run starts");
         (kernel, instance_id)
+    }
+
+    /// A scripted native adapter for driver-loop tests: `None` entries are
+    /// empty polls, `Some` entries are delivered frames. `on_start` fires
+    /// inside `start_turn` (after the kernel's own run start); `with_cancel`
+    /// arms an ack event plus the terminal the delegate emits afterwards.
+    struct ScriptedAdapter {
+        capability: ProviderCapability,
+        script: std::collections::VecDeque<Option<NativeProviderEvent>>,
+        on_start: Option<Box<dyn FnMut()>>,
+        cancel_ack: Option<NativeProviderEvent>,
+        cancel_follow_up: Option<NativeProviderEvent>,
+        cancellations: Vec<CancellationDepth>,
+    }
+
+    impl ScriptedAdapter {
+        fn new(script: Vec<Option<NativeProviderEvent>>) -> Self {
+            Self {
+                capability: builtin_provider_capabilities()
+                    .into_iter()
+                    .find(|capability| capability.provider_kind == ProviderKind::Fixture)
+                    .expect("fixture capability"),
+                script: script.into(),
+                on_start: None,
+                cancel_ack: None,
+                cancel_follow_up: None,
+                cancellations: Vec::new(),
+            }
+        }
+
+        fn with_on_start(mut self, hook: Box<dyn FnMut()>) -> Self {
+            self.on_start = Some(hook);
+            self
+        }
+
+        fn with_cancel(mut self, ack: NativeProviderEvent, terminal: NativeProviderEvent) -> Self {
+            self.cancel_ack = Some(ack);
+            self.cancel_follow_up = Some(terminal);
+            self
+        }
+    }
+
+    impl NativeProviderAdapter for ScriptedAdapter {
+        fn provider_id(&self) -> &str {
+            "scripted"
+        }
+
+        fn capability(&self) -> &ProviderCapability {
+            &self.capability
+        }
+
+        fn start_turn(
+            &mut self,
+            _request: NativeProviderTurnRequest,
+        ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
+            if let Some(hook) = self.on_start.as_mut() {
+                hook();
+            }
+            Ok(self
+                .script
+                .pop_front()
+                .flatten()
+                .expect("scripted start event"))
+        }
+
+        fn next_event(
+            &mut self,
+            _run_id: &str,
+        ) -> Result<Option<NativeProviderEvent>, NativeProviderBoundaryError> {
+            Ok(self.script.pop_front().unwrap_or(None))
+        }
+
+        fn cancel_turn(
+            &mut self,
+            cancellation: NativeProviderCancellation,
+        ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
+            self.cancellations.push(cancellation.requested_depth);
+            let ack = self.cancel_ack.take().expect("scripted cancel ack");
+            if let Some(terminal) = self.cancel_follow_up.take() {
+                self.script.push_front(Some(terminal));
+            }
+            Ok(ack)
+        }
+    }
+
+    fn scripted_event(kind: NativeProviderEventKind, event_type: &str) -> NativeProviderEvent {
+        NativeProviderEvent {
+            provider_id: "scripted".to_owned(),
+            run_id: "run-tell".to_owned(),
+            event_kind: kind,
+            provider_event_type: event_type.to_owned(),
+            provider_session_id: None,
+            provider_turn_id: None,
+            sequence: None,
+            evidence: json!({}),
+            artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_polls_do_not_consume_the_event_budget() {
+        // DR-0035 Decision 4: `max_events` bounds DELIVERED frames only. With a
+        // budget of 2, three empty polls before the terminal must not push the
+        // turn into the synthetic timeout (pre-B2 they consumed the budget).
+        let (mut kernel, instance_id) = kernel_with_queued_agent_tell();
+        let execution = AgentTurnExecution {
+            instance_id: &instance_id,
+            effect_id: "tell",
+            run_id: "run-tell",
+            provider: "scripted",
+            worker_id: "worker-1",
+            lease_id: "lease-tell",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            agent: "worker",
+            profile: Some("repo-writer"),
+            input_json: r#"{"prompt":"go"}"#,
+            skill_names: &[],
+        };
+        let mut adapter = ScriptedAdapter::new(vec![
+            Some(scripted_event(
+                NativeProviderEventKind::Started,
+                "scripted.started",
+            )),
+            None,
+            None,
+            None,
+            Some(scripted_event(
+                NativeProviderEventKind::Completed,
+                "scripted.completed",
+            )),
+        ]);
+        let request = NativeProviderTurnRequest {
+            provider_id: "scripted".to_owned(),
+            provider_kind: ProviderKind::Fixture,
+            surface: AdapterSurface::Fixture,
+            run_id: "run-tell".to_owned(),
+            effect_id: "tell".to_owned(),
+            agent: "worker".to_owned(),
+            profile: Some("repo-writer".to_owned()),
+            prompt_json: json!("go"),
+            workspace_policy: "read_only".to_owned(),
+            required_capabilities: Vec::new(),
+            cancellation_depth: CancellationDepth::None,
+            artifact_policy: "metadata".to_owned(),
+            credential_ref: None,
+            provider_options: std::collections::BTreeMap::new(),
+        };
+
+        kernel
+            .run_native_agent_turn(execution, request, &mut adapter, 2)
+            .expect("turn completes");
+
+        let runs = kernel.store().list_runs(&instance_id).expect("runs list");
+        let run = runs.iter().find(|r| r.run_id == "run-tell").expect("run");
+        assert_eq!(
+            run.status, "completed",
+            "the turn completed instead of timing out on empty polls"
+        );
+    }
+
+    #[test]
+    fn driver_never_launches_provider_when_cancel_requested_before_start() {
+        // DR-0035 Decision 5 (B3 residual, verified closed at the store
+        // layer): `store.start_run` transactionally refuses to start a run
+        // while a cancellation request is open, so a delegated turn with a
+        // pre-start request never invokes the provider — the same pre-launch
+        // protection the owned harness has.
+        let (mut kernel, instance_id) = start_running_agent_turn_without_evidence();
+        kernel
+            .store_mut()
+            .request_effect_cancellation(EffectCancellationRequest {
+                instance_id: &instance_id,
+                effect_id: "tell",
+                revision_id: None,
+                reason: Some("pre-start cancellation"),
+                requested_by: "test",
+                causation_event_id: None,
+                idempotency_key: Some("test-pre-start-cancel"),
+            })
+            .expect("cancellation request records");
+        let execution = AgentTurnExecution {
+            instance_id: &instance_id,
+            effect_id: "tell",
+            run_id: "run-tell",
+            provider: "scripted",
+            worker_id: "worker-1",
+            lease_id: "lease-tell",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            agent: "worker",
+            profile: Some("repo-writer"),
+            input_json: r#"{"prompt":"go"}"#,
+            skill_names: &[],
+        };
+        // An adapter whose start would panic proves the provider never launches.
+        struct NeverLaunchAdapter {
+            capability: ProviderCapability,
+        }
+        impl NativeProviderAdapter for NeverLaunchAdapter {
+            fn provider_id(&self) -> &str {
+                "scripted"
+            }
+            fn capability(&self) -> &ProviderCapability {
+                &self.capability
+            }
+            fn start_turn(
+                &mut self,
+                _request: NativeProviderTurnRequest,
+            ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
+                panic!("provider must not launch after a pre-start cancellation request");
+            }
+            fn next_event(
+                &mut self,
+                _run_id: &str,
+            ) -> Result<Option<NativeProviderEvent>, NativeProviderBoundaryError> {
+                panic!("provider must not stream after a pre-start cancellation request");
+            }
+            fn cancel_turn(
+                &mut self,
+                _cancellation: NativeProviderCancellation,
+            ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
+                panic!("pre-start skip needs no provider cancel");
+            }
+        }
+        let mut adapter = NeverLaunchAdapter {
+            capability: builtin_provider_capabilities()
+                .into_iter()
+                .find(|capability| capability.provider_kind == ProviderKind::Fixture)
+                .expect("fixture capability"),
+        };
+        let request = NativeProviderTurnRequest {
+            provider_id: "scripted".to_owned(),
+            provider_kind: ProviderKind::Fixture,
+            surface: AdapterSurface::Fixture,
+            run_id: "run-tell".to_owned(),
+            effect_id: "tell".to_owned(),
+            agent: "worker".to_owned(),
+            profile: Some("repo-writer".to_owned()),
+            prompt_json: json!("go"),
+            workspace_policy: "read_only".to_owned(),
+            required_capabilities: Vec::new(),
+            cancellation_depth: CancellationDepth::None,
+            artifact_policy: "metadata".to_owned(),
+            credential_ref: None,
+            provider_options: std::collections::BTreeMap::new(),
+        };
+
+        // The store-level guard fires before any provider work; the
+        // NeverLaunchAdapter proves start_turn/next_event were never reached.
+        let error = kernel
+            .run_native_agent_turn(execution, request, &mut adapter, 8)
+            .expect_err("run start is refused while a cancellation request is open");
+        assert!(
+            matches!(&error, StoreError::Conflict(message) if message.contains("cancellation")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn driver_cancels_running_delegate_on_open_cancellation_request() {
+        // DR-0035 Decision 5: an open durable cancellation request reaches the
+        // running delegate through the driver loop — cancel_turn is no longer
+        // dead code. The ack is a non-terminal Diagnostic; the delegate's own
+        // `cancelled` terminal ends the run (exactly one terminal).
+        let store_path = std::env::temp_dir().join(format!(
+            "whip-kernel-delegate-cancel-{}.sqlite",
+            idempotency_key(&["delegate-cancel", "store"])
+        ));
+        let _ = fs::remove_file(&store_path);
+        let store = SqliteStore::open(&store_path).expect("store opens");
+        let (mut kernel, instance_id) = kernel_with_queued_agent_tell_on(store);
+        let execution = AgentTurnExecution {
+            instance_id: &instance_id,
+            effect_id: "tell",
+            run_id: "run-tell",
+            provider: "scripted",
+            worker_id: "worker-1",
+            lease_id: "lease-tell",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            agent: "worker",
+            profile: Some("repo-writer"),
+            input_json: r#"{"prompt":"go"}"#,
+            skill_names: &[],
+        };
+        // The cancellation request lands from a second store connection while
+        // the turn is starting — the effect is `running` by then.
+        let request_path = store_path.clone();
+        let request_instance = instance_id.clone();
+        let mut adapter = ScriptedAdapter::new(vec![Some(scripted_event(
+            NativeProviderEventKind::Started,
+            "scripted.started",
+        ))])
+        .with_on_start(Box::new(move || {
+            let mut store = SqliteStore::open(&request_path).expect("store reopens");
+            store
+                .request_effect_cancellation(EffectCancellationRequest {
+                    instance_id: &request_instance,
+                    effect_id: "tell",
+                    revision_id: None,
+                    reason: Some("test delegate cancellation"),
+                    requested_by: "test",
+                    causation_event_id: None,
+                    idempotency_key: Some("test-delegate-cancel"),
+                })
+                .expect("cancellation request records");
+        }))
+        .with_cancel(
+            scripted_event(NativeProviderEventKind::Diagnostic, "scripted.cancel_ack"),
+            scripted_event(NativeProviderEventKind::Cancelled, "scripted.cancelled"),
+        );
+        let request = NativeProviderTurnRequest {
+            provider_id: "scripted".to_owned(),
+            provider_kind: ProviderKind::Fixture,
+            surface: AdapterSurface::Fixture,
+            run_id: "run-tell".to_owned(),
+            effect_id: "tell".to_owned(),
+            agent: "worker".to_owned(),
+            profile: Some("repo-writer".to_owned()),
+            prompt_json: json!("go"),
+            workspace_policy: "read_only".to_owned(),
+            required_capabilities: Vec::new(),
+            cancellation_depth: CancellationDepth::NativeStop,
+            artifact_policy: "metadata".to_owned(),
+            credential_ref: None,
+            provider_options: std::collections::BTreeMap::new(),
+        };
+
+        kernel
+            .run_native_agent_turn(execution, request, &mut adapter, 8)
+            .expect("turn cancels");
+
+        // The delegate saw exactly one cancel at the authorized depth.
+        assert_eq!(adapter.cancellations, vec![CancellationDepth::NativeStop]);
+        let runs = kernel.store().list_runs(&instance_id).expect("runs list");
+        let run = runs.iter().find(|r| r.run_id == "run-tell").expect("run");
+        assert_eq!(run.status, "cancelled");
+        // The ack was recorded as a non-terminal diagnostic before the terminal.
+        let evidence = kernel
+            .store()
+            .list_evidence(&instance_id)
+            .expect("evidence lists");
+        assert!(
+            evidence
+                .iter()
+                .any(|row| row.metadata_json.contains("scripted.cancel_ack")),
+            "cancel ack recorded"
+        );
+        // Exactly one terminal lifecycle fact for the run.
+        let events = kernel
+            .store()
+            .list_events(&instance_id)
+            .expect("events list");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "agent.turn.cancelled")
+                .count(),
+            1
+        );
+        let _ = fs::remove_file(&store_path);
+    }
+
+    #[test]
+    fn protocol_violations_record_as_evidence_not_lifecycle_events() {
+        // DR-0035 Decision 3 (T1/T3): adapter-surfaced `whip.protocol.*` frames
+        // and frames arriving after the run's terminal both land as
+        // `agent.turn.protocol_violation` evidence — never as lifecycle events,
+        // and they never reopen the run.
+        let (mut kernel, instance_id) = start_running_agent_turn_without_evidence();
+        let execution = AgentTurnExecution {
+            instance_id: &instance_id,
+            effect_id: "tell",
+            run_id: "run-tell",
+            provider: "codex",
+            worker_id: "worker-1",
+            lease_id: "lease-tell",
+            lease_expires_at: "2030-01-01T00:00:00Z",
+            agent: "worker",
+            profile: Some("repo-writer"),
+            input_json: r#"{"prompt":"go"}"#,
+            skill_names: &[],
+        };
+        let frame = |event_type: &str, kind: NativeProviderEventKind| NativeProviderEvent {
+            provider_id: "codex".to_owned(),
+            run_id: "run-tell".to_owned(),
+            event_kind: kind,
+            provider_event_type: event_type.to_owned(),
+            provider_session_id: None,
+            provider_turn_id: None,
+            sequence: None,
+            evidence: json!({"violation": {"frame_type": "item/started", "frame_run_id": "run-other"}}),
+            artifacts: Vec::new(),
+        };
+
+        // While running: an adapter-surfaced misrouted frame is a violation.
+        kernel
+            .record_native_provider_event(
+                execution,
+                &frame(
+                    "whip.protocol.misrouted_frame",
+                    NativeProviderEventKind::Diagnostic,
+                ),
+                "violation-0",
+            )
+            .expect("adapter-surfaced violation records");
+
+        // Terminate the run (recovery resolves it to the uncertain terminal).
+        kernel
+            .recover_running_provider_runs(&instance_id)
+            .expect("recovery resolves the run");
+        let events_at_terminal = kernel
+            .store()
+            .list_events(&instance_id)
+            .expect("events list")
+            .len();
+
+        // Post-terminal: even an ordinary stream frame is a violation now.
+        kernel
+            .record_native_provider_event(
+                execution,
+                &frame("item/started", NativeProviderEventKind::Streamed),
+                "violation-1",
+            )
+            .expect("post-terminal violation records");
+
+        let evidence = kernel
+            .store()
+            .list_evidence(&instance_id)
+            .expect("evidence lists");
+        let violations = evidence
+            .iter()
+            .filter(|row| row.kind == "agent.turn.protocol_violation")
+            .collect::<Vec<_>>();
+        assert_eq!(violations.len(), 2, "both frames land as violations");
+        let reasons = violations
+            .iter()
+            .map(|row| {
+                serde_json::from_str::<Value>(&row.metadata_json)
+                    .expect("violation metadata")
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .expect("reason present")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            reasons.contains(&"adapter_surfaced".to_owned()),
+            "{reasons:?}"
+        );
+        assert!(reasons.contains(&"post_terminal".to_owned()), "{reasons:?}");
+        // The adapter-constructed identifiers survive into the evidence.
+        assert!(
+            violations
+                .iter()
+                .any(|row| row.metadata_json.contains("run-other")),
+            "violation detail carries the stray frame's run id"
+        );
+        // Violations add no lifecycle events and the run stays terminal.
+        assert!(
+            !evidence
+                .iter()
+                .any(|row| row.kind == "agent.turn.native_event"),
+            "no lifecycle observation was appended for a violation"
+        );
+        let events_after = kernel
+            .store()
+            .list_events(&instance_id)
+            .expect("events list")
+            .len();
+        assert_eq!(
+            events_after, events_at_terminal,
+            "a post-terminal frame appends no events"
+        );
+        let runs = kernel.store().list_runs(&instance_id).expect("runs list");
+        let run = runs.iter().find(|r| r.run_id == "run-tell").expect("run");
+        assert_eq!(
+            run.status, "uncertain",
+            "the violation never reopens the run"
+        );
     }
 
     #[test]
@@ -7403,316 +8167,6 @@ rule wait
             .expect("failed coerce fact");
         assert!(failed_fact.value_json.contains("\"redacted\":true"));
         assert!(!failed_fact.value_json.contains("invalid output"));
-    }
-
-    #[test]
-    fn fake_loft_claim_records_evidence_and_success_fact() {
-        let store = SqliteStore::open_in_memory().expect("store opens");
-        let mut kernel = RuntimeKernel::new(store);
-        let version = kernel
-            .create_program_version(ProgramVersionInput {
-                program_name: "LoftClaim",
-                source_hash: "source",
-                ir_hash: "ir",
-                compiler_version: "test",
-            })
-            .expect("program version creates");
-        let instance_id = kernel
-            .create_instance(&version, "{}")
-            .expect("instance creates");
-        let effects = [NewEffect {
-            timeout_seconds: None,
-            effect_id: "claim",
-            kind: "loft.claim",
-            target: None,
-            input_json: r#"{"issue_id":"iss_abc"}"#,
-            status: "queued",
-            idempotency_key: "rule=start;effect=claim",
-            required_capabilities_json: r#"["loft.claim"]"#,
-            profile: Some("repo-writer"),
-            correlation_id: None,
-            source_span_json: None,
-        }];
-        kernel
-            .commit_rule(RuleCommit {
-                instance_id: &instance_id,
-                rule: "start",
-                trigger_event_id: None,
-                facts: &[],
-                consumed_fact_ids: &[],
-                effects: &effects,
-                dependencies: &[],
-                terminal: None,
-                idempotency_key: Some("commit-start"),
-            })
-            .expect("rule commits");
-
-        let request = LoftEffectRequest {
-            action: LoftAction::Claim,
-            issue_id: "iss_abc".to_owned(),
-            lease_id: None,
-            claim_ready: false,
-            issue_version: None,
-            actor: Some("agent-a".to_owned()),
-            lease_duration_seconds: Some(1800),
-            command_id: "cmd-claim".to_owned(),
-            note: None,
-            target_status: None,
-            evidence_json: None,
-            evidence_kind: None,
-            evidence_artifact: None,
-            evidence_data_path: None,
-            resource_intent_json: None,
-            release_after_failure: false,
-            expect_heads: vec!["evt_head".to_owned()],
-            metadata_json: "{}".to_owned(),
-        };
-        let terminal = kernel
-            .run_loft_effect(
-                LoftEffectExecution {
-                    instance_id: &instance_id,
-                    effect_id: "claim",
-                    run_id: "run-claim",
-                    provider: "fake-loft",
-                    worker_id: "worker-1",
-                    lease_id: "lease-whipplescript-claim",
-                    lease_expires_at: "2030-01-01T00:00:00Z",
-                    request: &request,
-                },
-                &FakeLoftClient::succeeds(
-                    r#"{"lease_id":"lea_abc","issue":{"id":"iss_abc","state_token":"b3:ok"},"expires_at":"2030-01-01T00:00:00Z"}"#,
-                ),
-            )
-            .expect("loft claim runs");
-
-        assert_eq!(terminal.sequence, 3);
-        check_trace(kernel.trace()).expect("kernel trace conforms");
-        let store = kernel.into_store();
-        let evidence = store.list_evidence(&instance_id).expect("evidence lists");
-        assert_eq!(evidence.len(), 2);
-        assert!(evidence
-            .iter()
-            .any(|evidence| evidence.kind == "loft.claim.provider"
-                && evidence.metadata_json.contains("cmd-claim")
-                && evidence.metadata_json.contains("evt_head")));
-        let facts = store.list_facts(&instance_id).expect("facts list");
-        assert!(
-            facts
-                .iter()
-                .any(|fact| fact.name == "loft.claim.succeeded"
-                    && fact.value_json.contains("lea_abc"))
-        );
-    }
-
-    #[test]
-    fn fake_loft_claim_failure_records_failed_fact() {
-        let store = SqliteStore::open_in_memory().expect("store opens");
-        let mut kernel = RuntimeKernel::new(store);
-        let version = kernel
-            .create_program_version(ProgramVersionInput {
-                program_name: "LoftClaimFail",
-                source_hash: "source",
-                ir_hash: "ir",
-                compiler_version: "test",
-            })
-            .expect("program version creates");
-        let instance_id = kernel
-            .create_instance(&version, "{}")
-            .expect("instance creates");
-        let effects = [NewEffect {
-            timeout_seconds: None,
-            effect_id: "claim",
-            kind: "loft.claim",
-            target: None,
-            input_json: r#"{"issue_id":"iss_abc"}"#,
-            status: "queued",
-            idempotency_key: "rule=start;effect=claim",
-            required_capabilities_json: r#"["loft.claim"]"#,
-            profile: Some("repo-writer"),
-            correlation_id: None,
-            source_span_json: None,
-        }];
-        kernel
-            .commit_rule(RuleCommit {
-                instance_id: &instance_id,
-                rule: "start",
-                trigger_event_id: None,
-                facts: &[],
-                consumed_fact_ids: &[],
-                effects: &effects,
-                dependencies: &[],
-                terminal: None,
-                idempotency_key: Some("commit-start"),
-            })
-            .expect("rule commits");
-
-        let request = LoftEffectRequest {
-            action: LoftAction::Claim,
-            issue_id: "iss_abc".to_owned(),
-            lease_id: None,
-            claim_ready: false,
-            issue_version: None,
-            actor: Some("agent-a".to_owned()),
-            lease_duration_seconds: None,
-            command_id: "cmd-claim".to_owned(),
-            note: None,
-            target_status: None,
-            evidence_json: None,
-            evidence_kind: None,
-            evidence_artifact: None,
-            evidence_data_path: None,
-            resource_intent_json: None,
-            release_after_failure: false,
-            expect_heads: Vec::new(),
-            metadata_json: "{}".to_owned(),
-        };
-        kernel
-            .run_loft_effect(
-                LoftEffectExecution {
-                    instance_id: &instance_id,
-                    effect_id: "claim",
-                    run_id: "run-claim",
-                    provider: "fake-loft",
-                    worker_id: "worker-1",
-                    lease_id: "lease-whipplescript-claim",
-                    lease_expires_at: "2030-01-01T00:00:00Z",
-                    request: &request,
-                },
-                &FakeLoftClient::fails("issue already leased"),
-            )
-            .expect("failed claim records terminal event");
-
-        assert!(kernel.trace().iter().any(|record| matches!(
-            &record.event,
-            TraceEvent::ProviderDiagnostic {
-                run_id,
-                effect_id,
-                provider,
-                status,
-                diagnostics_json,
-                ..
-            } if run_id == "run-claim"
-                && effect_id == "claim"
-                && provider == "fake-loft"
-                && *status == EffectStatus::Failed
-                && diagnostics_json.contains("\"redacted\":true")
-                && !diagnostics_json.contains("issue already leased")
-        )));
-        check_trace(kernel.trace()).expect("kernel trace conforms");
-        let store = kernel.into_store();
-        let diagnostics = store
-            .list_diagnostics(Some(&instance_id))
-            .expect("diagnostics list");
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code.as_deref(), Some("loft.claim.failed"));
-        assert_eq!(diagnostics[0].subject_id.as_deref(), Some("claim"));
-        assert_eq!(diagnostics[0].run_id.as_deref(), Some("run-claim"));
-        assert!(!diagnostics[0].message.contains("issue already leased"));
-
-        let facts = store.list_facts(&instance_id).expect("facts list");
-        let failed_fact = facts
-            .iter()
-            .find(|fact| fact.name == "loft.claim.failed")
-            .expect("failed loft fact");
-        assert!(failed_fact.value_json.contains("\"redacted\":true"));
-        assert!(!failed_fact.value_json.contains("issue already leased"));
-    }
-
-    #[test]
-    fn fake_loft_renew_records_evidence_and_success_fact() {
-        let store = SqliteStore::open_in_memory().expect("store opens");
-        let mut kernel = RuntimeKernel::new(store);
-        let version = kernel
-            .create_program_version(ProgramVersionInput {
-                program_name: "LoftRenew",
-                source_hash: "source",
-                ir_hash: "ir",
-                compiler_version: "test",
-            })
-            .expect("program version creates");
-        let instance_id = kernel
-            .create_instance(&version, "{}")
-            .expect("instance creates");
-        let effects = [NewEffect {
-            timeout_seconds: None,
-            effect_id: "renew",
-            kind: "loft.renew",
-            target: None,
-            input_json: r#"{"lease_id":"lea_abc"}"#,
-            status: "queued",
-            idempotency_key: "rule=maintain;effect=renew",
-            required_capabilities_json: r#"["loft.renew"]"#,
-            profile: Some("repo-writer"),
-            correlation_id: None,
-            source_span_json: None,
-        }];
-        kernel
-            .commit_rule(RuleCommit {
-                instance_id: &instance_id,
-                rule: "maintain",
-                trigger_event_id: None,
-                facts: &[],
-                consumed_fact_ids: &[],
-                effects: &effects,
-                dependencies: &[],
-                terminal: None,
-                idempotency_key: Some("commit-maintain"),
-            })
-            .expect("rule commits");
-
-        let request = LoftEffectRequest {
-            action: LoftAction::Renew,
-            issue_id: "iss_abc".to_owned(),
-            lease_id: Some("lea_abc".to_owned()),
-            claim_ready: false,
-            issue_version: None,
-            actor: None,
-            lease_duration_seconds: Some(1800),
-            command_id: "cmd-renew".to_owned(),
-            note: None,
-            target_status: None,
-            evidence_json: None,
-            evidence_kind: None,
-            evidence_artifact: None,
-            evidence_data_path: None,
-            resource_intent_json: None,
-            release_after_failure: false,
-            expect_heads: Vec::new(),
-            metadata_json: "{}".to_owned(),
-        };
-        let terminal = kernel
-            .run_loft_effect(
-                LoftEffectExecution {
-                    instance_id: &instance_id,
-                    effect_id: "renew",
-                    run_id: "run-renew",
-                    provider: "fake-loft",
-                    worker_id: "worker-1",
-                    lease_id: "lease-whipplescript-renew",
-                    lease_expires_at: "2030-01-01T00:00:00Z",
-                    request: &request,
-                },
-                &FakeLoftClient::succeeds(
-                    r#"{"lease_id":"lea_abc","expires_at":"2030-01-01T00:30:00Z"}"#,
-                ),
-            )
-            .expect("loft renew runs");
-
-        assert_eq!(terminal.sequence, 3);
-        check_trace(kernel.trace()).expect("kernel trace conforms");
-        let store = kernel.into_store();
-        let evidence = store.list_evidence(&instance_id).expect("evidence lists");
-        assert!(evidence
-            .iter()
-            .any(|evidence| evidence.kind == "loft.renew.provider"
-                && evidence.metadata_json.contains("cmd-renew")));
-        let facts = store.list_facts(&instance_id).expect("facts list");
-        assert!(
-            facts
-                .iter()
-                .any(|fact| fact.name == "loft.renew.succeeded"
-                    && fact.value_json.contains("lea_abc"))
-        );
     }
 
     #[test]

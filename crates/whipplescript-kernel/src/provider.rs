@@ -12,7 +12,6 @@ pub enum ProviderKind {
     Fixture,
     Command,
     SchemaCoerce,
-    Loft,
 }
 
 impl ProviderKind {
@@ -24,7 +23,6 @@ impl ProviderKind {
             Self::Fixture => "fixture",
             Self::Command => "command",
             Self::SchemaCoerce => "schema_coercer",
-            Self::Loft => "loft",
         }
     }
 
@@ -36,7 +34,6 @@ impl ProviderKind {
             "fixture" => Some(Self::Fixture),
             "command" => Some(Self::Command),
             "schema_coercer" => Some(Self::SchemaCoerce),
-            "loft" => Some(Self::Loft),
             _ => None,
         }
     }
@@ -51,7 +48,6 @@ pub enum AdapterSurface {
     Fixture,
     Command,
     CoerceHttp,
-    LoftCli,
 }
 
 impl AdapterSurface {
@@ -64,7 +60,6 @@ impl AdapterSurface {
             Self::Fixture => "fixture",
             Self::Command => "command",
             Self::CoerceHttp => "coerce_http",
-            Self::LoftCli => "loft_cli",
         }
     }
 
@@ -77,7 +72,6 @@ impl AdapterSurface {
             "fixture" => Some(Self::Fixture),
             "command" => Some(Self::Command),
             "coerce_http" => Some(Self::CoerceHttp),
-            "loft_cli" => Some(Self::LoftCli),
             _ => None,
         }
     }

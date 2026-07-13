@@ -2,11 +2,14 @@
 description "Inbound + outbound messaging: react to a channel message and reply on the same channel"
 workflow MessagingDemo
 
-# A `channel` is a named route through a messaging provider. Declaring one
-# auto-registers the built-in `std.messaging` contract (no `use`/lock needed);
-# `send via` and `when message from` name it. Under the fixture provider,
-# outbound `send` records a receipt and inbound messages are injected with
-# `whip message`.
+# `send via` is provided by the embedded `std.messaging` package: importing it
+# authorizes the construct with no package lock (the binary is its own supply
+# chain). Inbound `when message from` needs only the `channel` declaration.
+use std.messaging
+
+# A `channel` is a named route through a messaging provider; `send via` and
+# `when message from` name it. Under the fixture provider, outbound `send`
+# records a receipt and inbound messages are injected with `whip message`.
 channel ops_room {
   provider slack
   destination "#ops"

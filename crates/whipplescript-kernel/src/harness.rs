@@ -740,11 +740,50 @@ fn command_is_executable(path: &Path) -> bool {
 
 #[cfg_attr(not(unix), allow(unused_variables))]
 fn configure_child_process(command: &mut Command) {
+    strip_control_plane_secrets(command);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
 
         command.process_group(0);
+    }
+}
+
+/// whip's own control-plane secrets that a spawned provider process (the
+/// command harness or a stdio sidecar) must never inherit. These authorize
+/// the whole control plane / governance signing and are irrelevant to a
+/// provider child — leaking them into a process that runs an untrusted
+/// model's tool loop (or a PATH-hijacked binary) is a least-privilege
+/// violation. Provider API credentials (ANTHROPIC/OPENAI keys) are NOT
+/// stripped: a provider child may legitimately need them, and a malicious
+/// child would receive them over the protocol regardless. Extend this list
+/// when new control-plane secrets are introduced.
+pub(crate) const CONTROL_PLANE_SECRET_ENV: &[&str] = &[
+    "WHIP_CONTROL_TOKEN",
+    "WHIP_EXECUTOR_TOKEN",
+    "WHIPPLESCRIPT_GOV_ADMIN",
+];
+
+/// Remove whip's control-plane secrets from a child command's inherited
+/// environment. Applied to every provider subprocess spawn.
+pub(crate) fn strip_control_plane_secrets(command: &mut Command) {
+    strip_env_vars(command, CONTROL_PLANE_SECRET_ENV);
+}
+
+/// Provider API-credential env vars, grouped by family. A provider sidecar
+/// only needs its OWN family's credentials, so — least privilege — each spawn
+/// strips the OTHER families' keys: the Claude sidecar has no business seeing
+/// an OpenAI key, nor the codex app-server an Anthropic key. (The child's own
+/// family is left inherited; it may read it directly.)
+#[cfg(feature = "codex")]
+pub(crate) const ANTHROPIC_CREDENTIAL_ENV: &[&str] = &["ANTHROPIC_API_KEY"];
+#[cfg(feature = "claude")]
+pub(crate) const OPENAI_CREDENTIAL_ENV: &[&str] = &["OPENAI_API_KEY"];
+
+/// Remove the named env vars from a child command's inherited environment.
+pub(crate) fn strip_env_vars(command: &mut Command, names: &[&str]) {
+    for name in names {
+        command.env_remove(name);
     }
 }
 
@@ -851,6 +890,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn strip_control_plane_secrets_removes_whip_secrets_but_keeps_others() {
+        // A control-plane secret and an unrelated WHIP_-prefixed var both live
+        // in this process's environment.
+        std::env::set_var("WHIPPLESCRIPT_GOV_ADMIN", "1");
+        std::env::set_var("WHIP_KEEP_PROBE_ENVVAR", "retained");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo GOV=${WHIPPLESCRIPT_GOV_ADMIN:-absent} KEEP=${WHIP_KEEP_PROBE_ENVVAR:-absent}")
+            .stdout(Stdio::piped());
+        strip_control_plane_secrets(&mut command);
+        let output = command.output().expect("child runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // The secret is not inherited; an unrelated var (prefix match would be
+        // wrong — the count vars WHIPPLESCRIPT_*_MAX_TOKEN must survive) is.
+        assert!(
+            stdout.contains("GOV=absent"),
+            "gov-admin secret must be stripped: {stdout}"
+        );
+        assert!(
+            stdout.contains("KEEP=retained"),
+            "unrelated env must still be inherited: {stdout}"
+        );
+        std::env::remove_var("WHIPPLESCRIPT_GOV_ADMIN");
+        std::env::remove_var("WHIP_KEEP_PROBE_ENVVAR");
+    }
+
+    #[test]
+    fn strip_env_vars_removes_only_named_keys() {
+        // Per-provider scoping: a spawn strips the OTHER family's key while
+        // leaving unrelated env intact. Uses test-unique names (race-safe).
+        std::env::set_var("WHIP_PROBE_FOREIGN_KEY", "foreign");
+        std::env::set_var("WHIP_PROBE_OWN_KEY", "own");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo FOREIGN=${WHIP_PROBE_FOREIGN_KEY:-absent} OWN=${WHIP_PROBE_OWN_KEY:-absent}")
+            .stdout(Stdio::piped());
+        strip_env_vars(&mut command, &["WHIP_PROBE_FOREIGN_KEY"]);
+        let output = command.output().expect("child runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("FOREIGN=absent"),
+            "the named key must be stripped: {stdout}"
+        );
+        assert!(
+            stdout.contains("OWN=own"),
+            "an unnamed key must be retained: {stdout}"
+        );
+        std::env::remove_var("WHIP_PROBE_FOREIGN_KEY");
+        std::env::remove_var("WHIP_PROBE_OWN_KEY");
+    }
+
+    #[test]
     fn command_harness_sends_request_to_stdin_and_captures_output() {
         let harness = CommandAgentHarness::new(
             CommandLaunchPlan::new("fixture", "sh")
@@ -865,7 +958,7 @@ mod tests {
             agent: "worker".to_owned(),
             profile: Some("repo-writer".to_owned()),
             input_json: r#"{"prompt":"go"}"#.to_owned(),
-            skill_names: vec!["loft-user".to_owned()],
+            skill_names: vec!["repo-user".to_owned()],
         });
 
         assert_eq!(result.status, ProviderRunStatus::Completed);
