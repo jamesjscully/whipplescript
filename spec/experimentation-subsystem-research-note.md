@@ -1033,18 +1033,50 @@ hat; only confidentiality was the gap.
 **The proposer is the hard residual — owned by the improve note** ("The
 proposer"): improve makes the program a derived artifact of the data, and
 the response is stratified by threat model (statistical control
-in-workspace, hard checks at source-egress doors). Policy tiers there are
-**deliberately open**.
+in-workspace, hard checks at source-egress doors). Policy tiers there
+were **settled 2026-07-11** (reader-set-delta keying; campaign-attached
+`proposer redacted`; cleared providers reclassified as reader-side
+machinery; no v1 budget, trigger observable).
 
-**Registered undesigned door: cross-workspace evidence sharing.** §13's
+**The cross-workspace evidence door — constitution SETTLED 2026-07-11
+(Jack); build deferred until packages-with-gauges are real.** §13's
 staggered-adoption payoff ("v2.1 improved gauges across 14 adopters") is
-the corpus's only flow where evidence *leaves* a workspace, promised by a
-product bullet and designed by nobody. Predictable shape: per-workspace
-opt-in; aggregate-only under aggregator signatures (never rows or
-traces); a k-adopters threshold so the author never sees one adopter's
-numbers; and a rendezvous service that is naturally *hosted* — open-core
-seam territory. Registered here; designed when packages-with-gauges
-become real.
+the corpus's only flow where evidence *leaves* a workspace. What makes it
+worth a door at all (vs. generic telemetry, which was considered and
+would dissolve the promise): gauge evidence is *poolable* — the package
+version (treatment) and the gauge declaration + judge (instrument) are
+content-hash-identical across adopters, which is exactly what licenses a
+pooled causal estimate; and it is *content-derived* — a gauge score is a
+judge's verdict over the adopter's confidential payloads, so this is
+evidence-plane egress to a third party, never mechanics telemetry. The
+five ground rules everything interim must stay compatible with:
+
+1. **Aggregates only, under aggregator flow signatures** — estimate + N +
+   honesty tags per (published package version, gauge); never rows,
+   traces, scenario refs, or derefable hashes. The rendezvous key is the
+   package's *published* version identity, not interior slice hashes
+   (hash equality is a one-bit covert channel). Differential privacy
+   stays the recorded horizon.
+2. **Consent is a grant** in the §9 idiom: per-workspace, per-package,
+   named-gauge-set, hard expiry, revocable, listed in the guarantee
+   report — never a global toggle or an export config.
+3. **k-adopters threshold, subtraction-safe**: the author sees a pooled
+   cell only at ≥ k contributors (floor 3, default 5), and the threshold
+   applies to every query shape *including differences between pools* —
+   a difference query is refused when the symmetric difference of the
+   contributor sets is below k, because subtraction is the first thing a
+   curious author tries, not an exotic attack.
+4. **Tag hygiene crosses the door**: `fixture-provider` evidence is
+   excluded from pools outright; `unheld-out` / `redacted-view` pool but
+   the pooled estimate carries the tag mix ("14 adopters, 3 unheld-out").
+5. **The rendezvous is hosted, behind the open-core seam** (engine and
+   local ledger stay core). Reciprocity is give-to-get: contributors see
+   the pools they contribute to; authors always see their packages'
+   pools.
+
+Deferred to the build (when adopter bases exist): wire protocol,
+contribution signing/attestation, DP calibration, and whether scenario
+counts (vs. estimates) may cross for the author's τ-priors.
 
 ## 19. Non-goals
 
@@ -1094,10 +1126,12 @@ become real.
   membrane, the no-new-readers rule for judges, pooling shape
   (pool-internally / view-per-reader with honest deficit), redaction via
   the shipped construct + `redacted-view` tag, the cross-workspace
-  evidence door registered. Residual opens: **proposer leakage policy
-  tiers** (deliberately open — improve note, "The proposer"); grant
-  syntax/home for reader-set extensions (ADR detail); the
-  purpose-granularity refinement (noted, undesigned).
+  evidence door's constitution SETTLED 2026-07-11 (five ground rules,
+  §18.2; build deferred to packages-with-gauges). Residual opens:
+  **proposer leakage policy tiers** (SETTLED 2026-07-11 — improve note,
+  "The proposer": reader-set-delta tiers, campaign-attached `proposer
+  redacted`, built); grant syntax/home for reader-set extensions (ADR
+  detail); the purpose-granularity refinement (noted, undesigned).
 - The edit-type taxonomy for lineage priors: seeding, and keeping learned τ
   honest with few observations per type (mitigated by §13.2's retrospective
   training).

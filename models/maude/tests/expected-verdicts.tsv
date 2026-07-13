@@ -36,7 +36,8 @@ guard-commit-bite.maude	NNSS
 harness-class.maude	SSNN
 harness-evidence-fork.maude	SSNN
 improve-acceptance.maude	SNNNNSSS
-improve-holdout.maude	NSSSNSS
+improve-holdout.maude	NSSNSNSS
+improve-precedent.maude	NSNNSSN
 infoflow-carriage.maude	SSNN
 infoflow-composition.maude	SSSSSSSSSNNNNNNNNN
 infoflow-confidentiality.maude	SSSSNNNN

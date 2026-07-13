@@ -22,10 +22,10 @@ posture, canary = RCT.
 - [ ] ⚑ **Does improve/evals build into 0.4, or does 0.4 re-cut as the
       version-control release with improve/evals as 0.5's banner?**
       *(Update 2026-07-11: the improve/evals v1 build LANDED — DR-0037,
-      build items below — which weakens the "cannot start immediately"
-      arm of the against-case; the four design passes remain open but v1
-      deferred each on settled conservative ground. The decision is still
-      Jack's: ship v1 in 0.4, or hold it for 0.5 with the design passes.)*
+      build items below — AND all four design passes CLOSED with Jack the
+      same day, which retires the against-case's "cannot start
+      immediately" arm entirely. The decision is still Jack's: ship v1 in
+      0.4, or hold it for 0.5.)*
 
       *Analysis (2026-07-10; decision is Jack's):*
 
@@ -54,15 +54,50 @@ posture, canary = RCT.
 ## Build items (v1 built 2026-07-11 on settled ground only — DR-0037; the
 ## four Jack-held passes stay open and v1 deferred each conservatively)
 
-- [~] The four open design passes with Jack (discussion-first; each
-      closes into the design notes). **Campaign scope SETTLED 2026-07-11**
+- [x] The four open design passes with Jack (discussion-first; each
+      closed into the design notes 2026-07-11). **Campaign scope SETTLED 2026-07-11**
       (improve note §3: gauge-layer partition refinements, complement
       auto-guarded; case-feature predicates + pin-time tag rung; grant
       grammar shares the predicate form only; campaign target decoupled).
-      Remaining three: proposer leakage tiers; the utility model; the
-      cross-workspace evidence door. (v1 postures until each settles:
-      propose-don't-apply + review door only; always ask on tradeoffs;
-      single-workspace.)
+      **Proposer leakage tiers SETTLED + BUILT 2026-07-11** (improve note
+      §7: reader-set-delta keying; campaign-attached `proposer redacted`
+      clause + `--redacted-view` flag, tighten-only; `leakage-overlap`
+      verbatim-fragment flag on cards; `redactedReflect` invariant added
+      to improve-holdout.maude; cleared providers = reader-side machinery;
+      no v1 budget, trigger observable via adoption counts). **Local
+      utility model SETTLED 2026-07-11** (improve note §12: precedent set
+      in the campaign record; monotone Pareto-dominance auto-resolution ON
+      BY DEFAULT, locality-bounded, precedent-citing, revocable;
+      direction-vector posterior optional and authority-free — EVSI ask
+      pricing only; cold start = empty set, so the v1 always-ask build is
+      already conformant). **Cross-workspace evidence door constitution
+      SETTLED 2026-07-11** (research note §18.2: five ground rules —
+      aggregates-only under signatures keyed by published version
+      identity; consent = per-workspace/package/gauge grant; k-threshold
+      subtraction-safe, floor 3 default 5; tag hygiene crosses,
+      fixture-provider excluded; hosted rendezvous behind the open-core
+      seam, give-to-get — build deferred until packages-with-gauges are
+      real). **ALL FOUR PASSES CLOSED.**
+- [x] Build: the tradeoff answer surface + precedent engine — BUILT
+      2026-07-13. `whip answer <c>:<k> --accept|--reject|--revoke [--by]`
+      (tradeoffs only; double-answer refused until revoked; accept makes
+      the candidate adoptable — adopt gate extended); precedents =
+      `preference.answered`/`preference.revoked` events in the campaign
+      record, folded workspace-wide (`ImproveStore::list_events_of_type`);
+      auto-resolution at verdict time by monotone Pareto dominance,
+      default-on, locality-bounded to the answer-time band neighborhood,
+      gauge-set-exact, conflict-asks, citing the precedent on the card
+      (`auto-resolved:precedent` / `auto-rejected:precedent`); cards carry
+      per-gauge `direction` so precedents are self-contained. Modeled
+      first: `models/maude/improve-precedent.maude` (naive interpolating
+      resolver as the bite; revoked/stale precedents grant nothing;
+      reject dual). Evidence: engine unit tests
+      (`precedent_dominance_grants_and_refuses` + siblings), e2e
+      `answered_tradeoff_becomes_precedent_and_auto_resolves`.
+- [ ] Precedent residuals: the standing-contradiction reopener (needs the
+      parent surface's evidence flags — lands with `settle`/`evidence`);
+      the optional EVSI ask-pricer (deferred until ask volume justifies
+      it).
 - [x] ADR for the `gauge`/`campaign` surface — DR-0037 (accepted + built
       2026-07-11; `mark` deliberately excluded from v1, below). Word-form
       bars (`at least`/`at most`, `within N percent`) close the

@@ -38,6 +38,8 @@ mod WHIPPLESCRIPT-IMPROVE-HOLDOUT is
 
   op reflect : -> Cfg [ctor] .      --- sound reflection pass
   op naiveReflect : -> Cfg [ctor] . --- naive reflection pass (hazard)
+  op redactedReflect : -> Cfg [ctor] . --- campaign-attached redacted view:
+                                    --- aggregates only, NO scenario reads
   op gate : -> Cfg [ctor] .         --- one pending promotion gate
   op gated : -> Cfg [ctor] .        --- promotion gate scored
   op anchor : -> Cfg [ctor] .       --- one anchor ask routed at a sealed scenario
@@ -61,6 +63,11 @@ mod WHIPPLESCRIPT-IMPROVE-HOLDOUT is
   rl [naive-reflect-sealed] :
       naiveReflect wants(S) sealed(S, K)
       => naiveReflect sealed(S, K) readByProposer(S) .
+
+  --- Campaign-attached redacted view, settled 2026-07-11: there is NO
+  --- rule handing ANY scenario -- open or sealed -- to the proposer under
+  --- redactedReflect. The proposer works from aggregates alone; that
+  --- absence is the whole policy.
 
   --- A promotion gate scores against a sealed scenario and wears it.
   crl [gate-sealed] :

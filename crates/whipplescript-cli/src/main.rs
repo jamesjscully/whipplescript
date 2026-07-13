@@ -214,6 +214,7 @@ fn main() -> ExitCode {
         Some("campaigns") => improve::campaigns_command(&options),
         Some("campaign") => improve::campaign_detail_command(&options),
         Some("adopt") => improve::adopt_command(&options),
+        Some("answer") => improve::answer_command(&options),
         Some("pin") => improve::pin_command(&options),
         Some("gauges") => improve::gauges_command(&options),
         Some("diagnostics") => diagnostics(&options),
@@ -628,7 +629,7 @@ fn print_usage() {
         "          artifacts, inbox, signal, issue, leases, ledger, counters, evidence, diagnostics, trace"
     );
     println!("          otel-export, pause, resume, cancel, checkpoint, restore, fork, retry, recover, doctor, deploy");
-    println!("          improve, campaigns, campaign, adopt, pin, gauges");
+    println!("          improve, campaigns, campaign, adopt, answer, pin, gauges");
     println!("run `whip <command> --help` or `whip help <command>` for command usage");
 }
 
@@ -636,10 +637,11 @@ fn command_usage(command: &str) -> Option<&'static str> {
     Some(match command {
         "check" => "usage: whip check [--model-search] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--package-lock <path>] <workflow.whip>...",
         "lint" => "usage: whip [--json] lint [--root <workflow>] <workflow.whip>",
-        "improve" => "usage: whip [--json] improve [<gauge>[><=<target>] ... [then ...] | <campaign>] [--program <workflow.whip>] [--sacrifice <gauge>] [--within <gauge>=<band>%] [--spend-cap $<n>] [--proposer fixture|native] [--provider <name>]\n  bare `whip improve` = repair mode (restore violated bars, touch nothing else)",
+        "improve" => "usage: whip [--json] improve [<gauge>[><=<target>] ... [then ...] | <campaign>] [--program <workflow.whip>] [--sacrifice <gauge>] [--within <gauge>=<band>%] [--spend-cap $<n>] [--proposer fixture|native] [--provider <name>] [--redacted-view]\n  bare `whip improve` = repair mode (restore violated bars, touch nothing else)",
         "campaigns" => "usage: whip [--json] campaigns",
         "campaign" => "usage: whip [--json] campaign <id>",
         "adopt" => "usage: whip [--json] adopt <campaign>:<candidate> [--program <workflow.whip>]",
+        "answer" => "usage: whip [--json] answer <campaign>:<candidate> --accept|--reject|--revoke [--by <who>]\n  answers a surfaced tradeoff; the answer is a precedent that auto-resolves future tradeoffs it Pareto-dominates",
         "pin" => "usage: whip [--json] pin <instance> --as <name>",
         "gauges" => "usage: whip [--json] gauges [<gauge>]",
         "lsp" => "usage: whip lsp   (Language Server over stdio; launched by an editor)",

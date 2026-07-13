@@ -202,6 +202,10 @@ improve-holdout.maude            holdout sealing: the proposer never reads seale
                                  scenarios; kmax promotion gates wear a seal out with
                                  ambient refresh; anchor asks retire seals honestly;
                                  below the floor the gate passes tagged unheld-out
+improve-precedent.maude          tradeoff precedent authority: auto-resolution only by
+                                 monotone dominance over an applicable un-revoked
+                                 answered precedent (accept and reject duals); the
+                                 naive interpolating resolver demonstrates the hazard
 ```
 
 The shell script runs every Maude test file and checks the expected number of

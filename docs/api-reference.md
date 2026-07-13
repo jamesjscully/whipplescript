@@ -1106,6 +1106,7 @@ deterministic judges (exec + builtins).
 whip [--json] improve [<gauge>[>=<target>] ... [then ...] | <campaign>]
      [--program <workflow.whip>] [--sacrifice <gauge>] [--within <gauge>=<band>%]
      [--spend-cap $<n>] [--proposer fixture|native] [--provider <name>]
+     [--redacted-view]
 ```
 
 Runs an improvement campaign. The partition is expressed by which gauges
@@ -1121,7 +1122,12 @@ evaluate → dominance verdict → sealed promotion gate. A candidate is
 proposed only if it improves an ascend gauge, regresses nothing guarded,
 and meets every bar; a genuine tradeoff is surfaced as a decision, never
 auto-accepted. The proposer never sees sealed scenario contents
-(aggregates only). Terminal state is an evidence card per candidate —
+(aggregates only); `--redacted-view` (or a declared `proposer redacted`
+clause) extends that to ALL scenario content — the campaign's evidence is
+tagged `proposer:redacted-view`. Every candidate is checked for verbatim
+scenario-payload fragments newly present in its source; matches tag the
+card `leakage-overlap` (a flag, never a block — adoption remains the
+audited human act). Terminal state is an evidence card per candidate —
 propose, don't apply.
 
 ### `campaigns` / `campaign`
@@ -1140,9 +1146,28 @@ stood, sealing, adoption decisions — program archaeology's data.
 whip [--json] adopt <campaign>:<candidate> [--program <workflow.whip>]
 ```
 
-Writes a proposed candidate's source into the program — the explicit human
-adoption act. Refuses honestly if the program changed since the campaign
-evaluated its baseline.
+Writes a candidate's source into the program — the explicit human adoption
+act. Reserved for candidates the campaign proposed, or tradeoffs accepted
+via `whip answer`. Refuses honestly if the program changed since the
+campaign evaluated its baseline.
+
+### `answer`
+
+```
+whip [--json] answer <campaign>:<candidate> --accept|--reject|--revoke [--by <who>]
+```
+
+Answers a surfaced tradeoff (only `candidate.tradeoff` decisions are
+answerable). The answer is a **precedent** — a recorded speech act that
+makes an accepted candidate adoptable and, by default, auto-resolves
+future tradeoffs by *monotone precedent dominance*: a new tradeoff at
+least as good on every gauge as an accepted precedent auto-accepts; one at
+most as good as a rejected precedent everywhere auto-rejects; anything
+between — or covered by conflicting precedents, or outside the answer-time
+operating point's band neighborhood — asks. Every auto-resolution cites
+its precedent on the evidence card (`auto-resolved:precedent` /
+`auto-rejected:precedent` tags). `--revoke` withdraws the answer and with
+it all authority it granted.
 
 ## Credentials
 

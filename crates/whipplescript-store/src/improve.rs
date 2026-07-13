@@ -525,6 +525,26 @@ impl ImproveStore {
         Ok(rows)
     }
 
+    /// All events of one type across every campaign, in append order —
+    /// the workspace-wide precedent lookup (`preference.answered` /
+    /// `preference.revoked` events live in campaign records but carry
+    /// authority across campaigns).
+    pub fn list_events_of_type(&self, event_type: &str) -> StoreResult<Vec<CampaignEventRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT campaign_id, seq, event_type, payload_json, created_at
+                 FROM campaign_events WHERE event_type = ?1 ORDER BY campaign_id, seq",
+            )
+            .map_err(StoreError::from)?;
+        let rows = statement
+            .query_map(params![event_type], campaign_event_from_row)
+            .map_err(StoreError::from)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(rows)
+    }
+
     /// Fold every campaign's event log into a head-line summary.
     pub fn list_campaigns(&self) -> StoreResult<Vec<CampaignSummary>> {
         // The fold reads payloads only for `campaign.opened` (the spec) and

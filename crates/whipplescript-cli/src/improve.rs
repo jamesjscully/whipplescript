@@ -211,6 +211,10 @@ struct CampaignSpec {
     /// Band overrides in percent of the baseline operating point.
     within_percent: BTreeMap<String, f64>,
     spend_cap_micros: Option<i64>,
+    /// Campaign-attached stratified reflection (leakage policy, improve
+    /// note §7, settled 2026-07-11): the proposer sees aggregates only —
+    /// never scenario names, inputs, traces, or judge rationales.
+    redacted_view: bool,
     /// Repair mode: restore violated bars, touch nothing else.
     repair: bool,
     /// `Some(name)` when adopted from a declared `campaign` block.
@@ -232,6 +236,7 @@ impl CampaignSpec {
             "sacrifice": self.sacrifice,
             "within_percent": self.within_percent,
             "spend_cap_micros": self.spend_cap_micros,
+            "redacted_view": self.redacted_view,
             "repair": self.repair,
             "declared": self.declared,
         })
@@ -338,6 +343,9 @@ fn parse_improve_args(
                     args.get(index).ok_or("--spend-cap requires an amount")?,
                 )?);
             }
+            "--redacted-view" => {
+                spec.redacted_view = true;
+            }
             "--proposer" => {
                 index += 1;
                 proposer = args
@@ -397,6 +405,9 @@ fn parse_improve_args(
         adopted.sacrifice.extend(spec.sacrifice);
         adopted.within_percent.extend(spec.within_percent);
         adopted.spend_cap_micros = spec.spend_cap_micros.or(adopted.spend_cap_micros);
+        // A CLI flag may TIGHTEN a declared campaign to redacted view,
+        // never loosen a declared `proposer redacted`.
+        adopted.redacted_view |= spec.redacted_view;
         spec = adopted;
     } else {
         let mut stages_iter = stages.into_iter().filter(|stage| !stage.is_empty());
@@ -459,6 +470,7 @@ fn declared_campaign_specs(ir: &IrProgram) -> Result<Vec<(String, CampaignSpec)>
                 spec.within_percent.insert(guard.gauge.clone(), percent);
             }
             spec.sacrifice = campaign.sacrifice.clone();
+            spec.redacted_view = campaign.proposer_redacted;
             Ok((campaign.name.clone(), spec))
         })
         .collect()
@@ -928,6 +940,53 @@ fn run_prompt_judge(
     Ok(reading)
 }
 
+/// The v1 MI lower bound at the review surface (leakage policy, improve
+/// note §7): verbatim scenario-payload fragments appearing in the proposed
+/// source but NOT in the baseline. A flag, never a block — adoption stays
+/// the audited declassification act.
+fn leakage_overlap(
+    candidate_source: &str,
+    baseline_source: &str,
+    scenarios: &[&ScenarioRow],
+) -> Vec<String> {
+    fn payload_strings(value: &Value, into: &mut Vec<String>) {
+        match value {
+            Value::String(text) => {
+                let trimmed = text.trim();
+                if trimmed.len() >= 12 {
+                    into.push(trimmed.to_owned());
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    payload_strings(item, into);
+                }
+            }
+            Value::Object(fields) => {
+                for item in fields.values() {
+                    payload_strings(item, into);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut fragments = Vec::new();
+    for scenario in scenarios {
+        if let Ok(input) = serde_json::from_str::<Value>(&scenario.input_json) {
+            payload_strings(&input, &mut fragments);
+        }
+    }
+    fragments.sort();
+    fragments.dedup();
+    fragments
+        .into_iter()
+        .filter(|fragment| {
+            candidate_source.contains(fragment.as_str())
+                && !baseline_source.contains(fragment.as_str())
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Evaluation: run a program over scenarios in disposable stores
 // ---------------------------------------------------------------------------
@@ -1177,6 +1236,9 @@ struct GaugeVerdictLine {
     band: f64,
     bar_met: Option<bool>,
     reach_met: Option<bool>,
+    /// The gauge's better-direction, carried onto the card so answered
+    /// tradeoffs are self-contained precedents.
+    direction_up: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1308,6 +1370,7 @@ fn dominance_verdict(
             band,
             bar_met: bar_status,
             reach_met,
+            direction_up: spec.direction_up,
         });
     }
     // Repair mode: proposable iff a bar the BASELINE violated is restored
@@ -1324,6 +1387,193 @@ fn dominance_verdict(
         proposable,
         tradeoff,
         reasons,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tradeoff precedents (the local utility model, settled 2026-07-11)
+// ---------------------------------------------------------------------------
+
+/// One gauge's record inside an answered-tradeoff precedent.
+#[derive(Clone, Debug)]
+struct PrecedentGauge {
+    baseline: f64,
+    candidate: f64,
+    band: f64,
+    direction_up: bool,
+}
+
+impl PrecedentGauge {
+    fn adjusted_delta(&self) -> f64 {
+        if self.direction_up {
+            self.candidate - self.baseline
+        } else {
+            self.baseline - self.candidate
+        }
+    }
+}
+
+/// An answered tradeoff: a human speech act carried in the campaign
+/// record, the only source of auto-resolution authority
+/// (`improve-precedent.maude`).
+#[derive(Clone, Debug)]
+struct Precedent {
+    campaign: String,
+    candidate: String,
+    accepted: bool,
+    answered_at: String,
+    gauges: BTreeMap<String, PrecedentGauge>,
+}
+
+impl Precedent {
+    fn citation(&self) -> String {
+        format!(
+            "{}:{} ({} {})",
+            self.campaign,
+            self.candidate,
+            if self.accepted {
+                "accepted"
+            } else {
+                "rejected"
+            },
+            self.answered_at
+        )
+    }
+}
+
+/// Workspace-wide precedent fold: latest answer per (campaign, candidate)
+/// wins; a revocation removes it entirely.
+fn load_precedents(store: &ImproveStore) -> Result<Vec<Precedent>, String> {
+    let answered = store
+        .list_events_of_type("preference.answered")
+        .map_err(|error| format!("failed to load precedents: {error:?}"))?;
+    let revoked = store
+        .list_events_of_type("preference.revoked")
+        .map_err(|error| format!("failed to load revocations: {error:?}"))?;
+    let mut by_key: BTreeMap<(String, String), Precedent> = BTreeMap::new();
+    for event in answered {
+        let Some(candidate) = event.payload["candidate"].as_str() else {
+            continue;
+        };
+        let mut gauges = BTreeMap::new();
+        for line in event.payload["gauges"].as_array().into_iter().flatten() {
+            let (Some(gauge), Some(baseline), Some(cand), Some(band)) = (
+                line["gauge"].as_str(),
+                line["baseline"].as_f64(),
+                line["candidate"].as_f64(),
+                line["band"].as_f64(),
+            ) else {
+                continue;
+            };
+            gauges.insert(
+                gauge.to_owned(),
+                PrecedentGauge {
+                    baseline,
+                    candidate: cand,
+                    band,
+                    direction_up: line["direction"].as_str() != Some("down"),
+                },
+            );
+        }
+        by_key.insert(
+            (event.campaign_id.clone(), candidate.to_owned()),
+            Precedent {
+                campaign: event.campaign_id.clone(),
+                candidate: candidate.to_owned(),
+                accepted: event.payload["verdict"].as_str() == Some("accepted"),
+                answered_at: event.created_at.clone(),
+                gauges,
+            },
+        );
+    }
+    for event in revoked {
+        if let Some(candidate) = event.payload["candidate"].as_str() {
+            by_key.remove(&(event.campaign_id.clone(), candidate.to_owned()));
+        }
+    }
+    Ok(by_key.into_values().collect())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PrecedentResolution {
+    AutoAccept(String),
+    AutoReject(String),
+}
+
+/// A precedent applies only while the current baseline sits within its
+/// answer-time band neighborhood on EVERY shared gauge, and only when the
+/// gauge sets line up exactly — a tradeoff over gauges the precedent never
+/// covered is a new decision. Fail closed on anything unmeasured.
+fn precedent_applies(precedent: &Precedent, lines: &[GaugeVerdictLine]) -> bool {
+    let comparable: Vec<&GaugeVerdictLine> = lines
+        .iter()
+        .filter(|line| line.role != "sacrifice")
+        .collect();
+    if comparable.len() != precedent.gauges.len() {
+        return false;
+    }
+    comparable.iter().all(|line| {
+        let Some(prec) = precedent.gauges.get(&line.gauge) else {
+            return false;
+        };
+        let Some(baseline) = line.baseline else {
+            return false;
+        };
+        line.candidate.is_some()
+            && line.direction_up == prec.direction_up
+            && (baseline - prec.baseline).abs() <= prec.band
+    })
+}
+
+fn line_adjusted_delta(line: &GaugeVerdictLine) -> Option<f64> {
+    let (baseline, candidate) = (line.baseline?, line.candidate?);
+    Some(if line.direction_up {
+        candidate - baseline
+    } else {
+        baseline - candidate
+    })
+}
+
+/// Monotone precedent dominance — the ONLY auto-resolution authority
+/// (default-on): auto-accept iff the candidate is at least an accepted
+/// precedent's adjusted delta on every gauge; auto-reject iff at most a
+/// rejected precedent's on every gauge; a conflict (both apply) asks.
+fn precedent_resolution(
+    precedents: &[Precedent],
+    lines: &[GaugeVerdictLine],
+) -> Option<PrecedentResolution> {
+    const EPS: f64 = 1e-9;
+    let dominance = |precedent: &Precedent, accept_side: bool| -> bool {
+        lines
+            .iter()
+            .filter(|line| line.role != "sacrifice")
+            .all(|line| {
+                let (Some(delta), Some(prec)) =
+                    (line_adjusted_delta(line), precedent.gauges.get(&line.gauge))
+                else {
+                    return false;
+                };
+                if accept_side {
+                    delta >= prec.adjusted_delta() - EPS
+                } else {
+                    delta <= prec.adjusted_delta() + EPS
+                }
+            })
+    };
+    let accept = precedents
+        .iter()
+        .filter(|precedent| precedent.accepted && precedent_applies(precedent, lines))
+        .find(|precedent| dominance(precedent, true));
+    let reject = precedents
+        .iter()
+        .filter(|precedent| !precedent.accepted && precedent_applies(precedent, lines))
+        .find(|precedent| dominance(precedent, false));
+    match (accept, reject) {
+        // Inconsistent precedents: no authority, ask.
+        (Some(_), Some(_)) => None,
+        (Some(precedent), None) => Some(PrecedentResolution::AutoAccept(precedent.citation())),
+        (None, Some(precedent)) => Some(PrecedentResolution::AutoReject(precedent.citation())),
+        (None, None) => None,
     }
 }
 
@@ -1515,24 +1765,46 @@ fn build_reflection(
         }
         reflection.push_str(&sealed_line);
     }
-    reflection.push_str("\n## Worst open scenarios\n");
-    for observation in baseline_open {
-        let failing: Vec<&str> = observation
-            .readings
-            .iter()
-            .filter(|(_, reading)| reading.passed == Some(false))
-            .map(|(gauge, _)| gauge.as_str())
-            .collect();
-        if let (Some(scenario), false) = (&observation.scenario, failing.is_empty()) {
-            reflection.push_str(&format!(
-                "- scenario `{scenario}` fails: {}\n",
-                failing.join(", ")
-            ));
-            if let Some(row) = open_scenarios
+    if campaign.redacted_view {
+        // Campaign-attached stratified reflection: aggregates only. No
+        // scenario names, no inputs, no traces — the proposer works from
+        // counts (`proposer:redacted-view` rides the campaign's evidence).
+        reflection.push_str("\n## Failing open scenarios (redacted view: aggregates only)\n");
+        for (index, observation) in baseline_open.iter().enumerate() {
+            let failing: Vec<&str> = observation
+                .readings
                 .iter()
-                .find(|row| Some(&row.name) == observation.scenario.as_ref())
-            {
-                reflection.push_str(&format!("  input: {}\n", row.input_json));
+                .filter(|(_, reading)| reading.passed == Some(false))
+                .map(|(gauge, _)| gauge.as_str())
+                .collect();
+            if !failing.is_empty() {
+                reflection.push_str(&format!(
+                    "- scenario #{} fails: {}\n",
+                    index + 1,
+                    failing.join(", ")
+                ));
+            }
+        }
+    } else {
+        reflection.push_str("\n## Worst open scenarios\n");
+        for observation in baseline_open {
+            let failing: Vec<&str> = observation
+                .readings
+                .iter()
+                .filter(|(_, reading)| reading.passed == Some(false))
+                .map(|(gauge, _)| gauge.as_str())
+                .collect();
+            if let (Some(scenario), false) = (&observation.scenario, failing.is_empty()) {
+                reflection.push_str(&format!(
+                    "- scenario `{scenario}` fails: {}\n",
+                    failing.join(", ")
+                ));
+                if let Some(row) = open_scenarios
+                    .iter()
+                    .find(|row| Some(&row.name) == observation.scenario.as_ref())
+                {
+                    reflection.push_str(&format!("  input: {}\n", row.input_json));
+                }
             }
         }
     }
@@ -1720,6 +1992,9 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
         // Fixture-evaluated evidence must never pass for model behavior.
         campaign_tags.push("fixture-provider".to_owned());
     }
+    if args.spec.redacted_view {
+        campaign_tags.push("proposer:redacted-view".to_owned());
+    }
     let outcome = (|store: &mut ImproveStore| -> Result<(Vec<Value>, bool, usize), String> {
         store
             .append_campaign_event(
@@ -1795,6 +2070,9 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
             "native" => Box::new(NativeProposer),
             other => return Err(format!("unknown proposer `{other}` (fixture|native)")),
         };
+        // Answered tradeoffs from every prior campaign: the only source of
+        // auto-resolution authority (default-on, locality-bounded).
+        let precedents = load_precedents(store)?;
         let mut prior_failures: Vec<String> = Vec::new();
         let mut cards: Vec<Value> = Vec::new();
         let mut proposed_any = false;
@@ -1938,7 +2216,15 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                     gate_tags.push("holdout-refused".to_owned());
                 }
             }
-            let card = evidence_card(
+            // The v1 MI lower bound: verbatim scenario-payload fragments
+            // newly present in the candidate. Flag, never block.
+            let all_scenarios: Vec<&ScenarioRow> =
+                open.iter().chain(sealed.iter()).copied().collect();
+            let overlap = leakage_overlap(&proposal.source, &source, &all_scenarios);
+            if !overlap.is_empty() {
+                gate_tags.push("leakage-overlap".to_owned());
+            }
+            let mut card = evidence_card(
                 &campaign_id,
                 &candidate_id,
                 &proposal.rationale,
@@ -1946,7 +2232,37 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 &gate_tags,
                 unheld_out,
             );
-            if verdict.proposable {
+            if !overlap.is_empty() {
+                card["overlap"] = json!(overlap
+                    .iter()
+                    .map(|fragment| fragment.chars().take(48).collect::<String>())
+                    .collect::<Vec<_>>());
+            }
+            // A tradeoff first consults the precedent set: the Pareto-safe
+            // closure of the human's actual answers may resolve it
+            // (`improve-precedent.maude`); anything else asks as before.
+            let resolution = if verdict.tradeoff {
+                precedent_resolution(&precedents, &verdict.lines)
+            } else {
+                None
+            };
+            if let Some(resolution) = &resolution {
+                let (tag, citation) = match resolution {
+                    PrecedentResolution::AutoAccept(citation) => {
+                        ("auto-resolved:precedent", citation)
+                    }
+                    PrecedentResolution::AutoReject(citation) => {
+                        ("auto-rejected:precedent", citation)
+                    }
+                };
+                card["precedent"] = json!(citation);
+                card["tags"]
+                    .as_array_mut()
+                    .expect("cards always carry a tags array")
+                    .push(json!(tag));
+            }
+            if verdict.proposable || matches!(resolution, Some(PrecedentResolution::AutoAccept(_)))
+            {
                 proposed_any = true;
                 store
                     .append_campaign_event(&campaign_id, "candidate.proposed", &card)
@@ -1955,6 +2271,15 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 // Propose-don't-apply: first undominated candidate ends the
                 // stage; adoption is the human's move (`whip adopt`).
                 break;
+            } else if matches!(resolution, Some(PrecedentResolution::AutoReject(_))) {
+                store
+                    .append_campaign_event(&campaign_id, "candidate.rejected", &card)
+                    .map_err(|error| format!("failed to record rejection: {error:?}"))?;
+                prior_failures.push(format!(
+                    "{candidate_id}: auto-rejected by precedent ({})",
+                    verdict.reasons.join("; ")
+                ));
+                cards.push(card);
             } else if verdict.tradeoff {
                 store
                     .append_campaign_event(&campaign_id, "candidate.tradeoff", &card)
@@ -2055,6 +2380,7 @@ fn evidence_card(
             "band": line.band,
             "bar_met": line.bar_met,
             "reach_met": line.reach_met,
+            "direction": if line.direction_up { "up" } else { "down" },
         })).collect::<Vec<_>>(),
     })
 }
@@ -2092,6 +2418,9 @@ fn print_card(card: &Value) {
                 suffix
             );
         }
+    }
+    if let Some(citation) = card["precedent"].as_str() {
+        println!("  precedent: {citation}");
     }
     if let Some(reasons) = card["reasons"].as_array() {
         for reason in reasons {
@@ -2281,13 +2610,28 @@ fn run_adopt(options: &CliOptions) -> Result<ExitCode, String> {
                 && event.payload["candidate"].as_str() == Some(candidate_id)
         })
         .ok_or_else(|| format!("campaign `{campaign_id}` has no candidate `{candidate_id}`"))?;
-    // Adoption is only offered for candidates the dominance invariant
-    // actually surfaced — a refused or tradeoff candidate is a decision the
-    // evidence card escalates, never a silent write path around the model.
+    // Adoption is offered for candidates the dominance invariant surfaced
+    // as proposed, OR tradeoffs the human explicitly ACCEPTED via
+    // `whip answer` (an un-revoked accepting answer IS the decision).
     let proposed = events.iter().any(|event| {
         event.event_type == "candidate.proposed"
             && event.payload["candidate"].as_str() == Some(candidate_id)
-    });
+    }) || events
+        .iter()
+        .rev()
+        .find_map(|event| {
+            if event.payload["candidate"].as_str() != Some(candidate_id) {
+                return None;
+            }
+            match event.event_type.as_str() {
+                "preference.answered" => {
+                    Some(event.payload["verdict"].as_str() == Some("accepted"))
+                }
+                "preference.revoked" => Some(false),
+                _ => None,
+            }
+        })
+        .unwrap_or(false);
     if !proposed {
         return Err(format!(
             "candidate `{candidate_id}` was not proposed by campaign `{campaign_id}`              (it was refused or escalated as a tradeoff); adoption is reserved for              proposed candidates"
@@ -2332,6 +2676,147 @@ fn run_adopt(options: &CliOptions) -> Result<ExitCode, String> {
         })));
     }
     println!("adopted {campaign_id}:{candidate_id} into `{program_path}`");
+    Ok(ExitCode::SUCCESS)
+}
+
+pub(crate) fn answer_command(options: &CliOptions) -> ExitCode {
+    match run_answer(options) {
+        Ok(code) => code,
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `whip answer <campaign>:<candidate> --accept|--reject|--revoke`: answer
+/// a surfaced tradeoff. The answer is a PRECEDENT — a speech act recorded
+/// in the campaign record that (a) makes an accepted candidate adoptable
+/// and (b) auto-resolves future tradeoffs it Pareto-dominates
+/// (`improve-precedent.maude`). `--revoke` withdraws a prior answer.
+fn run_answer(options: &CliOptions) -> Result<ExitCode, String> {
+    let mut target = None;
+    let mut verdict: Option<&str> = None;
+    let mut answered_by = None;
+    let mut index = 0;
+    while index < options.args.len() {
+        match options.args[index].as_str() {
+            "--accept" => verdict = Some("accepted"),
+            "--reject" => verdict = Some("rejected"),
+            "--revoke" => verdict = Some("revoked"),
+            "--by" => {
+                index += 1;
+                answered_by = options.args.get(index).cloned();
+            }
+            other if target.is_none() => target = Some(other.to_owned()),
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+        index += 1;
+    }
+    let usage = "usage: whip answer <campaign>:<candidate> --accept|--reject|--revoke [--by <who>]";
+    let target = target.ok_or(usage)?;
+    let verdict = verdict.ok_or(usage)?;
+    let (campaign_id, candidate_id) = target
+        .split_once(':')
+        .ok_or("answer target must be <campaign>:<candidate> (e.g. C-1:K-2)")?;
+    let mut store = open_improve_store()?;
+    let events = store
+        .list_campaign_events(campaign_id)
+        .map_err(|error| format!("failed to read campaign: {error:?}"))?;
+    if events.is_empty() {
+        return Err(format!("unknown campaign `{campaign_id}`"));
+    }
+    let already_answered = events.iter().rev().find_map(|event| {
+        if event.payload["candidate"].as_str() != Some(candidate_id) {
+            return None;
+        }
+        match event.event_type.as_str() {
+            "preference.answered" => Some(true),
+            "preference.revoked" => Some(false),
+            _ => None,
+        }
+    });
+    if verdict == "revoked" {
+        if already_answered != Some(true) {
+            return Err(format!(
+                "candidate `{candidate_id}` has no standing answer to revoke"
+            ));
+        }
+        store
+            .append_campaign_event(
+                campaign_id,
+                "preference.revoked",
+                &json!({"candidate": candidate_id, "by": answered_by}),
+            )
+            .map_err(|error| format!("failed to record revocation: {error:?}"))?;
+        if options.json {
+            return Ok(emit_json(json!({
+                "schema": "whipplescript.answer.v0",
+                "campaign": campaign_id,
+                "candidate": candidate_id,
+                "verdict": "revoked",
+            })));
+        }
+        println!("revoked the answer on {campaign_id}:{candidate_id}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    if already_answered == Some(true) {
+        return Err(format!(
+            "candidate `{candidate_id}` is already answered; revoke first              (`whip answer {campaign_id}:{candidate_id} --revoke`)"
+        ));
+    }
+    // Only surfaced tradeoffs are answerable: proposed candidates are
+    // adoptable already, refused candidates carry the model's verdict.
+    let tradeoff = events
+        .iter()
+        .find(|event| {
+            event.event_type == "candidate.tradeoff"
+                && event.payload["candidate"].as_str() == Some(candidate_id)
+        })
+        .ok_or_else(|| {
+            format!(
+                "candidate `{candidate_id}` was not surfaced as a tradeoff;                  only tradeoff decisions are answerable"
+            )
+        })?;
+    let gauges = tradeoff.payload["gauges"].clone();
+    if !gauges
+        .as_array()
+        .is_some_and(|lines| lines.iter().all(|line| line["direction"].is_string()))
+    {
+        return Err(
+            "this tradeoff card predates precedent support (no gauge directions recorded)"
+                .to_owned(),
+        );
+    }
+    store
+        .append_campaign_event(
+            campaign_id,
+            "preference.answered",
+            &json!({
+                "candidate": candidate_id,
+                "verdict": verdict,
+                "by": answered_by,
+                "gauges": gauges,
+            }),
+        )
+        .map_err(|error| format!("failed to record answer: {error:?}"))?;
+    if options.json {
+        return Ok(emit_json(json!({
+            "schema": "whipplescript.answer.v0",
+            "campaign": campaign_id,
+            "candidate": candidate_id,
+            "verdict": verdict,
+            "adoptable": verdict == "accepted",
+        })));
+    }
+    println!(
+        "{verdict} {campaign_id}:{candidate_id} — recorded as a precedent{}",
+        if verdict == "accepted" {
+            "; the candidate is now adoptable"
+        } else {
+            ""
+        }
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2833,6 +3318,226 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("ratchet")));
+    }
+
+    #[test]
+    fn redacted_view_reflection_carries_no_scenario_content() {
+        let campaign = CampaignSpec {
+            ascend: vec![("focus".to_owned(), None)],
+            redacted_view: true,
+            ..Default::default()
+        };
+        let specs = vec![spec_quality("focus")];
+        let failing = vec![RunObservation {
+            scenario: Some("acme-outage-email".to_owned()),
+            readings: BTreeMap::from([(
+                "focus".to_owned(),
+                GaugeReading {
+                    score: 0.0,
+                    passed: Some(false),
+                    tags: Vec::new(),
+                },
+            )]),
+            skipped: Vec::new(),
+        }];
+        let row = ScenarioRow {
+            name: "acme-outage-email".to_owned(),
+            instance_id: "i".to_owned(),
+            workflow: None,
+            input_json: r#"{"ticket":{"body":"the acme production database is down"}}"#.to_owned(),
+            program_hash: None,
+            pinned_at: String::new(),
+            retired: false,
+            wear: 0,
+        };
+        let reflection = build_reflection(
+            "workflow X",
+            &campaign,
+            &specs,
+            &failing,
+            &[],
+            &[&row],
+            &[],
+            false,
+        );
+        assert!(
+            !reflection.contains("acme"),
+            "redacted view must carry neither scenario names nor inputs"
+        );
+        assert!(reflection.contains("scenario #1 fails: focus"));
+        assert!(reflection.contains("redacted view"));
+    }
+
+    #[test]
+    fn leakage_overlap_flags_new_verbatim_fragments_only() {
+        let row = ScenarioRow {
+            name: "s".to_owned(),
+            instance_id: "i".to_owned(),
+            workflow: None,
+            input_json: r#"{"ticket":{"body":"the acme production database is down","signature":"already in the baseline prompt"}}"#
+                .to_owned(),
+            program_hash: None,
+            pinned_at: String::new(),
+            retired: false,
+            wear: 0,
+        };
+        let baseline = "workflow X\n# already in the baseline prompt\n";
+        let candidate =
+            "workflow X\n# already in the baseline prompt\n# handle: the acme production database is down\n";
+        let overlap = leakage_overlap(candidate, baseline, &[&row]);
+        assert_eq!(overlap.len(), 1, "only the NEW fragment is flagged");
+        assert!(overlap[0].contains("acme production database"));
+        let clean = leakage_overlap(baseline, baseline, &[&row]);
+        assert!(clean.is_empty());
+    }
+
+    #[test]
+    fn redacted_view_flag_parses_and_tightens() {
+        let args: Vec<String> = ["focus", "--redacted-view"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = parse_improve_args(&args, &[]).expect("parses");
+        assert!(parsed.spec.redacted_view);
+        // A declared campaign without the clause is tightened by the flag.
+        let declared = vec![(
+            "release_tuning".to_owned(),
+            CampaignSpec {
+                ascend: vec![("focus".to_owned(), None)],
+                ..Default::default()
+            },
+        )];
+        let args: Vec<String> = ["release_tuning", "--redacted-view"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = parse_improve_args(&args, &declared).expect("parses");
+        assert!(parsed.spec.redacted_view);
+        assert_eq!(parsed.spec.declared.as_deref(), Some("release_tuning"));
+    }
+
+    fn verdict_line(
+        gauge: &str,
+        role: &'static str,
+        baseline: f64,
+        candidate: f64,
+        band: f64,
+    ) -> GaugeVerdictLine {
+        GaugeVerdictLine {
+            gauge: gauge.to_owned(),
+            role,
+            delta: Delta::InBand,
+            baseline: Some(baseline),
+            candidate: Some(candidate),
+            band,
+            bar_met: None,
+            reach_met: None,
+            direction_up: true,
+        }
+    }
+
+    fn precedent_from(accepted: bool, gauges: &[(&str, f64, f64, f64)]) -> Precedent {
+        Precedent {
+            campaign: "C-9".to_owned(),
+            candidate: "K-9".to_owned(),
+            accepted,
+            answered_at: "2026-07-12 00:00:00".to_owned(),
+            gauges: gauges
+                .iter()
+                .map(|(gauge, baseline, candidate, band)| {
+                    (
+                        (*gauge).to_owned(),
+                        PrecedentGauge {
+                            baseline: *baseline,
+                            candidate: *candidate,
+                            band: *band,
+                            direction_up: true,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn precedent_dominance_grants_and_refuses() {
+        // The human accepted: focus +0.3, guard -0.05 (both direction-up).
+        let precedent = precedent_from(
+            true,
+            &[("focus", 0.5, 0.8, 0.05), ("guarded", 0.9, 0.85, 0.05)],
+        );
+        // A new tradeoff at least as good everywhere auto-accepts.
+        let dominant = vec![
+            verdict_line("focus", "ascend", 0.5, 0.85, 0.02),
+            verdict_line("guarded", "guard", 0.9, 0.86, 0.02),
+        ];
+        match precedent_resolution(&[precedent.clone()], &dominant) {
+            Some(PrecedentResolution::AutoAccept(citation)) => {
+                assert!(citation.contains("C-9:K-9"));
+            }
+            other => panic!("expected auto-accept, got {other:?}"),
+        }
+        // Falling short of the precedent anywhere asks.
+        let short = vec![
+            verdict_line("focus", "ascend", 0.5, 0.85, 0.02),
+            verdict_line("guarded", "guard", 0.9, 0.80, 0.02),
+        ];
+        assert_eq!(precedent_resolution(&[precedent.clone()], &short), None);
+        // Locality: the operating point moved beyond the answer-time band.
+        let moved = vec![
+            verdict_line("focus", "ascend", 0.7, 0.99, 0.02),
+            verdict_line("guarded", "guard", 0.9, 0.86, 0.02),
+        ];
+        assert_eq!(precedent_resolution(&[precedent.clone()], &moved), None);
+        // Gauge-set mismatch fails closed: the precedent never covered the
+        // extra gauge, so it carries no authority over it.
+        let extra = vec![
+            verdict_line("focus", "ascend", 0.5, 0.85, 0.02),
+            verdict_line("guarded", "guard", 0.9, 0.86, 0.02),
+            verdict_line("tone", "guard", 0.9, 0.7, 0.02),
+        ];
+        assert_eq!(precedent_resolution(&[precedent], &extra), None);
+    }
+
+    #[test]
+    fn rejected_precedent_auto_rejects_dominated_candidates_only() {
+        // The human rejected: focus +0.2, guard -0.1.
+        let precedent = precedent_from(
+            false,
+            &[("focus", 0.5, 0.7, 0.05), ("guarded", 0.9, 0.8, 0.05)],
+        );
+        // Strictly worse everywhere: auto-reject.
+        let worse = vec![
+            verdict_line("focus", "ascend", 0.5, 0.65, 0.02),
+            verdict_line("guarded", "guard", 0.9, 0.75, 0.02),
+        ];
+        match precedent_resolution(&[precedent.clone()], &worse) {
+            Some(PrecedentResolution::AutoReject(citation)) => {
+                assert!(citation.contains("C-9:K-9"));
+            }
+            other => panic!("expected auto-reject, got {other:?}"),
+        }
+        // Better than the rejection anywhere: ask (it might be the
+        // improvement the human was waiting for).
+        let better = vec![
+            verdict_line("focus", "ascend", 0.5, 0.9, 0.02),
+            verdict_line("guarded", "guard", 0.9, 0.75, 0.02),
+        ];
+        assert_eq!(precedent_resolution(&[precedent], &better), None);
+    }
+
+    #[test]
+    fn conflicting_precedents_carry_no_authority() {
+        // An accepted and a rejected precedent that both apply and both
+        // dominate: inconsistent — ask.
+        let accepted = precedent_from(true, &[("focus", 0.5, 0.7, 0.05)]);
+        let rejected = precedent_from(false, &[("focus", 0.5, 0.9, 0.05)]);
+        let lines = vec![verdict_line("focus", "ascend", 0.5, 0.8, 0.02)];
+        assert_eq!(
+            precedent_resolution(&[accepted, rejected], &lines),
+            None,
+            "conflicting precedents must fall back to the ask"
+        );
     }
 
     #[test]

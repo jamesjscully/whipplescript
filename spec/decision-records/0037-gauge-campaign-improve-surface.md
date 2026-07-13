@@ -119,8 +119,12 @@ better, no ascend gauge worse, every guarded gauge within band (fail
 closed: a guarded gauge that becomes unmeasurable on the candidate
 refuses), declared bars hard regardless of partition, sacrifice releases
 the guard only. Focus-up + guard-broken = a genuine tradeoff: recorded
-and surfaced, never accepted (v1 always asks; the utility model is one of
-the four open passes). Holdout: 20%/floor-2 sealed per campaign,
+and surfaced. *(Amended 2026-07-13, after the utility-model design pass
+settled:)* a surfaced tradeoff is answerable via `whip answer` — the
+answer is a precedent, and future tradeoffs auto-resolve by monotone
+precedent dominance (default-on, locality-bounded, citing the precedent,
+revocable; `models/maude/improve-precedent.maude`); everything without an
+applicable dominant precedent still asks. Holdout: 20%/floor-2 sealed per campaign,
 deterministic per campaign id (rotation across campaigns), engaged only at
 ≥ 4 scenarios — below that the campaign runs tagged `unheld-out`; the
 proposer's reflection is holdout-blind (sealed aggregates only — tested);
@@ -151,10 +155,16 @@ outputs never pass silently for model behavior.
 `--proposer native` = one structured native-coerce turn (schema
 `{rationale, source}`) fed program source + campaign spec + open-scenario
 evidence + prior refusals; `--proposer fixture` = deterministic env-fed
-candidates for tests/dev. Leakage posture = the settled baseline only:
-propose-don't-apply + the human adoption door; the policy *tiers*
-(stratified reflection, cleared providers, leakage budgets) stay open with
-Jack per the improve note.
+candidates for tests/dev. Leakage posture (tiers settled 2026-07-11,
+improve note §7): propose-don't-apply + the human adoption door as the
+baseline; every candidate checked for verbatim scenario-payload fragments
+newly present in its source (`leakage-overlap` card tag — flag, never
+block); **campaign-attached stratified reflection** via the `proposer
+redacted` declaration clause or `--redacted-view` (tighten-only), under
+which the proposer sees aggregates alone — modeled as the
+`redactedReflect` no-read invariant in `improve-holdout.maude` and tagged
+`proposer:redacted-view` on the campaign's evidence. Reader-set-delta
+tier keying engages when the evidence-plane IFC build lands.
 
 ## Honest v1 gaps (recorded, tagged at runtime where visible)
 

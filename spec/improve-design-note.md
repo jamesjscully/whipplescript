@@ -313,13 +313,36 @@ labels of the reflection material that produced it. The response is
   makes it auditable); auto-apply policies are unavailable, not merely
   discouraged, for campaigns over labeled reach.
 
-**OPEN — policy tiers** (deliberately, 2026-07-03): whether high-label
-campaigns run the proposer on stratified inputs (aggregates + redacted
-exemplars, with a `proposer: redacted-view` tag), on local/cleared
-provider profiles, or unrestricted-with-flag; and whether a cumulative
-per-campaign leakage budget exists in v1 (lean no — diff capacity is
-small and the review door stands; a budget is the principled upgrade if
-campaigns ever adopt hundreds of edits against one corpus).
+**Policy tiers — SETTLED 2026-07-11 (Jack).** Two decompositions first:
+local/cleared provider profiles solve the *reader* problem (which
+provider sees traces — already governed by no-new-readers + profile
+selection) and are **not a tier of this policy**; and the tier structure
+keys off the **reader-set delta** — leakage matters only when the program
+source's reader set is wider than the reflection material's. The tiers:
+**no delta** (program readers ⊆ data readers, the common single-team
+case) → unrestricted, unflagged — nothing can be laundered by embedding
+data everyone could already read; **delta present** → default
+**unrestricted-with-flag** (the settled statistical-control stance: the
+MI/overlap heuristic flags at the review surface, adoption remains the
+audited declassification act, egress doors keep their hard checks);
+**stratified reflection** (aggregates only, `proposer:redacted-view` tag)
+is **campaign-attached** — a `proposer redacted` clause on the campaign
+declaration or `--redacted-view` on the invocation, an operator's
+explicit call, chosen over label-class-attached engagement so a data
+owner's label choice never silently degrades someone else's campaign
+quality (the flag may tighten a declared clause, never loosen it).
+Built 2026-07-11 with the v1 loop's follow-on pass: redacted reflection
+(no scenario names/inputs/traces), the verbatim-fragment overlap flag
+(`leakage-overlap` on evidence cards, new-in-candidate fragments only,
+flag-never-block), the `redactedReflect` invariant in
+`improve-holdout.maude` (no read rule exists — the absence is the
+policy). The reader-set-delta keying engages automatically when the
+evidence-plane IFC build lands (v1 has no reader sets to compute deltas
+from; until then the flag/clause is the whole surface). **No cumulative
+leakage budget in v1**, with the upgrade trigger made observable rather
+than aspirational: the campaign record counts adoptions per reflection
+reach, so "hundreds of adopted edits against one corpus" is a queryable
+fact when it happens and the budget can be specified then, with data.
 
 ## 8. Ground truth, Goodhart, and the holdout policy
 
@@ -573,6 +596,34 @@ exception. This note only records the dependency.
   segments an idiom; the grant grammar shares the predicate form only;
   campaign *target* (workstream line vs. mainline) decoupled — mechanics
   riding the candidates-as-branches residual.
+- **Proposer leakage policy tiers** (§7): tiers keyed off the reader-set
+  delta (no delta → unrestricted unflagged; delta → unrestricted-with-flag
+  default); stratified reflection is CAMPAIGN-ATTACHED (`proposer
+  redacted` / `--redacted-view`, tighten-only) — built same day; cleared
+  providers reclassified as reader-side machinery outside this policy; no
+  v1 leakage budget, trigger observable via the campaign record.
+- **The local utility model**: representation = a PRECEDENT SET, not a
+  parameter blob — answered tradeoffs stored verbatim (full
+  direction-adjusted delta vector, operating point at answer time,
+  verdict, answerer) in the campaign-record family, where elicited
+  preferences already live as governance records. Auto-resolution =
+  **monotone precedent dominance, engaged by default**: a candidate
+  Pareto-at-least-as-good (direction-adjusted, per gauge) as an approved
+  tradeoff auto-approves; one Pareto-worse than a rejected tradeoff
+  auto-rejects; everything between asks. Sole assumption is monotonicity
+  in each gauge's better-direction (already baked into the surface).
+  Every auto-resolution cites its precedent (program archaeology extends
+  to preferences); precedents are speech acts — inspectable, revocable by
+  deletion, reopened by the standing-contradiction machinery. Locality:
+  a precedent applies only while the current operating point sits within
+  the indifference-band neighborhood of its answer-time point; stale
+  precedents become inapplicable, never silently deleted. A learned
+  direction-vector posterior is an OPTIONAL component that carries no
+  authority — permitted solely as the EVSI pricer for ask ordering and
+  ask-worthiness. Cold start = the empty precedent set (always-ask is
+  the degenerate case, so the v1 build is already conformant). Stronger
+  delegation is written, never learned: an explicit standing policy in
+  the §9 grant idiom.
 
 **Open:**
 - **Canary authorization surface** — shared with the quasi-experimental
@@ -580,11 +631,6 @@ exception. This note only records the dependency.
   2026-07-03 to the canary grant grammar (§9).
 - **Improve-as-whip careful look** — authority/IFC, self-reference guard,
   version coupling.
-- **Local utility model details** — representation, cold start, how strongly
-  it may auto-resolve future tradeoffs vs. always asking.
-- **Proposer leakage policy tiers** (§7) — stratified reflection vs.
-  cleared providers vs. unrestricted-with-flag; per-campaign leakage
-  budget in v1 (lean no).
 - **Regeneration side-effect containment** — settled in principle 2026-07-03
   (versioned-workspace note, "Per-door containment policy"); residual = the
   consent surface (§9, owned here) plus that note's open sub-forks (§11).

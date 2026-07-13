@@ -359,6 +359,10 @@ pub struct CampaignDecl {
     pub reach: Vec<CampaignReach>,
     pub guard: Vec<CampaignGuard>,
     pub sacrifice: Vec<GaugeRef>,
+    /// `proposer redacted`: campaign-attached stratified reflection — the
+    /// proposer sees aggregates only, never scenario contents (leakage
+    /// policy, improve note §7; settled 2026-07-11).
+    pub proposer_redacted: bool,
     pub span: SourceSpan,
 }
 
@@ -1143,6 +1147,8 @@ pub struct IrCampaign {
     pub reach: Vec<IrCampaignReach>,
     pub guard: Vec<IrCampaignGuard>,
     pub sacrifice: Vec<String>,
+    /// Campaign-attached stratified reflection (`proposer redacted`).
+    pub proposer_redacted: bool,
     pub span: SourceSpan,
 }
 
@@ -3254,6 +3260,9 @@ impl IrProgram {
                 }
                 if !campaign.sacrifice.is_empty() {
                     line.push_str(&format!(" sacrifice={}", campaign.sacrifice.join(",")));
+                }
+                if campaign.proposer_redacted {
+                    line.push_str(" proposer=redacted");
                 }
                 push_line(&mut snapshot, line);
             }
@@ -6514,6 +6523,7 @@ fn lower_campaign(campaign: CampaignDecl, ir: &mut IrProgram, diagnostics: &mut 
             .into_iter()
             .map(|gauge| gauge.name)
             .collect(),
+        proposer_redacted: campaign.proposer_redacted,
         span: campaign.span,
     });
 }
@@ -17295,6 +17305,9 @@ fn format_item(item: Item, formatted: &mut String) {
                     .join(", ");
                 push_line(formatted, format!("  sacrifice {names}"));
             }
+            if campaign.proposer_redacted {
+                push_line(formatted, "  proposer redacted");
+            }
             push_line(formatted, "}");
         }
         Item::Channel(channel) => {
@@ -20069,6 +20082,7 @@ impl Parser<'_> {
         let mut reach: Vec<CampaignReach> = Vec::new();
         let mut guard: Vec<CampaignGuard> = Vec::new();
         let mut sacrifice: Vec<GaugeRef> = Vec::new();
+        let mut proposer_redacted = false;
         while !self.is_at_end() && !self.at_symbol('}') {
             if self.at_ident("ascend") {
                 self.advance();
@@ -20149,6 +20163,14 @@ impl Parser<'_> {
                 {
                     self.synchronize_to_block_item();
                 }
+            } else if self.at_ident("proposer") {
+                self.advance();
+                if self.consume_ident("redacted") {
+                    proposer_redacted = true;
+                } else {
+                    self.expected("`redacted` after `proposer`");
+                    self.synchronize_to_block_item();
+                }
             } else {
                 let span = self.peek().map(|token| token.span).unwrap_or(open.span);
                 self.diagnostics.push(Diagnostic {
@@ -20156,7 +20178,8 @@ impl Parser<'_> {
                     span,
                     message: "unknown campaign clause".to_owned(),
                     suggestion: Some(
-                        "campaign clauses are `ascend`, `reach`, `guard`, and `sacrifice`"
+                        "campaign clauses are `ascend`, `reach`, `guard`, `sacrifice`, \
+                         and `proposer redacted`"
                             .to_owned(),
                     ),
                 });
@@ -20181,6 +20204,7 @@ impl Parser<'_> {
             reach,
             guard,
             sacrifice,
+            proposer_redacted,
             span: SourceSpan { start, end },
         })
     }
@@ -30487,6 +30511,7 @@ campaign release_tuning {
   reach std.latency at most 800ms
   guard tail_latency within 2 percent
   sacrifice fulfillment_cost
+  proposer redacted
 }
 
 rule j
@@ -30540,10 +30565,11 @@ rule j
         assert_eq!(campaign.guard[0].gauge, "tail_latency");
         assert_eq!(campaign.guard[0].band_percent, "2");
         assert_eq!(campaign.sacrifice, vec!["fulfillment_cost"]);
+        assert!(campaign.proposer_redacted);
         let snapshot = ir.to_snapshot();
         assert!(snapshot.contains("gauge extract_quality judge=coerce:DueDateJudge site=j.result expect=chance:due_date_correct>=0.9"));
         assert!(snapshot.contains(
-            "campaign release_tuning ascend=extract_quality reach=std.latency<=800ms guard=tail_latency:within:2% sacrifice=fulfillment_cost"
+            "campaign release_tuning ascend=extract_quality reach=std.latency<=800ms guard=tail_latency:within:2% sacrifice=fulfillment_cost proposer=redacted"
         ));
     }
 
@@ -30668,7 +30694,7 @@ rule j
 
     #[test]
     fn formats_gauge_and_campaign_declarations() {
-        let source = "workflow Improve\n\n\ngauge extract_quality on j.result {\n  judge via exec \"./judge.py\"\n  expect P(ok) at least 0.9\n}\n\ncampaign release_tuning {\n  ascend extract_quality\n  reach std.latency at most 800ms\n  guard std.tokens within 2 percent\n  sacrifice std.spend\n}\n";
+        let source = "workflow Improve\n\n\ngauge extract_quality on j.result {\n  judge via exec \"./judge.py\"\n  expect P(ok) at least 0.9\n}\n\ncampaign release_tuning {\n  ascend extract_quality\n  reach std.latency at most 800ms\n  guard std.tokens within 2 percent\n  sacrifice std.spend\n  proposer redacted\n}\n";
         let formatted = format_program(source);
         assert_eq!(formatted.diagnostics, Vec::new());
         let once = formatted.formatted.expect("formats");
@@ -30678,6 +30704,7 @@ rule j
         assert!(once.contains("campaign release_tuning {"));
         assert!(once.contains("  reach std.latency at most 800ms"));
         assert!(once.contains("  guard std.tokens within 2 percent"));
+        assert!(once.contains("  proposer redacted"));
         let twice = format_program(&once).formatted.expect("reformats");
         assert_eq!(once, twice, "gauge/campaign formatting is idempotent");
     }

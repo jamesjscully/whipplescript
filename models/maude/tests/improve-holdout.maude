@@ -20,6 +20,12 @@ search [1] in WHIPPLESCRIPT-IMPROVE-HOLDOUT :
   reflect wants(s1) sealed(s1, z) wants(s2) openSc(s2)
   =>* readByProposer(s2) RESIDUAL:Cfg .
 
+--- Bite: under a campaign-attached redacted view NOTHING reaches the
+--- proposer -- open scenarios included, not just sealed ones.
+search [1] in WHIPPLESCRIPT-IMPROVE-HOLDOUT :
+  redactedReflect wants(s1) sealed(s1, z) wants(s2) openSc(s2)
+  =>* readByProposer(S:Sid) RESIDUAL:Cfg .
+
 --- Coverage: kmax promotion gates wear a sealed scenario out; it retires
 --- and holdout duty is refreshed from a recent ambient run.
 search [1] in WHIPPLESCRIPT-IMPROVE-HOLDOUT :

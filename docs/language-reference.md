@@ -1458,9 +1458,14 @@ campaign release_tuning {
 Named gauges ascend toward better; `reach` sets a target that holds as a
 hard bound once met; `guard` widens a gauge's indifference band; `sacrifice`
 releases a gauge from the guard set (the evidence card says so). Unnamed
-gauges are always guarded — there are no modes. See `whip improve` in the
-[CLI Reference](api-reference.md) for the campaign loop, holdout policy,
-and adoption.
+gauges are always guarded — there are no modes. An optional
+`proposer redacted` clause attaches stratified reflection to the campaign:
+the proposer sees aggregate statistics only — never scenario names,
+inputs, traces, or judge rationales — and the campaign's evidence carries
+the `proposer:redacted-view` tag (`whip improve --redacted-view` tightens
+any campaign the same way; a flag can never loosen a declared clause).
+See `whip improve` in the [CLI Reference](api-reference.md) for the
+campaign loop, holdout policy, and adoption.
 
 ## Channels (`std.messaging`)
 

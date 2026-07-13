@@ -342,3 +342,110 @@ fn improve_refuses_dominated_candidate_as_tradeoff() {
         "dominated candidate adoption must be refused: {stderr}"
     );
 }
+
+#[test]
+fn answered_tradeoff_becomes_precedent_and_auto_resolves() {
+    let env = Env::new("precedent");
+    write_judges(&env.dir);
+    let program_path = env.dir.join("triage.whip");
+    fs::write(&program_path, program("low", "ticket.id", &env.dir)).expect("write program");
+    let program_str = program_path.to_string_lossy().into_owned();
+
+    dev_and_pin(&env, &program_str);
+
+    // The tradeoff candidate: improves the focus gauge, breaks the guard.
+    let candidate_path = env.dir.join("candidate.whip");
+    fs::write(&candidate_path, program("high", "\"wrong\"", &env.dir)).expect("write candidate");
+    let candidate_env: (&str, &str) = (
+        "WHIPPLESCRIPT_IMPROVE_PROPOSALS",
+        &candidate_path.to_string_lossy(),
+    );
+
+    // Campaign 1: surfaced as a tradeoff, not proposed.
+    let report = env.run_json(
+        &[
+            "--json",
+            "improve",
+            "priority_correct",
+            "--program",
+            &program_str,
+            "--proposer",
+            "fixture",
+        ],
+        &[candidate_env],
+    );
+    assert_eq!(report["proposed"].as_bool(), Some(false));
+    let campaign_1 = report["campaign"].as_str().expect("campaign id").to_owned();
+    let target_1 = format!("{campaign_1}:K-1");
+
+    // A proposed candidate is not answerable; a tradeoff is.
+    let answered = env.run_json(&["--json", "answer", &target_1, "--accept"], &[]);
+    assert_eq!(answered["verdict"].as_str(), Some("accepted"));
+    assert_eq!(answered["adoptable"].as_bool(), Some(true));
+
+    // Double answers are refused until revoked.
+    let stderr = env.run_expect_failure(&["answer", &target_1, "--reject"]);
+    assert!(stderr.contains("already answered"), "{stderr}");
+
+    // Campaign 2: the identical tradeoff now auto-resolves by precedent —
+    // proposed, tagged, citing the human's answer.
+    let report = env.run_json(
+        &[
+            "--json",
+            "improve",
+            "priority_correct",
+            "--program",
+            &program_str,
+            "--proposer",
+            "fixture",
+        ],
+        &[candidate_env],
+    );
+    assert_eq!(
+        report["proposed"].as_bool(),
+        Some(true),
+        "the Pareto-safe closure of an answered ask auto-accepts: {report}"
+    );
+    let card = &report["cards"].as_array().expect("cards")[0];
+    assert!(card["tags"]
+        .as_array()
+        .expect("tags")
+        .iter()
+        .any(|tag| tag.as_str() == Some("auto-resolved:precedent")));
+    assert!(card["precedent"]
+        .as_str()
+        .expect("citation")
+        .contains(&target_1));
+
+    // The accepted tradeoff itself became adoptable via the answer.
+    let adopted = env.run_json(
+        &["--json", "adopt", &target_1, "--program", &program_str],
+        &[],
+    );
+    assert_eq!(adopted["candidate"].as_str(), Some("K-1"));
+
+    // Revoke the precedent; restore the baseline program; the same
+    // tradeoff surfaces again — authority is gone.
+    let revoked = env.run_json(&["--json", "answer", &target_1, "--revoke"], &[]);
+    assert_eq!(revoked["verdict"].as_str(), Some("revoked"));
+    fs::write(&program_path, program("low", "ticket.id", &env.dir)).expect("restore baseline");
+    let report = env.run_json(
+        &[
+            "--json",
+            "improve",
+            "priority_correct",
+            "--program",
+            &program_str,
+            "--proposer",
+            "fixture",
+        ],
+        &[candidate_env],
+    );
+    assert_eq!(
+        report["proposed"].as_bool(),
+        Some(false),
+        "a revoked precedent grants nothing: {report}"
+    );
+    let card = &report["cards"].as_array().expect("cards")[0];
+    assert_eq!(card["tradeoff"].as_bool(), Some(true));
+}
