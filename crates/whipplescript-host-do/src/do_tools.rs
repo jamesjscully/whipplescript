@@ -278,7 +278,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     pub fn for_instance(sql: Rc<Sql>, instance_id: &str) -> Self {
         Self {
             sql,
-            key_prefix: format!("{instance_id}\0"),
+            key_prefix: format!("{instance_id}/"),
         }
     }
 
@@ -955,6 +955,34 @@ mod tests {
         let read = exec.execute(&call("read", json!({ "path": "a.txt" })));
         assert_eq!(read.status, ToolStatus::Ok);
         assert_eq!(read.content, "hello");
+    }
+
+    #[test]
+    fn governed_host_instances_do_not_share_workspace_keys() {
+        let sql = Rc::new(store().sql);
+        let first = DoToolExecutor::for_instance(Rc::clone(&sql), "instance-a");
+        let second = DoToolExecutor::for_instance(sql, "instance-b");
+        assert_eq!(
+            first
+                .execute(&call("write", json!({ "path": "same.txt", "content": "a" })))
+                .status,
+            ToolStatus::Ok,
+        );
+        assert_eq!(
+            second
+                .execute(&call("read", json!({ "path": "same.txt" })))
+                .status,
+            ToolStatus::Error,
+        );
+        second.execute(&call("write", json!({ "path": "same.txt", "content": "b" })));
+        assert_eq!(
+            first.execute(&call("read", json!({ "path": "same.txt" }))).content,
+            "a",
+        );
+        assert_eq!(
+            second.execute(&call("read", json!({ "path": "same.txt" }))).content,
+            "b",
+        );
     }
 
     #[test]

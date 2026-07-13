@@ -698,7 +698,7 @@ export class WorkflowInstance implements DurableObject {
       if (!this.instanceExists(instanceId)) {
         return Response.json({ error: "instance not found" }, { status: 404 });
       }
-      const prefix = `${instanceId}\0`;
+      const prefix = `${instanceId}/`;
       const path = url.searchParams.get("path");
       if (path != null) {
         const rows = this.ctx.storage.sql
@@ -749,7 +749,7 @@ export class WorkflowInstance implements DurableObject {
       }
       normalized.set(path, candidate.content);
     }
-    const prefix = `${instanceId}\0`;
+    const prefix = `${instanceId}/`;
     const retainPaths = parsed.retain_paths;
     if (retainPaths !== undefined) {
       if (!Array.isArray(retainPaths) || retainPaths.some((path) => typeof path !== "string")) {

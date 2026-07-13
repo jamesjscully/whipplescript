@@ -86,13 +86,13 @@ impl<S: DoSql> DoSqlStorage<S> {
         }
     }
 
-    /// Scope the flat DO file plane to one governed host instance. The NUL
-    /// delimiter cannot occur in a portable workspace path and prevents two
-    /// chat instances inside the same placement DO from sharing file keys.
+    /// Scope the flat DO file plane to one governed host instance. Runtime
+    /// instance ids contain no slash, so this prefix cannot collide with a
+    /// workspace path or another chat inside the same placement DO.
     pub fn for_instance(sql: S, instance_id: &str) -> Self {
         Self {
             sql,
-            key_prefix: format!("{instance_id}\0"),
+            key_prefix: format!("{instance_id}/"),
         }
     }
 
