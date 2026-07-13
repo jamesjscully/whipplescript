@@ -244,6 +244,11 @@ pub struct RuleCommit<'a> {
     pub dependencies: &'a [NewEffectDependency<'a>],
     pub terminal: Option<WorkflowTerminal<'a>>,
     pub idempotency_key: Option<&'a str>,
+    /// Declared `mark` names riding this committing site: a `mark.reached`
+    /// event per name is appended IN the commit transaction, so a cut
+    /// coordinate can never be lost between a durable commit and a
+    /// separate append (the experimentation surface's named cut points).
+    pub marks: &'a [&'a str],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2133,6 +2138,27 @@ impl SqliteStore {
             },
         )?;
 
+        for mark in commit.marks {
+            let mark_payload = serde_json::json!({
+                "mark": mark,
+                "site": commit.rule,
+                "committed_event_id": event.event_id,
+            })
+            .to_string();
+            let mark_key = format!("mark-reached:{mark}:{}", event.event_id);
+            append_event_on(
+                &tx,
+                NewEvent {
+                    instance_id: commit.instance_id,
+                    event_type: "mark.reached",
+                    payload_json: &mark_payload,
+                    source: "kernel",
+                    causation_id: Some(&event.event_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&mark_key),
+                },
+            )?;
+        }
         for fact in commit.facts {
             insert_fact(
                 &tx,
@@ -5394,6 +5420,95 @@ impl SqliteStore {
         }
         tx.commit()?;
         Ok(event)
+    }
+
+    /// A transactionally-consistent snapshot of this store into a new file
+    /// (`VACUUM INTO`): safe against live writers and WAL sidecars, unlike
+    /// a file copy. The prefix-replay driver clones sources through this.
+    pub fn snapshot_to(&self, target: &Path) -> StoreResult<()> {
+        let target = target.to_string_lossy().replace('\'', "''");
+        self.connection
+            .execute_batch(&format!("VACUUM INTO '{target}'"))
+            .map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    /// Prefix-replay support (`models/maude/prefix-replay.maude`): drop
+    /// every event after the cut for one instance, so a subsequent
+    /// `rebuild_projections` folds exactly the frozen prefix. FOR
+    /// DISPOSABLE COUNTERFACTUAL STORES ONLY — the live store's log is
+    /// append-only (a live rewind is `commit_restore`, which marks instead
+    /// of deleting); the caller owns that discipline. Unlike a restore
+    /// marker this does not bump the restore generation, so every pre-cut
+    /// identity re-derives byte-identically and replayed work dedupes
+    /// exactly (INV-P1 by exact dedup).
+    pub fn truncate_instance_events_after(
+        &mut self,
+        instance_id: &str,
+        cut_sequence: i64,
+    ) -> StoreResult<u64> {
+        let dropped = self
+            .connection
+            .execute(
+                "DELETE FROM events WHERE instance_id = ?1 AND sequence > ?2",
+                params![instance_id, cut_sequence],
+            )
+            .map_err(StoreError::from)?;
+        // Interaction rows are not sequence-keyed and would otherwise
+        // resurrect POST-cut recorded outcomes through byte-identical
+        // re-derived effect ids: a re-claimed pre-cut invoke would harvest
+        // the recorded child terminal, a re-asked human question would find
+        // its recorded answer. Dropping them is safe for the prefix too —
+        // effects settled pre-cut fold terminal and are never re-claimed,
+        // so their rows are unread; queued ones must regenerate fresh.
+        self.connection
+            .execute(
+                "DELETE FROM workflow_invocations WHERE parent_instance_id = ?1",
+                params![instance_id],
+            )
+            .map_err(StoreError::from)?;
+        self.connection
+            .execute(
+                "DELETE FROM inbox_items WHERE instance_id = ?1",
+                params![instance_id],
+            )
+            .map_err(StoreError::from)?;
+        Ok(dropped as u64)
+    }
+
+    /// Prefix-replay support: pin the instance row's version pointer to
+    /// the given prefix-derived value — a live activation that happened
+    /// AFTER the cut stamped the row with a version the truncated log no
+    /// longer contains (only replayed activation events restore it).
+    pub fn set_instance_version(
+        &mut self,
+        instance_id: &str,
+        version_id: &str,
+        revision_epoch: i64,
+    ) -> StoreResult<()> {
+        self.connection
+            .execute(
+                "UPDATE instances SET version_id = ?2, revision_epoch = ?3
+                 WHERE instance_id = ?1",
+                params![instance_id, version_id, revision_epoch],
+            )
+            .map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    /// Prefix-replay support: a truncated prefix may predate the source
+    /// run's terminal, but `rebuild_projections` never resets the instance
+    /// row's status (only replayed terminal/transition events move it) —
+    /// reopen it so the suffix can drive.
+    pub fn reset_instance_to_running(&mut self, instance_id: &str) -> StoreResult<()> {
+        self.connection
+            .execute(
+                "UPDATE instances SET status = 'running', last_error = NULL,
+                   completed_at = NULL WHERE instance_id = ?1",
+                params![instance_id],
+            )
+            .map_err(StoreError::from)?;
+        Ok(())
     }
 
     pub fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {
@@ -10835,6 +10950,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-keep"),
+                marks: &[],
             })
             .expect("commit keep");
         // Orphaned-to-be segment: seq 2 commits eff-orphan.
@@ -10849,6 +10965,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-orphan"),
+                marks: &[],
             })
             .expect("commit orphan");
         assert_eq!(store.list_effects("instance-a").expect("list").len(), 2);
@@ -10896,6 +11013,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-resume"),
+                marks: &[],
             })
             .expect("commit resume");
         let visible = store.list_effects("instance-a").expect("list");
@@ -10935,6 +11053,7 @@ mod tests {
                 dependencies: &dependencies,
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commit succeeds");
 
@@ -10975,6 +11094,7 @@ mod tests {
                     idempotency_key: Some("workflow-complete-result"),
                 }),
                 idempotency_key: Some("commit-finish"),
+                marks: &[],
             })
             .expect("terminal commit succeeds");
 
@@ -11000,6 +11120,7 @@ mod tests {
             dependencies: &[],
             terminal: None,
             idempotency_key: Some("commit-again"),
+            marks: &[],
         });
         assert!(matches!(duplicate, Err(StoreError::Conflict(_))));
     }
@@ -11021,6 +11142,7 @@ mod tests {
             dependencies: &[],
             terminal: None,
             idempotency_key: Some("bad-commit"),
+            marks: &[],
         });
 
         assert!(result.is_err());
@@ -11045,6 +11167,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commit succeeds");
 
@@ -11084,6 +11207,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commit succeeds");
 
@@ -11176,6 +11300,7 @@ mod tests {
                 dependencies: &dependencies,
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commit succeeds");
         store
@@ -11240,6 +11365,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-seed"),
+                marks: &[],
             })
             .expect("seed commit succeeds");
 
@@ -11262,6 +11388,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-finish"),
+                marks: &[],
             })
             .expect("consume commit succeeds");
 
@@ -11307,6 +11434,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commit succeeds");
 
@@ -11353,6 +11481,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commit succeeds");
 
@@ -11494,6 +11623,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commit succeeds");
 
@@ -11558,6 +11688,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commit succeeds");
 
@@ -11605,6 +11736,7 @@ mod tests {
                 dependencies: &dependencies,
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commit succeeds");
 
@@ -11681,6 +11813,7 @@ mod tests {
                     dependencies: &dependencies,
                     terminal: None,
                     idempotency_key: Some("commit-start"),
+                    marks: &[],
                 })
                 .expect("rule commit succeeds");
             store
@@ -11757,6 +11890,7 @@ mod tests {
                 dependencies: &dependencies,
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commit succeeds");
 
@@ -11844,6 +11978,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
         store
@@ -11903,6 +12038,7 @@ mod tests {
                     idempotency_key: Some("workflow-complete-terminal-guard"),
                 }),
                 idempotency_key: Some("commit-finish-terminal-guard"),
+                marks: &[],
             })
             .expect("terminal commit succeeds");
 
@@ -11977,6 +12113,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-old"),
+                marks: &[],
             })
             .expect("old rule commits");
         assert_eq!(
@@ -12016,6 +12153,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-new"),
+                marks: &[],
             })
             .expect("new rule commits");
 
@@ -12099,6 +12237,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-stale"),
+                marks: &[],
             },
             RuleCommitRevisionGuard {
                 program_version_id: &version1.version_id,
@@ -12196,6 +12335,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-old"),
+                marks: &[],
             })
             .expect("old rule commits");
         store
@@ -12247,6 +12387,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-new"),
+                marks: &[],
             })
             .expect("new rule commits");
         let blocked = store
@@ -12300,6 +12441,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-policy-old"),
+                marks: &[],
             })
             .expect("old rule commits");
         store
@@ -12513,6 +12655,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-kept-effects"),
+                marks: &[],
             })
             .expect("old effects commit");
         store
@@ -12588,6 +12731,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-request-cancel"),
+                marks: &[],
             })
             .expect("rule commits");
         store
@@ -12683,6 +12827,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-request-cancel-after-terminal"),
+                marks: &[],
             })
             .expect("rule commits");
         store
@@ -12758,6 +12903,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-request-cancel-timeout"),
+                marks: &[],
             })
             .expect("rule commits");
         store
@@ -12867,6 +13013,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-invoke-child"),
+                marks: &[],
             })
             .expect("parent invoke rule commits");
         let child = store
@@ -13181,6 +13328,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-work"),
+                marks: &[],
             })
             .expect("fact commits");
 
@@ -13285,6 +13433,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-work"),
+                marks: &[],
             })
             .expect("fact commits");
 
@@ -13401,6 +13550,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-replay-full-old"),
+                marks: &[],
             })
             .expect("old rule commits");
         store
@@ -13532,6 +13682,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-bounded-a"),
+                marks: &[],
             })
             .expect("effect A commits");
         store
@@ -13545,6 +13696,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-bounded-b"),
+                marks: &[],
             })
             .expect("effect B commits");
 
@@ -13618,6 +13770,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-restore-a"),
+                marks: &[],
             })
             .expect("effect A commits");
         store
@@ -13631,6 +13784,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-restore-b"),
+                marks: &[],
             })
             .expect("effect B commits");
 
@@ -13660,6 +13814,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-restore-c"),
+                marks: &[],
             })
             .expect("effect C commits");
 
@@ -13813,6 +13968,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-checkpoint-busy"),
+                marks: &[],
             })
             .expect("effect commits");
         store
@@ -14026,6 +14182,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-terminal-replay"),
+                marks: &[],
             })
             .expect("effect commits");
         store
@@ -14114,6 +14271,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-lease-replay"),
+                marks: &[],
             })
             .expect("effect commits");
         store
@@ -14192,6 +14350,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-replay-old"),
+                marks: &[],
             })
             .expect("old rule commits");
         store
@@ -14215,6 +14374,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-replay-new"),
+                marks: &[],
             })
             .expect("new rule commits");
 
@@ -14272,6 +14432,7 @@ mod tests {
                 dependencies: &dependencies,
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commit succeeds");
 
@@ -14303,6 +14464,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commit succeeds");
         store
@@ -14356,6 +14518,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commit succeeds");
         store
@@ -14469,6 +14632,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
         let run_metadata_json = r#"{"native_provider":{"provider_id":"coder","provider_kind":"codex","surface":"codex.app_server"}}"#;
@@ -14622,6 +14786,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
         let run_event = store
@@ -14767,6 +14932,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
         store
@@ -14944,6 +15110,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-workspace-record"),
+                marks: &[],
             })
             .expect("rule commits");
         store
@@ -15144,6 +15311,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
         let blocked = store
@@ -15226,6 +15394,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-go"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -15293,6 +15462,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-go"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -15370,6 +15540,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-go"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -15417,6 +15588,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -15478,6 +15650,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -15533,6 +15706,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
         let claimable = store
@@ -15645,6 +15819,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -15709,6 +15884,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -15785,6 +15961,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
         store
@@ -15847,6 +16024,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -15899,6 +16077,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 

@@ -15958,6 +15958,7 @@ rule accept
             dependencies: &[],
             terminal: None,
             idempotency_key: Some("external-window-invalid-duration"),
+            marks: &[],
         })
         .expect("commit external fact");
 

@@ -449,3 +449,197 @@ fn answered_tradeoff_becomes_precedent_and_auto_resolves() {
     let card = &report["cards"].as_array().expect("cards")[0];
     assert_eq!(card["tradeoff"].as_bool(), Some(true));
 }
+
+const PREFIX_JUDGE: &str = r#"
+import json, sys
+record = json.load(sys.stdin)
+priority = None
+classified = False
+for fact in record.get("facts", []):
+    if fact.get("name") == "Assessment":
+        priority = fact.get("value", {}).get("priority")
+    if fact.get("name") == "Classified":
+        classified = True
+print(json.dumps({"ok": classified and priority == "high"}))
+"#;
+
+fn chained_program(priority: &str, judge_dir: &std::path::Path) -> String {
+    let judge = judge_dir.join("judge_chain.py");
+    format!(
+        r#"workflow Triage
+
+input ticket Ticket
+
+class Ticket {{
+  id string
+  title string
+}}
+
+class Classified {{
+  ticket string
+  kind string
+}}
+
+class Assessment {{
+  ticket string
+  priority string
+}}
+
+mark "classified" after classify
+
+gauge priority_correct {{
+  judge via exec "python3 {judge}"
+  expect P(ok) at least 0.5
+}}
+
+rule classify
+  when Ticket as ticket
+=> {{
+  record Classified {{
+    ticket ticket.id
+    kind "bug"
+  }}
+}}
+
+rule triage
+  when Classified as c
+=> {{
+  record Assessment {{
+    ticket c.ticket
+    priority "{priority}"
+  }}
+}}
+"#,
+        judge = judge.display(),
+    )
+}
+
+#[test]
+fn mark_pinned_scenario_replays_prefix_and_regenerates_suffix() {
+    let env = Env::new("mark-replay");
+    fs::write(env.dir.join("judge_chain.py"), PREFIX_JUDGE).expect("write judge");
+    let program_path = env.dir.join("triage.whip");
+    fs::write(&program_path, chained_program("low", &env.dir)).expect("write program");
+    let program_str = program_path.to_string_lossy().into_owned();
+
+    // Baseline dev run stamps the mark when `classify` commits.
+    let dev = env.run_json(
+        &[
+            "--store",
+            &env.store,
+            "--input",
+            r#"{"ticket":{"id":"T-1","title":"Fix login"}}"#,
+            "--json",
+            "dev",
+            &program_str,
+            "--provider",
+            "fixture",
+        ],
+        &[],
+    );
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // Pin the frozen prefix at the mark.
+    let pinned = env.run_json(
+        &[
+            "--store",
+            &env.store,
+            "--json",
+            "pin",
+            &instance,
+            "at",
+            "classified",
+            "--as",
+            "case-m",
+        ],
+        &[],
+    );
+    assert_eq!(pinned["mark"].as_str(), Some("classified"));
+    assert!(
+        pinned["cut_sequence"].as_i64().is_some(),
+        "the mark event's sequence is the cut: {pinned}"
+    );
+
+    // Pinning at an unknown mark is refused with the stamped set.
+    let stderr = env.run_expect_failure(&[
+        "--store", &env.store, "pin", &instance, "at", "missing", "--as", "x",
+    ]);
+    assert!(stderr.contains("never reached mark"), "{stderr}");
+
+    // Suppose under a candidate that fixes the suffix: the prefix replays,
+    // only the suffix re-executes, and the gauge flips.
+    let candidate_path = env.dir.join("candidate.whip");
+    fs::write(&candidate_path, chained_program("high", &env.dir)).expect("write candidate");
+    let supposed = env.run_json(
+        &[
+            "--json",
+            "suppose",
+            "case-m",
+            "--program",
+            &candidate_path.to_string_lossy(),
+        ],
+        &[],
+    );
+    assert_eq!(
+        supposed["mode"].as_str(),
+        Some("prefix-replay"),
+        "mark pins regenerate from the frozen prefix: {supposed}"
+    );
+    let gauge = supposed["gauges"]
+        .as_array()
+        .expect("gauges")
+        .iter()
+        .find(|line| line["gauge"].as_str() == Some("priority_correct"))
+        .expect("gauge line");
+    assert_eq!(gauge["regenerated_passed"].as_bool(), Some(true));
+    assert_eq!(
+        gauge["recorded_passed"].as_bool(),
+        Some(false),
+        "the recorded run is the paired control"
+    );
+    assert!(gauge["tags"]
+        .as_array()
+        .expect("tags")
+        .iter()
+        .any(|tag| tag.as_str() == Some("prefix-replay")));
+    let replay_note = supposed["skipped"]
+        .as_array()
+        .expect("skipped")
+        .iter()
+        .find(|entry| entry["gauge"].as_str() == Some("replay"))
+        .expect("replay accounting note");
+    assert!(
+        replay_note["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("0 refires"),
+        "the fact-recording prefix must not refire: {replay_note}"
+    );
+
+    // A campaign over the mark-pinned scenario: both arms regenerate from
+    // the cut (paired), and the dominant candidate is proposed.
+    let report = env.run_json(
+        &[
+            "--json",
+            "improve",
+            "priority_correct",
+            "--program",
+            &program_str,
+            "--proposer",
+            "fixture",
+        ],
+        &[(
+            "WHIPPLESCRIPT_IMPROVE_PROPOSALS",
+            &candidate_path.to_string_lossy(),
+        )],
+    );
+    assert_eq!(
+        report["proposed"].as_bool(),
+        Some(true),
+        "prefix-paired evaluation proposes the dominant candidate: {report}"
+    );
+}

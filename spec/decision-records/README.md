@@ -190,6 +190,14 @@ others are active workshop material.
   `unheld-out` degradation (`improve-holdout.maude`), holdout-blind reflective
   proposer, propose-don't-apply with baseline-hash-guarded `whip adopt`.
   *Accepted + built.*
+- [0038-mark-pins-and-prefix-replay.md](0038-mark-pins-and-prefix-replay.md):
+  the checkpoint-substrate integration — `mark "<name>" after <site>` cut
+  points stamped at rule commit, `whip pin ... at <mark>` prefix-pinned
+  scenarios, the clone-and-truncate replay driver (replayed prefixes fire
+  nothing, quiescence-at-cut refusal, revision activation for candidates,
+  epoch-bump refires tagged), `whip suppose` as the what-if verb, and
+  campaign evaluation paired at the cut. Witness model
+  `prefix-replay.maude`. *Accepted + built.*
 
 ## Historical Decision Trackers
 

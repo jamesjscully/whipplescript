@@ -1082,13 +1082,32 @@ workspace-scoped improve store (`.whipplescript/improve.sqlite`, env
 ### `pin`
 
 ```
-whip [--json] pin <instance> --as <name>
+whip [--json] pin <instance> [at <mark>] --as <name>
 ```
 
 Pins a run as a named scenario — the regression corpus grows out of use,
-not authoring. v1 scenario identity is the run's frozen input; campaign
-evaluation regenerates it by re-running the workflow on that input in a
-disposable store.
+not authoring. A bare pin freezes the run's input (regeneration re-runs
+the whole workflow); `at <mark>` freezes the prefix at the first time the
+run reached the declared mark — regeneration then replays that prefix
+(replayed effects never re-fire) and re-executes only the suffix, pairing
+both arms at the cut.
+
+### `suppose`
+
+```
+whip [--json] suppose <scenario> [--program <workflow.whip>] [--root <workflow>]
+     [--provider <name>] [--provider-config <path>]
+```
+
+One what-if regeneration of the pinned scenario under the current (or a
+candidate) program — the everyday debugging what-if. Mark pins replay the
+frozen prefix; the recorded run is scored in place as the paired control;
+output is per-gauge `recorded → regenerated` with pass verdicts, replay
+accounting (events replayed, refires), and honesty tags
+(`prefix-replay`, `replay-refire`, `clock-sensitive`, `replay-fallback`).
+Every suppose lands in the evidence ledger. A candidate program that is
+not revision-compatible with the frozen prefix degrades honestly to input
+replay.
 
 ### `gauges`
 

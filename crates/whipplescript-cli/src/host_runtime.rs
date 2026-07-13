@@ -2454,6 +2454,7 @@ impl GovernedHostRuntime {
                             &command.command_id,
                             "host-turn-commit",
                         ])),
+                        marks: &[],
                     })
                     .map_err(HostRuntimeError::Store)?;
                 false

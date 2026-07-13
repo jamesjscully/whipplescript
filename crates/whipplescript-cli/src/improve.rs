@@ -991,6 +991,26 @@ fn leakage_overlap(
 // Evaluation: run a program over scenarios in disposable stores
 // ---------------------------------------------------------------------------
 
+/// v1 storage-plane containment: for the rest of this process every
+/// workspace-scoped side store (coordination leases/counters/ledgers,
+/// backlog items, harness content) resolves into the eval scratch, so a
+/// counterfactual run's writes land nowhere near the workspace stores.
+/// Shared by `whip improve` and `whip suppose`.
+fn contain_side_stores() {
+    std::env::set_var(
+        "WHIPPLESCRIPT_COORDINATION_STORE",
+        eval_scratch_dir().join("coordination.sqlite"),
+    );
+    std::env::set_var(
+        "WHIPPLESCRIPT_ITEMS_STORE",
+        eval_scratch_dir().join("items.sqlite"),
+    );
+    std::env::set_var(
+        "WHIPPLESCRIPT_CONTENT_STORE",
+        eval_scratch_dir().join("content.sqlite"),
+    );
+}
+
 fn eval_scratch_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("whip-improve-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -1011,7 +1031,122 @@ fn evaluate_scenario(
     ir: &IrProgram,
     seq: &mut usize,
 ) -> Result<RunObservation, String> {
+    // Mark-pinned scenarios regenerate from the frozen prefix (paired at
+    // the cut); a replay failure degrades honestly to input replay with a
+    // `replay-fallback` tag rather than sinking the campaign.
+    if scenario.cut_sequence.is_some() {
+        match replay_scenario(
+            program_path,
+            root,
+            provider,
+            provider_config_paths,
+            scenario,
+            specs,
+            ir,
+            seq,
+        ) {
+            // Mid-drive errors are HARD: suffix provider work already ran,
+            // so a fallback would execute it twice.
+            Ok(outcome) => return outcome,
+            Err(reason) => {
+                eprintln!(
+                    "scenario `{}`: prefix replay unavailable ({reason}); falling back to input replay",
+                    scenario.name
+                );
+                let mut observation = input_replay_scenario(
+                    program_path,
+                    root,
+                    provider,
+                    provider_config_paths,
+                    scenario,
+                    specs,
+                    ir,
+                    seq,
+                )?;
+                for reading in observation.readings.values_mut() {
+                    reading.tags.push("replay-fallback".to_owned());
+                }
+                return Ok(observation);
+            }
+        }
+    }
+    input_replay_scenario(
+        program_path,
+        root,
+        provider,
+        provider_config_paths,
+        scenario,
+        specs,
+        ir,
+        seq,
+    )
+}
+
+/// Drive one instance to idle inside a disposable store: the shared suffix
+/// of both regeneration modes.
+#[allow(clippy::too_many_arguments)]
+fn drive_to_idle(
+    store_path: &Path,
+    instance_id: &str,
+    program_path: &str,
+    root: Option<&str>,
+    provider: &str,
+    provider_config_paths: &[PathBuf],
+    ir: &IrProgram,
+    version_guard: Option<&str>,
+) -> Result<(), String> {
+    for _ in 0..16 {
+        let step_report = crate::step_instance(
+            store_path,
+            instance_id,
+            ir,
+            Some(Path::new(program_path)),
+            version_guard,
+        )
+        .map_err(|error| format!("evaluation step failed: {error:?}"))?;
+        let worker_report = crate::run_worker_once(
+            store_path,
+            &crate::WorkerOptions {
+                instance_id: instance_id.to_owned(),
+                provider: provider.to_owned(),
+                exec_profile: crate::ExecProfile::from_env(),
+                script_manifest_path: None,
+                package_lock_path: None,
+                outcome: crate::FixtureOutcome::default(),
+                variant: None,
+                program_path: Some(PathBuf::from(program_path)),
+                root: root.map(str::to_owned),
+                provider_config_paths: provider_config_paths.to_vec(),
+                max_child_iterations: 8,
+                agent_outcomes: BTreeMap::new(),
+                coerce_outputs: BTreeMap::new(),
+                virtual_now: None,
+                work_unit_root: None,
+            },
+        )
+        .map_err(|error| format!("evaluation worker failed: {error:?}"))?;
+        if crate::drive_pass_idle(&step_report, &worker_report) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Whole-run regeneration: re-run the workflow on the scenario's frozen
+/// input in a disposable store (the v1 default; matched on input).
+#[allow(clippy::too_many_arguments)]
+fn input_replay_scenario(
+    program_path: &str,
+    root: Option<&str>,
+    provider: &str,
+    provider_config_paths: &[PathBuf],
+    scenario: &ScenarioRow,
+    specs: &[GaugeSpec],
+    ir: &IrProgram,
+    seq: &mut usize,
+) -> Result<RunObservation, String> {
     *seq += 1;
+    contain_side_stores_for_eval(*seq);
     let store_path = eval_scratch_dir().join(format!("eval-{seq}.sqlite"));
     let _ = std::fs::remove_file(&store_path);
     let eval_options = CliOptions {
@@ -1034,51 +1169,382 @@ fn evaluate_scenario(
             scenario.name
         )
     })?;
-    for _ in 0..16 {
-        let step_report = crate::step_instance(
-            &store_path,
-            &started.instance_id,
-            ir,
-            Some(Path::new(program_path)),
-            None,
-        )
-        .map_err(|error| format!("evaluation step failed: {error:?}"))?;
-        let worker_report = crate::run_worker_once(
-            &store_path,
-            &crate::WorkerOptions {
-                instance_id: started.instance_id.clone(),
-                provider: provider.to_owned(),
-                exec_profile: crate::ExecProfile::from_env(),
-                script_manifest_path: None,
-                package_lock_path: None,
-                outcome: crate::FixtureOutcome::default(),
-                variant: None,
-                program_path: Some(PathBuf::from(program_path)),
-                root: root.map(str::to_owned),
-                provider_config_paths: provider_config_paths.to_vec(),
-                max_child_iterations: 8,
-                agent_outcomes: BTreeMap::new(),
-                coerce_outputs: BTreeMap::new(),
-                virtual_now: None,
-                work_unit_root: None,
-            },
-        )
-        .map_err(|error| format!("evaluation worker failed: {error:?}"))?;
-        if crate::drive_pass_idle(&step_report, &worker_report) {
-            break;
-        }
-    }
+    drive_to_idle(
+        &store_path,
+        &started.instance_id,
+        program_path,
+        root,
+        provider,
+        provider_config_paths,
+        ir,
+        None,
+    )?;
     let store = SqliteStore::open(&store_path)
         .map_err(|error| format!("failed to reopen evaluation store: {error:?}"))?;
-    let observation = score_instance(
+    let mut observation = score_instance(
         &store,
         &started.instance_id,
         specs,
         Some(&scenario.name),
         false,
     );
+    // A run that never settled (wedged effect, exhausted drive budget)
+    // must not pass for a finished regeneration.
+    let incomplete = store
+        .list_effects(&started.instance_id)
+        .map_err(|error| format!("failed to read effects: {error:?}"))?
+        .iter()
+        .any(|effect| {
+            matches!(effect.status.as_str(), "running" | "queued")
+                || effect.status.starts_with("blocked")
+        });
+    if incomplete {
+        for reading in observation.readings.values_mut() {
+            reading.tags.push("drive-incomplete".to_owned());
+        }
+        observation
+            .skipped
+            .push(("drive".to_owned(), "drive incomplete".to_owned()));
+    }
     let _ = std::fs::remove_file(&store_path);
     Ok(observation)
+}
+
+/// Prefix regeneration for a mark-pinned scenario: snapshot the source
+/// store (`VACUUM INTO` — consistent against live writers), truncate the
+/// instance's log to the cut, rebuild the projections (the frozen prefix
+/// — settled effects unclaimable, `prefix-replay.maude`), then drive only
+/// the suffix under the given program. When the program differs from the
+/// recorded version it is activated as a revision (compatibility-
+/// checked); the epoch bump means a pre-cut NON-consuming rule can
+/// re-derive a distinct effect id and refire — detected post-drive by
+/// exact identity and tagged `replay-refire` (the documented
+/// cross-revision residual). Errors before the drive begins are safe to
+/// fall back from; a mid-drive error is NOT (provider work already
+/// executed) and surfaces as a hard failure.
+#[allow(clippy::too_many_arguments)]
+fn replay_scenario(
+    program_path: &str,
+    root: Option<&str>,
+    provider: &str,
+    provider_config_paths: &[PathBuf],
+    scenario: &ScenarioRow,
+    specs: &[GaugeSpec],
+    ir: &IrProgram,
+    seq: &mut usize,
+) -> Result<Result<RunObservation, String>, String> {
+    // Outer Err = pre-drive (fallback-safe); inner Err = mid-drive (hard).
+    let cut = scenario
+        .cut_sequence
+        .ok_or("scenario carries no cut sequence")?;
+    let source_store = scenario
+        .store_path
+        .as_deref()
+        .ok_or("scenario carries no source store path")?;
+    if !Path::new(source_store).exists() {
+        return Err(format!("source store `{source_store}` no longer exists"));
+    }
+    *seq += 1;
+    contain_side_stores_for_eval(*seq);
+    let store_path = eval_scratch_dir().join(format!("replay-{seq}.sqlite"));
+    let _ = std::fs::remove_file(&store_path);
+    // A transactionally-consistent snapshot (VACUUM INTO): a plain file
+    // copy of a WAL-mode store loses un-checkpointed commits and can tear
+    // against a live writer.
+    SqliteStore::open(source_store)
+        .map_err(|error| format!("failed to open source store: {error:?}"))?
+        .snapshot_to(&store_path)
+        .map_err(|error| format!("failed to snapshot source store: {error:?}"))?;
+    let mut store = SqliteStore::open(&store_path)
+        .map_err(|error| format!("failed to open replay store: {error:?}"))?;
+    // A `cancels` consequence of the marked commit lands AFTER the mark
+    // event, so the cut would resurrect an effect the recorded run
+    // cancelled. Detect it against the un-truncated log and refuse.
+    let full_events = store
+        .list_events(&scenario.instance_id)
+        .map_err(|error| format!("failed to read source events: {error:?}"))?;
+    let post_cut_cancels = full_events
+        .iter()
+        .any(|event| event.sequence > cut && event.event_type == "effect.cancelled");
+    if post_cut_cancels {
+        return Err(
+            "the recorded run cancelled effects after the cut; replay would resurrect them \
+             (place the mark after the cancelling consequence settles)"
+                .to_owned(),
+        );
+    }
+    store
+        .truncate_instance_events_after(&scenario.instance_id, cut)
+        .map_err(|error| format!("failed to truncate to the cut: {error:?}"))?;
+    store
+        .rebuild_projections(&scenario.instance_id)
+        .map_err(|error| format!("failed to fold the prefix: {error:?}"))?;
+    // A cut that CONTAINS the workflow terminal has no suffix to
+    // regenerate — refuse (the mark rode a terminal-committing site).
+    let folded = store
+        .get_instance(&scenario.instance_id)
+        .map_err(|error| format!("failed to read instance: {error:?}"))?
+        .ok_or("instance missing from the cloned store")?;
+    if matches!(folded.status.as_str(), "completed" | "failed") {
+        return Err(
+            "the cut contains the workflow terminal; there is no suffix to regenerate".to_owned(),
+        );
+    }
+    // A live activation AFTER the cut stamped the row with a version the
+    // truncated log no longer contains; reconcile the pointer to the
+    // prefix's own version (replayed activations already re-stamped it if
+    // any were in the prefix).
+    let prefix_events = store
+        .list_events(&scenario.instance_id)
+        .map_err(|error| format!("failed to read prefix events: {error:?}"))?;
+    let prefix_has_activation = prefix_events
+        .iter()
+        .any(|event| event.event_type == "workflow.revision_activated");
+    if !prefix_has_activation {
+        let facts = store
+            .list_facts_including_consumed(&scenario.instance_id)
+            .map_err(|error| format!("failed to read prefix facts: {error:?}"))?;
+        if let Some(fact) = facts.first() {
+            if let Some(version) = fact.program_version_id.as_deref() {
+                if version != folded.version_id || fact.revision_epoch != folded.revision_epoch {
+                    store
+                        .set_instance_version(&scenario.instance_id, version, fact.revision_epoch)
+                        .map_err(|error| {
+                            format!("failed to reconcile the version pointer: {error:?}")
+                        })?;
+                }
+            }
+        }
+    }
+    store
+        .reset_instance_to_running(&scenario.instance_id)
+        .map_err(|error| format!("failed to reopen the instance: {error:?}"))?;
+    // Quiescence at the cut: a mid-flight effect would fold as `running`
+    // — unclaimable and never completing — so the suffix would hang.
+    // Refuse (mirroring capture_checkpoint) and let the caller fall back.
+    let effects = store
+        .list_effects(&scenario.instance_id)
+        .map_err(|error| format!("failed to read folded effects: {error:?}"))?;
+    if effects.iter().any(|effect| effect.status == "running") {
+        return Err("the cut lands mid-effect (a run was in flight at the mark)".to_owned());
+    }
+    // Snapshot the settled prefix effects (ids + exact identity) for
+    // refire detection: a NEW effect (id not in the prefix) with an
+    // IDENTICAL (rule, kind, input) identity is a pre-cut site
+    // re-executing; a loop iteration with new input is not.
+    let prefix_ids: BTreeSet<String> = effects
+        .iter()
+        .map(|effect| effect.effect_id.clone())
+        .collect();
+    let prefix_triples: BTreeSet<(String, String, String)> = effects
+        .iter()
+        .map(|effect| {
+            (
+                effect.created_by_rule.clone(),
+                effect.kind.clone(),
+                effect.input_json.clone(),
+            )
+        })
+        .collect();
+    let replayed_events = prefix_events.len();
+    let instance = store
+        .get_instance(&scenario.instance_id)
+        .map_err(|error| format!("failed to read instance: {error:?}"))?
+        .ok_or("instance missing from the cloned store")?;
+    // Register the candidate program; identical content resolves to the
+    // recorded version (idempotent per source/ir hash) and drives without
+    // activation. A different program is activated as a revision after a
+    // compatibility check.
+    let source = std::fs::read_to_string(program_path)
+        .map_err(|error| format!("failed to read `{program_path}`: {error}"))?;
+    let snapshot = ir.to_snapshot();
+    let stores = whipplescript_store::native_stores::NativeStores {
+        runtime: store,
+        coord: open_scratch_coord(*seq)?,
+        items: open_scratch_items(*seq)?,
+    };
+    let mut kernel = whipplescript_kernel::RuntimeKernel::new(stores);
+    let version = kernel
+        .create_program_version_for_program(
+            whipplescript_kernel::ProgramVersionInput {
+                program_name: &ir.workflow,
+                source_hash: &whipplescript_kernel::rule_lowering::stable_hash_hex(&source),
+                ir_hash: &whipplescript_kernel::rule_lowering::stable_hash_hex(&snapshot),
+                compiler_version: whipplescript_core::version(),
+            },
+            ir,
+        )
+        .map_err(|error| format!("failed to register the candidate version: {error:?}"))?;
+    if version.version_id != instance.version_id {
+        use whipplescript_store::RuntimeStore as _;
+        let report = kernel
+            .store()
+            .analyze_revision_compatibility(&scenario.instance_id, &version.version_id)
+            .map_err(|error| format!("revision compatibility analysis failed: {error:?}"))?;
+        if !report.diagnostics.is_empty() {
+            return Err(format!(
+                "candidate is not revision-compatible with the frozen prefix: {}",
+                report
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        kernel
+            .activate_revision(whipplescript_store::RevisionActivation {
+                instance_id: &scenario.instance_id,
+                from_version_id: &instance.version_id,
+                to_version_id: &version.version_id,
+                activation_policy_json: "{}",
+                cancellation_policy: "keep",
+                idempotency_key: Some(&format!("replay-activate-{}", scenario.name)),
+            })
+            .map_err(|error| format!("failed to activate the candidate: {error:?}"))?;
+    }
+    drop(kernel);
+    // Everything below has executed suffix work: errors are HARD (inner
+    // Err) — a fallback here would re-run provider effects.
+    Ok(replay_drive_and_score(
+        &store_path,
+        program_path,
+        root,
+        provider,
+        provider_config_paths,
+        scenario,
+        specs,
+        ir,
+        &version.version_id,
+        &prefix_ids,
+        &prefix_triples,
+        replayed_events,
+    ))
+}
+
+/// The mid-drive half of replay: drive the suffix, score, tag.
+#[allow(clippy::too_many_arguments)]
+fn replay_drive_and_score(
+    store_path: &Path,
+    program_path: &str,
+    root: Option<&str>,
+    provider: &str,
+    provider_config_paths: &[PathBuf],
+    scenario: &ScenarioRow,
+    specs: &[GaugeSpec],
+    ir: &IrProgram,
+    version_id: &str,
+    prefix_ids: &BTreeSet<String>,
+    prefix_triples: &BTreeSet<(String, String, String)>,
+    replayed_events: usize,
+) -> Result<RunObservation, String> {
+    drive_to_idle(
+        store_path,
+        &scenario.instance_id,
+        program_path,
+        root,
+        provider,
+        provider_config_paths,
+        ir,
+        Some(version_id),
+    )?;
+    let store = SqliteStore::open(store_path)
+        .map_err(|error| format!("failed to reopen replay store: {error:?}"))?;
+    let mut observation = score_instance(
+        &store,
+        &scenario.instance_id,
+        specs,
+        Some(&scenario.name),
+        false,
+    );
+    // std.latency is unmeasurable under prefix replay: folded prefix runs
+    // carry fold-time timestamps, so the prefix's real duration is gone.
+    // Remove the reading on BOTH arms (symmetric) rather than report a
+    // fabricated improvement.
+    if observation.readings.remove("std.latency").is_some() {
+        observation.skipped.push((
+            "std.latency".to_owned(),
+            "unmeasurable under prefix replay (folded prefix timestamps)".to_owned(),
+        ));
+    }
+    let post_effects = store
+        .list_effects(&scenario.instance_id)
+        .map_err(|error| format!("failed to read effects: {error:?}"))?;
+    // Refire detection by exact identity: new id, identical triple.
+    let refires = post_effects
+        .iter()
+        .filter(|effect| !prefix_ids.contains(&effect.effect_id))
+        .filter(|effect| {
+            prefix_triples.contains(&(
+                effect.created_by_rule.clone(),
+                effect.kind.clone(),
+                effect.input_json.clone(),
+            ))
+        })
+        .count();
+    // Completeness: a suffix that never settled (wedged effect, exhausted
+    // drive budget) must not pass for a finished regeneration.
+    let incomplete = post_effects.iter().any(|effect| {
+        matches!(effect.status.as_str(), "running" | "queued")
+            || effect.status.starts_with("blocked")
+    });
+    for reading in observation.readings.values_mut() {
+        reading.tags.push("prefix-replay".to_owned());
+        if refires > 0 {
+            reading.tags.push("replay-refire".to_owned());
+        }
+        if incomplete {
+            reading.tags.push("drive-incomplete".to_owned());
+        }
+        if ir.sources.iter().any(|source| source.is_clock) {
+            // The virtual-clock hazard (research note §9.6): a suffix
+            // regenerated later runs under a different clock.
+            reading.tags.push("clock-sensitive".to_owned());
+        }
+    }
+    observation.skipped.push((
+        "replay".to_owned(),
+        format!(
+            "prefix-replay: {replayed_events} events replayed, {refires} refires{}",
+            if incomplete { ", drive incomplete" } else { "" }
+        ),
+    ));
+    let _ = std::fs::remove_file(store_path);
+    Ok(observation)
+}
+
+/// Per-evaluation coordination/items scratch: one shared file would let
+/// coordination state (counters, breakers, claims) leak between scenarios
+/// and between the baseline and candidate arms, breaking the pairing.
+fn contain_side_stores_for_eval(seq: usize) {
+    std::env::set_var(
+        "WHIPPLESCRIPT_COORDINATION_STORE",
+        eval_scratch_dir().join(format!("coordination-{seq}.sqlite")),
+    );
+    std::env::set_var(
+        "WHIPPLESCRIPT_ITEMS_STORE",
+        eval_scratch_dir().join(format!("items-{seq}.sqlite")),
+    );
+    std::env::set_var(
+        "WHIPPLESCRIPT_CONTENT_STORE",
+        eval_scratch_dir().join(format!("content-{seq}.sqlite")),
+    );
+}
+
+fn open_scratch_coord(
+    seq: usize,
+) -> Result<whipplescript_store::coordination::CoordinationStore, String> {
+    whipplescript_store::coordination::CoordinationStore::open(
+        eval_scratch_dir().join(format!("coordination-{seq}.sqlite")),
+    )
+    .map_err(|error| format!("failed to open scratch coordination store: {error:?}"))
+}
+
+fn open_scratch_items(seq: usize) -> Result<whipplescript_store::items::WorkItemStore, String> {
+    whipplescript_store::items::WorkItemStore::open(
+        eval_scratch_dir().join(format!("items-{seq}.sqlite")),
+    )
+    .map_err(|error| format!("failed to open scratch items store: {error:?}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1247,6 +1713,61 @@ struct CandidateVerdict {
     proposable: bool,
     tradeoff: bool,
     reasons: Vec<String>,
+}
+
+/// A baseline/candidate observation pair is comparable only when both
+/// arms measured the same estimand: same regeneration mode (a prefix
+/// replay against a whole-run fallback compares different quantities),
+/// and neither arm poisoned by a refire or an unsettled drive. Dropping
+/// the pair keeps the verdict honest; the card says how many were
+/// dropped.
+fn observation_pair_comparable(a: &RunObservation, b: &RunObservation) -> bool {
+    fn flags(observation: &RunObservation) -> (bool, bool, bool, bool) {
+        let mut prefix = false;
+        let mut fallback = false;
+        let mut refire = false;
+        let mut incomplete = false;
+        for reading in observation.readings.values() {
+            for tag in &reading.tags {
+                match tag.as_str() {
+                    "prefix-replay" => prefix = true,
+                    "replay-fallback" => fallback = true,
+                    "replay-refire" => refire = true,
+                    "drive-incomplete" => incomplete = true,
+                    _ => {}
+                }
+            }
+        }
+        (prefix, fallback, refire, incomplete)
+    }
+    let (a_prefix, a_fallback, a_refire, a_incomplete) = flags(a);
+    let (b_prefix, b_fallback, b_refire, b_incomplete) = flags(b);
+    a_prefix == b_prefix
+        && a_fallback == b_fallback
+        && !a_refire
+        && !b_refire
+        && !a_incomplete
+        && !b_incomplete
+}
+
+/// Retain only comparable pairs (index-aligned by scenario order),
+/// returning the filtered arms and the number of dropped pairs.
+fn comparable_pairs(
+    base: &[RunObservation],
+    cand: &[RunObservation],
+) -> (Vec<RunObservation>, Vec<RunObservation>, usize) {
+    let mut base_kept = Vec::new();
+    let mut cand_kept = Vec::new();
+    let mut dropped = 0usize;
+    for (a, b) in base.iter().zip(cand.iter()) {
+        if observation_pair_comparable(a, b) {
+            base_kept.push(a.clone());
+            cand_kept.push(b.clone());
+        } else {
+            dropped += 1;
+        }
+    }
+    (base_kept, cand_kept, dropped)
 }
 
 /// The dominance invariant, exactly as modeled: accept only if at least one
@@ -1968,22 +2489,7 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
         .map_err(|error| format!("failed to open campaign: {error:?}"))?;
     let (open, sealed, sealing_engaged) = seal_scenarios(&campaign_id, &scenarios);
     let unheld_out = !sealing_engaged;
-    // v1 storage-plane containment: for the rest of this process every
-    // workspace-scoped side store (coordination leases/counters/ledgers,
-    // backlog items, harness content) resolves into the eval scratch, so a
-    // counterfactual run's writes land nowhere near the workspace stores.
-    std::env::set_var(
-        "WHIPPLESCRIPT_COORDINATION_STORE",
-        eval_scratch_dir().join("coordination.sqlite"),
-    );
-    std::env::set_var(
-        "WHIPPLESCRIPT_ITEMS_STORE",
-        eval_scratch_dir().join("items.sqlite"),
-    );
-    std::env::set_var(
-        "WHIPPLESCRIPT_CONTENT_STORE",
-        eval_scratch_dir().join("content.sqlite"),
-    );
+    contain_side_stores();
     let mut campaign_tags: Vec<String> = Vec::new();
     if unheld_out {
         campaign_tags.push("unheld-out".to_owned());
@@ -2175,10 +2681,29 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                     }),
                 )
                 .map_err(|error| format!("failed to record candidate: {error:?}"))?;
-            let open_verdict =
-                dominance_verdict(&specs, &args.spec, &baseline_open, &candidate_open);
+            let (paired_base, paired_cand, dropped_pairs) =
+                comparable_pairs(&baseline_open, &candidate_open);
+            if paired_base.is_empty() {
+                store
+                    .append_campaign_event(
+                        &campaign_id,
+                        "candidate.rejected",
+                        &json!({
+                            "candidate": candidate_id,
+                            "reason": "no comparable scenario pairs (mode mismatch, refires, or incomplete drives)",
+                            "rationale": proposal.rationale,
+                        }),
+                    )
+                    .map_err(|error| format!("failed to record rejection: {error:?}"))?;
+                prior_failures.push(format!("{candidate_id}: no comparable scenario pairs"));
+                continue;
+            }
+            let open_verdict = dominance_verdict(&specs, &args.spec, &paired_base, &paired_cand);
             let mut verdict = open_verdict.clone();
             let mut gate_tags = campaign_tags.clone();
+            if dropped_pairs > 0 {
+                gate_tags.push(format!("pairs-dropped:{dropped_pairs}"));
+            }
             if verdict.proposable && sealing_engaged {
                 // Promotion gate: score the sealed holdout on BOTH arms and
                 // re-check dominance over the combined evidence. Every gate
@@ -2198,14 +2723,19 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 for scenario in &sealed {
                     let _ = store.bump_scenario_wear(&scenario.name, WEAR_OUT_AT);
                 }
-                let combined_base: Vec<RunObservation> = baseline_open
+                let (sealed_base, sealed_cand, sealed_dropped) =
+                    comparable_pairs(&baseline_sealed, &candidate_sealed);
+                if sealed_dropped > 0 {
+                    gate_tags.push(format!("sealed-pairs-dropped:{sealed_dropped}"));
+                }
+                let combined_base: Vec<RunObservation> = paired_base
                     .iter()
-                    .chain(baseline_sealed.iter())
+                    .chain(sealed_base.iter())
                     .cloned()
                     .collect();
-                let combined_cand: Vec<RunObservation> = candidate_open
+                let combined_cand: Vec<RunObservation> = paired_cand
                     .iter()
-                    .chain(candidate_sealed.iter())
+                    .chain(sealed_cand.iter())
                     .cloned()
                     .collect();
                 verdict = dominance_verdict(&specs, &args.spec, &combined_base, &combined_cand);
@@ -2835,8 +3365,10 @@ pub(crate) fn pin_command(options: &CliOptions) -> ExitCode {
 }
 
 fn run_pin(options: &CliOptions) -> Result<ExitCode, String> {
+    let usage = "usage: whip pin <instance> [at <mark>] --as <name>";
     let mut instance_id = None;
     let mut name = None;
+    let mut mark = None;
     let mut index = 0;
     while index < options.args.len() {
         match options.args[index].as_str() {
@@ -2844,31 +3376,282 @@ fn run_pin(options: &CliOptions) -> Result<ExitCode, String> {
                 index += 1;
                 name = options.args.get(index).cloned();
             }
+            "at" => {
+                index += 1;
+                mark = Some(options.args.get(index).ok_or(usage)?.clone());
+            }
             other if instance_id.is_none() => instance_id = Some(other.to_owned()),
             other => return Err(format!("unexpected argument `{other}`")),
         }
         index += 1;
     }
-    let instance_id = instance_id.ok_or("usage: whip pin <instance> --as <name>")?;
-    let name = name.ok_or("usage: whip pin <instance> --as <name>")?;
+    let instance_id = instance_id.ok_or(usage)?;
+    let name = name.ok_or(usage)?;
     let store = SqliteStore::open(&options.store_path)
         .map_err(|error| format!("failed to open store: {error:?}"))?;
     let instance = store
         .get_instance(&instance_id)
         .map_err(|error| format!("failed to read instance: {error:?}"))?
         .ok_or_else(|| format!("unknown instance `{instance_id}`"))?;
+    // A mark pin freezes the prefix at the FIRST time the run reached the
+    // mark; the mark.reached event's own sequence is the cut coordinate.
+    let mut mark_occurrences = 0usize;
+    let cut_sequence = if let Some(mark) = &mark {
+        let events = store
+            .list_events(&instance_id)
+            .map_err(|error| format!("failed to read events: {error:?}"))?;
+        let matches: Vec<i64> = events
+            .iter()
+            .filter(|event| {
+                event.event_type == "mark.reached"
+                    && serde_json::from_str::<Value>(&event.payload_json)
+                        .ok()
+                        .and_then(|payload| payload["mark"].as_str().map(str::to_owned))
+                        .as_deref()
+                        == Some(mark.as_str())
+            })
+            .map(|event| event.sequence)
+            .collect();
+        mark_occurrences = matches.len();
+        let cut = matches.first().copied();
+        let Some(cut) = cut else {
+            let stamped: BTreeSet<String> = events
+                .iter()
+                .filter(|event| event.event_type == "mark.reached")
+                .filter_map(|event| {
+                    serde_json::from_str::<Value>(&event.payload_json)
+                        .ok()
+                        .and_then(|payload| payload["mark"].as_str().map(str::to_owned))
+                })
+                .collect();
+            return Err(format!(
+                "instance {instance_id} never reached mark `{mark}` (marks stamped: {})",
+                if stamped.is_empty() {
+                    "none".to_owned()
+                } else {
+                    stamped.into_iter().collect::<Vec<_>>().join(", ")
+                }
+            ));
+        };
+        Some(cut)
+    } else {
+        None
+    };
+    let store_path = std::fs::canonicalize(&options.store_path)
+        .unwrap_or_else(|_| options.store_path.clone())
+        .to_string_lossy()
+        .into_owned();
     let mut improve_store = open_improve_store()?;
     improve_store
-        .pin_scenario(&name, &instance_id, None, &instance.input_json, None)
+        .pin_scenario(
+            &name,
+            &instance_id,
+            None,
+            &instance.input_json,
+            None,
+            mark.as_deref(),
+            cut_sequence,
+            cut_sequence.is_some().then_some(store_path.as_str()),
+        )
         .map_err(|error| format!("failed to pin: {error:?}"))?;
     if options.json {
         return Ok(emit_json(json!({
             "schema": "whipplescript.pin.v0",
             "scenario": name,
             "instance": instance_id,
+            "mark": mark,
+            "cut_sequence": cut_sequence,
+            "mark_occurrences": (mark_occurrences > 0).then_some(mark_occurrences),
         })));
     }
-    println!("pinned `{name}` from instance {instance_id}");
+    match &mark {
+        Some(mark) => {
+            println!(
+                "pinned `{name}` from instance {instance_id} at mark `{mark}` (cut seq {})",
+                cut_sequence.unwrap_or(0)
+            );
+            if mark_occurrences > 1 {
+                println!(
+                    "  note: the mark fired {mark_occurrences} times; pinned the FIRST \
+                     occurrence (occurrence selection is a follow-on)"
+                );
+            }
+        }
+        None => println!("pinned `{name}` from instance {instance_id}"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub(crate) fn suppose_command(options: &CliOptions) -> ExitCode {
+    match run_suppose(options) {
+        Ok(code) => code,
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `whip suppose <scenario> [--program <p>]`: ONE what-if regeneration of
+/// the pinned scenario under the current program — the everyday debugging
+/// what-if, and the do-operator as a verb. Mark-pinned scenarios replay
+/// the frozen prefix and re-execute only the suffix (paired at the cut);
+/// input pins re-run the whole workflow. The recorded run is the paired
+/// control; the regenerated readings land in the evidence ledger.
+fn run_suppose(options: &CliOptions) -> Result<ExitCode, String> {
+    let usage = "usage: whip suppose <scenario> [--program <workflow.whip>] [--root <workflow>] [--provider <name>] [--provider-config <path>]";
+    let mut scenario_name = None;
+    let mut program = None;
+    let mut root = None;
+    let mut provider = "fixture".to_owned();
+    let mut provider_config_paths: Vec<PathBuf> = Vec::new();
+    let mut index = 0;
+    while index < options.args.len() {
+        match options.args[index].as_str() {
+            "--program" => {
+                index += 1;
+                program = options.args.get(index).cloned();
+            }
+            "--root" => {
+                index += 1;
+                root = options.args.get(index).cloned();
+            }
+            "--provider" => {
+                index += 1;
+                provider = options.args.get(index).ok_or(usage)?.clone();
+            }
+            "--provider-config" => {
+                index += 1;
+                provider_config_paths.push(PathBuf::from(options.args.get(index).ok_or(usage)?));
+            }
+            other if scenario_name.is_none() => scenario_name = Some(other.to_owned()),
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+        index += 1;
+    }
+    let scenario_name = scenario_name.ok_or(usage)?;
+    let program_path = resolve_program_path(program)?;
+    let (_, ir) =
+        crate::compile_source_path_with_root(&program_path, root.as_deref()).map_err(|error| {
+            format!(
+                "`{program_path}` does not compile: {}",
+                compile_failure_summary(&error)
+            )
+        })?;
+    let specs = collect_gauge_specs(&ir);
+    let mut improve_store = open_improve_store()?;
+    let scenario = improve_store
+        .get_scenario(&scenario_name)
+        .map_err(|error| format!("failed to read scenario: {error:?}"))?
+        .ok_or_else(|| format!("unknown scenario `{scenario_name}`"))?;
+    contain_side_stores();
+    // The recorded run is the paired control: score it in place (read-only
+    // against the source store).
+    let source_store_path = scenario
+        .store_path
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| options.store_path.clone());
+    // Never create a store while looking for the control: an unresolvable
+    // path yields an honest "no recorded control", not judge scores over a
+    // blank record.
+    let recorded = source_store_path
+        .exists()
+        .then(|| SqliteStore::open(&source_store_path).ok())
+        .flatten()
+        .map(|store| {
+            score_instance(
+                &store,
+                &scenario.instance_id,
+                &specs,
+                Some(&scenario.name),
+                false,
+            )
+        });
+    let mut seq = 0usize;
+    let regenerated = evaluate_scenario(
+        &program_path,
+        root.as_deref(),
+        &provider,
+        &provider_config_paths,
+        &scenario,
+        &specs,
+        &ir,
+        &mut seq,
+    )?;
+    let mode = if regenerated
+        .readings
+        .values()
+        .any(|reading| reading.tags.iter().any(|tag| tag == "prefix-replay"))
+    {
+        "prefix-replay"
+    } else {
+        "input-replay"
+    };
+    // The observation lands in the ledger: every suppose is evidence.
+    let source = std::fs::read_to_string(&program_path).unwrap_or_default();
+    let hash = program_hash(&source);
+    record_observations(
+        &mut improve_store,
+        std::slice::from_ref(&regenerated),
+        &specs,
+        "regen",
+        &hash,
+        None,
+        None,
+        &["suppose".to_owned()],
+    );
+    let gauges: Vec<Value> = specs
+        .iter()
+        .filter_map(|spec| {
+            let after = regenerated.readings.get(&spec.name)?;
+            let before = recorded
+                .as_ref()
+                .and_then(|observation| observation.readings.get(&spec.name));
+            Some(json!({
+                "gauge": spec.name,
+                "recorded": before.map(|reading| reading.score),
+                "regenerated": after.score,
+                "recorded_passed": before.and_then(|reading| reading.passed),
+                "regenerated_passed": after.passed,
+                "tags": after.tags,
+            }))
+        })
+        .collect();
+    if options.json {
+        return Ok(emit_json(json!({
+            "schema": "whipplescript.suppose.v0",
+            "scenario": scenario_name,
+            "mode": mode,
+            "gauges": gauges,
+            "skipped": regenerated
+                .skipped
+                .iter()
+                .map(|(gauge, reason)| json!({"gauge": gauge, "reason": reason}))
+                .collect::<Vec<_>>(),
+        })));
+    }
+    println!("suppose `{scenario_name}` ({mode})");
+    for line in &gauges {
+        let recorded = line["recorded"]
+            .as_f64()
+            .map(|value| format!("{value:.4}"))
+            .unwrap_or_else(|| "—".to_owned());
+        println!(
+            "  {}: {} -> {:.4}{}",
+            line["gauge"].as_str().unwrap_or("?"),
+            recorded,
+            line["regenerated"].as_f64().unwrap_or(f64::NAN),
+            match line["regenerated_passed"].as_bool() {
+                Some(true) => " ✓",
+                Some(false) => " ✗",
+                None => "",
+            }
+        );
+    }
+    for (gauge, reason) in &regenerated.skipped {
+        println!("  · {gauge}: {reason}");
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -3193,6 +3976,9 @@ mod tests {
             workflow: None,
             input_json: "{}".to_owned(),
             program_hash: None,
+            mark: None,
+            cut_sequence: None,
+            store_path: None,
             pinned_at: String::new(),
             retired: false,
             wear: 0,
@@ -3346,6 +4132,9 @@ mod tests {
             workflow: None,
             input_json: r#"{"ticket":{"body":"the acme production database is down"}}"#.to_owned(),
             program_hash: None,
+            mark: None,
+            cut_sequence: None,
+            store_path: None,
             pinned_at: String::new(),
             retired: false,
             wear: 0,
@@ -3377,6 +4166,9 @@ mod tests {
             input_json: r#"{"ticket":{"body":"the acme production database is down","signature":"already in the baseline prompt"}}"#
                 .to_owned(),
             program_hash: None,
+            mark: None,
+            cut_sequence: None,
+            store_path: None,
             pinned_at: String::new(),
             retired: false,
             wear: 0,
@@ -3471,7 +4263,7 @@ mod tests {
             verdict_line("focus", "ascend", 0.5, 0.85, 0.02),
             verdict_line("guarded", "guard", 0.9, 0.86, 0.02),
         ];
-        match precedent_resolution(&[precedent.clone()], &dominant) {
+        match precedent_resolution(std::slice::from_ref(&precedent), &dominant) {
             Some(PrecedentResolution::AutoAccept(citation)) => {
                 assert!(citation.contains("C-9:K-9"));
             }
@@ -3482,13 +4274,19 @@ mod tests {
             verdict_line("focus", "ascend", 0.5, 0.85, 0.02),
             verdict_line("guarded", "guard", 0.9, 0.80, 0.02),
         ];
-        assert_eq!(precedent_resolution(&[precedent.clone()], &short), None);
+        assert_eq!(
+            precedent_resolution(std::slice::from_ref(&precedent), &short),
+            None
+        );
         // Locality: the operating point moved beyond the answer-time band.
         let moved = vec![
             verdict_line("focus", "ascend", 0.7, 0.99, 0.02),
             verdict_line("guarded", "guard", 0.9, 0.86, 0.02),
         ];
-        assert_eq!(precedent_resolution(&[precedent.clone()], &moved), None);
+        assert_eq!(
+            precedent_resolution(std::slice::from_ref(&precedent), &moved),
+            None
+        );
         // Gauge-set mismatch fails closed: the precedent never covered the
         // extra gauge, so it carries no authority over it.
         let extra = vec![
@@ -3511,7 +4309,7 @@ mod tests {
             verdict_line("focus", "ascend", 0.5, 0.65, 0.02),
             verdict_line("guarded", "guard", 0.9, 0.75, 0.02),
         ];
-        match precedent_resolution(&[precedent.clone()], &worse) {
+        match precedent_resolution(std::slice::from_ref(&precedent), &worse) {
             Some(PrecedentResolution::AutoReject(citation)) => {
                 assert!(citation.contains("C-9:K-9"));
             }

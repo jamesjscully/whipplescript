@@ -129,6 +129,7 @@ pub enum Item {
     Tracker(TrackerDecl),
     Channel(ChannelDecl),
     Gauge(GaugeDecl),
+    Mark(MarkDecl),
     Campaign(CampaignDecl),
     FileStore(FileStoreDecl),
     MemoryPool(MemoryPoolDecl),
@@ -164,6 +165,7 @@ impl Item {
             Self::Tracker(decl) => decl.span,
             Self::Channel(decl) => decl.span,
             Self::Gauge(decl) => decl.span,
+            Self::Mark(decl) => decl.span,
             Self::Campaign(decl) => decl.span,
             Self::FileStore(decl) => decl.span,
             Self::MemoryPool(decl) => decl.span,
@@ -278,6 +280,24 @@ pub struct ChannelDecl {
     pub provider: Ident,
     pub workspace: Option<Ident>,
     pub destination: Option<StringLiteral>,
+    pub span: SourceSpan,
+}
+
+/// `mark "<name>" after <site>` (experimentation subsystem §4.2): a named
+/// cut point. The runtime stamps a `mark.reached` event when the named
+/// site commits on any run, so every run's meaningful moments are
+/// addressable — `whip pin <run> at <mark>` freezes the prefix as a
+/// scenario, and regeneration replays that prefix and re-executes only
+/// the suffix. Names are stable across edits (event offsets shift, marks
+/// don't). Deliberately a separate declaration from `milestone`
+/// (child→parent lifecycle signaling vs. event-log position).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkDecl {
+    pub name: StringLiteral,
+    /// The committing site the cut rides: a rule name (dotted for
+    /// flow-generated segments).
+    pub site: String,
+    pub site_span: SourceSpan,
     pub span: SourceSpan,
 }
 
@@ -974,6 +994,7 @@ pub struct IrProgram {
     pub trackers: Vec<IrTracker>,
     pub channels: Vec<IrChannel>,
     pub gauges: Vec<IrGauge>,
+    pub marks: Vec<IrMark>,
     pub campaigns: Vec<IrCampaign>,
     pub file_stores: Vec<IrFileStore>,
     pub memory_pools: Vec<IrMemoryPool>,
@@ -1105,6 +1126,16 @@ pub struct IrChannel {
     pub provider: String,
     pub workspace: Option<String>,
     pub destination: Option<String>,
+    pub span: SourceSpan,
+}
+
+/// A lowered `mark` declaration: a named cut point riding a committing
+/// site. `metadata_only`; the runtime stamps `mark.reached` events, the
+/// improve store pins scenarios at them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrMark {
+    pub name: String,
+    pub site: String,
     pub span: SourceSpan,
 }
 
@@ -2173,6 +2204,7 @@ pub fn document_symbols(source: &str) -> Vec<DeclSymbol> {
             Item::Table(decl) => ("table", decl.name.name.clone(), decl.span),
             Item::Gauge(decl) => ("gauge", decl.name.name.clone(), decl.span),
             Item::Campaign(decl) => ("campaign", decl.name.name.clone(), decl.span),
+            Item::Mark(decl) => ("mark", decl.name.value.clone(), decl.span),
             _ => continue,
         };
         symbols.push(DeclSymbol {
@@ -2808,6 +2840,7 @@ fn referenced_decl_name(item: &Item) -> Option<(String, SourceSpan)> {
         Item::Table(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::Gauge(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::Campaign(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::Mark(decl) => Some((decl.name.value.clone(), decl.span)),
         _ => None,
     }
 }
@@ -3233,6 +3266,16 @@ impl IrProgram {
                     line.push_str(&format!(" inputs={}", gauge.inputs.join(",")));
                 }
                 push_line(&mut snapshot, line);
+            }
+        }
+
+        if !self.marks.is_empty() {
+            push_line(&mut snapshot, "marks");
+            for mark in &self.marks {
+                push_line(
+                    &mut snapshot,
+                    format!("  mark {:?} after {}", mark.name, mark.site),
+                );
             }
         }
 
@@ -4087,6 +4130,7 @@ fn lower_program(
         trackers: Vec::new(),
         channels: Vec::new(),
         gauges: Vec::new(),
+        marks: Vec::new(),
         campaigns: Vec::new(),
         file_stores: Vec::new(),
         memory_pools: Vec::new(),
@@ -4175,6 +4219,7 @@ fn lower_program(
             Item::Tracker(queue) => lower_tracker(queue, &mut ir, &mut diagnostics),
             Item::Channel(channel) => lower_channel(channel, &mut ir, &mut diagnostics),
             Item::Gauge(gauge) => lower_gauge(gauge, &mut ir, &mut diagnostics),
+            Item::Mark(mark) => lower_mark(mark, &mut ir, &mut diagnostics),
             Item::Campaign(campaign) => lower_campaign(campaign, &mut ir, &mut diagnostics),
             // The `file store` declaration (capability-scoped store identity)
             // lowers to its name + literal root; the runtime file provider reads
@@ -4999,6 +5044,12 @@ fn pattern_body_admission(
             message: "campaign declarations are not allowed in pattern bodies".to_owned(),
             suggestion: Some("declare campaigns at source top level".to_owned()),
         }),
+        Item::Mark(mark) => Some(Diagnostic {
+            related: Vec::new(),
+            span: mark.span,
+            message: "mark declarations are not allowed in pattern bodies".to_owned(),
+            suggestion: Some("declare marks at source top level".to_owned()),
+        }),
         Item::Rule(rule) => pattern_rule_terminal_span(rule).map(|span| Diagnostic {
             related: Vec::new(),
             span,
@@ -5068,10 +5119,10 @@ fn expand_pattern_item(
             format!("channel:{}", channel.name.name),
             Item::Channel(channel),
         )),
-        // Gauges and campaigns are rejected from pattern bodies by
-        // `pattern_body_admission` (objective intent is top-level); there is
-        // deliberately no expansion path for them.
-        Item::Gauge(_) | Item::Campaign(_) => None,
+        // Gauges, campaigns, and marks are rejected from pattern bodies by
+        // `pattern_body_admission` (objective intent and cut points are
+        // top-level); there is deliberately no expansion path for them.
+        Item::Gauge(_) | Item::Campaign(_) | Item::Mark(_) => None,
         Item::FileStore(file_store) => Some((
             format!("file-store:{}", file_store.name.name),
             Item::FileStore(file_store),
@@ -6473,6 +6524,26 @@ fn lower_gauge(gauge: GaugeDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
     });
 }
 
+fn lower_mark(mark: MarkDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    if let Some(existing) = ir.marks.iter().find(|other| other.name == mark.name.value) {
+        diagnostics.push(
+            Diagnostic {
+                related: Vec::new(),
+                span: mark.name.span,
+                message: format!("mark `{}` is declared more than once", mark.name.value),
+                suggestion: Some("give each mark a unique name".to_owned()),
+            }
+            .with_related(existing.span, "first declared here"),
+        );
+        return;
+    }
+    ir.marks.push(IrMark {
+        name: mark.name.value,
+        site: mark.site,
+        span: mark.span,
+    });
+}
+
 fn lower_campaign(campaign: CampaignDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
     if let Some(existing) = ir
         .campaigns
@@ -6534,6 +6605,25 @@ fn lower_campaign(campaign: CampaignDecl, ir: &mut IrProgram, diagnostics: &mut 
 /// declared gauge or a built-in resource gauge, and a campaign's partition
 /// must be disjoint (a gauge cannot be both ascended and sacrificed).
 fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    // A mark rides a committing site: its `after` target must be a rule
+    // (flow segments have lowered to `flow.<name>.segN` rules by now).
+    for mark in &ir.marks {
+        if !ir.rules.iter().any(|rule| rule.name == mark.site) {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: mark.span,
+                message: format!("mark `{}` rides unknown site `{}`", mark.name, mark.site),
+                suggestion: Some(format!(
+                    "declared rules: {}",
+                    ir.rules
+                        .iter()
+                        .map(|rule| rule.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            });
+        }
+    }
     let gauge_names: BTreeSet<&str> = ir.gauges.iter().map(|gauge| gauge.name.as_str()).collect();
     let resolves = |name: &str| gauge_names.contains(name) || BUILTIN_GAUGES.contains(&name);
     let unknown = |name: &str, span: SourceSpan, diagnostics: &mut Vec<Diagnostic>| {
@@ -17225,6 +17315,12 @@ fn format_item(item: Item, formatted: &mut String) {
             push_line(formatted, format!("  provider {}", queue.provider.name));
             push_line(formatted, "}");
         }
+        Item::Mark(mark) => {
+            push_line(
+                formatted,
+                format!("mark {:?} after {}", mark.name.value, mark.site),
+            );
+        }
         Item::Gauge(gauge) => {
             let mut header = format!("gauge {}", gauge.name.name);
             if let Some(site) = &gauge.site {
@@ -18984,6 +19080,10 @@ impl Parser<'_> {
             self.reject_pending_tags(pending_tags, "campaign");
             self.reject_pending_description(pending_description, "campaign");
             self.parse_campaign().map(Item::Campaign)
+        } else if self.at_ident("mark") {
+            self.reject_pending_tags(pending_tags, "mark");
+            self.reject_pending_description(pending_description, "mark");
+            self.parse_mark().map(Item::Mark)
         } else if self.at_ident("source") {
             self.reject_pending_tags(pending_tags, "source");
             self.reject_pending_description(pending_description, "source");
@@ -19895,6 +19995,26 @@ impl Parser<'_> {
             suggestion,
         });
         None
+    }
+
+    /// `mark "<name>" after <site>`.
+    fn parse_mark(&mut self) -> Option<MarkDecl> {
+        let start = self.expect_keyword("mark")?.span.start;
+        let name = self.expect_string("mark name")?;
+        if !self.consume_ident("after") {
+            self.expected("`after` and a committing site in the mark declaration");
+            return None;
+        }
+        let (site, site_span) = self.parse_dotted_name_spanned("mark site")?;
+        Some(MarkDecl {
+            name,
+            site,
+            site_span,
+            span: SourceSpan {
+                start,
+                end: site_span.end,
+            },
+        })
     }
 
     /// `gauge <name> [on <site>] { judge via <form> [expect <bar>]
@@ -30569,6 +30689,58 @@ rule j
         assert!(snapshot.contains(
             "campaign release_tuning ascend=extract_quality reach=std.latency<=800ms guard=tail_latency:within:2% sacrifice=fulfillment_cost proposer=redacted"
         ));
+    }
+
+    #[test]
+    fn mark_declaration_parses_lowers_and_validates() {
+        let source = r##"
+@service
+workflow Improve
+
+output result R
+class R { v string }
+signal go.now { x string }
+
+mark "triaged" after j
+
+rule j
+  when go.now as g
+=> {
+  complete result {
+    v "ok"
+  }
+}
+"##;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("program compiles");
+        assert_eq!(ir.marks.len(), 1);
+        assert_eq!(ir.marks[0].name, "triaged");
+        assert_eq!(ir.marks[0].site, "j");
+        assert!(ir.to_snapshot().contains("mark \"triaged\" after j"));
+        // An unknown site is a diagnostic.
+        let unknown = compile_program(&source.replace(
+            "mark \"triaged\" after j",
+            "mark \"nowhere\" after missing_rule",
+        ));
+        assert!(unknown.diagnostics.iter().any(|d| d
+            .message
+            .contains("mark `nowhere` rides unknown site `missing_rule`")));
+        // Duplicate names are rejected.
+        let dup = compile_program(&source.replace(
+            "mark \"triaged\" after j",
+            "mark \"triaged\" after j\nmark \"triaged\" after j",
+        ));
+        assert!(dup.diagnostics.iter().any(|d| d
+            .message
+            .contains("mark `triaged` is declared more than once")));
+        // Formatting is idempotent.
+        let formatted = format_program(source).formatted.expect("formats");
+        assert!(formatted.contains("mark \"triaged\" after j"));
+        assert_eq!(
+            format_program(&formatted).formatted.expect("reformats"),
+            formatted
+        );
     }
 
     #[test]

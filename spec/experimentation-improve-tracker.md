@@ -110,10 +110,25 @@ posture, canary = RCT.
       from `whip dev`, `whip pin` + `whip gauges`. Evidence: parser tests
       (`gauge_and_campaign_*`), store unit tests, e2e
       `crates/whipplescript-cli/tests/improve_loop.rs`.
-- [ ] `mark` declaration + prefix-cut scenarios + `suppose`/`settle`:
-      deliberately NOT in v1 (needs the checkpoint-substrate integration;
-      v1 scenarios are whole-run input replays, honestly recorded in
-      DR-0037).
+- [x] `mark` declaration + prefix-cut scenarios + `suppose` — BUILT
+      2026-07-13 (DR-0038): `mark "<name>" after <site>` stamping
+      `mark.reached` at rule commit; `whip pin ... at <mark>`; the
+      clone-and-truncate replay driver (prefix fires nothing —
+      `models/maude/prefix-replay.maude`; quiescence-at-cut refusal with
+      honest input-replay fallback; revision activation for candidates;
+      epoch-bump refires detected + tagged); `whip suppose` (paired
+      recorded control, replay accounting, evidence rows); campaign
+      evaluation paired at the cut for mark pins. Evidence: parser
+      `mark_declaration_*`, e2e
+      `mark_pinned_scenario_replays_prefix_and_regenerates_suffix`.
+- [ ] `settle` (racing + stopping) — the next spine step; suppose prints
+      the paired comparison without a belief-update estimator until the
+      evidence machinery grows one.
+- [ ] Replay residuals (DR-0038): pre-flight refire refusal +
+      consumption-boundary lint; live-store branch-grade suppose (the
+      versioned-workspace containment dependency); ambient-row reuse for
+      the recorded control (transfer layer); mode-aware identity for the
+      clock hazard (v1 = `clock-sensitive` tag).
 - [ ] §18.2 IFC refinement on the evidence plane (scope ⊥ clearance,
       no-new-readers for judges): not built; v1 judges are exec/labels
       (no provider flow) or the same native coerce provider.

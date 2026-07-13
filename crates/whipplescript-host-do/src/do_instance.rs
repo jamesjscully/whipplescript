@@ -1116,6 +1116,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-go"),
+                marks: &[],
             })
             .expect("commit exec effects");
 

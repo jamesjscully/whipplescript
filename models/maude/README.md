@@ -206,6 +206,10 @@ improve-precedent.maude          tradeoff precedent authority: auto-resolution o
                                  monotone dominance over an applicable un-revoked
                                  answered precedent (accept and reject duals); the
                                  naive interpolating resolver demonstrates the hazard
+prefix-replay.maude              mark-pinned scenario seeding: a replayed pre-cut
+                                 effect never fires again, post-cut recorded outcomes
+                                 are dropped (the suffix re-executes live), suffix
+                                 sites become claimable only after the seed completes
 ```
 
 The shell script runs every Maude test file and checks the expected number of

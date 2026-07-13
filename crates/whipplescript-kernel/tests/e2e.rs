@@ -43,6 +43,7 @@ fn e2e_compiles_and_runs_minimal_workflow() {
             dependencies: &[],
             terminal: None,
             idempotency_key: Some("commit-observe-start"),
+            marks: &[],
         })
         .expect("minimal rule commits");
 
@@ -121,6 +122,7 @@ fn e2e_coerce_success_and_failure_branches_are_deterministic() {
             dependencies: &dependencies,
             terminal: None,
             idempotency_key: Some("commit-classify-failure"),
+            marks: &[],
         })
         .expect("coerce failure rule commits");
     failure_kernel
@@ -213,6 +215,7 @@ fn e2e_concurrent_instances_do_not_cross_contaminate_facts() {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some(&idempotency_key(&[instance_id, "observe_start"])),
+                marks: &[],
             })
             .expect("rule commits");
     }
@@ -618,6 +621,7 @@ fn e2e_restart_rebuilds_projection_from_event_log() {
             dependencies: &dependencies,
             terminal: None,
             idempotency_key: Some("commit-recall"),
+            marks: &[],
         })
         .expect("rule commits before restart");
 
@@ -662,6 +666,7 @@ fn e2e_repeated_dependency_claimability_stress() {
                 dependencies: &dependencies,
                 terminal: None,
                 idempotency_key: Some(&format!("commit-stress-{index}")),
+                marks: &[],
             })
             .expect("stress rule commits");
 
@@ -805,6 +810,7 @@ fn e2e_revision_queued_cancel_terminal_cancels_old_effects() {
             dependencies: &dependencies,
             terminal: None,
             idempotency_key: Some("commit-queued-revision"),
+            marks: &[],
         })
         .expect("queued effects commit");
 
@@ -1060,6 +1066,7 @@ fn e2e_child_revision_parent_observes_terminal_output() {
                 idempotency_key: Some("child-terminal"),
             }),
             idempotency_key: Some("commit-child-terminal"),
+            marks: &[],
         })
         .expect("child workflow completes");
     kernel
@@ -1191,6 +1198,7 @@ fn commit_single_effect(
             dependencies: &[],
             terminal: None,
             idempotency_key: Some(&commit_key),
+            marks: &[],
         })
         .expect("single effect commits");
 }

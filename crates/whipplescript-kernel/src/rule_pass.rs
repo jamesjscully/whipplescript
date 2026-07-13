@@ -247,6 +247,17 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                     context.identity.as_deref().unwrap_or("started"),
                     &lowering_key,
                 ]);
+                // Named cut points (experimentation surface): every
+                // declared `mark "<name>" after <site>` riding this rule is
+                // stamped IN the commit transaction — a durable commit can
+                // never exist without its cut coordinate. One event per
+                // firing, so a looping site marks each pass.
+                let mark_names: Vec<&str> = ir
+                    .marks
+                    .iter()
+                    .filter(|mark| mark.site == rule.name)
+                    .map(|mark| mark.name.as_str())
+                    .collect();
                 let event = kernel.commit_rule_with_revision_guard(
                     RuleCommit {
                         instance_id,
@@ -258,6 +269,7 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                         dependencies: &new_dependencies,
                         terminal,
                         idempotency_key: Some(&commit_key),
+                        marks: &mark_names,
                     },
                     RuleCommitRevisionGuard {
                         program_version_id: &active_version_id,

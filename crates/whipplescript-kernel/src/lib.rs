@@ -4909,6 +4909,7 @@ rule start
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
         kernel
@@ -5020,6 +5021,7 @@ rule start
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -5143,6 +5145,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -5177,6 +5180,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -5291,6 +5295,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -5503,6 +5508,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
         kernel
@@ -5564,6 +5570,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
         kernel
@@ -5682,6 +5689,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -5781,6 +5789,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -5858,6 +5867,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -6245,6 +6255,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start-secret-seed"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -6419,6 +6430,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -6509,6 +6521,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -6691,6 +6704,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start-artifact-failure"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -6776,6 +6790,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start-recovery"),
+                marks: &[],
             })
             .expect("rule commits");
         kernel
@@ -6933,6 +6948,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start-uncertain"),
+                marks: &[],
             })
             .expect("rule commits");
         (kernel, instance_id)
@@ -7565,6 +7581,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start-artifact-recovery"),
+                marks: &[],
             })
             .expect("rule commits");
         kernel
@@ -7711,6 +7728,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start-restart-provider-recovery"),
+                marks: &[],
             })
             .expect("rule commits");
         kernel
@@ -7827,6 +7845,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start-codex-native-recovery"),
+                marks: &[],
             })
             .expect("rule commits");
         kernel
@@ -7987,6 +8006,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -8089,6 +8109,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
         let request = CoerceRequest {
@@ -8192,6 +8213,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 
@@ -8281,6 +8303,7 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("rule commits");
 

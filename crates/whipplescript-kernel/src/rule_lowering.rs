@@ -480,6 +480,7 @@ pub fn empty_ir_program() -> IrProgram {
         trackers: Vec::new(),
         channels: Vec::new(),
         gauges: Vec::new(),
+        marks: Vec::new(),
         campaigns: Vec::new(),
         file_stores: Vec::new(),
         memory_pools: Vec::new(),

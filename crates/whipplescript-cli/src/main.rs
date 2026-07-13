@@ -215,6 +215,7 @@ fn main() -> ExitCode {
         Some("adopt") => improve::adopt_command(&options),
         Some("answer") => improve::answer_command(&options),
         Some("pin") => improve::pin_command(&options),
+        Some("suppose") => improve::suppose_command(&options),
         Some("gauges") => improve::gauges_command(&options),
         Some("diagnostics") => diagnostics(&options),
         Some("trace") => trace(&options),
@@ -628,7 +629,7 @@ fn print_usage() {
         "          artifacts, inbox, signal, issue, leases, ledger, counters, evidence, diagnostics, trace"
     );
     println!("          otel-export, pause, resume, cancel, checkpoint, restore, fork, retry, recover, doctor, deploy");
-    println!("          improve, campaigns, campaign, adopt, answer, pin, gauges");
+    println!("          improve, campaigns, campaign, adopt, answer, pin, suppose, gauges");
     println!("run `whip <command> --help` or `whip help <command>` for command usage");
 }
 
@@ -641,7 +642,8 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "campaign" => "usage: whip [--json] campaign <id>",
         "adopt" => "usage: whip [--json] adopt <campaign>:<candidate> [--program <workflow.whip>]",
         "answer" => "usage: whip [--json] answer <campaign>:<candidate> --accept|--reject|--revoke [--by <who>]\n  answers a surfaced tradeoff; the answer is a precedent that auto-resolves future tradeoffs it Pareto-dominates",
-        "pin" => "usage: whip [--json] pin <instance> --as <name>",
+        "pin" => "usage: whip [--json] pin <instance> [at <mark>] --as <name>",
+        "suppose" => "usage: whip [--json] suppose <scenario> [--program <workflow.whip>] [--root <workflow>] [--provider <name>] [--provider-config <path>]\n  one what-if regeneration of the pinned scenario; mark pins replay the frozen prefix and re-execute only the suffix",
         "gauges" => "usage: whip [--json] gauges [<gauge>]",
         "lsp" => "usage: whip lsp   (Language Server over stdio; launched by an editor)",
         "compile" => "usage: whip compile [--model-search] [--root <workflow>] [--package-lock <path>] <workflow.whip>",
@@ -48895,6 +48897,7 @@ workflow Child {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("commit invoke effect");
 
@@ -49035,6 +49038,7 @@ workflow Child {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("commit invoke effect");
 
@@ -49204,6 +49208,7 @@ workflow Child {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("commit invoke effect");
 
@@ -49754,6 +49759,7 @@ rule go
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
             })
             .expect("commit exec effects");
 
@@ -49899,6 +49905,7 @@ rule go
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-notify"),
+                marks: &[],
             })
             .expect("queued notify effect");
 

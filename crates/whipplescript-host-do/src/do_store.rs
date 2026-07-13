@@ -372,6 +372,27 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 idempotency_key: commit.idempotency_key,
             },
         )?;
+        for mark in commit.marks {
+            let mark_payload = serde_json::json!({
+                "mark": mark,
+                "site": commit.rule,
+                "committed_event_id": event.event_id,
+            })
+            .to_string();
+            let mark_key = format!("mark-reached:{mark}:{}", event.event_id);
+            do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: commit.instance_id,
+                    event_type: "mark.reached",
+                    payload_json: &mark_payload,
+                    source: "kernel",
+                    causation_id: Some(&event.event_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&mark_key),
+                },
+            )?;
+        }
         for fact in commit.facts {
             do_insert_fact(
                 &self.sql,
@@ -10160,6 +10181,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-1"),
+                marks: &[],
             })
             .expect("commit_rule");
         assert!(ev.event_id.starts_with("evt_"));
@@ -10188,6 +10210,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-2"),
+                marks: &[],
             },
             RuleCommitRevisionGuard {
                 program_version_id: "ver_WRONG",
@@ -10605,6 +10628,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("c1"),
+                marks: &[],
             })
             .expect("commit");
         // Then start + complete a run for the effect (appends run_started + terminal).
@@ -10743,6 +10767,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("c_a"),
+                marks: &[],
             })
             .expect("commit A");
         let cut = max_sequence(&store);
@@ -10771,6 +10796,7 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("c_b"),
+                marks: &[],
             })
             .expect("commit B");
 
@@ -11085,6 +11111,7 @@ mod tests {
                     dependencies: &[],
                     terminal: None,
                     idempotency_key: Some(key),
+                    marks: &[],
                 })
                 .expect("commit");
         };

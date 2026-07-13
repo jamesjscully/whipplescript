@@ -1442,6 +1442,23 @@ gauge extract_quality on summarize.extract {
   gauges: deterministic observables from the run ledger, present without
   declaration, descending-toward-better.
 
+A `mark` declares a named cut point — *where* the meaningful moments of a
+run are, as program structure:
+
+```whip
+mark "triaged" after classify
+```
+
+The runtime stamps a `mark.reached` event whenever the named rule commits,
+on every run, so capture is retroactively ambient: any past run can become
+a scenario at any declared mark (`whip pin <instance> at triaged --as
+subject-line-case`). A mark-pinned scenario freezes the run's *prefix*;
+`whip suppose` and campaign evaluation replay that prefix (replayed
+effects never re-fire) and re-execute only the suffix — paired
+regeneration at the cut. Mark names are stable across edits (event offsets
+shift, marks don't). `mark` is deliberately separate from `milestone`
+(lifecycle signaling vs. event-log position).
+
 A `campaign` declares versioned, diffable objective intent — a partition of
 the gauge vector at higher ceremony than a CLI invocation
 (`whip improve release_tuning` adopts it):
