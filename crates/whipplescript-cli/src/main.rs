@@ -23273,10 +23273,9 @@ fn decode_cached_exec_result(
         Some(ingested) => {
             if let Some(single) = ingested.get("single") {
                 Some(ExecIngest::Single(single.clone()))
-            } else if let Some(stream) = ingested.get("stream").and_then(Value::as_array) {
-                Some(ExecIngest::Stream(stream.clone()))
             } else {
-                return None;
+                let stream = ingested.get("stream").and_then(Value::as_array)?;
+                Some(ExecIngest::Stream(stream.clone()))
             }
         }
     };
