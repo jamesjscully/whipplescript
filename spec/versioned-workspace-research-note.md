@@ -1174,8 +1174,7 @@ the pressure valve.
   merge; the composition theorem is shared.
 - **Open-core seam** — the substrate is core-shaped (like IFC); hosted
   replication/collaboration services, if ever, sit behind the standard seam.
-- **Un-tie substrate replacement**
-  (`untie-substrate-replacement-research-note.md`) — this note's first
+- **Un-tie substrate replacement** — this note's first
   external customer and the strongest forcing function for its build: the
   workspace replaces git in un-tie/gaugewright (13-operation mapping;
   handoff export; per-blob erasure as the honest upgrade over tombstoned

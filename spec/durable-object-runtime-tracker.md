@@ -146,7 +146,7 @@ is the design SSOT; this list is the at-a-glance summary.
    same "only if a real typed high-throughput data-plane appears" gate.
 
 7. **Subprocess effects do not exist on the pure-DO host.** `exec.command` and the
-   stdio agent sidecars (codex/claude/pi) are native-only drivers. On the DO they
+   stdio agent sidecars (codex/claude) are native-only drivers. On the DO they
    are either unavailable or re-expressed as HTTP to a container sidecar (which is
    then just another network effect on the step machine).
 
@@ -281,7 +281,7 @@ linear undo chain). No phase work now.
       compare terminal, summary, steps, observation stream, merged usage, tool
       calls, and the checkpoint sequence. Native production stays on
       `run_brokered_loop` (zero behavior change) until Phase 5 flips the DO on.
-- [x] Stdio sidecars (codex/claude/pi) confirmed native-only opaque drivers —
+- [x] Stdio sidecars (codex/claude) confirmed native-only opaque drivers —
       they do not implement `HarnessModelClient` and never touch the step
       machine (DR-0033 Decision 7). Gates: kernel 204 + e2e 17; full kernel+CLI
       suite exit 0; fmt + `clippy -D warnings` clean. No user-facing surface, so

@@ -35,7 +35,7 @@ agent implementer {
 }
 ```
 
-- `provider` names the family (`owned`, `codex`, `claude`, `pi`, `fixture`).
+- `provider` names the family (`owned`, `codex`, `claude`, `fixture`).
 - `profile` describes authority, such as `repo-reader` or `repo-writer`.
 - `capacity` bounds concurrent turns.
 - `capabilities` lists what the agent may be asked to do.
@@ -51,7 +51,7 @@ endpoints, declare named endpoints with `harness` and bind agents with
 
 ## Owned harness (`provider owned`)
 
-The `codex`/`claude`/`pi` families **delegate** the whole agent turn to a
+The `codex`/`claude` families **delegate** the whole agent turn to a
 provider's own harness; whip captures a redacted summary and cannot truly
 enforce what the turn does. The **owned** harness instead runs the tool-use loop
 itself: the model requests a tool, *whip* executes it, feeds the result back, and
@@ -208,7 +208,7 @@ prompts, or raw provider responses.
 
 ## Native providers
 
-Native adapters for Codex, Claude, and Pi are experimental: setup,
+Native adapters for Codex and Claude are experimental: setup,
 cancellation behavior, artifact capture, and evidence shape may change.
 
 The Codex and Claude adapters are now **optional Cargo features** (`codex`,
@@ -228,7 +228,6 @@ message rather than silently falling back.
 | --- | --- | --- | --- | --- |
 | Codex | app-server JSON-RPC | thread + turn id | `turn/interrupt` | notifications, tool/approval summaries, diff metadata |
 | Claude | Agent SDK sidecar | session id | cooperative SDK cancellation | stream messages, hook/tool summaries, usage |
-| Pi | RPC mode | session + parent id | RPC `abort` | RPC events, model metadata, terminal summaries |
 
 After a crash leaves native runs interrupted, `whip recover <instance>`
 reconciles them from persisted provider evidence.

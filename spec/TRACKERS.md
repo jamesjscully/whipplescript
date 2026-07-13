@@ -64,13 +64,12 @@ closed/archived (shipped or historical).
 |---------|--------|-----------------------------------|--------------|---------|
 | `spec/distribution-tracker.md` | active | Packaging, versioning, and distribution of whipplescript artifacts | 2026-06-30 | v0.2 |
 | `spec/expression-kernel-tracker.md` | active | The expression/evaluation kernel implementation | 2026-06-30 | v0.2 |
-| `spec/native-provider-implementation-tracker.md` | active | Building usable native Codex/Claude/Pi providers (prose tracker) | 2026-06-30 | v0.2 |
+| `spec/native-provider-implementation-tracker.md` | active | Building usable native Codex/Claude providers (prose tracker) | 2026-06-30 | v0.2 |
 | `spec/workflow-composition-transition-tracker.md` | active | Migrating to the workflow-composition model (invoke/subworkflows) | 2026-06-30 | v0.2 |
 | `spec/workflow-encapsulation-implementation-tracker.md` | closed | v1 workflow-encapsulation + invocation-authorization theorem — all phases shipped 2026-07-02; open remnants re-homed to owned-harness-tool-surface.md | 2026-07-02 |
 | `spec/durable-object-runtime-tracker.md` | active | Sans-IO async refactor + Cloudflare Durable Object host binding (run whip in a wasm isolate) | 2026-07-01 | v0.3 |
 | `spec/context-assembly-tracker.md` | closed | Owned-harness context assembly (mirror pi): system-prompt seam, skills registry/catalogue, project-instructions, and pluggable cache-aware compaction | 2026-07-04 | v0.3 |
 | `spec/experimentation-improve-tracker.md` | active | Experimentation/improve subsystem (the v0.4 banner's second half): release-scope decision + the four open design passes + the gauge/mark/campaign build — registered 2026-07-10, previously pre-ADR notes | 2026-07-10 | v0.4 (lean: re-cut → v0.5) |
-| `spec/untie-substrate-readiness-tracker.md` | active | Whip-side capabilities for the un-tie substrate replacement (canonical build home for the versioned workspace + workspace API + conversational runtime + policy/auth + store seam) — Phases 0–5 ALL SHIPPED 2026-07-10; open: the ⚑ sequencing-fork decision (Jack) + the presigned-transfer `[~]` (rides container billing) | 2026-07-10 | v0.3–v0.4 |
 | `spec/decision-records/language-ergonomics-tracker.md` | active | v2 language-surface ergonomics decisions + build-out; **canonical home** for the small-language-follow-ups (see dedup) — Part B reconciled 2026-07-01; B1g closed 2026-07-02, only B1a-refactor / `consume`-removal remain | 2026-07-02 | v0.2 (B1a→v0.3) |
 | `spec/decision-records/standard-package-design-tracker.md` | active | Open design todos for the standard packages | 2026-06-30 | v0.2 |
 | `spec/decision-records/discriminated-families-design.md` | closed | Discriminated-families — all four families (A/B/C) + selector capstone + §5.4 observer-only check SHIPPED & gated; closed 2026-07-03. Sole non-`[x]`: the Stage 1a internal pass-collapse refactor, a deferred-with-cause `[~]` (dropped Rev 2026-06-28e, no capability lost). §9 = demand-gated / v2 design questions, not open build intent. | 2026-07-03 |
@@ -106,8 +105,6 @@ Same concern tracked in more than one place. Registry rule: work it in the
 | C6/C7/C8/C9 capabilities (coord/messaging/telemetry/script/time/ingress) | shipped in core (language-ergonomics) | standard-package-design treats as future *packages* — that tracker is now a packaging/namespacing design question, not feature work |
 | `case`/sum-types/coerce→enum narrowing | discriminated-families-design (closed, shipped) | language-ergonomics C1; expression-kernel tagged-terminal rows |
 | vNext epic (retarget / fact migration / cancellation depth / destructive confirms) | final-audit (deferred log) = archived `workflow-revision-followups` | native-provider NP-060 builds only the cancellation request/ack model, not out-of-band depth |
-| Versioned-workspace build | untie-substrate-readiness (Phases 0–2) | versioned-workspace-research-note = design intent only, holds no build boxes |
-| Pi-mirrored harness behaviors | context-assembly-tracker (system prompt, skills, project instructions, compaction) | untie-substrate-readiness Phase 3 owns the *remaining* harness-owned set (tool ergonomics, turn lifecycle, abort, thread continuation, stderr) and points there |
 
 ## Not trackers (design/spec docs that merely match the name pattern)
 

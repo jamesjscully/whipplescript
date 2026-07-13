@@ -183,7 +183,7 @@ as complete:
 - [x] Reject object literals outside an expected schema context.
 - [x] Reject plain strings where `AgentRef<...>` is required.
 - [x] Emit statically unsatisfiable finite-domain guard diagnostics when useful,
-  for example `task.provider == "gpt5"` against `"codex" | "claude" | "pi"`.
+  for example `task.provider == "gpt5"` against `"codex" | "claude"`.
 
 ### 3. Runtime Evaluator
 
@@ -219,7 +219,7 @@ as complete:
 
 ### 5. AgentRef And Deterministic Routing
 
-- [x] Specify source syntax for `AgentRef<codex | claude | pi>` or its chosen
+- [x] Specify source syntax for `AgentRef<codex | claude>` or its chosen
   equivalent in [type-system.md](type-system.md) and
   [language.md](language.md).
 - [x] Represent `AgentRef` structurally in IR.
@@ -348,7 +348,7 @@ Tagged terminal-output union branch matching implementation checklist:
 
 ## Acceptance Gates
 
-- [x] A shared task schema can route work across Codex, Claude, and Pi using
+- [x] A shared task schema can route work across Codex and Claude using
   deterministic source metadata without duplicate provider-specific classes.
 - [x] Guards using enum/literal fields are type-checked and finite-domain typos
   are rejected or diagnosed before runtime.

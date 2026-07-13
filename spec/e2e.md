@@ -19,8 +19,8 @@ Those artifacts are written before trace conformance is checked, so a failed
 test leaves the abstract lifecycle trace available for debugging.
 
 The deterministic CLI e2e suite includes `examples/provider-language-e2e.whip`
-and its acceptance fixture. That workflow drives logical `codex`, `claude`,
-and `pi` agents through six table-seeded language-generation tasks, then
+and its acceptance fixture. That workflow drives logical `codex` and `claude`
+agents through four table-seeded language-generation tasks, then
 reviews every completed turn with typed schema coercion. The default run uses
 the fixture worker, so it checks orchestration, dependencies, effect/fact
 projection, assertion reads, trace summaries, provider-run/evidence metadata,
@@ -29,13 +29,13 @@ credentials.
 
 This workflow is also a language-feature regression target. The intended
 source shape is one shared `LanguageTask` schema with a typed
-`AgentRef<codex | claude | pi>` provider field, not one duplicate task class
+`AgentRef<codex | claude>` provider field, not one duplicate task class
 per provider. The test should not ask coerce or any language model to decide
 provider identity, model identity, or route selection.
 
 The deterministic suite also includes the companion-skill acceptance fixture.
 That workflow seeds three phase-review tasks, routes them through typed
-`AgentRef<codex | claude | pi>` metadata, tells each logical reviewer to update
+`AgentRef<codex | claude>` metadata, tells each logical reviewer to update
 the same visible tracker path, and records
 `CompanionReviewDispatch` facts after successful fixture turns. Source
 assertions prove one dispatch per logical reviewer and three completed
@@ -48,9 +48,8 @@ and `examples/provider-language-e2e.accept.json` pins the final report:
 ```text
 count(LanguageE2EResult where provider == "codex") == 2
 count(LanguageE2EResult where provider == "claude") == 2
-count(LanguageE2EResult where provider == "pi") == 2
-count(agent.turn.completed) == 6
-count(coerce.succeeded) == 6
+count(agent.turn.completed) == 4
+count(coerce.succeeded) == 4
 ```
 
 `coerce.succeeded` is the current fixture projection for the coerce-backed
@@ -78,7 +77,7 @@ Required deterministic coverage:
 
 | Area | E2E expectation |
 | --- | --- |
-| Guard routing | One shared `LanguageTask` schema routes `codex`, `claude`, and `pi` with deterministic `where` guards or typed `AgentRef` fields. |
+| Guard routing | One shared `LanguageTask` schema routes `codex` and `claude` with deterministic `where` guards or typed `AgentRef` fields. |
 | Boolean and comparison operators | Source includes `&&`, `||`, `!`, equality, inequality, and numeric ordering in guards or assertions. |
 | Membership and presence | Source includes `in`, `not in`, `exists path`, optional-present access, and null/missing-sensitive checks. |
 | Projection functions | Source assertions use `count`, `exists(collection)`, and `empty` over fact and effect projections. |
@@ -170,8 +169,7 @@ final message and a `turn.completed` JSONL event, and records
 Destructive provider tests are refused unless the target is explicitly marked
 disposable. Set `WHIPPLESCRIPT_REAL_PROVIDER_DESTRUCTIVE_TESTS=1` for all
 selected providers, or `WHIPPLESCRIPT_CODEX_DESTRUCTIVE_TESTS=1`,
-`WHIPPLESCRIPT_CLAUDE_DESTRUCTIVE_TESTS=1`,
-`WHIPPLESCRIPT_PI_DESTRUCTIVE_TESTS=1`, or
+`WHIPPLESCRIPT_CLAUDE_DESTRUCTIVE_TESTS=1`, or
 `WHIPPLESCRIPT_COERCE_DESTRUCTIVE_TESTS=1` for one provider. The matching run must
 also set either provider-specific disposable marker variables, such as
 `WHIPPLESCRIPT_CODEX_DISPOSABLE_TARGET` and
@@ -216,10 +214,10 @@ counts, and the provider's own preflight records.
 
 Native provider compatibility checks can be requested without the all-provider
 strict gate by setting `WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_SURFACE=1`. This
-selects the native Codex app-server, Claude Agent SDK, and Pi RPC validation
+selects the native Codex app-server and Claude Agent SDK validation
 paths for whichever providers are listed in `WHIPPLESCRIPT_REAL_PROVIDERS`.
 The optional GitHub Actions workflow `Native Provider Validation` runs a
-Codex/Claude/Pi matrix in that mode and uploads the generated reports. Its
+Codex/Claude matrix in that mode and uploads the generated reports. Its
 `strict=true` dispatch input runs the all-provider strict gate; missing native
 provider config paths or required live prerequisites then fail the workflow.
 

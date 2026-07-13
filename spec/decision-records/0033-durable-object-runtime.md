@@ -166,7 +166,7 @@ and the DO shell a single `fetch` driver.
 
 ## Decision 7 — Subprocess effects do not exist on the pure-DO host
 
-`exec.command` and the stdio agent sidecars (codex / claude / pi) are **native-only
+`exec.command` and the stdio agent sidecars (codex / claude) are **native-only
 drivers**. On the DO they are either unavailable or re-expressed as HTTP to a
 container sidecar — which is then just another network effect on the step machine
 (Decision 2), not a special case. This keeps the wasm isolate free of any

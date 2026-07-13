@@ -150,7 +150,7 @@ network providers (the CoerceStepMachine/BrokeredTurnMachine precedent;
 DO-compatible by construction); (2) **subprocess adapter** for local tooling
 (native-only, DO counterpart = DO tracker Phase 8);
 (3) **native adapter trait behind a cargo feature** for deep session
-protocols (codex/claude/pi). One NEW seam lands now: a `CapabilityProvider`
+protocols (codex/claude). One NEW seam lands now: a `CapabilityProvider`
 host-projection trait replacing the fixture else-branch at
 kernel/effect_handlers.rs:1883-1887, keeping the existing
 validate→complete_run→derive-fact tail unchanged; and `capability_bound`
@@ -433,8 +433,7 @@ rewritten inside the script slice (onto the AST), not via a framework.
 ### E1. Names
 
 std.coord, std.tracker, std.agent (with std.agent.codex and std.agent.claude
-as thin provider packages; std.agent.pi DEFERRED name-reserved — pi_variant
-is pure spec), std.messaging, std.memory (manifest id `memory` →
+as thin provider packages), std.messaging, std.memory (manifest id `memory` →
 `std.memory`; KEEP capability ids `memory.query`/`memory.write` — the
 panel's `memory.recall`/`memory.learn` was an undecided invention,
 rejected), std.time, std.ingress, std.files, std.script, std.telemetry,
@@ -493,8 +492,7 @@ lines gate authority.
 
 ### E6. Merge/split/defer/drop verdicts
 
-Keep all rows except: std.agent.pi deferred (name reserved; pi_variant has
-no lock/provenance/discovery design); std.test already dropped. No new
+Keep all rows except: std.test already dropped. No new
 merges or splits — time stays separate from ingress, messaging separate from
 ingress, and coord's four lease mechanisms stay separate per Jack's standing
 decision. The ADR-0002 event-sourced tracker rebuild is split IN TIME, not

@@ -251,7 +251,7 @@ class WorkReview {
 Field types follow the coerce-compatible subset: scalars (`string`, `int`,
 `float`, `bool`), arrays (`string[]`), classes, enums, optionals, string
 literals and literal unions (`status "open" | "done"`), and agent domains
-(`AgentRef<codex | claude | pi>`). Literal-typed fields are the idiomatic way
+(`AgentRef<codex | claude>`). Literal-typed fields are the idiomatic way
 to model small state machines.
 
 ### `agent`
@@ -274,7 +274,7 @@ agent coder delegated to claude {
 
 A plain `agent name { … }` is **managed** by default: WhippleScript's own
 harness runs the turn and assembles its context. `agent name delegated to
-<provider>` names a foreign runtime (`codex`, `claude`, `pi`,
+<provider>` names a foreign runtime (`codex`, `claude`,
 `native-fixture`, `command`) that assembles its own context (DR-0034). The
 legacy `provider <kind>` field and `using <harness>` bindings remain
 supported and classify onto the same managed/delegated axis.
@@ -1677,7 +1677,7 @@ harness reviewer: claude
 agent worker using coder { ... }
 ```
 
-Supported harness kinds: `codex`, `claude`, `pi`, `fixture`,
+Supported harness kinds: `codex`, `claude`, `fixture`,
 `native-fixture`, `command`. Reach for this only when a plain `provider`
 binding genuinely cannot express the endpoint topology you need.
 

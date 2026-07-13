@@ -52,7 +52,7 @@ others are active workshop material.
   backend.
 - [0015-agent-harness-feature-semantics.md](0015-agent-harness-feature-semantics.md):
   `std.agent` standardizes the provider boundary and feature-report taxonomy,
-  while Codex, Claude, and Pi live in separate provider packages with native
+  while Codex and Claude live in separate provider packages with native
   semantics and truthful capability maps.
 - [0016-codex-agent-provider-package.md](0016-codex-agent-provider-package.md):
   `std.agent.codex` maps the shared agent-provider contract onto Codex App
@@ -62,10 +62,6 @@ others are active workshop material.
   `std.agent.claude` maps the shared agent-provider contract onto the Claude
   Agent SDK sidecar, Claude tool/permission policy, skills, plugins, hooks,
   subagents, sessions, and redacted Claude evidence.
-- [0018-pi-agent-provider-package.md](0018-pi-agent-provider-package.md):
-  `std.agent.pi` maps the shared agent-provider contract onto Pi RPC and
-  `pi_variant` package/extension sets with command/tool discovery and redacted
-  Pi evidence.
 - [0019-files-package.md](0019-files-package.md): `std.files` owns
   capability-scoped file stores, deterministic file/document codecs,
   read/write/import/export effects, and turn-scoped agent file grants.
@@ -167,7 +163,7 @@ others are active workshop material.
 - [0035-delegated-harness-wire-protocol.md](0035-delegated-harness-wire-protocol.md):
   the D8-6 follow-on under DR-0034 — the delegated turn contract is formalized as
   **obligations over the existing dialects** (Claude whip-sidecar JSONL, Codex
-  app-server JSON-RPC, Pi RPC), not one unified wire format: canonical turn
+  app-server JSON-RPC), not one unified wire format: canonical turn
   envelope with narrowing-only policy projections, exactly-one-terminal +
   tolerant run-id routing, two-clock liveness (inactivity wall clock + delivered-
   frame budget), ack-then-terminal cancellation wired into the driver, declared

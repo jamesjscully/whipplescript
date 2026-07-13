@@ -133,7 +133,7 @@ custom status panels
 provider-specific health checks
 ```
 
-Agent provider adapters are the clearest example. Codex, Claude, and Pi should
+Agent provider adapters are the clearest example. Codex and Claude should
 not be treated as plain `exec` wrappers because WhippleScript needs structured
 turn lifecycle, session identifiers, streaming observations, approvals,
 cancellation, and artifacts. Existing harness terminology should be treated as

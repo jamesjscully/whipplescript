@@ -161,9 +161,9 @@ Track R (runtime loop, builds on Stage R0):
 
 Track R:
 
-7. **Stage 7 provider bindings** (Codex / Claude / Pi / coerce / human config,
+7. **Stage 7 provider bindings** (Codex / Claude / coerce / human config,
    health checks, explainable selection, blocked-effect status). After Stage 6.
-8. **Stage 8 real adapters** (Codex / Claude / Pi adapters; transcript / artifact /
+8. **Stage 8 real adapters** (Codex / Claude adapters; transcript / artifact /
    failure-evidence capture; `agent.turn.*` normalization; control-plane driver;
    workspace records). After Stage 7.
 
@@ -223,7 +223,7 @@ WhippleScript v0 should provide:
   cancelling workflow instances
 - first-party effects for agent turns, schema coercion,
   human review, skills, and evidence capture
-- adapter support for at least Codex, Claude Code, and Pi-style harnesses
+- adapter support for at least Codex and Claude Code harnesses
 - formal checks and trace-conformance checks that catch orchestration bugs
 - e2e tests that run real workflows through the full stack
 
@@ -243,7 +243,7 @@ WhippleScript v0 should provide:
 - [x] M5: Capability registry, skills, real agent harnesses,
   schema-coercion backends, human review, and observability are wired
   through typed effect contracts. (Verified 2026-06-18: all components ship — capability
-  registry/skills (Stage 7), Codex/Claude/Pi adapters (implemented + green native-adapter
+  registry/skills (Stage 7), Codex/Claude adapters (implemented + green native-adapter
   checks), coerce, human-review/inbox, otel/trace — and the wiring is validated by
   the green required `native provider contract` check. Live execution against real
   provider SDKs is validated separately and remains env-gated — see M7.)
@@ -785,10 +785,10 @@ Goal: safely bind authority at runtime without bloating the core.
   - [x] internet-research
   - [x] human-review
 - [x] Implement custom profile loading from config.
-- [x] Implement provider binding config for Codex, Claude, Pi, fixture, coerce,
+- [x] Implement provider binding config for Codex, Claude, fixture, coerce,
   and human inbox providers. (Verified 2026-06-18: `provider_selection.kind`
-  binds codex/claude/pi/fixture; coerce/inbox have their own provider paths; the
-  native Codex/Claude/Pi adapter + coerce checks are green required checks.)
+  binds codex/claude/fixture; coerce/inbox have their own provider paths; the
+  native Codex/Claude adapter + coerce checks are green required checks.)
 - [x] Implement provider health checks and explainable provider selection. Provider
   health checks: `doctor_providers_reports_deterministic_health_posture` (green
   required "provider doctor posture"). Explainable selection (implemented 2026-06-18):
@@ -868,12 +868,6 @@ Goal: wire the built-in effect families through the same contract system.
   capture, and usage capture. (Implemented in `claude_agent_sdk.rs`:
   `artifact_refs_from_claude_event`, reader/writer profile→allowed-tool policy maps,
   usage/result redaction; green required "Claude native adapter". LIVE gated.)
-- [x] Implement Pi adapter through the Pi extension system, with WhippleScript
-  effect/run correlation to Pi conversation threads, transcript/evidence export,
-  and completion detection. (Implemented in `pi_rpc.rs`: prompt start + policy
-  payload, event streaming, `artifact_refs_from_pi_message`, abort-ack non-terminal
-  until turn end (completion/cancel correlation); green required "Pi native adapter".
-  LIVE gated.)
 - [x] Capture provider transcripts, artifacts, exit/status, tool calls, usage,
   diffs, and changed files for real Codex and Claude turns. (Reconciled 2026-06-23:
   the buildable capture machinery is complete and mock-tested — adapters parse +
@@ -881,7 +875,7 @@ Goal: wire the built-in effect families through the same contract system.
   (codex), `usage_shape` + artifact events (claude), tool calls; `native_lifecycle`
   normalizes them to `agent.turn.streamed/tool_requested/artifact_captured`
   evidence (tests `normalizes_codex_started_diff_tool_and_cancelled_terminal`,
-  `normalizes_claude_and_pi_artifact_events`); exit/status + boundary fields land
+  `normalizes_claude_artifact_events`); exit/status + boundary fields land
   in terminal payloads (this stage's sub-items above). Evidence is persisted +
   retrievable (`whip evidence`, control_plane evidence tests). Capture FROM REAL
   turns is exercised by the credential-gated `check-{codex-app-server,claude-agent-sdk}-artifact-smoke.sh`
@@ -905,7 +899,7 @@ Goal: wire the built-in effect families through the same contract system.
   - [x] Real adapters still need provider-native cancellation and
     artifact-capture failure coverage. (Verified 2026-06-18: each native adapter has
     `cancel_turn` + a `*_ack_is_non_terminal_until_*` test (codex interrupt, claude
-    cancel, pi abort) plus client cancel/abort tests + green non-live interrupt-smoke
+    cancel) plus client cancel/abort tests + green non-live interrupt-smoke
     checks; artifact-capture failure is `record_artifact_capture_failure` /
     `enforce_required_artifact_capture_failure` with tests
     `artifact_capture_failure_records_redacted_event_and_diagnostic`,
@@ -1316,8 +1310,8 @@ not be considered complete until that tracker reaches its acceptance gates.
 
 Acceptance:
 
-- [x] A single shared task schema can route six language tasks across Codex,
-  Claude, and Pi without duplicate provider-specific classes.
+- [x] A single shared task schema can route four language tasks across Codex
+  and Claude without duplicate provider-specific classes.
 - [x] Provider counts, agent-turn counts, and typed-review counts are asserted
   in source or first-class assertion fixtures.
 - [x] The typed schema-coercion review output contains only reviewable artifact
@@ -1387,7 +1381,7 @@ Acceptance:
   answering the inbox item (`inbox answer … --choice approve`) + a `step` records
   `ReviewDecision {decision: approve, decidedBy: alice}`. `whip fmt` idempotent;
   `.ir` golden regenerated; `whip lint` clean; docs-examples gate green.
-- [x] Real-provider validation can be run with Codex, Claude, and Pi provider
+- [x] Real-provider validation can be run with Codex and Claude provider
   bindings independently, with skipped providers reported as unavailable rather
   than silently passing. (DONE 2026-06-23. Per-provider independence:
   `WHIPPLESCRIPT_REAL_PROVIDERS` selects any subset; `check-real-providers.sh`

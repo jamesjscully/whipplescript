@@ -2,7 +2,7 @@
 
 Status: accepted 2026-06-24 (founding premise + invariants). Opens a new harness
 *mode* alongside the existing delegating one
-([`agent-harness.md`](../agent-harness.md), DR-0015..0018). This record locks
+([`agent-harness.md`](../agent-harness.md), DR-0015..0017). This record locks
 **only** the premise and the three invariants every downstream decision must
 preserve. The durability granularity, governance-capability map, sandbox
 mechanism, and lifecycle/replay formalization are deliberately **left open** and
@@ -11,8 +11,8 @@ tracked as later steps (see "What this record does not decide").
 ## Problem
 
 Today an `agent.tell` effect is executed by *delegating* the entire agent turn to
-a provider's own native harness — Codex's App Server, the Claude Agent SDK
-sidecar, Pi RPC (DR-0015..0018, [`agent-harness.md`](../agent-harness.md)). That
+a provider's own native harness — Codex's App Server and the Claude Agent SDK
+sidecar (DR-0015..0017, [`agent-harness.md`](../agent-harness.md)). That
 model is correct for what it is: a way to run a heavyweight external coding agent
 and capture a normalized terminal summary plus opaque evidence.
 
@@ -52,7 +52,7 @@ enforceable, the delegating harness already exists and we should just use it.
 
 Introduce the **owned (brokered) harness** as a first-class harness mode,
 intended to become the default agent-turn executor. The provider-native
-harnesses (Codex, Claude, Pi) are **not removed**: they are reframed as the
+harnesses (Codex, Claude) are **not removed**: they are reframed as the
 *external harness* mode — "bring a bigger external agent when the task needs
 one" — and demoted from default. Both modes satisfy invariants I2 and I3 below;
 only the owned harness satisfies I1, and only I1 makes boundaries enforceable.
@@ -60,7 +60,7 @@ only the owned harness satisfies I1, and only I1 makes boundaries enforceable.
 The owned harness is `coerce`'s direct-model-call plumbing generalized from a
 single structured decision to a multi-turn tool-use loop. The model gets the
 raw, trained-on tools it is good at (read / write / edit / bash, designs
-borrowed from the open-source Codex/Pi harnesses — see step 2); whip's
+borrowed from the open-source Codex harness — see step 2); whip's
 structured primitives are **not** in the model's tool list. They are the
 *enforced envelope around the loop*.
 
@@ -236,7 +236,7 @@ existential feasibility question and becomes a bounded engineering one (step 4).
 
 ```text
 delegating / external harness   owned / brokered harness
-(DR-0015..0018, agent-harness)  (this record)
+(DR-0015..0017, agent-harness)  (this record)
 ------------------------------  ------------------------------
 provider native process runs    whip runs the tools
 the tools
@@ -259,7 +259,7 @@ stream events, not committed effects, and carry no exactly-once guarantee.
 These are explicitly open and sequenced as the next design steps:
 
 ```text
-step 2  Tool taxonomy. A scoped read of the open-source Codex/Pi tools:
+step 2  Tool taxonomy. A scoped read of the open-source Codex tools:
         which mutate vs are pure reads, idempotency, per-turn cadence, and the
         compaction model. Taxonomy, not a reimplementation study. Feeds step 3.
         DONE 2026-06-24 -> spec/owned-harness-tool-taxonomy.md
@@ -297,7 +297,7 @@ persistent sessions   Codex-style exec_command + write_stdin live PTY sessions
                       that survive across tool calls/turns. They are layer-1
                       external-world resource state and cannot be resumed across
                       a crash without process-level checkpointing. v0 uses
-                      fresh-spawn-only shells (Pi-style); revisit as a session
+                      fresh-spawn-only shells; revisit as a session
                       resource modeled like leases/claims (with cancel cleanup).
 
 atomic-turn isolation Roll a turn back cleanly (snapshot / git worktree /

@@ -537,7 +537,7 @@ Requirements:
 - redact secrets, paths outside allowed roots when necessary, tokens, prompts
   marked sensitive, and provider credentials
 - attach provider feature reports when a requested feature is unavailable
-- attach version/probe information for Codex, Claude, Pi, and other harnesses
+- attach version/probe information for Codex, Claude, and other harnesses
 - distinguish "provider cannot do this" from "provider failed while doing this"
 
 Example:

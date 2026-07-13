@@ -130,7 +130,7 @@ only file/command/tracker ops and drops recall/learn through `_ => {}`
 - Governance: memory pools join file/command/tracker in
   `enforce_turn_access_governance` — an envelope that does not govern the pool
   resource rejects the grant (harness_tools.rs:2135-2163).
-- Native adapters (codex/claude/pi) get no memory tools in v1; providers own
+- Native adapters (codex/claude) get no memory tools in v1; providers own
   exposure mechanics per DR-0008, and only the owned harness has the tool seam
   today. This is made loud, not silent: static check 4 (below) warns on a
   memory grant whose target statically resolves to a native adapter, so the
@@ -210,7 +210,7 @@ implements and enforces per E7):
    hint that provider selection is binding-owned (manifest `bindings[]`);
    `context limit` must be a positive integer.
 4. Memory-grant exposure (MEM-5): a `with access to <pool>` grant on a tell
-   whose target agent statically resolves to a native adapter (codex/claude/pi)
+   whose target agent statically resolves to a native adapter (codex/claude)
    is a **check-time warning** — the grant would be inert at turn time, since
    only the owned harness has the tool seam in v1. This deliberately narrows
    DR-0008's "checker must reject a memory grant if the target

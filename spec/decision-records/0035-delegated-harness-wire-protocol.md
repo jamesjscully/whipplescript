@@ -15,19 +15,19 @@ when the compute plane ships).
 
 ## Problem
 
-WhippleScript drives three delegated runtimes today, and each speaks its own
+WhippleScript drives two delegated runtimes today, and each speaks its own
 dialect against one implicit Rust boundary:
 
-| | Claude | Codex | Pi |
-|---|---|---|---|
-| Transport | whip-owned Node sidecar (`scripts/claude-agent-sdk-sidecar.mjs`), JSONL over stdio | `codex app-server`, JSON-RPC 2.0 over stdio lines | `pi --mode rpc --no-session`, bespoke JSONL |
-| Process lifecycle | one process per turn | persistent, per-turn ephemeral thread | persistent, single session |
-| Handshake | none | `initialize` (result discarded) | none (`get_state` doubles as liveness) |
-| Turn start | `run/start {run_id, request}` | `thread/start` + `turn/start` | `get_state` + `prompt` |
-| Policy projection | allowed/disallowed tools + permission mode + setting_sources | sandbox mode + approval policy (+ `networkAccess:false`) | tool allowlist (`read/edit/write/bash`) |
-| Terminal signal | `claude.turn.{completed,failed,cancelled}` | `turn/completed` (status field) | `turn_end` (stopReason/errorMessage) |
-| Cancel verb | `run/cancel` (cooperative) | `turn/interrupt {threadId,turnId}` (NativeStop, before-terminal) | `abort` (NativeStop, ack-may-follow-terminal) |
-| Version on the wire | none | clientInfo sent, server reply ignored | none |
+| | Claude | Codex |
+|---|---|---|
+| Transport | whip-owned Node sidecar (`scripts/claude-agent-sdk-sidecar.mjs`), JSONL over stdio | `codex app-server`, JSON-RPC 2.0 over stdio lines |
+| Process lifecycle | one process per turn | persistent, per-turn ephemeral thread |
+| Handshake | none | `initialize` (result discarded) |
+| Turn start | `run/start {run_id, request}` | `thread/start` + `turn/start` |
+| Policy projection | allowed/disallowed tools + permission mode + setting_sources | sandbox mode + approval policy (+ `networkAccess:false`) |
+| Terminal signal | `claude.turn.{completed,failed,cancelled}` | `turn/completed` (status field) |
+| Cancel verb | `run/cancel` (cooperative) | `turn/interrupt {threadId,turnId}` (NativeStop, before-terminal) |
+| Version on the wire | none | clientInfo sent, server reply ignored |
 
 The *shared* contract — the obligations a delegate must meet for the turn to be
 admissible as evidence — exists only as conventions in the adapters and the
@@ -49,7 +49,7 @@ load-bearing and leaky:
    attempts". A sidecar that holds its pipe open silently blocks the worker
    thread indefinitely.
 4. **Cancellation is half-wired.** The ack-is-`Diagnostic`, terminal-follows
-   shape is right (and live-validated for Pi), but `cancel_turn` is dead code:
+   shape is right, but `cancel_turn` is dead code:
    the kernel driver loop has no path that invokes it.
 5. **No version negotiation.** Two of three dialects exchange nothing; the one
    handshake that exists (Codex `initialize`) throws the reply away.
@@ -66,12 +66,6 @@ load-bearing and leaky:
    sidecar's pre-redaction, but nothing states which side *owns* the guarantee
    for an out-of-repo sidecar.
 
-One correction to the record it extends: DR-0034's problem statement says
-"(pi retired)". That is stale — `pi` is in the parser's supported-kind set,
-its dispatch arm is unconditionally compiled (unlike feature-gated codex and
-claude), and it classifies Delegated. This record treats Pi as a live,
-conforming dialect.
-
 ## Decision 1 — Formalize obligations, not one dialect
 
 **The protocol is a conformance contract over the existing dialects, not a
@@ -80,18 +74,18 @@ single wire format all providers must speak.**
 The fork considered:
 
 - **Option A — obligations over dialects.** Keep each adapter's native
-  transport (Codex stays JSON-RPC app-server, Pi stays RPC-mode JSONL, Claude
-  stays the whip sidecar). Formalize the *class-level obligations* (Decisions
+  transport (Codex stays JSON-RPC app-server, Claude stays the whip sidecar).
+  Formalize the *class-level obligations* (Decisions
   2–8) that every dialect must witness, enforce them once in the kernel driver
   where they are checkable, and keep the per-dialect mapping in the adapter.
 - **Option B — one whip sidecar protocol.** Generalize the Claude sidecar's
   JSONL dialect (`run/start`, `run/cancel`, `run/error`, typed events) into
-  *the* protocol; Codex and Pi get wrapping sidecars or in-process shims.
+  *the* protocol; Codex gets a wrapping sidecar or in-process shim.
 
 Option B buys one fake for all tests, one framing to document, and symmetric
 transport for the compute plane's Class-B containers. But it wraps Codex's
 JSON-RPC — a real protocol with ids, server-initiated requests, and approvals —
-inside a second protocol, adds a process hop to Pi for no capability gain, and
+inside a second protocol, and
 makes the wrapping sidecar itself load-bearing infrastructure per provider
 (the thing DR-0034 argued we should stop pretending we control). The delegate's
 value is that it brings its own runtime; forcing its surface through our
@@ -120,9 +114,9 @@ The **policy projection** is dialect-specific by design (Decision 7 of
 DR-0034: authority is WhippleScript's; the *encoding* is the provider's):
 Claude projects to allowed/disallowed tools + permission mode +
 setting_sources; Codex to sandbox mode + approval policy with
-`networkAccess: false`; Pi to a tool allowlist. The projection function per
-dialect (`build_claude_agent_tool_policy`, `build_codex_app_server_policy`,
-`build_pi_rpc_tool_policy`) is part of the adapter's conformance surface, and
+`networkAccess: false`. The projection function per
+dialect (`build_claude_agent_tool_policy`, `build_codex_app_server_policy`)
+is part of the adapter's conformance surface, and
 its output is what the D8-2 attestation's `policy_hash` covers — the hash
 commits to *what was projected*, so the attestation is checkable against the
 projection function.
@@ -184,8 +178,8 @@ high frequency, which a wall clock alone never trips.
 The validated shape becomes the contract: a cancel request produces a
 **non-terminal acknowledgement** (`Diagnostic`), and the run still ends with
 exactly one terminal frame (normally `cancelled`), which may — per dialect —
-arrive before or after the ack (Codex: before-terminal; Pi: ack may trail the
-terminal; both already declared via `ProviderCancellationPolicy`). Depth
+arrive before or after the ack (Codex: before-terminal; declared via
+`ProviderCancellationPolicy`). Depth
 gating stays Rust-side per `CancellationDepth` (the wire carries no depth).
 
 Two consequences:
@@ -214,8 +208,8 @@ protocol-violation diagnostic, not a second admission (the idempotency-key
 unique index already absorbs the duplicate).
 
 **Build finding (2026-07-07, B4 deferred with cause):** every delegated
-surface today is a *subprocess of the worker* — the Claude sidecar, the codex
-app-server, and the pi RPC process all die with the worker whose crash
+surface today is a *subprocess of the worker* — the Claude sidecar and the
+codex app-server both die with the worker whose crash
 recovery would want to re-query them. There is no peer left to answer
 `run/query`, so a re-query declaration would be machinery with zero possible
 implementations (the original "codex thread/turn ids survive" hunch is wrong
@@ -238,8 +232,6 @@ and the adapter checks it against `ProviderCapability.protocol_version`:
   server's advertised info as evidence and fail fast on a schema-incompatible
   peer (the schema pin already exists in the surface gate; this moves the
   check onto the live connection).
-- Pi: `get_state` already returns version-adjacent state; pass through what it
-  exposes as evidence; no hard pin until the surface exposes one.
 
 Mismatch policy: incompatible → `provider_health` binding block (recoverable,
 pre-turn), never a mid-turn failure. The doctor's declarative `health_checks`
@@ -294,7 +286,7 @@ delegated-settings-authority lesson).
       adapter inactivity clock (`WHIPPLESCRIPT_NATIVE_PROVIDER_INACTIVITY_TIMEOUT`,
       default 300s) synthesizing the TimedOut terminal; `max_events` counts
       delivered frames only. (551bb09) Residual closed in the follow-up: the
-      codex/pi turn-start RPCs and the claude `hello` read are budget-bounded
+      codex turn-start RPCs and the claude `hello` read are budget-bounded
       too (a hung peer fails the start instead of pinning the worker thread).
 - [x] B3 — Cancel plumb-through: the driver consults the durable
       `effect_cancellation_requests` surface each iteration and calls
@@ -312,8 +304,8 @@ delegated-settings-authority lesson).
 - [x] B5 — Version exchange: `hello` handshake + `protocol` field in the
       sidecar dialect (answered-mismatch → binding block; legacy and dead
       sidecars tolerated — liveness stays a start_turn concern); Codex
-      `initialize` reply consumed as started-event evidence; pi declares no
-      version surface yet. (c96d966) Residual resolved in the follow-up: the
+      `initialize` reply consumed as started-event evidence. (c96d966)
+      Residual resolved in the follow-up: the
       live protocol probe lands in `check-claude-agent-sdk-surface.sh` (the
       sidecar is whip-owned and credential-free), not the doctor — the doctor
       deliberately skips live provider checks, and that stance holds.
@@ -326,7 +318,7 @@ delegated-settings-authority lesson).
   understands them; the shipped sidecar never emits them (tool_use is folded
   into stream shapes). Require the sidecar to emit them (richer attestation of
   tool activity inside the delegate) or drop them from the Claude dialect?
-- **Usage/token capture**: Codex and Pi capture none today; the Claude summary
+- **Usage/token capture**: Codex captures none today; the Claude summary
   keeps only a usage *shape*. Worth an optional `usage` field on terminal
   frames (spend evidence feeds `std.spend` gauges) or out of scope?
 - **Artifact dedup**: the driver records every artifact ref on every event;

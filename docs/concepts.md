@@ -115,7 +115,7 @@ The thing that executes effects. The *fixture provider* is deterministic and
 local: it completes effects with synthetic results, which makes it the right
 default for development, tutorials, and tests. The *owned harness* runs the
 agent tool-use loop inside whip itself — whip is the executor. The delegating
-native providers (Codex and Claude; Pi is deferred) instead hand the whole
+native providers (Codex and Claude) instead hand the whole
 turn to the provider's own harness. See [providers & packages](providers.md).
 
 ## Worker

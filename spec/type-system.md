@@ -137,7 +137,7 @@ deterministic routing:
 
 ```whipplescript
 class LanguageTask {
-  provider AgentRef<codex | claude | pi>
+  provider AgentRef<codex | claude>
 }
 ```
 
@@ -205,7 +205,7 @@ IR should represent types structurally:
 { "type": "literal", "value": "accepted" }
 {
   "type": "agent_ref",
-  "agents": ["codex", "claude", "pi"],
+  "agents": ["codex", "claude"],
   "constraints": {
     "profiles": ["code"],
     "capacities": ["medium", "high"],
@@ -366,7 +366,6 @@ is a core workflow concern:
 enum Provider {
   Codex
   Claude
-  Pi
 }
 
 class LanguageTask {
@@ -394,7 +393,7 @@ field to an incompatible scalar type is a compile-time error.
 Agent references are a distinct routing type, not arbitrary strings:
 
 ```whipplescript
-AgentRef<codex | claude | pi>
+AgentRef<codex | claude>
 ```
 
 An `AgentRef` value may be matched, stored in facts, and used by `tell` only
@@ -510,13 +509,12 @@ Literal-union patterns must use one of the exact literal values in the union:
 
 ```whipplescript
 class LanguageTask {
-  provider "codex" | "claude" | "pi"
+  provider "codex" | "claude"
 }
 
 case task.provider {
   "codex" => ...
   "claude" => ...
-  "pi" => ...
 }
 ```
 

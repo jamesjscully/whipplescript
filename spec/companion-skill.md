@@ -56,7 +56,7 @@ Current authoring guidance from validation:
 
 - Use guarded fact matches for deterministic routing over typed fields, for
   example `when LanguageTask as task where task.provider == "codex"`.
-- Prefer `AgentRef<codex | claude | pi>` for dynamic agent routing. `tell`
+- Prefer `AgentRef<codex | claude>` for dynamic agent routing. `tell`
   targets should be literal declared agents or `AgentRef` fields such as
   `tell task.provider`; never ask a model or schema-coercion output to decide
   the route.
@@ -77,7 +77,7 @@ Current authoring guidance from validation:
 The checked companion-skill validation fixture uses:
 
 - one shared `CompanionReviewTask` schema with
-  `reviewer AgentRef<codex | claude | pi>`.
+  `reviewer AgentRef<codex | claude>`.
 - deterministic source-seeded review tasks for spec, validation, and docs
   review phases.
 - `tell task.reviewer requires ["agent.tell"]` so the compiler and runtime
@@ -85,7 +85,7 @@ The checked companion-skill validation fixture uses:
 - source assertions over `CompanionReviewDispatch` and `effect kind agent.tell`
   counts.
 
-The fixture deliberately does not ask coerce, Codex, Claude, Pi, or any other
+The fixture deliberately does not ask coerce, Codex, Claude, or any other
 model to identify which provider/model is active or which route should be
 selected. The prompt repeats that route identity has already been selected by
 typed source metadata and asks the thread only to review its assigned phase and

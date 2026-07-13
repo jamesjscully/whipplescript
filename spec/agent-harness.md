@@ -33,7 +33,7 @@ harness keyword      a soft-deprecated source keyword for advanced named
                      "the `harness` keyword" when referenced here.
 
 native harness       the provider's own agent harness (Codex's harness, Claude
-                     Code, Pi). Always written as "native harness" / "provider
+                     Code). Always written as "native harness" / "provider
                      harness" when referenced here.
 ```
 
@@ -123,7 +123,7 @@ completed_at
 ```
 
 Provider tool calls and approval events are **provider-incompatible stream
-concepts** (Codex approvals, Claude tool/hook events, Pi tool events do not
+concepts** (Codex approvals and Claude tool/hook events do not
 share a shape), so they are not typed result fields. They live in evidence,
 reachable through `evidence_refs`/`artifact_refs`. Each adapter may obtain the
 summary fields differently, but the harness normalizes them before appending
@@ -133,15 +133,15 @@ unavailable rather than silently dropped.
 ### Cancellation
 
 `run` takes an abort/cancel signal because the providers expose materially
-different cancellation surfaces: Codex `turn/interrupt`, Claude request-only
-cancel (semantics still unvalidated), and Pi RPC `abort` whose acknowledgement
+different cancellation surfaces: Codex `turn/interrupt` and Claude request-only
+cancel (semantics still unvalidated), and a provider's abort acknowledgement
 can arrive out of order with the terminal event. The adapter contract therefore
 requires a cancel entry point and a rule for how it resolves:
 
 ```text
 cancel acknowledged + terminal observed  -> status = cancelled
 cancel requested, terminal arrives first  -> use the observed terminal
-                                             (Pi: terminal may precede the
+                                             (terminal may precede the
                                              abort ack; tolerate reordering)
 cancel requested, no terminal observable, provider supports idempotent re-query
                                           -> re-query; admit discovered terminal
@@ -171,7 +171,6 @@ Initial provider targets:
 ```text
 codex
 claude-code
-pi
 command fixture
 enterprise broker
 ```
@@ -239,30 +238,8 @@ The Claude adapter therefore needs:
 - Streaming message handling and final result extraction.
 - Artifact capture for transcript, tool calls, edits, command output, and usage.
 
-### Pi Provider
-
-Pi should integrate first through `pi --mode rpc`. The extension and SDK surfaces
-remain important for custom resources and tools, but the validated native
-adapter boundary is the RPC subprocess protocol, not ordinary print mode or a
-WhippleScript-specific extension.
-
-The Pi adapter therefore needs:
-
-- A Pi RPC subprocess client that sends prompt, state, and abort commands.
-- A way to correlate WhippleScript `effect_id` / `run_id` with Pi session ids.
-- Event observation for `agent_start`, `turn_start`, message events, `turn_end`,
-  and `agent_end`.
-- Completion and cancellation detection from terminal event metadata, including
-  assistant `stopReason: "aborted"` for RPC aborts.
-- Artifact capture for thread snapshots, extension events, user-visible
-  messages, and final outcome metadata.
-
-Pi stores conversation sessions, so those session ids and snapshots should be
-first-class evidence. A thread/session export bridge is useful for audit and
-recovery, but it should complement the RPC adapter rather than replace it.
-
 Provider adapters are replaceable. The rule language addresses logical agents
-and profiles; the registry chooses whether that means Codex, Claude Code, Pi,
+and profiles; the registry chooses whether that means Codex, Claude Code,
 an enterprise broker, or a test fixture.
 
 ## Control Plane Bridge
@@ -399,7 +376,7 @@ for the test/compatibility surface: missing required environment keys,
 unresolvable adapter commands, missing configured workspaces, launch/stdin/wait
 failures, provider timeout, nonzero exit, and invalid structured stdout are
 classified before they become `ProviderRunResult` values. This does not make
-Codex, Claude, or Pi real adapters complete; it gives those adapters a stable
+Codex or Claude real adapters complete; it gives those adapters a stable
 failure vocabulary to target.
 
 If the failure happens before a provider run can be started, the effect should
@@ -451,14 +428,6 @@ claude:
   ANTHROPIC_API_KEY or cloud-provider credential ref
   allowed_tools mapped from WhippleScript profile
   hooks and cwd policy
-
-pi:
-  RPC subprocess configuration
-  provider/model defaults
-  --tools allowlist mapped from WhippleScript profile
-  extension/skill/resource refs
-  session store/export path
-  completion and abort observation policy
 ```
 
 The status view for a blocked effect must distinguish missing provider config,

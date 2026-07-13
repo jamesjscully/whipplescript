@@ -158,7 +158,7 @@ config, and std.coercion is the operator-config package for model-backed
 effects — its boundary IS config + CLI; (b) every consumer already reaches it
 through the coercion module — this ratifies reality; (c) the owned harness's
 model backends are model *clients* like coercion; the std.agent provider
-packages (codex/claude/pi session adapters) keep their own auth, NOT rehomed;
+packages (codex/claude session adapters) keep their own auth, NOT rehomed;
 (d) the alternatives are worse: core would swallow provider-specific policy
 (OAuth terms rulings), std.agent would couple every coercion to the agent
 package. DR-0014's "provider configuration as library concepts" exclusion is

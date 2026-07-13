@@ -56,7 +56,7 @@ The expression diagnostic matrix is:
 | Presence proof scope | `a || a.field == "x"` or proof only in a non-dominating branch | the proof that failed to dominate the access |
 | Non-boolean guard/assertion | `where task.provider` or `assert count(LanguageTask)` | the expression result type and required `bool` result |
 | Bad equality | comparing disjoint scalar or finite domains | both operand types or domains |
-| Unsatisfiable finite-domain guard | `task.provider == "gpt5"` for provider domain `codex`/`claude`/`pi` | the invalid literal and the valid domain |
+| Unsatisfiable finite-domain guard | `task.provider == "gpt5"` for provider domain `codex`/`claude` | the invalid literal and the valid domain |
 | Bad ordering | ordering strings, booleans, records, arrays, maps, or incompatible numeric/time types | the operator and supported ordered types |
 | Bad membership | `"codex" in task.provider` or `1 in task.metadata` | collection operand type and required array/map shape |
 | Bad array literal | `["codex", 1]` outside a common typed context | the incompatible element positions and expected common type |
@@ -72,8 +72,8 @@ Diagnostics should be attached to the smallest useful source span: the bad
 field, operator, literal, pattern, or dynamic target rather than the whole rule.
 Where the compiler has enough type information, help text should include the
 source-level repair, for example adding `exists issue.assignee &&` before an
-optional access or changing a provider string to an `AgentRef<codex | claude |
-pi>` field.
+optional access or changing a provider string to an `AgentRef<codex | claude>`
+field.
 
 Current checked coverage includes invalid fixtures for unknown schemas, bad
 records, effect-output scope leaks, effectful self-loops, bad effect payloads,

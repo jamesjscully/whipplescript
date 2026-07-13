@@ -102,7 +102,7 @@ timeouts, and replay. The language owns policy.
 - [workflow-composition-transition-tracker.md](workflow-composition-transition-tracker.md): transition checklist for `workflow`, `pattern`, `apply`, `invoke`, `include`, and explicit terminal actions
 - [workflow-revision-transition-tracker.md](workflow-revision-transition-tracker.md): transition checklist for in-flight workflow revision, revision epochs, and cancellation policy
 - [workflow-revision-followups-tracker.md](workflow-revision-followups-tracker.md): vNext planning tracker for root retargeting, live fact migration, provider cancellation depth, and destructive confirmation policies
-- [native-provider-surfaces.md](native-provider-surfaces.md): validated Codex, Claude, and Pi native integration surface notes
+- [native-provider-surfaces.md](native-provider-surfaces.md): validated Codex and Claude native integration surface notes
 - [native-provider-implementation-tracker.md](native-provider-implementation-tracker.md): execution tracker for native provider capability/config, adapter spikes, cancellation, artifacts, recovery, and validation
 - [capability-registry.md](capability-registry.md): runtime authority bindings and enforcement modes
 - [plugin-system.md](plugin-system.md): legacy runtime provider-registry notes

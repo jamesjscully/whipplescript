@@ -5,7 +5,7 @@ Status: validated assumptions for native-provider implementation.
 Date: May 31, 2026.
 
 This note records the current external-system shapes before we build native
-Codex, Claude, and Pi adapters. These providers should not be forced through the
+Codex and Claude adapters. These providers should not be forced through the
 same command-wrapper contract: their stable integration surfaces expose
 different lifecycle, permission, artifact, session, and cancellation primitives.
 
@@ -27,7 +27,6 @@ Observed locally on May 31, 2026:
 ```text
 codex-cli 0.137.0 (schema pin refreshed June 14, 2026)
 Claude Code 2.1.116
-pi 0.73.0
 ```
 
 The exact local versions matter as reviewed baselines. Codex app-server is
@@ -137,78 +136,20 @@ Adapter implications:
 - `claude -p --output-format stream-json` can remain a compatibility probe, but
   it should not be the final native adapter boundary.
 
-## Pi
-
-Validated sources:
-
-- Local `pi --help`, `pi list`, and `pi --version`.
-- Pi RPC mode documentation: `https://pi.dev/docs/latest/rpc`.
-- Pi SDK documentation: `https://pi.dev/docs/latest/sdk`.
-- Pi extension documentation: `https://pi.dev/docs/latest/extensions`.
-- Pi JSON event stream documentation: `https://pi.dev/docs/latest/json`.
-- `scripts/check-pi-rpc-surface.sh`, which records local CLI/package posture and
-  validates an offline RPC `get_state` request.
-
-Useful facts:
-
-- Pi has a documented SDK through `@earendil-works/pi-coding-agent`.
-- The SDK exposes `createAgentSession`, `AgentSession`, event subscription,
-  session managers, auth storage, model registry, tool selection, resource
-  loading, skills, extensions, and custom tools.
-- Pi RPC mode is a headless JSON protocol over stdin/stdout and is explicitly
-  intended for embedding in other applications.
-- Local `pi --version` reports `0.73.0`.
-- `npm view @earendil-works/pi-coding-agent ...` reports latest `0.78.0`;
-  `npm view @mariozechner/pi-coding-agent ...` reports latest `0.73.1`.
-- A local `pi --mode rpc --no-session --offline` `get_state` request returned a
-  successful `response` with session id, model provider, model id, and
-  `isStreaming` state.
-- A local offline RPC `abort` request returned a successful `response` for the
-  `abort` command. This validates command shape only; it does not prove
-  in-flight terminal ordering.
-- A live RPC in-flight abort probe with tools disabled accepted a `prompt`, sent
-  `abort` on `turn_start`, observed assistant `stopReason: "aborted"` on
-  assistant message and `turn_end` events, saw exactly one `turn_end`, and
-  received a successful abort acknowledgement.
-- The local Pi CLI writes `--help` and `--version` human-readable output to
-  stderr while exiting successfully; readiness checks should capture both
-  streams.
-- Pi supports session persistence and selection through CLI flags, and sessions
-  have ids/parent ids in the SDK model.
-- Pi's built-in tools and extension system use lower-case tool names and a
-  package/resource model that differs from Claude's tool naming and Codex's
-  app-server approvals.
-
-Adapter implications:
-
-- The first native Pi adapter should use `pi --mode rpc` as a subprocess, not
-  ordinary print mode. The SDK remains a fallback/probe path if RPC lacks a
-  required control.
-- WhippleScript must persist Pi session ids, event stream entries, tool
-  execution events, extension errors, and model/provider selection.
-- Pi workspace policy maps naturally to SDK `cwd`, tool selection, session
-  manager, resource loader, and extension loading rather than Codex-style
-  approvals or Claude permission modes.
-- Cancellation should use RPC `abort` for the current operation. The validated
-  live ordering is prompt acceptance, `turn_start`, `abort`, assistant
-  `stopReason: "aborted"`, exactly one `turn_end`, `agent_end`, then abort
-  acknowledgement; runtime normalization must tolerate the acknowledgement
-  arriving after the terminal event.
-
 ## Shared Contract Shape
 
 The shared adapter contract should model capabilities, not implementation
 mechanics:
 
-| Capability | Codex | Claude | Pi |
-| --- | --- | --- | --- |
-| Primary native surface | app-server JSON-RPC | Agent SDK | SDK or RPC mode |
-| Session identity | thread/turn ids | SDK/CLI session id | session id/parent id |
-| Streaming | server notifications | SDK messages / stream-json compatibility | SDK events / RPC events |
-| Tool policy | approvals and config | tool allowlist, permission mode, hooks | tool selection, custom tools, extensions |
-| Artifact/diff capture | diff/item notifications | SDK tool/hook output and result messages | SDK tool events, edit diff/patch details |
-| Cancellation | `turn/interrupt` candidate | SDK/CLI cancellation must be validated | SDK/RPC cancellation must be validated |
-| Health/config | app-server schema and auth | API/provider auth and SDK availability | auth storage, provider/model registry, extensions |
+| Capability | Codex | Claude |
+| --- | --- | --- |
+| Primary native surface | app-server JSON-RPC | Agent SDK |
+| Session identity | thread/turn ids | SDK/CLI session id |
+| Streaming | server notifications | SDK messages / stream-json compatibility |
+| Tool policy | approvals and config | tool allowlist, permission mode, hooks |
+| Artifact/diff capture | diff/item notifications | SDK tool/hook output and result messages |
+| Cancellation | `turn/interrupt` candidate | SDK/CLI cancellation must be validated |
+| Health/config | app-server schema and auth | API/provider auth and SDK availability |
 
 Therefore the next code work should introduce a provider capability description
 and validation layer before implementing any single provider deeply. The first
@@ -217,7 +158,7 @@ runtime API should be able to express:
 - supported session identity fields
 - supported stream event kinds
 - a cancel/abort entry point plus supported cancellation depth (Codex
-  `turn/interrupt`, Claude request-only cancel, Pi RPC `abort`); an
+  `turn/interrupt`, Claude request-only cancel); an
   unacknowledged or out-of-order cancel resolves per the exactly-once /
   `uncertain` terminal rules in
   [`admission-and-idempotency.md`](admission-and-idempotency.md)

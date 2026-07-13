@@ -34,7 +34,6 @@ genre the same way `TRACKERS.md` governs trackers.
 | `versioned-workspace-research-note.md` | active-design | Whip-native VCS: branches, certified merge (per-plane decomposition, confluence, trains), reconciliation daemon (nose = slice), workstreams (imported from un-tie), mediated MVCC, scope semantics (make/know/owe/say; workspace plane; posture per category × role), materialization + evidence-grade boundary, egress-boundary identity, git bridge. |
 | `std-package-ecosystem-shape.md` | feeding-ADR | Standard-package ecosystem shape: mechanism decisions M1–M8 (grammar authorization, provider seams, capability planes, renames, std-as-manifest, versions, DO plane, static checks) + ecosystem decisions E1–E7 + candidate build order; two ⚑ forks awaiting Jack. |
 | `compute-plane-design-note.md` | active-design | DO-host compute plane (tracker Phase 8's design): two service classes, workspace-wide delta-kernel result cache, workspace-DO pool + per-turn Class-B containers w/ WS, image digest = env hash, IFC span, priority classes, `whip deploy` sketch. |
-| `untie-substrate-replacement-research-note.md` | active-design | Long-term goal: whip replaces Pi AND git in un-tie/gaugewright. Authority split (gaugewright = policy authority via policy epochs; whip = machinery), WhipHarness + archetype-as-package, workspace-for-git mapping, separate stores + three seam disciplines, dependency-ordered plan. Cross-repo. |
 
 (Notes rewrite in place per design pass; prior versions live in git history.)
 

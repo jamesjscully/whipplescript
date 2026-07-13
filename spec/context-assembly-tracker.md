@@ -50,7 +50,7 @@ lands.
   a "no skills injected" row on every turn. `agent { skills [...] }` parses into
   IR and dead-ends at `declared_skills`. `tell … with skills [...]` is **rejected
   by the parser** ("not supported yet").
-- **Delegated path** (codex/claude/pi) does its own context assembly; WhippleScript
+- **Delegated path** (codex/claude) does its own context assembly; WhippleScript
   currently force-disables it (`setting_sources: Vec::new()` → Claude does not
   read its own `CLAUDE.md`).
 
@@ -197,7 +197,7 @@ Everything else in this tracker rides this seam.
   `list_skills`, only when a read-class tool is present; rides the assembler seam so
   it is a `context.bundle` evidence row. Unit test (read-tool gate) + integration
   test (workspace skill → owned turn → available_skills evidence). Exact pi XML is
-  approximated; the Pi-conformance pass (un-tie Phase 3) reconciles the wording.
+  approximated.
 - [x] **Activation = registry-backed read** (v0.3) — `SqliteStore::skill_body`
   resolves a catalogue location to the registered content-addressed body; the owned
   read tool checks the skill registry first (bypassing the file-glob policy, since

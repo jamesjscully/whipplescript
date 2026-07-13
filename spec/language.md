@@ -912,7 +912,7 @@ the deterministic stepper before any fact or effect is committed:
 
 ```whipplescript
 class LanguageTask {
-  provider "codex" | "claude" | "pi"
+  provider "codex" | "claude"
   language string
   expectedScript string
   prompt string
@@ -1232,7 +1232,7 @@ Dynamic agent routing is typed:
 
 ```whipplescript
 class LanguageTask {
-  provider AgentRef<codex | claude | pi>
+  provider AgentRef<codex | claude>
   language string
   expectedScript string
   prompt string
@@ -1283,13 +1283,6 @@ table language_tasks as LanguageTask [
     provider claude
     language "Hindi"
     expectedScript "Devanagari"
-    status "queued"
-  }
-
-  {
-    provider pi
-    language "Japanese"
-    expectedScript "Kana and kanji"
     status "queued"
   }
 ]

@@ -154,9 +154,9 @@ Common messages:
 - `WHIPPLESCRIPT_PROVIDER_CONFIGS is required in native strict mode` — set it
   to a colon-separated list of provider config files.
 - `command-wrapper provider is not accepted in native strict mode` — strict
-  mode requires the Codex, Claude, and Pi native surfaces.
-- `missing required native provider config` — add bindings for `codex-main`,
-  `claude-main`, and `pi-main`.
+  mode requires the Codex and Claude native surfaces.
+- `missing required native provider config` — add bindings for `codex-main`
+  and `claude-main`.
 
 For a single-provider probe, use surface mode instead:
 

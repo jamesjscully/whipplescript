@@ -472,7 +472,7 @@ The target behavior is specified in [language.md](language.md),
   correctness gate; the invocation machinery it would exercise is already covered by
   the deterministic parent-child e2e above. Build as a showcase once the surface is
   frozen. (Belongs with the gaugewright dogfood engine, per open-core notes.)
-- [~] Add opt-in real-provider validation that invokes Codex, Claude, and Pi review
+- [~] Add opt-in real-provider validation that invokes Codex and Claude review
   workflows and validates outputs through `coerce`. **Deferred — external/opt-in.**
   Requires live provider credentials and network; it is the real-provider tier
   tracked canonically in `native-provider-implementation-tracker.md` (NP live

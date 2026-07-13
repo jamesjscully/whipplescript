@@ -180,9 +180,9 @@ null           -> Null, assignable only to optional/null-accepting targets
 Finite domains are first-class static types:
 
 ```text
-enum Provider { Codex, Claude, Pi }        -> finite domain {Codex, Claude, Pi}
-"codex" | "claude" | "pi"                 -> finite literal domain
-AgentRef<codex | claude | pi>             -> finite agent domain
+enum Provider { Codex, Claude }            -> finite domain {Codex, Claude}
+"codex" | "claude"                        -> finite literal domain
+AgentRef<codex | claude>                  -> finite agent domain
 Optional<T>                               -> finite presence domain {Some, None}
 ```
 
@@ -192,7 +192,7 @@ outside the domain is a compile-time error even if it appears on the syntactic
 side that is not currently implemented as the "field side":
 
 ```whipplescript
-task.provider == "gpt5"     # invalid if provider is "codex" | "claude" | "pi"
+task.provider == "gpt5"     # invalid if provider is "codex" | "claude"
 "gpt5" == task.provider     # same diagnostic
 task.provider != "gpt5"     # same domain error; do not silently accept as true
 "gpt5" != task.provider     # same diagnostic
@@ -542,7 +542,7 @@ operator is specified.
 Membership is deterministic and type-checked:
 
 ```whipplescript
-task.provider in ["codex", "claude", "pi"]
+task.provider in ["codex", "claude"]
 "repo-writer" in agent.profiles
 "owner" in issue.labels
 "priority" in issue.metadata
@@ -742,7 +742,7 @@ transcripts.
 `AgentRef<...>` is the only dynamic agent-target type:
 
 ```whipplescript
-AgentRef<codex | claude | pi>
+AgentRef<codex | claude>
 ```
 
 The compiler must prove that every possible value names a declared agent and

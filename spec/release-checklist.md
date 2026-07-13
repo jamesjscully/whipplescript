@@ -44,9 +44,8 @@ automatable from inside the build.
    (8abc7aa) are built, runtime-verified, and gate-green. DR-0014 can move
    `proposed`→`accepted`. No scope decision remains here.
 
-2. **Live provider validation (G-008) — Codex + Claude only.** Pi is deferred for
-   0.2 (the owned/native harness supersedes the standalone Pi provider); its live
-   checks are commented out of the gate and endpoint-health is codex+claude-only.
+2. **Live provider validation (G-008) — Codex + Claude.** Endpoint-health is
+   codex+claude-only.
    With Codex logged in (`codex`) and Claude authed (`claude` — claude.ai login or
    `ANTHROPIC_API_KEY`), and a provider config for config-validation:
    `WHIPPLESCRIPT_RELEASE_STRICT_EXTERNAL=1 WHIPPLESCRIPT_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json scripts/check-release-readiness.sh`
@@ -173,7 +172,7 @@ bump + CHANGELOG date; full readiness gate
 
 ## Native Provider Release Gate
 
-For a release that advertises usable native Codex, Claude, and Pi providers,
+For a release that advertises usable native Codex and Claude providers,
 the following checks are ship-blocking:
 
 - [x] Native surface probes pass:
@@ -205,15 +204,8 @@ the following checks are ship-blocking:
 - [x] Claude live artifact smoke passes against a disposable workspace using
       local Claude auth or embedded API/provider auth:
       `WHIPPLESCRIPT_CLAUDE_AGENT_SDK_ARTIFACT_LIVE=1 WHIPPLESCRIPT_CLAUDE_DISPOSABLE_TARGET=claude-artifact-fixture WHIPPLESCRIPT_CLAUDE_DISPOSABLE_ACK=I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE scripts/check-claude-agent-sdk-artifact-smoke.sh`
-- [x] Pi RPC surface and interrupt smokes pass, including live in-flight abort:
-      `scripts/check-pi-rpc-surface.sh` and
-      `WHIPPLESCRIPT_PI_RPC_INTERRUPT_LIVE=1 scripts/check-pi-rpc-interrupt-smoke.sh`
-- [x] Pi live source workflow smoke passes through the native bridge:
-      `WHIPPLESCRIPT_PI_NATIVE_WORKFLOW_LIVE=1 scripts/check-pi-native-workflow-smoke.sh`
-- [x] Pi live artifact smoke passes against a disposable workspace:
-      `WHIPPLESCRIPT_PI_RPC_ARTIFACT_LIVE=1 WHIPPLESCRIPT_PI_DISPOSABLE_TARGET=pi-artifact-fixture WHIPPLESCRIPT_PI_DISPOSABLE_ACK=I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE scripts/check-pi-rpc-artifact-smoke.sh`
 - [x] Native provider config validation passes for configs containing
-      `codex-main`, `claude-main`, and `pi-main`:
+      `codex-main` and `claude-main`:
       `WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json scripts/check-native-provider-configs.sh`
 - [x] Strict real-provider validation passes and emits per-provider reports:
       `WHIPPLESCRIPT_E2E_REAL_PROVIDERS=1 WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_STRICT=1 WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json scripts/check-real-providers-report.sh`
@@ -242,11 +234,6 @@ target/claude-agent-sdk-interrupt-smoke.json
 target/claude-agent-sdk-artifact-smoke.json
 target/claude-agent-sdk-error-smoke.json
 target/claude-native-workflow-smoke.json
-target/pi-rpc-surface.json
-target/pi-rpc-interrupt-smoke.json
-target/pi-rpc-artifact-smoke.json
-target/pi-rpc-error-smoke.json
-target/pi-native-workflow-smoke.json
 target/native-provider-config-validation.json
 target/real-provider-smoke-report.md
 target/real-provider-preflight.jsonl
@@ -259,8 +246,7 @@ Command-wrapper-only coerce/Codex checks do not satisfy this gate.
 Native provider gate result for v0.1: passed locally on 2026-06-02.
 Codex live app-server, interrupt, diff-artifact, error-shape, and source
 workflow bridge smokes passed. Claude Agent SDK live, interrupt, artifact,
-error-shape, and source workflow bridge smokes passed. Pi RPC live interrupt,
-artifact, error-shape, and source workflow bridge smokes passed. Strict
+error-shape, and source workflow bridge smokes passed. Strict
 native-provider config/report validation passed with
 `examples/provider-configs/native/native.example.json`. The live Codex source
 workflow smoke exposed and then validated a fix for duplicate native lifecycle
@@ -331,9 +317,6 @@ scripts/check-codex-app-server-schema.sh
 scripts/check-claude-agent-sdk-surface.sh
 scripts/check-claude-agent-sdk-live-smoke.sh
 scripts/check-claude-agent-sdk-interrupt-smoke.sh
-scripts/check-pi-rpc-surface.sh
-scripts/check-pi-rpc-interrupt-smoke.sh
-WHIPPLESCRIPT_PI_RPC_INTERRUPT_LIVE=1 scripts/check-pi-rpc-interrupt-smoke.sh
 WHIPPLESCRIPT_CODEX_APP_SERVER_LIVE=1 scripts/check-codex-app-server-live-smoke.sh
 WHIPPLESCRIPT_CODEX_APP_SERVER_LIVE=1 scripts/check-codex-app-server-interrupt-smoke.sh
 WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json scripts/check-native-provider-configs.sh
@@ -367,7 +350,7 @@ was validated against the skipped-provider path. CI runs fast release readiness 
 as the `readiness-reports` artifact.
 Native-provider surface validation writes
 `target/native-provider-surface.jsonl`; strict external readiness should treat
-missing Codex, Claude, or Pi native surfaces as ship-blocking for the
+missing Codex or Claude native surfaces as ship-blocking for the
 native-provider release track.
 Codex app-server schema validation writes
 `target/codex-app-server-schema-report.json`, always requires `initialize`,
@@ -430,39 +413,10 @@ the Claude Agent SDK adapter and records redacted local-auth posture plus
 durable native lifecycle events. The smoke reopens the store through
 `whip recover <instance>` and records `replayAfterRestart.recoveredCount`,
 which must be zero after normal completion.
-Pi RPC surface validation writes `target/pi-rpc-surface.json`; it records the
-selected RPC subprocess strategy, local Pi CLI version/flags, current Pi SDK
-package posture, and an offline RPC `get_state` response with session/model
-metadata.
-Pi RPC interrupt smoke validation writes `target/pi-rpc-interrupt-smoke.json`;
-by default it validates the `abort` command response shape in offline RPC mode.
-With `WHIPPLESCRIPT_PI_RPC_INTERRUPT_LIVE=1`, it validates a live in-flight
-prompt abort with tools disabled, assistant `stopReason: "aborted"`, exactly one
-`turn_end`, and abort acknowledgement. Strict external release readiness runs
-the live path.
-Pi RPC artifact smoke validation writes `target/pi-rpc-artifact-smoke.json`; by
-default it validates deterministic metadata-only artifact extraction. With
-`WHIPPLESCRIPT_PI_RPC_ARTIFACT_LIVE=1`, it requires
-`WHIPPLESCRIPT_PI_DISPOSABLE_TARGET` and
-`WHIPPLESCRIPT_PI_DISPOSABLE_ACK=I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_DISPOSABLE`,
-then asks Pi RPC to create a fixed artifact file in a temporary disposable
-workspace and records only metadata/hash.
-Pi RPC error smoke validation writes `target/pi-rpc-error-smoke.json`; by default
-it validates deterministic adapter remote-error mapping. With
-`WHIPPLESCRIPT_PI_RPC_ERROR_LIVE=1`, it validates the installed Pi RPC error
-response shape using an intentionally invalid command and records only the error
-payload shape.
-Pi native workflow smoke validation writes `target/pi-native-workflow-smoke.json`;
-by default it runs deterministic native bridge coverage, and with
-`WHIPPLESCRIPT_PI_NATIVE_WORKFLOW_LIVE=1` it drives a source `.whip` workflow
-through `whip dev --provider pi` into the Pi RPC adapter and records durable
-native lifecycle events from the RPC stream. The smoke reopens the store through
-`whip recover <instance>` and records `replayAfterRestart.recoveredCount`,
-which must be zero after normal completion.
 Native-provider config validation writes
 `target/native-provider-config-validation.json`; strict external readiness
 requires `WHIPPLESCRIPT_NATIVE_PROVIDER_CONFIGS` to point at configs containing
-`codex-main`, `claude-main`, and `pi-main` native bindings.
+`codex-main` and `claude-main` native bindings.
 `whip doctor --record-provider-evidence <instance-id>` records parsed provider
 binding validation results as `provider.validation` evidence without starting
 provider runs; use it after creating or selecting a release-validation instance.
@@ -499,7 +453,7 @@ acknowledgement equal to
 under `target/real-provider-reports/` with redacted environment posture,
 evidence refs, check counts, and provider-specific preflight records.
 The optional GitHub Actions workflow `Native Provider Validation` runs a
-Codex/Claude/Pi matrix with
+Codex/Claude matrix with
 `WHIPPLESCRIPT_REAL_PROVIDER_NATIVE_SURFACE=1` and uploads those reports.
 Dispatch it with `strict=true` to enforce the all-provider native gate; missing
 native provider config paths or live prerequisites fail that strict job.

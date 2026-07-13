@@ -343,7 +343,6 @@ Package-specific minimum checks:
 | `std.agent` | portable agent turn contract, feature-report taxonomy, turn-scoped grants, no provider-specific feature lies |
 | `std.agent.codex` | Codex feature report across known CLI/app-server versions, slash-command handling, plugin/hook/subagent availability reporting |
 | `std.agent.claude` | Claude SDK/CLI feature report, hooks/plugins/tool permissions, cancellation and artifact boundaries |
-| `std.agent.pi` | Pi RPC feature report, `pi_variant` resolution, extension/tool availability reporting |
 | `std.coercion` | unstructured input to structured output, schema validation, backend failure reporting, no workflow control-flow semantics |
 | `std.messaging` | channel declarations, outbound `send`, inbound generic `Message`, one-way local/desktop providers, stdio request/reply transport boundaries |
 | `std.ingress` | typed `signal` admission, CLI/HTTP/HTTPS/stdio/file/gRPC source providers, validation before admission |

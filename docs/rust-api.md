@@ -276,7 +276,6 @@ Provider traits and helpers:
 | `CommandAgentHarness` | Command-backed harness for local adapters. |
 | `CodexAgentHarness` | Codex adapter wrapper over command launch plan. |
 | `ClaudeCodeAgentHarness` | Claude Code adapter wrapper over command launch plan. |
-| `PiStyleAgentHarness` | Pi-style adapter wrapper over command launch plan. |
 | `MockAgentHarness` | Deterministic test harness. |
 | `CoerceClient` / `FakeCoerceClient` | coerce provider abstraction. |
 
@@ -287,8 +286,7 @@ Native provider modules:
 | `provider` | Provider capability/config validation and built-in native capabilities. |
 | `codex_app_server` | Codex app-server transport and evidence summaries. |
 | `claude_agent_sdk` | Claude Agent SDK sidecar client, policy mapping, and evidence summaries. |
-| `pi_rpc` | Pi RPC client, policy mapping, and event summaries. |
-| `native_lifecycle` | Codex/Claude/Pi event normalization into `agent.turn.*`. |
+| `native_lifecycle` | Codex/Claude event normalization into `agent.turn.*`. |
 | `artifact_manifest` | Artifact manifest and capture-failure payload helpers. |
 
 Trace API:

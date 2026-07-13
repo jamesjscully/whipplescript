@@ -84,8 +84,7 @@ follow-on configuration step — it is not on by default. See
   turn resumes from that projection). The delegating Codex/Claude adapters are now
   optional Cargo features, with the owned harness as the built-in path.
 - Native provider adapters — Codex and Claude are the validated delegating
-  adapters; the Pi native provider is deferred (adapter present in-tree, not a
-  shipped runtime provider). Their cancellation, artifact, and recovery behavior,
+  adapters. Their cancellation, artifact, and recovery behavior,
   and live execution against real provider SDKs, are credential-gated.
 - Native `coerce` against real LLMs (OpenAI Responses / Anthropic Messages): the
   request/response logic is built and tested, but live calls are opt-in

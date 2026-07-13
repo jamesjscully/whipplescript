@@ -6,7 +6,7 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 > 0.3 adds cloud deployment (the Cloudflare Durable Object runtime) and the owned
 > harness. The experimentation/evals + versioned-workspace work (0.4) is tracked
 > separately and is **not** part of 0.3. Native provider support is validated for
-> **Codex and Claude**; the Pi native provider is deferred.
+> **Codex and Claude**.
 
 ## [0.4.0] — Unreleased (staged 2026-07-10; date set at cut)
 
@@ -43,6 +43,7 @@ move as one coherent, provenance-carrying line.
 - Host-resolved provider profiles (`WHIPPLESCRIPT_PROVIDER_PROFILES`): the
   policy channel hands whip resolved credentials; whip's own auth is the thin
   standalone fallback.
+- Removed the Pi provider backend.
 - The store seam: `whip handles` (stable pointers for external admission
   logs), `whip checkpoint --external-positions` (the position-pair cut for
   cross-store backup/handoff), and the seam-contract draft.
@@ -196,7 +197,7 @@ privileges — with no ambient authority.
 - Native **Codex** (app-server) and **Claude** (Agent SDK sidecar) providers,
   live-validated: lifecycle normalization to `agent.turn.*`, provider-native
   cancellation, artifact/evidence capture with redaction, and crash/restart
-  recovery. A Pi (RPC) adapter is present in-tree but deferred (not part of 0.2).
+  recovery.
 - Durable SQLite runtime with event-sourced replay, workflow revision, and a
   worker/`dev` driver; deterministic fixtures for CI.
 

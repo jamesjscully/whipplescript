@@ -7,8 +7,7 @@ Governed by [`std-package-ecosystem-shape.md`](std-package-ecosystem-shape.md)
 capability disclosure), and
 [`owned-harness-tool-surface.md`](owned-harness-tool-surface.md). This document
 also designs the thin provider packages **`std.agent.codex`** and
-**`std.agent.claude`**; **`std.agent.pi`** is deferred name-reserved (see
-Deferred With Cause).
+**`std.agent.claude`**.
 
 ## Framing
 
@@ -18,10 +17,10 @@ shape "Semantic domains vs provider catalogs"). Core owns what an agent turn
 can truthfully do*: provider kinds, the profile-preset table, the feature-class
 taxonomy, and the capability-report schema its provider sub-packages fill in.
 
-Why it belongs: three provider adapters plus the owned harness already exist
+Why it belongs: two provider adapters plus the owned harness already exist
 with real behavioral differences (cancellation, sessions, tool policy), and
 today those differences live as scattered string convention — hard-matched
-preset names in each adapter (kernel/pi_rpc.rs:107-135), hidden default tool
+preset names in each adapter, hidden default tool
 policy inside sidecar JavaScript (scripts/claude-agent-sdk-sidecar.mjs:182-186),
 a compiled-in closed provider-kind check (parser/lib.rs:6038-6043), and a
 catalog advertising Claude cancellation DR-0017 says not to advertise
@@ -184,7 +183,6 @@ agents` namespace. The DR-0009 CLI suite is deferred; `whip doctor
 | `command` | subprocess adapter (native-only; DO counterpart = DO tracker Phase 8) | `std.agent` |
 | `codex` | native adapter trait behind cargo feature `codex` (kernel/Cargo.toml) | `std.agent.codex` |
 | `claude` | native adapter trait behind cargo feature `claude` + Node sidecar | `std.agent.claude` |
-| `pi` | native adapter trait (always built today, kernel/pi_rpc.rs) | `std.agent.pi` — deferred |
 
 **Taxonomy position of `owned`:** `provider owned` is the DEFAULT agent path
 (DR-0024) and lives in `std.agent` as its reference provider row — not a
@@ -337,10 +335,6 @@ report schema — no premature shared framework.
 
 ## Deferred with cause
 
-- **`std.agent.pi` (name reserved).** Cause: `pi_variant` has no
-  lock/provenance/discovery design (zero parser/IR/runtime hits) — ecosystem
-  shape "Merge/split/defer/drop verdicts". Re-entry: pi_variant locking per
-  DR-0015 "Provider-Specific Semantics" + its "Next Validation Work" probes.
 - **Skills wiring.** Declared skills parse and persist but dispatch sends
   `skill_names: &[]` (main.rs:21302); the provenance schema is an open DR-0009
   question. Re-entry: `skill.attach` feature class + the spec/skills.md

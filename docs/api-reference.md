@@ -89,7 +89,7 @@ searches or report-schema validation outside the packaged CI environment.
 With `--provider-config`, JSON output includes `provider_config_checks`. Each
 check contains the config path and redacted validation `results`.
 With `--providers`, JSON output includes `provider_health_checks`, a
-deterministic non-live posture for Codex, Claude, and Pi. It reports CLI
+deterministic non-live posture for Codex and Claude. It reports CLI
 availability, credential-reference posture, and deeper checks that require
 explicit real-provider validation without printing credential values.
 

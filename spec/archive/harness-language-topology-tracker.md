@@ -51,7 +51,7 @@ paths, workspace policy, timeouts, and other environment-specific details.
 
 ## Audit Follow-Ups
 
-- [x] Provider config values are applied to Codex, Claude, and Pi native request
+- [x] Provider config values are applied to Codex and Claude native request
       fields after harness selection.
 - [x] Worker and dev commands accept `--provider-config` and still support
       environment-provided config paths.

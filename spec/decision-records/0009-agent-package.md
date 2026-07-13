@@ -43,13 +43,12 @@ Concrete first-party harnesses live in provider-specific packages:
 ```text
 std.agent.codex
 std.agent.claude
-std.agent.pi
 std.agent.fixture
 ```
 
-The split is intentional. Codex slash commands/plugins/hooks/subagents, Claude
-Agent SDK slash commands/skills/hooks/plugins/subagents, and Pi RPC/extensions
-are not equivalent semantics. The shared package defines the boundary and report
+The split is intentional. Codex slash commands/plugins/hooks/subagents and
+Claude Agent SDK slash commands/skills/hooks/plugins/subagents are not
+equivalent semantics. The shared package defines the boundary and report
 shape; each provider package maps its native feature surface into that shape.
 See [`0015-agent-harness-feature-semantics.md`](0015-agent-harness-feature-semantics.md).
 
@@ -109,7 +108,7 @@ skill metadata visible to source analysis. It must not authorize provider
 execution. Runtime provider authority still flows through provider bindings,
 profile allowlists, credentials, workspace policy, and effect capabilities.
 
-This record should therefore avoid treating Codex, Claude, Pi, fixture, or
+This record should therefore avoid treating Codex, Claude, fixture, or
 broker integrations as alternate `tell` semantics. They are provider
 implementations behind the core `agent.tell` effect and canonical
 `agent.turn.*` observations. The construct graph can reference their
@@ -169,7 +168,7 @@ health_checks
 extra provider options
 ```
 
-Native provider lifecycle normalization maps Codex, Claude, and Pi events into
+Native provider lifecycle normalization maps Codex and Claude events into
 the canonical rule-matchable lifecycle facts `agent.turn.started`,
 `agent.turn.completed`, `agent.turn.failed`, `agent.turn.timed_out`, and
 `agent.turn.cancelled`. In-turn `streamed`, `tool_requested`, and
@@ -251,7 +250,7 @@ disambiguation):
 harness layer    the runtime execution layer that runs agent.tell effects
                  (see agent-harness.md)
 harness keyword  a soft-deprecated source keyword for advanced named endpoints
-native harness   the provider's own agent harness (Codex/Claude/Pi)
+native harness   the provider's own agent harness (Codex/Claude)
 ```
 
 The `harness` keyword is an implementation and compatibility term for advanced
@@ -260,7 +259,7 @@ should route agents through ordinary `provider`-binding clauses rather than ad
 hoc header syntax. References to a provider's own runner are "native harness".
 
 Models must not choose routes from prompt text. Dynamic routing should use
-typed source data such as `AgentRef<codex | claude | pi>`, enums, literal
+typed source data such as `AgentRef<codex | claude>`, enums, literal
 fields, or tracker assignment fields.
 
 ## Profiles And Capabilities
@@ -279,7 +278,7 @@ the package should eventually publish named presets instead of relying on
 informal string convention.
 
 This is the **canonical first-party preset list**. It is pinned here once; the
-harness layer and the provider decision records (0016/0017/0018) reference this
+harness layer and the provider decision records (0016/0017) reference this
 list rather than restating their own preset sets:
 
 ```text
@@ -345,12 +344,12 @@ supported effect capabilities
 
 This supports `whip doctor`, hosted deployment checks, and source validation.
 It also keeps provider differences honest: Codex app-server, Claude Agent SDK,
-Pi RPC, command harnesses, and enterprise brokers do not have identical
+command harnesses, and enterprise brokers do not have identical
 streaming, cancellation, artifact, approval, or credential behavior.
 
 ## Native Providers
 
-Codex, Claude, and Pi should remain native/sidecar providers, not plain
+Codex and Claude should remain native/sidecar providers, not plain
 `exec` wrappers. They need:
 
 ```text
@@ -501,7 +500,7 @@ id, provider kind, surface, and redacted config posture.
 - `agent`, `tell`, `AgentRef`, capacity, and `agent.turn.*` stay core.
 - `std.agent` becomes the shared contract for profile presets, feature reports,
   skill/context attachment, health checks, and provider capability discovery.
-- Codex, Claude, Pi, fixture, command, and broker bindings live in provider
+- Codex, Claude, fixture, command, and broker bindings live in provider
   packages that implement the `std.agent` contract.
 - `harness` remains supported but should be documented as advanced endpoint
   routing, not the main concept.

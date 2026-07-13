@@ -56,7 +56,6 @@ constitution ([std-package-ecosystem-shape.md](../std-package-ecosystem-shape.md
 | `std.agent` | Concrete design written | [std-agent.md](../std-agent.md) — boundary/taxonomy pkg; codex/claude thin sub-pkgs in-doc; `agent.turn` is the grandfathered id≠kind |
 | `std.agent.codex` | Designed in std-agent.md | provider-catalog sub-package (open provider registry from manifests) |
 | `std.agent.claude` | Designed in std-agent.md | provider-catalog sub-package (SDK sidecar; centralized 7-preset profile table) |
-| `std.agent.pi` | Deferred (name reserved) | `pi_variant` is pure spec — no lock/provenance/discovery design yet |
 | `std.messaging` | Concrete design written | [std-messaging.md](../std-messaging.md) — 3 local providers; owns human-review migration question |
 | `std.memory` | Concrete design written | [std-memory.md](../std-memory.md) — forcing case for the CapabilityProvider seam (M2/S5) |
 | `std.time` | Concrete design written | [std-time.md](../std-time.md) — updated in place; recurrence shipped; package identity + clock_source authorability |
@@ -73,8 +72,8 @@ ANSWERED 2026-07-04 — each question maps to a decision in
 [std-package-ecosystem-shape.md](../std-package-ecosystem-shape.md):
 names → "Names" (E1); domains vs catalogs → E2; authoring vs operator-config
 → E3; missing lowering classes → E4; bundled-but-imported → E5;
-merge/split/defer/drop → E6 (std.agent.pi deferred name-reserved; std.test
-stays dropped; no new merges/splits); package-vs-core line → E7. The
+merge/split/defer/drop → E6 (std.test stays dropped; no new merges/splits);
+package-vs-core line → E7. The
 cross-cutting mechanism answers (meta-grammar, provider seam, capability
 planes, renames, std-as-manifest, versions, DO plane, static checks) are that
 note's M1–M8.
@@ -111,12 +110,12 @@ implementation slices chosen from those designs   [ ] ← current gate (slices e
   schema coercion, not the name of the standard package and not workflow
   decision semantics.
 - `std.agent` is a shared boundary package, not a monolithic harness bundle.
-  Codex, Claude, and Pi belong in separate provider packages. The portable layer
+  Codex and Claude belong in separate provider packages. The portable layer
   is a feature taxonomy and truthful capability report, while native slash
   commands, hooks, plugins, extensions, sessions, and subagents remain
   provider-specific.
-- Pi installed extension/package sets should be modeled as `pi_variant`; reserve
-  `environment` for a future package-manager or deployment-environment concept.
+- Reserve `environment` for a future package-manager or deployment-environment
+  concept.
 - Reserved bare words such as `claim`, `renew`, and `release` are platform
   catalog privileges. Package manifests may use them only when the platform
   catalog grants that exact library, construct family, scope, and lowering
