@@ -1017,15 +1017,74 @@ pub fn run_file_import_effect_generic<S: RuntimeStore>(
 /// Host-agnostic core (DR-0033 chunk 3): the lease/ledger/counter op + its terminal
 /// over a held `RuntimeKernel<S>`; coordination is the DO's own store there, so
 /// `S: RuntimeStore + Coordination` unifies both surfaces.
+/// Fail a coordination effect with the DR-0032 typed base (handler honesty,
+/// spec/std-coord.md v1 slice 2): opens the run, fails it, and derives the
+/// `{kind}.failed` fact whose `value` is the uniform `EffectError` base — the
+/// same terminal shape every other failing effect kind produces, so
+/// `after <acquire> fails as f` binds a typed `f`.
+fn fail_coordination_effect<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    reason: &str,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "coord-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "coord-lease"]);
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "coordination",
+        worker_id: "whip-coordination",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &json!({"kind": effect.kind}).to_string(),
+    })?;
+    let terminal = kernel.fail_run(EffectCompletion {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "coordination",
+        worker_id: "whip-coordination",
+        status: "failed",
+        exit_code: None,
+        summary: Some(reason),
+        metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
+        idempotency_key: Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "terminal",
+        ])),
+    })?;
+    kernel.derive_fact(
+        instance_id,
+        &format!("{}.failed", effect.kind),
+        &effect.effect_id,
+        &json!({
+            "effect_id": effect.effect_id,
+            "run_id": run_id,
+            "status": "failed",
+            "value": effect_failure_base(&effect.kind, reason, reason, &effect.effect_id, &run_id),
+            "error": { "message": reason },
+        })
+        .to_string(),
+        Some(&terminal.event_id),
+        Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "coord-fact",
+        ])),
+    )?;
+    Ok(terminal)
+}
+
 pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     effect: &ClaimableEffect,
     now: &str,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    use whipplescript_store::coordination::{
-        AcquireOutcome, ConsumeOutcome, DEFAULT_COORDINATION_OWNER,
-    };
+    use whipplescript_store::coordination::{AcquireOutcome, ConsumeOutcome};
 
     let input = json_from_str(&effect.input_json);
     let workflow_owner = coordination_owner_for_instance(kernel.store(), instance_id)?;
@@ -1036,6 +1095,29 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
             .unwrap_or_default()
             .to_owned()
     };
+    // Handler honesty (spec/std-coord.md v1 slice 2): a missing/mistyped
+    // numeric field is MALFORMED input — well-formed lowering always emits it
+    // from the declaration — and fails the effect with a typed DR-0032 error
+    // instead of running under a smuggled default (the old slots=1 / ttl=600 /
+    // retain=86400 / cap=0). Pre-release one-way break per M4 posture.
+    macro_rules! require_i64 {
+        ($source:expr, $name:literal) => {
+            match $source.get($name).and_then(Value::as_i64) {
+                Some(value) => value,
+                None => {
+                    return fail_coordination_effect(
+                        kernel,
+                        instance_id,
+                        effect,
+                        &format!(
+                            "malformed `{}` input: missing or non-integer `{}`",
+                            effect.kind, $name
+                        ),
+                    )
+                }
+            }
+        };
+    }
     let owner = {
         let declared = field("coordination_owner");
         if declared.is_empty() {
@@ -1048,15 +1130,14 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
         "lease.acquire" => {
             let resource = field("resource");
             let key = field("key");
+            let slots = require_i64!(input, "slots");
+            let ttl_seconds = require_i64!(input, "ttl_seconds");
             let outcome = kernel.store_mut().try_acquire_for_owner(
                 &owner,
                 &resource,
                 &key,
-                input.get("slots").and_then(Value::as_i64).unwrap_or(1),
-                input
-                    .get("ttl_seconds")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(600),
+                slots,
+                ttl_seconds,
                 instance_id,
             )?;
             match outcome {
@@ -1132,15 +1213,16 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
                 .filter(|owner| !owner.is_empty())
                 .unwrap_or(&workflow_owner)
                 .to_owned();
-            let mut released = kernel.store_mut().release_for_owner(
+            // Handler honesty (slice 2): the pre-partitioning shared-owner
+            // fallback — retrying an owner-scoped miss as an any-owner
+            // release — is dropped; a release only ever frees its own
+            // acquire's owner-scoped lease. One-way break per M4 posture.
+            let released = kernel.store_mut().release_for_owner(
                 &acquire_owner,
                 &resource,
                 &key,
                 instance_id,
             )?;
-            if !released && acquire_owner != DEFAULT_COORDINATION_OWNER {
-                released = kernel.store_mut().release(&resource, &key, instance_id)?;
-            }
             json!({
                 "variant": "Released",
                 "resource": resource,
@@ -1177,27 +1259,33 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
                 .filter(|owner| !owner.is_empty())
                 .unwrap_or(&workflow_owner)
                 .to_owned();
-            let ttl_seconds = input
+            // A renew without its own `until` duration inherits the acquire's
+            // declared TTL — that is the renew contract, not a default. Both
+            // missing is malformed input (well-formed lowering always records
+            // the acquire's TTL) and fails typed, per slice 2.
+            let ttl_seconds = match input
                 .get("ttl_seconds")
                 .and_then(Value::as_i64)
                 .or_else(|| acquire_input.get("ttl_seconds").and_then(Value::as_i64))
-                .unwrap_or(600);
-            let mut expires_at = kernel.store_mut().renew_lease_for_owner(
+            {
+                Some(ttl_seconds) => ttl_seconds,
+                None => return fail_coordination_effect(
+                    kernel,
+                    instance_id,
+                    effect,
+                    "malformed `lease.renew` input: no `ttl_seconds` on the renew or its acquire",
+                ),
+            };
+            // The pre-partitioning DEFAULT-owner retry is dropped alongside
+            // release's shared-owner fallback (slice 2): a renew only ever
+            // extends its own acquire's owner-scoped lease.
+            let expires_at = kernel.store_mut().renew_lease_for_owner(
                 &acquire_owner,
                 &resource,
                 &key,
                 ttl_seconds,
                 instance_id,
             )?;
-            if expires_at.is_none() && acquire_owner != DEFAULT_COORDINATION_OWNER {
-                expires_at = kernel.store_mut().renew_lease_for_owner(
-                    DEFAULT_COORDINATION_OWNER,
-                    &resource,
-                    &key,
-                    ttl_seconds,
-                    instance_id,
-                )?;
-            }
             match expires_at {
                 Some(expires_at) => json!({
                     "variant": "Renewed",
@@ -1216,16 +1304,14 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
             let ledger = field("ledger");
             let partition = field("partition");
             let entry = input.get("entry").cloned().unwrap_or(Value::Null);
+            let retain_seconds = require_i64!(input, "retain_seconds");
             let seq = kernel.store_mut().append_for_owner(
                 &owner,
                 &ledger,
                 &partition,
                 &entry.to_string(),
                 instance_id,
-                input
-                    .get("retain_seconds")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(86400),
+                retain_seconds,
             )?;
             json!({
                 "variant": "Appended",
@@ -1237,15 +1323,12 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
         "counter.consume" => {
             let counter = field("counter");
             let key = field("key");
+            let amount = require_i64!(input, "amount");
+            let cap = require_i64!(input, "cap");
             let period = kernel.store_mut().current_period(&field("reset"))?;
-            let outcome = kernel.store_mut().consume_for_owner(
-                &owner,
-                &counter,
-                &key,
-                input.get("amount").and_then(Value::as_i64).unwrap_or(0),
-                input.get("cap").and_then(Value::as_i64).unwrap_or(0),
-                &period,
-            )?;
+            let outcome = kernel
+                .store_mut()
+                .consume_for_owner(&owner, &counter, &key, amount, cap, &period)?;
             match outcome {
                 ConsumeOutcome::Ok { remaining } => json!({
                     "variant": "Ok",

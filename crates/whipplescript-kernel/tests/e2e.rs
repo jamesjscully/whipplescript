@@ -1341,3 +1341,118 @@ fn assert_e2e_trace(name: &str, kernel: &RuntimeKernel) {
         )
     });
 }
+
+#[test]
+fn e2e_malformed_coordination_input_fails_typed_instead_of_defaulting() {
+    // Handler honesty (spec/std-coord.md v1 slice 2): hand-crafted (forged)
+    // coordination inputs missing the numeric fields well-formed lowering
+    // always emits from the declaration must FAIL with the DR-0032 typed
+    // base -- never run under the old smuggled defaults
+    // (slots=1 / ttl=600 / retain=86400 / cap=0).
+    use whipplescript_kernel::effect_handlers::run_coordination_effect_generic;
+    use whipplescript_store::native_stores::NativeStores;
+    use whipplescript_store::{ClaimableEffect, RuntimeStore};
+
+    let dir = std::env::temp_dir().join(format!("whip-e2e-coord-honesty-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("temp dir creates");
+    let stores = NativeStores::open(
+        dir.join("rt.sqlite"),
+        dir.join("coord.sqlite"),
+        dir.join("items.sqlite"),
+    )
+    .expect("stores open");
+    let mut kernel = RuntimeKernel::new(stores);
+    let version = kernel
+        .create_program_version(ProgramVersionInput {
+            program_name: "CoordHonesty",
+            source_hash: "source",
+            ir_hash: "ir",
+            compiler_version: "e2e",
+        })
+        .expect("program version creates");
+    let instance_id = kernel
+        .create_instance(&version, "{}")
+        .expect("instance creates");
+
+    let cases = [
+        (
+            "acq-forged",
+            "lease.acquire",
+            r#"{"resource":"gate","key":"k"}"#,
+            "slots",
+        ),
+        (
+            "cons-forged",
+            "counter.consume",
+            r#"{"counter":"c","key":"k","reset":"daily","cap":5}"#,
+            "amount",
+        ),
+        (
+            "app-forged",
+            "ledger.append",
+            r#"{"ledger":"l","partition":"p","entry":{"n":1},"schema":"E"}"#,
+            "retain_seconds",
+        ),
+    ];
+    for (effect_id, kind, input_json, missing_field) in cases {
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "forged",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[NewEffect {
+                    timeout_seconds: None,
+                    effect_id,
+                    kind,
+                    target: None,
+                    input_json,
+                    status: "queued",
+                    idempotency_key: effect_id,
+                    required_capabilities_json: "[]",
+                    profile: None,
+                    correlation_id: None,
+                    source_span_json: None,
+                }],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some(effect_id),
+                marks: &[],
+            })
+            .expect("forged effect commits");
+        let claimable = ClaimableEffect {
+            effect_id: effect_id.to_owned(),
+            kind: kind.to_owned(),
+            target: None,
+            profile: None,
+            input_json: input_json.to_owned(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        };
+        run_coordination_effect_generic(
+            &mut kernel,
+            &instance_id,
+            &claimable,
+            "2026-01-01T00:00:00Z",
+        )
+        .expect("handler settles the malformed effect (typed failure, not a store error)");
+        let facts = kernel.store().list_facts(&instance_id).expect("facts list");
+        let failed = facts
+            .iter()
+            .find(|fact| fact.name == format!("{kind}.failed"))
+            .unwrap_or_else(|| panic!("{kind} must derive a typed .failed fact"));
+        assert!(
+            failed.value_json.contains(missing_field),
+            "{kind} failure names the missing `{missing_field}`: {}",
+            failed.value_json
+        );
+        assert!(
+            failed.value_json.contains("\"reason\""),
+            "{kind} failure carries the DR-0032 base: {}",
+            failed.value_json
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}

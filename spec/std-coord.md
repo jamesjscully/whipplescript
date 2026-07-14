@@ -283,12 +283,18 @@ the recommendation.
    `scripts/check-tla-models.sh` (slot guard / cap guard / idempotency
    guard stripped ⇒ invariant violation). `NoDeadlock`/`BoundedWait`
    explicitly out (their objects — lease order, wait queue — are deferred).
-2. **Handler honesty.** Remove the smuggled defaults for malformed input
-   (slots=1/ttl=600s/retain=86400s/cap=0, effect_handlers.rs:1100-1195) —
-   malformed input fails the effect with a typed DR-0032 error; drop the
-   pre-partitioning `lease.release` shared-owner fallback
-   (effect_handlers.rs:1154-1156). Pre-release one-way break per M4 posture.
-   Gate: negative tests per field; existing coord suites green.
+2. **Handler honesty. BUILT 2026-07-14.** The smuggled defaults for
+   malformed input (slots=1/ttl=600s/retain=86400s/cap=0) are gone —
+   `run_coordination_effect_generic` fails the effect with the DR-0032
+   typed base (`fail_coordination_effect` derives the `{kind}.failed` fact)
+   when a numeric field well-formed lowering always emits is missing or
+   mistyped; the pre-partitioning `lease.release` shared-owner fallback is
+   dropped, and `lease.renew`'s mirror DEFAULT-owner retry with it (a
+   renew/release only ever touches its own acquire's owner-scoped lease).
+   Renew's fall-back to the ACQUIRE's declared TTL stays: that is the renew
+   contract, not a default. Pre-release one-way break per M4 posture. Gate:
+   `e2e_malformed_coordination_input_fails_typed_instead_of_defaulting`
+   (per-field negatives over forged inputs); kernel/store/DO suites green.
 3. **Counter timezone anchor + replay determinism.** Parse `timezone <tz>` on
    counter; default-UTC `severity: warning` when omitted; period boundary
    computed with the clock-source tz machinery and — the substantive fix —
