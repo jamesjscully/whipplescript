@@ -728,7 +728,12 @@ pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
         session_identity_fields: strings(&["session_id"]),
         stream_event_kinds: strings(&["message", "tool_event", "hook_event", "result"]),
         tool_policy: "claude_tools_permissions_hooks".to_owned(),
-        cancellation_depths: vec![CancellationDepth::CooperativeRequest],
+        // DR-0017 ("Cancellation should remain conservative"): Claude interrupt
+        // has never been live-validated, so the catalog advertises NO depth —
+        // a binding requesting `cooperative_request` fails validation instead
+        // of pretending. The feature-report vocabulary (`turn.cancel: unknown`)
+        // is the report plane's half (std-agent slices 5/7).
+        cancellation_depths: vec![CancellationDepth::None],
         artifact_manifest: true,
         health_checks: strings(&["claude_sdk", "api_key", "tool_policy"]),
         auth_requirements: strings(&["anthropic_api_key_or_provider_config_ref"]),
@@ -1399,12 +1404,15 @@ mod tests {
 
     #[test]
     fn cancellation_depth_guard_rejects_requests_deeper_than_configured_depth() {
+        // Fixture advertises cooperative_request, so the configured depth is
+        // capability-supported and the failure isolates requested > configured.
+        // (Claude can no longer serve this case: its catalog depth is None per
+        // DR-0017 — see claude_advertises_no_cancellation_depth_per_dr0017.)
         let config = ProviderBindingConfig::from_json_str(
             r#"{
-              "provider_id": "claude-main",
-              "provider_kind": "claude",
-              "surface": "claude_agent_sdk",
-              "credentials_ref": "secret:claude",
+              "provider_id": "fixture-main",
+              "provider_kind": "fixture",
+              "surface": "fixture",
               "cancellation_depth": "cooperative_request"
             }"#,
         )
@@ -1418,7 +1426,7 @@ mod tests {
         .expect_err("native stop exceeds configured depth");
 
         assert_eq!(error.code, "cancellation_depth_denied");
-        assert_eq!(error.provider_id, "claude-main");
+        assert_eq!(error.provider_id, "fixture-main");
         assert_eq!(
             error
                 .to_json_redacted()
@@ -1426,6 +1434,49 @@ mod tests {
                 .and_then(Value::as_str),
             Some("object")
         );
+    }
+
+    /// DR-0017 conformance (std-agent slice 2): Claude interrupt was never
+    /// live-validated, so the catalog must not advertise any cancellation
+    /// depth, and both validation planes must refuse a binding that claims
+    /// `cooperative_request` for Claude.
+    #[cfg(feature = "claude")]
+    #[test]
+    fn claude_advertises_no_cancellation_depth_per_dr0017() {
+        let capabilities = builtin_provider_capabilities();
+        let claude = capabilities
+            .iter()
+            .find(|capability| {
+                capability.provider_kind == ProviderKind::Claude
+                    && capability.surface == AdapterSurface::ClaudeAgentSdk
+            })
+            .expect("claude capability registered");
+        assert_eq!(claude.cancellation_depths, vec![CancellationDepth::None]);
+
+        let config = ProviderBindingConfig::from_json_str(
+            r#"{
+              "provider_id": "claude-main",
+              "provider_kind": "claude",
+              "surface": "claude_agent_sdk",
+              "credentials_ref": "secret:claude",
+              "cancellation_depth": "cooperative_request"
+            }"#,
+        )
+        .expect("config parses");
+
+        let results = validate_provider_binding(&config, &capabilities);
+        assert!(results.iter().any(|result| {
+            result.status == ProviderValidationStatus::Fail
+                && result.code == "unsupported_cancellation_depth"
+        }));
+
+        let error = validate_native_cancellation_depth(
+            &config,
+            &capabilities,
+            CancellationDepth::CooperativeRequest,
+        )
+        .expect_err("configured cooperative_request is not capability-supported for claude");
+        assert_eq!(error.code, "unsupported_configured_cancellation_depth");
     }
 
     #[test]

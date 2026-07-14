@@ -51667,10 +51667,12 @@ rule finish_batch
                 && result.provider == "codex-main"
                 && result.code == "surface_supported"
         }));
+        // DR-0017: Claude advertises no validated cancellation depth, so a
+        // binding claiming cooperative_request is refused, not rubber-stamped.
         assert!(results.iter().any(|result| {
-            result.status == whipplescript_kernel::provider::ProviderValidationStatus::Pass
+            result.status == whipplescript_kernel::provider::ProviderValidationStatus::Fail
                 && result.provider == "reviewer"
-                && result.code == "cancellation_supported"
+                && result.code == "unsupported_cancellation_depth"
         }));
         assert!(!json!(results
             .iter()
