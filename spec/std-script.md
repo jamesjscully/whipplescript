@@ -357,8 +357,16 @@ Coverage AND bite gates apply.
 
 Each independently gateable under the per-piece review discipline.
 
-- **SC1 — model.** `script-hard-off.maude` as above. Gate: coverage + bite in
-  check-rule-coverage; no code change.
+- **SC1 — model. BUILT 2026-07-14** (`models/maude/script-hard-off.maude`,
+  verdicts SNNNNNSS in check-formal-models). Disposition of the
+  subsume-or-build question: `script-capability-seeding.maude` (S6d-6)
+  already carries the ADMISSION-plane half of property 1 (the two-key
+  forged-IR resistance) and is left in place; `script-hard-off.maude` is the
+  SPAWN-plane model — hard-off soundness (no-import and no-pin soups),
+  fail-closed (drifted bytes never spawn), no-injection (author payload
+  never reaches argv), provenance (every spawn records the executing hash),
+  and the plane-separation composite — with a SLOPPY negative-fixture module
+  giving the excluded patterns witnesses (bite). No code change.
 - **SC2 — package identity.** DEPENDS ON substrate slice S6 (the shared
   embedded-manifest mechanism — see Dependencies); SC2 does not build that
   machinery, it supplies std.script's data: embedded manifest (library,

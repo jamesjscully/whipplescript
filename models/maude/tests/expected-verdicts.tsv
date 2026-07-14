@@ -77,6 +77,7 @@ resolution-memory.maude	SNSSN
 restorable-context.maude	SSSNNNN
 restore-replay.maude	SNSN
 script-capability-seeding.maude	SNN
+script-hard-off.maude	SNNNNNSS
 seam-crossing.maude	SSNNSS
 selective-undo.maude	SNSSN
 settle-stopping.maude	NSSSN
