@@ -96,6 +96,25 @@ pub struct TurnContainerConfig {
     pub auth_token: Option<String>,
 }
 
+/// `agent.tell` effects have two admitted producers. Authored workflow effects
+/// carry the historical `{ "prompt": ... }` shape; the governed host facade
+/// stores the complete `StartTurnCommand`, whose user text is nested at
+/// `{ "input": { "text": ... } }`. Decode both explicitly at this adapter
+/// edge and never turn an absent field into a valid empty model request.
+fn agent_prompt(input: &serde_json::Value) -> Result<String, StoreError> {
+    input
+        .pointer("/input/text")
+        .or_else(|| input.get("prompt"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|prompt| !prompt.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            StoreError::Conflict(
+                "agent.tell input omitted both host input.text and workflow prompt".to_owned(),
+            )
+        })
+}
+
 /// Drives a workflow instance's rule pass + effect discovery on the durable object.
 pub struct DoInstanceDriver<'a, Sql: DoSql> {
     /// One held kernel over the DO's SQLite (backs runtime + coordination +
@@ -257,11 +276,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
             "agent.tell" if self.turn.is_some() => {
                 let cfg = self.turn.expect("guarded by arm pattern");
                 let input = json_from_str(&effect.input_json);
-                let prompt = input
-                    .get("prompt")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_owned();
+                let prompt = agent_prompt(&input)?;
                 let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "agent-run"]);
                 let lease_id =
                     idempotency_key(&[self.instance_id, &effect.effect_id, "agent-lease"]);
@@ -388,11 +403,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     )
                 })?;
                 let input = json_from_str(&effect.input_json);
-                let prompt = input
-                    .get("prompt")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_owned();
+                let prompt = agent_prompt(&input)?;
                 // Store-backed project instructions (context-assembly Phase 3
                 // item 4): the DO has no filesystem, so AGENTS.md/CLAUDE.md
                 // content registered at deploy resolves from the store — the
@@ -920,6 +931,32 @@ mod tests {
         fn remove(&self, _path: &std::path::Path) -> std::io::Result<()> {
             Err(std::io::Error::other("no files in this test"))
         }
+    }
+
+    #[test]
+    fn agent_prompt_reads_the_governed_host_turn_shape() {
+        let input = serde_json::json!({
+            "protocol": "whipplescript.host.v1",
+            "command_id": "command-1",
+            "input": {
+                "text": "the exact GaugeDesk user turn",
+                "images": [],
+            },
+        });
+        assert_eq!(
+            agent_prompt(&input).expect("host text"),
+            "the exact GaugeDesk user turn"
+        );
+    }
+
+    #[test]
+    fn agent_prompt_keeps_authored_effects_and_refuses_missing_text() {
+        assert_eq!(
+            agent_prompt(&serde_json::json!({"prompt": "authored turn"})).expect("authored prompt"),
+            "authored turn"
+        );
+        assert!(agent_prompt(&serde_json::json!({"input": {}})).is_err());
+        assert!(agent_prompt(&serde_json::json!({"prompt": "  "})).is_err());
     }
 
     // The DO drives an effect-free workflow's rule pass to its terminal through the
