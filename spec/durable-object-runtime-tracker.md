@@ -897,6 +897,13 @@ fixed-size `getRandom` pools). Open build work:
       Residuals (join the container tier when it lands): image build/push,
       pool provisioning, object-tier bucket (P7 by design).
 
+- [ ] DO-plane memory: port `MemoryStore` (whipplescript-store/src/memory.rs,
+      the std.memory `local` provider's seam) over `DoSql` so memory pools
+      work on the DO — same table shape, FTS5 replaced by the DO's LIKE-based
+      lexical match if the platform sqlite lacks FTS5. Registered here per
+      spec/std-memory.md MEM-3 (M7: the DO package layer lives in this
+      tracker); rides the same cadence as the other `Do*` store ports.
+
 ---
 
 ## Open questions / risks

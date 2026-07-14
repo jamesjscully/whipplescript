@@ -208,6 +208,7 @@ fn main() -> ExitCode {
         Some("ledger") => coordination_list(&options, "ledger"),
         Some("counters") => coordination_list(&options, "counters"),
         Some("issue") => issue(&options),
+        Some("memory") => memory_command(&options),
         Some("evidence") => evidence(&options),
         Some("improve") => improve::improve_command(&options),
         Some("campaigns") => improve::campaigns_command(&options),
@@ -672,6 +673,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "ledger" => "usage: whip ledger [<ledger>] [--partition <value>]",
         "counters" => "usage: whip counters [<counter>]",
         "issue" => ISSUE_USAGE,
+        "memory" => "usage: whip memory <pools|entries <pool> [--limit <n>]> (the workspace memory store; WHIPPLESCRIPT_MEMORY_STORE overrides the path)",
         "evidence" => "usage: whip evidence <instance>",
         "diagnostics" => "usage: whip diagnostics [--grouped] <instance>",
         "trace" => "usage: whip trace <instance> [--check]",
@@ -16376,7 +16378,11 @@ fn embedded_std_manifests() -> Vec<PackageManifest> {
 /// rows are deliberately invisible to the effect-provider surface
 /// (`package_operator_providers` is their only structured reader), and this
 /// consults defaults without registering anything on the admission plane.
-fn embedded_operator_provider_default(package: &str, provider_id: &str, key: &str) -> Option<String> {
+fn embedded_operator_provider_default(
+    package: &str,
+    provider_id: &str,
+    key: &str,
+) -> Option<String> {
     let (_, json) = EMBEDDED_STD_MANIFESTS
         .iter()
         .find(|(name, _)| *name == package)?;
@@ -22067,7 +22073,7 @@ fn run_capability_effect(
         )
     } else if bound_provider.as_deref() == Some("memory-provider") {
         let memory = MemoryCapabilityProvider {
-            store_path: store_path.with_extension("memory.jsonl"),
+            store_path: store_path.with_extension("memory.sqlite"),
         };
         run_capability_effect_generic(
             &mut kernel,
@@ -22222,29 +22228,64 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for StdioCapabili
 
 /// Native, file-backed memory provider (S5 first per-capability real provider,
 /// selected by the `memory-provider` binding for `memory.query`/`memory.write`).
-/// A single append-only `<store>.memory.jsonl` holds one JSON record per learned
-/// item; `recall` reads it back filtered by pool. Deterministic: the message id is
-/// derived from the effect id (no wall-clock, no randomness), so replay is stable.
-///
-/// Memory pools are provider-*less* by design — selection is owned by the binding,
-/// not the pool binding on the workflow — so both memory capabilities route here.
+/// The std.memory `local` provider (spec/std-memory.md MEM-3) over the store
+/// crate's `MemoryStore` seam: workspace-scoped SQLite at
+/// `<store>.memory.sqlite` (`WHIPPLESCRIPT_MEMORY_STORE` overrides), FTS5
+/// lexical match + recency. Deterministic inside the effect plane: message
+/// ids derive from the effect id and `created_at` stays empty — the effect
+/// plane never reads a clock; insertion order carries recency — so replay is
+/// stable. Memory pools are provider-*less* by design — selection is owned by
+/// the binding, not the pool declaration — so all three memory capabilities
+/// route here.
 struct MemoryCapabilityProvider {
     store_path: PathBuf,
 }
 
 impl MemoryCapabilityProvider {
-    /// Read every stored record, keeping only those in `pool`. A missing store is
-    /// an empty history (recall must return a valid context, never fail, when empty).
-    fn items_in_pool(&self, pool: &str) -> Vec<Value> {
-        let Ok(content) = std::fs::read_to_string(&self.store_path) else {
-            return Vec::new();
-        };
-        content
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|record| record.get("pool").and_then(Value::as_str) == Some(pool))
-            .collect()
+    fn open(&self) -> Result<whipplescript_store::memory::SqliteMemoryStore, String> {
+        let path = std::env::var(whipplescript_store::memory::MEMORY_STORE_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| self.store_path.clone());
+        whipplescript_store::memory::SqliteMemoryStore::open(&path)
+            .map_err(|error| format!("memory store {}: {error:?}", path.display()))
+    }
+
+    /// One recall item: the pre-seam record shape (`message_id`/`pool`/
+    /// `source`/`note`) kept stable — the message id recomputes
+    /// deterministically from the recorded write-effect id — plus the
+    /// MemoryContext enrichment (memory_id, text, created_at, provenance).
+    fn item_json(row: &whipplescript_store::memory::MemoryEntryRow) -> Value {
+        let mut item = serde_json::Map::new();
+        if let Some(effect_id) = &row.source_effect_id {
+            item.insert(
+                "message_id".to_owned(),
+                Value::String(idempotency_key(&[effect_id, "memory-message"])),
+            );
+        }
+        item.insert("memory_id".to_owned(), json!(row.memory_id));
+        item.insert("pool".to_owned(), Value::String(row.pool.clone()));
+        item.insert("text".to_owned(), Value::String(row.text.clone()));
+        item.insert(
+            "source".to_owned(),
+            row.source.clone().map(Value::String).unwrap_or(Value::Null),
+        );
+        if let Some(note) = &row.note {
+            item.insert("note".to_owned(), Value::String(note.clone()));
+        }
+        item.insert(
+            "created_at".to_owned(),
+            Value::String(row.created_at.clone()),
+        );
+        item.insert(
+            "provenance".to_owned(),
+            json!({
+                "source_instance_id": row.source_instance_id,
+                "source_effect_id": row.source_effect_id,
+                "source_run_id": row.source_run_id,
+                "author_actor": row.author_actor,
+            }),
+        );
+        Value::Object(item)
     }
 }
 
@@ -22272,35 +22313,53 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for MemoryCapabil
         // Deterministic message id: derived from the effect id, never wall-clock.
         let message_id = idempotency_key(&[&effect.effect_id, "memory-message"]);
 
+        let mut store = match self.open() {
+            Ok(store) => store,
+            Err(message) => {
+                return CapabilityOutcome::Failed {
+                    error_kind: "memory".to_owned(),
+                    message,
+                };
+            }
+        };
+        use whipplescript_store::memory::{CurateStrategy, MemoryStore, NewMemoryEntry};
         match effect.target.as_deref() {
             Some("memory.write") => {
-                // Append one record for the learned item. `source` is the resolved
-                // `from <source>` value; `note` the optional `{ note <expr> }` field.
-                let mut record = serde_json::Map::new();
-                record.insert("message_id".to_owned(), Value::String(message_id.clone()));
-                record.insert("pool".to_owned(), Value::String(pool.clone()));
-                record.insert(
-                    "source".to_owned(),
-                    input.get("source").cloned().unwrap_or(Value::Null),
-                );
-                if let Some(note) = input.get("note") {
-                    record.insert("note".to_owned(), note.clone());
-                }
-                let mut line = serde_json::to_string(&Value::Object(record))
-                    .unwrap_or_else(|_| "{}".to_owned());
-                line.push('\n');
-                if let Err(err) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.store_path)
-                    .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()))
-                {
+                // One entry for the learned item. `source` is the resolved
+                // `from <source>` value; `note` the optional `{ note <expr> }`
+                // field; text (the FTS-matchable body) prefers the note.
+                let source = input.get("source").and_then(Value::as_str);
+                let note = input.get("note").and_then(Value::as_str);
+                // The FTS-matchable body carries EVERYTHING the entry knows:
+                // a recall's query may name the source (`recall <pool> for
+                // <subject>`) or words from the note.
+                let text = match (source, note) {
+                    (Some(source), Some(note)) => format!("{source}\n{note}"),
+                    (Some(source), None) => source.to_owned(),
+                    (None, Some(note)) => note.to_owned(),
+                    (None, None) => input
+                        .get("source")
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                        .to_string(),
+                };
+                let entry = NewMemoryEntry {
+                    pool: &pool,
+                    text: &text,
+                    // The effect plane never reads a clock: recency rides
+                    // insertion order; provenance carries the effect id.
+                    created_at: "",
+                    source_instance_id: None,
+                    source_effect_id: Some(&effect.effect_id),
+                    source_run_id: None,
+                    author_actor: None,
+                    source,
+                    note,
+                };
+                if let Err(error) = store.write(&entry) {
                     return CapabilityOutcome::Failed {
                         error_kind: "memory".to_owned(),
-                        message: format!(
-                            "memory write to {} failed: {err}",
-                            self.store_path.display()
-                        ),
+                        message: format!("memory write failed: {error:?}"),
                     };
                 }
                 CapabilityOutcome::Produced(json!({
@@ -22310,80 +22369,48 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for MemoryCapabil
                 }))
             }
             Some("memory.query") => {
-                // A MemoryContext: the stored items for this pool (empty is valid).
-                let items = self.items_in_pool(&pool);
-                CapabilityOutcome::Produced(json!({
-                    "pool": pool,
-                    "count": items.len(),
-                    "items": items,
-                }))
+                // A MemoryContext: lexical match + recency when the recall
+                // carries a query, the pool's recent items otherwise (empty
+                // is valid — recall never fails on an empty pool).
+                let query_text = input
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let limit = input
+                    .get("context_limit")
+                    .and_then(Value::as_u64)
+                    .map(|limit| limit as usize);
+                match store.query(&pool, query_text, limit) {
+                    Ok(rows) => {
+                        let items: Vec<Value> = rows.iter().map(Self::item_json).collect();
+                        CapabilityOutcome::Produced(json!({
+                            "pool": pool,
+                            "count": items.len(),
+                            "items": items,
+                        }))
+                    }
+                    Err(error) => CapabilityOutcome::Failed {
+                        error_kind: "memory".to_owned(),
+                        message: format!("memory query failed: {error:?}"),
+                    },
+                }
             }
             Some("memory.curate") => {
-                // Deterministic maintenance: dedupe the pool's records by their
-                // `source`/`note` content (keep the first occurrence, drop later
-                // duplicates), rewrite the store, and report removed/kept. Records
-                // for OTHER pools are preserved verbatim. A missing store is empty
-                // (removed 0, kept 0). No wall-clock, no randomness — replay-stable.
-                let Ok(content) = std::fs::read_to_string(&self.store_path) else {
-                    return CapabilityOutcome::Produced(json!({
+                // Deterministic maintenance in the store: dedupe the pool by
+                // its content identity (source, note), first occurrence kept,
+                // other pools untouched. An empty/missing store curates to
+                // (removed 0, kept 0). No wall-clock, no randomness.
+                match store.curate(&pool, CurateStrategy::DedupeBySourceNote) {
+                    Ok(report) => CapabilityOutcome::Produced(json!({
                         "pool": pool,
-                        "removed": 0,
-                        "kept": 0,
-                    }));
-                };
-                let mut kept_lines: Vec<String> = Vec::new();
-                let mut seen: std::collections::BTreeSet<String> =
-                    std::collections::BTreeSet::new();
-                let mut removed: usize = 0;
-                let mut kept_in_pool: usize = 0;
-                for line in content.lines() {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let record: Value = match serde_json::from_str(line) {
-                        Ok(value) => value,
-                        // Preserve unparseable lines untouched (never lose data).
-                        Err(_) => {
-                            kept_lines.push(line.to_owned());
-                            continue;
-                        }
-                    };
-                    // Records for other pools pass through unchanged.
-                    if record.get("pool").and_then(Value::as_str) != Some(pool.as_str()) {
-                        kept_lines.push(line.to_owned());
-                        continue;
-                    }
-                    // Dedup key = the pool's content identity: (source, note).
-                    let dedup_key = serde_json::to_string(&json!({
-                        "source": record.get("source").cloned().unwrap_or(Value::Null),
-                        "note": record.get("note").cloned().unwrap_or(Value::Null),
-                    }))
-                    .unwrap_or_default();
-                    if seen.insert(dedup_key) {
-                        kept_lines.push(line.to_owned());
-                        kept_in_pool += 1;
-                    } else {
-                        removed += 1;
-                    }
-                }
-                let mut rewritten = kept_lines.join("\n");
-                if !rewritten.is_empty() {
-                    rewritten.push('\n');
-                }
-                if let Err(err) = std::fs::write(&self.store_path, rewritten.as_bytes()) {
-                    return CapabilityOutcome::Failed {
+                        "removed": report.removed,
+                        "kept": report.kept,
+                    })),
+                    Err(error) => CapabilityOutcome::Failed {
                         error_kind: "memory".to_owned(),
-                        message: format!(
-                            "memory curate of {} failed: {err}",
-                            self.store_path.display()
-                        ),
-                    };
+                        message: format!("memory curate failed: {error:?}"),
+                    },
                 }
-                CapabilityOutcome::Produced(json!({
-                    "pool": pool,
-                    "removed": removed,
-                    "kept": kept_in_pool,
-                }))
             }
             other => CapabilityOutcome::Failed {
                 error_kind: "memory".to_owned(),
@@ -29861,6 +29888,94 @@ fn message_command(options: &CliOptions) -> ExitCode {
 /// Coordination state is fully attributable and inspectable
 /// (spec/coordination.md): who holds which slot, who spent the budget, who
 /// wrote which entry.
+/// `whip memory pools|entries` (spec/std-memory.md MEM-3): the operator's
+/// read surface over the workspace memory store — the same
+/// `<store>.memory.sqlite` the std.memory `local` provider writes
+/// (`WHIPPLESCRIPT_MEMORY_STORE` overrides).
+fn memory_command(options: &CliOptions) -> ExitCode {
+    use whipplescript_store::memory::{MemoryStore, SqliteMemoryStore};
+    let usage = "usage: whip memory <pools|entries <pool> [--limit <n>]>";
+    let path = std::env::var(whipplescript_store::memory::MEMORY_STORE_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| options.store_path.with_extension("memory.sqlite"));
+    let store = match SqliteMemoryStore::open(&path) {
+        Ok(store) => store,
+        Err(error) => return report_store_error("failed to open memory store", error),
+    };
+    let mut args = options.args.iter().map(String::as_str);
+    match args.next() {
+        Some("pools") => {
+            let pools = match store.pools() {
+                Ok(pools) => pools,
+                Err(error) => return report_store_error("failed to list memory pools", error),
+            };
+            if options.json {
+                return emit_json(Value::Array(
+                    pools
+                        .iter()
+                        .map(|pool| {
+                            json!({
+                                "pool": pool.pool,
+                                "entries": pool.entries,
+                                "last_created_at": pool.last_created_at,
+                            })
+                        })
+                        .collect(),
+                ));
+            }
+            if pools.is_empty() {
+                println!("no memory pools at {}", path.display());
+            }
+            for pool in pools {
+                println!("{}\t{} entries", pool.pool, pool.entries);
+            }
+            ExitCode::SUCCESS
+        }
+        Some("entries") => {
+            let Some(pool) = args.next().filter(|arg| !arg.starts_with('-')) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let mut limit = None;
+            while let Some(arg) = args.next() {
+                if arg == "--limit" {
+                    limit = args.next().and_then(|raw| raw.parse::<usize>().ok());
+                }
+            }
+            let rows = match store.entries(pool, limit) {
+                Ok(rows) => rows,
+                Err(error) => return report_store_error("failed to list memory entries", error),
+            };
+            if options.json {
+                return emit_json(Value::Array(
+                    rows.iter()
+                        .map(|row| {
+                            json!({
+                                "memory_id": row.memory_id,
+                                "pool": row.pool,
+                                "text": row.text,
+                                "source": row.source,
+                                "note": row.note,
+                                "created_at": row.created_at,
+                                "source_effect_id": row.source_effect_id,
+                                "author_actor": row.author_actor,
+                            })
+                        })
+                        .collect(),
+                ));
+            }
+            for row in rows {
+                println!("{}\t{}", row.memory_id, row.text.replace('\n', " "));
+            }
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("{usage}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn coordination_list(options: &CliOptions, kind: &str) -> ExitCode {
     let store =
         match whipplescript_store::coordination::CoordinationStore::open(coordination_store_path())
@@ -40459,8 +40574,7 @@ coerce review() -> Review {
         let label = Path::new("<embedded:std.telemetry>");
         // Registration writes no admission-plane row: zero effect providers,
         // zero effect contracts, zero capabilities.
-        let providers =
-            package_provider_contracts(label, &value).expect("effect-provider parse");
+        let providers = package_provider_contracts(label, &value).expect("effect-provider parse");
         assert!(
             providers.is_empty(),
             "operator-plane rows must never become effect providers: {providers:?}"
@@ -40487,9 +40601,8 @@ coerce review() -> Review {
             "package_id": "p", "name": "p", "version": "0.1.0",
             "providers": [{"id": "x", "provider_kind": "k", "plane": "operator", "capability": "a.b"}]
         }"#;
-        let error =
-            package_manifest_from_json(Path::new("p.json"), with_capability.to_owned())
-                .expect_err("operator rows are capability-free by definition");
+        let error = package_manifest_from_json(Path::new("p.json"), with_capability.to_owned())
+            .expect_err("operator rows are capability-free by definition");
         assert!(error.contains("capability-free"), "{error}");
         let unknown_plane = r#"{
             "schema": "whipplescript.package_manifest.v0",

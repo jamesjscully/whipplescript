@@ -8440,6 +8440,44 @@ fn memory_curate_dedupes_the_pool_without_a_lock() {
         "the surviving entries are one `dup` (the deduped duplicate) and the `distinct` one"
     );
 
+    // The operator read surface (MEM-3): `whip memory pools|entries` lists
+    // the same store the provider wrote.
+    let pools = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store"),
+            "--json",
+            "memory",
+            "pools",
+        ],
+    );
+    let pools = pools.as_array().expect("pools array");
+    assert_eq!(
+        pools
+            .iter()
+            .find(|pool| pool.get("pool").and_then(Value::as_str) == Some("project_memory"))
+            .and_then(|pool| pool.get("entries").and_then(Value::as_u64)),
+        Some(2),
+        "whip memory pools reports the deduped pool"
+    );
+    let entries = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store"),
+            "--json",
+            "memory",
+            "entries",
+            "project_memory",
+        ],
+    );
+    assert_eq!(
+        entries.as_array().map(Vec::len),
+        Some(2),
+        "whip memory entries lists the surviving rows"
+    );
+
     let _ = fs::remove_dir_all(&dir);
 }
 

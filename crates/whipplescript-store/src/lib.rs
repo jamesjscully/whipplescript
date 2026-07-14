@@ -2787,6 +2787,13 @@ impl SqliteStore {
             .into_iter()
             .flatten()
         {
+            // Operator-plane rows (`"plane": "operator"`, std-telemetry.md
+            // T3) are capability-free configuration for operator CLI
+            // surfaces: registering one here would mint exactly the
+            // decorative admission-plane row the design forbids.
+            if provider.get("plane").and_then(Value::as_str) == Some("operator") {
+                continue;
+            }
             let config_json = provider
                 .get("config")
                 .map(Value::to_string)

@@ -4851,6 +4851,12 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .into_iter()
             .flatten()
         {
+            // Operator-plane rows (`"plane": "operator"`, std-telemetry.md
+            // T3) are capability-free operator-CLI configuration, never an
+            // admission-plane registration — parity with the native store.
+            if provider.get("plane").and_then(Value::as_str) == Some("operator") {
+                continue;
+            }
             let config_json = provider
                 .get("config")
                 .map(Value::to_string)
