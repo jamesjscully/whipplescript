@@ -202,6 +202,11 @@ others are active workshop material.
   WhippleScript's default governed `bash` implementation on native and Durable
   Object placements; non-bash external capabilities remain typed brokered
   effects. *Accepted; implementation in progress.*
+- [0042-secret-free-model-egress-broker.md](0042-secret-free-model-egress-broker.md):
+  hosted provider bindings explicitly select a transitional Worker secret or a
+  secret-free authenticated model broker; the broker receives WhippleScript's
+  admitted request with auth headers stripped and may only inject credentials +
+  perform transport. *Accepted; authenticated HTTP realization implemented.*
 
 ## Historical Decision Trackers
 

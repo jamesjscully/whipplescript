@@ -83,6 +83,20 @@ tests, the wasm32 no-default-features build, and Worker `tsc --noEmit`. A live
 GaugeDesk-to-deployed-Worker pass remains deployment/secret infrastructure, not
 open local host work.
 
+## Secret-free model egress broker (DR-0042 / GaugeDesk LLM-5)
+
+- [x] **Authenticated HTTP broker protocol.** Completed 2026-07-14: added the
+  `whipplescript.model-egress.v1` envelope, explicit `model-broker` provider
+  realization, exact sentinel/credential-ref checks, auth-header stripping,
+  fail-closed broker URL/token/response validation, and hermetic fake-broker
+  conformance. Worker TypeScript, host crate tests, wasm build, and a full
+  Wrangler dry-run bundle pass. This is the first slice replacing
+  deployment-wide BYOK secrets.
+- [ ] **Outbound local broker session.** Bind the same envelope to an authenticated
+  client-initiated session so a remote DO development turn can use a locally sealed
+  Codex credential without uploading its refresh token. HTTP Home brokers do not
+  depend on this transport.
+
 Out of scope (intentional asymmetries): `exec.command` is native-only by design
 (DR-0033 Decision 7, re-expressed as the Class-A executor HTTP effect); the
 coordination-state snapshot for the checkpoint cut is deferred on *both* hosts

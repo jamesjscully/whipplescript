@@ -1,6 +1,7 @@
 {
   "name": "whipplescript-runtime-worker",
   "private": true,
+  "type": "module",
   "version": "0.1.0",
   "description": "Cloudflare Worker + Durable Object shell for the sans-IO WhippleScript runtime (DR-0033).",
   "scripts": {
@@ -8,7 +9,8 @@
     "deploy": "npm run build:wasm && wrangler deploy",
     "dev": "npm run build:wasm && wrangler dev",
     "validate": "cargo build -p whipplescript-host-do --no-default-features --target wasm32-unknown-unknown --release && wasm-bindgen ../../../target/wasm32-unknown-unknown/release/whipplescript_host_do.wasm --out-dir pkg --target nodejs && node validate.cjs",
-    "build:executor": "cargo build --release -p whipplescript --bin whip && cp ../../../target/release/whip executor/whip"
+    "build:executor": "cargo build --release -p whipplescript --bin whip && cp ../../../target/release/whip executor/whip",
+    "test": "node --experimental-strip-types --test src/*.test.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260708.1",

@@ -21,7 +21,7 @@ needs a Cloudflare account and:
 ## Deploy steps
 
 **One command:** `whip deploy` (compute plane P8) runs the whole sequence
-below — dependency install, wasm build, optional provider secrets
+below — dependency install, wasm build, optional transitional provider secrets
 (`--set-secrets` forwards `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` from the local
 environment), and the wrangler deploy. `--dry-run` validates the bundle
 without publishing; `--worker-dir`/`WHIPPLESCRIPT_WORKER_DIR` point it at
@@ -37,11 +37,32 @@ reference:
    runtime store schema (`crates/whipplescript-store/migrations/0001_runtime_store.sql`,
    the same schema `do_store.rs` is ported against). Run it once on object init
    (embed the SQL and `sql.exec` it before `create`, or ship it as a DO migration).
-3. **Set provider secrets** (for coerce/agent effects):
+3. **Choose provider egress** (for governed host turns). The transitional
+   `worker-secret` realization resolves a named Worker secret only after
+   admission. Its binding must explicitly set `"execution":"worker-secret"`
+   and name `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in `secret`:
    ```
    wrangler secret put ANTHROPIC_API_KEY
    wrangler secret put OPENAI_API_KEY
    ```
+   The DR-0042 `model-broker` realization instead sets
+   `WHIP_MODEL_BROKER_URL`, stores only the broker-hop token as
+   `WHIP_MODEL_BROKER_TOKEN`, and declares no provider secret:
+   ```json
+   {
+     "binding_project_openai": {
+       "credential_id": "credential:project:alpha:v3",
+       "provider": "openai",
+       "model": "gpt-5",
+       "base_url": "https://api.openai.com",
+       "execution": "model-broker"
+     }
+   }
+   ```
+   This JSON is the non-secret `WHIP_HOST_PROVIDER_BINDINGS_JSON` deployment
+   variable. Set the hop token with
+   `wrangler secret put WHIP_MODEL_BROKER_TOKEN`. Broker failure is fail-closed;
+   the Worker never falls back to direct provider egress.
 4. **Deploy**: `npm run deploy` (`wrangler deploy`).
 5. **Validate**: use the canonical managed route
    `/v1/tenants/:tenant/placements/:placement/host/...` (Bearer
@@ -53,12 +74,12 @@ reference:
 
 - **`DoSqlBridge` → `state.storage.sql`** — `makeBridge` in `index.ts`. Rows come
   back positionally (`Object.values`, column order preserved per Cloudflare docs).
-- **`DurableEffectPorts` → secrets** — `create` accepts `coerce_config_json` (DO
-  secret), so **coerce runs on the deployed surface** alongside store-only + effect-
-  free workflows. The `index.ts` shell builds it from `ANTHROPIC_API_KEY`. *Remaining
-  follow-on: the messages-API agent model client (a pure Rust `HttpModelClient` like
-  coerce's `build_request`/`parse_response`, but for the tool-use messages API) — its
-  eviction-safe multi-round machinery is already built + proven (`snapshot`/`restore`).*
-- **`needs_http` → `fetch`** — `performFetch` in `index.ts`.
+- **`DurableEffectPorts` → admitted provider realization** — governed host turns
+  resolve either a transitional Worker secret or the fixed non-secret broker
+  sentinel. The binding id + opaque credential ref must match exactly before
+  either is available.
+- **`needs_http` → egress** — `performFetch` handles direct/container rounds;
+  `performModelBrokerFetch` strips sentinel auth and sends the admitted request
+  through the authenticated `whipplescript.model-egress.v1` broker envelope.
 
 Once these are wired and the object deployed, 5d is exercising already-proven Rust.

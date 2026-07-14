@@ -48,7 +48,11 @@ WHIP_TURN_URL = "http://turn"
 [build]
 command = "npm run build:wasm"
 
-# Provider credentials are DO secrets, set out-of-band:
+# Transitional provider credentials are DO secrets, set out-of-band:
 #   wrangler secret put ANTHROPIC_API_KEY
 #   wrangler secret put OPENAI_API_KEY
-# They flow into DurableEffectPorts (coerce/agent) once create() accepts them.
+# Secret-free governed turns instead configure the non-secret broker URL and
+# provider-binding map, then set only the broker-hop token as a Worker secret:
+#   WHIP_MODEL_BROKER_URL = "https://home.example/model-egress"
+#   WHIP_HOST_PROVIDER_BINDINGS_JSON = '{..."execution":"model-broker"...}'
+#   wrangler secret put WHIP_MODEL_BROKER_TOKEN
