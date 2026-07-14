@@ -4385,6 +4385,7 @@ fn lower_program(
     ir.rule_dependencies = build_rule_dependencies(&ir.rules);
     validate_turn_access_grant_file_operations(&ir, &mut diagnostics);
     validate_turn_access_grant_memory_operations(&ir, &mut diagnostics);
+    warn_inert_memory_grant_on_native_adapter(&ir, &mut warnings);
     validate_improve_declarations(&ir, &mut diagnostics);
 
     CompileOutput {
@@ -4469,6 +4470,64 @@ fn validate_turn_access_grant_memory_operations(ir: &IrProgram, diagnostics: &mu
                             ),
                         });
                     }
+                }
+            }
+        }
+    }
+}
+
+/// MEM-5 static check 4: a memory-pool grant on a `tell` whose agent runs a
+/// NATIVE adapter (codex/claude/command) is inert — only the owned harness
+/// exposes the granted memory tools. Warn instead of silently dropping the
+/// author's intent (the inert-grant honesty the design eliminates).
+fn warn_inert_memory_grant_on_native_adapter(ir: &IrProgram, warnings: &mut Vec<Diagnostic>) {
+    let memory_pools: BTreeSet<&str> = ir
+        .memory_pools
+        .iter()
+        .map(|pool| pool.name.as_str())
+        .collect();
+    if memory_pools.is_empty() {
+        return;
+    }
+    let harness_kind_of: BTreeMap<&str, &str> = ir
+        .harnesses
+        .iter()
+        .map(|harness| (harness.name.as_str(), harness.kind.as_str()))
+        .collect();
+    let agent_harness_kind: BTreeMap<&str, &str> = ir
+        .agents
+        .iter()
+        .filter_map(|agent| {
+            let harness = agent.harness.as_deref()?;
+            Some((agent.name.as_str(), *harness_kind_of.get(harness)?))
+        })
+        .collect();
+    for rule in &ir.rules {
+        for effect in &rule.metadata.effects {
+            let Some(agent) = effect.agent.as_deref() else {
+                continue;
+            };
+            let Some(kind) = agent_harness_kind.get(agent) else {
+                continue;
+            };
+            if !matches!(*kind, "codex" | "claude" | "command") {
+                continue;
+            }
+            for grant in &effect.access_grants {
+                if memory_pools.contains(grant.resource.as_str()) {
+                    warnings.push(Diagnostic {
+                        related: Vec::new(),
+                        span: effect.span,
+                        message: format!(
+                            "rule `{}` grants memory pool `{}` on a tell to `{agent}`, whose \
+                             harness kind `{kind}` is a native adapter — memory grants only \
+                             take effect on the owned harness, so this grant is inert",
+                            rule.name, grant.resource
+                        ),
+                        suggestion: Some(
+                            "target an owned-harness agent, or drop the memory grant".to_owned(),
+                        ),
+                    });
                 }
             }
         }
@@ -29584,6 +29643,72 @@ rule work
                 .any(|d| d.message.contains("more than once")),
             "{:?}",
             duplicate.diagnostics
+        );
+    }
+
+    /// MEM-5 static check 4: a memory grant on a tell whose harness is a
+    /// native adapter warns (the grant is inert there); the same grant on
+    /// an owned harness stays quiet.
+    #[test]
+    fn warns_inert_memory_grant_on_a_native_adapter_tell() {
+        let program = |harness_kind: &str| {
+            format!(
+                r#"
+@service
+workflow InertGrant
+
+output result R
+class R {{ ok bool }}
+class Ticket {{ id string  status "open" }}
+
+memory pool project_memory {{
+  context limit 4
+}}
+
+harness h: {harness_kind}
+agent coder using h {{ profile "repo-writer"  capacity 1 }}
+
+table seed as Ticket [ {{ id "T1"  status "open" }} ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+  when coder is available
+=> {{
+  tell coder as turn
+    with access to project_memory {{
+      recall for ticket
+    }}
+  "Work it."
+
+  after turn succeeds as outcome {{
+    complete result {{ ok true }}
+  }}
+}}
+"#
+            )
+        };
+        let native = compile_program(&program("codex"));
+        assert!(
+            native.diagnostics.is_empty(),
+            "the grant itself is legal: {:?}",
+            native.diagnostics
+        );
+        assert!(
+            native
+                .warnings
+                .iter()
+                .any(|warning| warning.message.contains("inert")),
+            "a codex-harness tell warns: {:?}",
+            native.warnings
+        );
+        let owned = compile_program(&program("owned"));
+        assert!(
+            owned
+                .warnings
+                .iter()
+                .all(|warning| !warning.message.contains("inert")),
+            "an owned-harness tell does not warn: {:?}",
+            owned.warnings
         );
     }
 

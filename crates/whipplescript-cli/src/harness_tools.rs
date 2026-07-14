@@ -52,6 +52,8 @@ pub const TOOL_ADD_TODO: &str = "add_todo";
 pub const TOOL_UPDATE_TODO: &str = "update_todo";
 pub const TOOL_WEB_SEARCH: &str = "web_search";
 pub const TOOL_WEB_FETCH: &str = "web_fetch";
+pub const TOOL_RECALL_MEMORY: &str = "recall_memory";
+pub const TOOL_LEARN_MEMORY: &str = "learn_memory";
 
 const TRACKER_RESOURCE: &str = "tracker";
 const WEB_RESOURCE: &str = "web";
@@ -328,6 +330,48 @@ fn web_tool_specs_for_turn(access: &TurnToolAccess) -> Vec<ToolSpec> {
     specs
 }
 
+/// The memory tools ride `with access to <pool> { recall … learn … }`
+/// grants only (MEM-5): per-operation exposure, so a recall-only grant
+/// never offers `learn_memory`.
+fn memory_tool_specs_for_turn(access: &TurnToolAccess) -> Vec<ToolSpec> {
+    let mut specs = Vec::new();
+    if access.memory.grants_recall() {
+        specs.push(ToolSpec {
+            name: TOOL_RECALL_MEMORY.into(),
+            description: "Recall entries from a granted memory pool: lexical match on the \
+                          query plus recency. Returns the matching entries with provenance."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pool": { "type": "string", "description": "a memory pool granted this turn" },
+                    "query": { "type": "string", "description": "words to match; empty returns the most recent entries" },
+                    "limit": { "type": "integer", "description": "max entries to return" }
+                },
+                "required": ["pool"],
+                "additionalProperties": false
+            }),
+        });
+    }
+    if access.memory.grants_learn() {
+        specs.push(ToolSpec {
+            name: TOOL_LEARN_MEMORY.into(),
+            description: "Store one entry into a granted memory pool for later recall.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pool": { "type": "string", "description": "a memory pool granted this turn" },
+                    "text": { "type": "string", "description": "the content to remember" },
+                    "note": { "type": "string", "description": "optional annotation" }
+                },
+                "required": ["pool", "text"],
+                "additionalProperties": false
+            }),
+        });
+    }
+    specs
+}
+
 fn tracker_tool_specs_for_turn(
     policy: &HarnessProfilePolicy,
     access: &TurnToolAccess,
@@ -388,6 +432,9 @@ pub struct FileToolExecutor {
     /// `None` preserves direct/test executor behavior; live owned turns install
     /// `Some` so tracker mutations are bound to `with access to tracker { ... }`.
     tracker_access: Option<TurnTrackerAccess>,
+    /// Per-pool memory authority (MEM-5). `None` = deny (direct/test
+    /// executors never expose the memory tools).
+    memory_access: Option<TurnMemoryAccess>,
     /// Registered `@tool` sub-workflows (DR-0025), dispatched synchronously.
     workflow_tools: Vec<WorkflowToolEntry>,
     /// Run-store path the sub-workflow child instances are created in. Set
@@ -461,6 +508,9 @@ struct TurnToolAccess {
     file_resources: Vec<String>,
     command_run: bool,
     tracker: TurnTrackerAccess,
+    /// `with access to <pool> { recall … learn … }` — per-pool memory
+    /// authority (spec/std-memory.md MEM-5). Deny = empty.
+    memory: TurnMemoryAccess,
     /// `with access to web { search }` — the web-search egress door.
     web_search: bool,
     /// `with access to web { fetch }` — the GET-only fetch egress door.
@@ -474,8 +524,67 @@ impl TurnToolAccess {
             file_resources: Vec::new(),
             command_run: false,
             tracker: TurnTrackerAccess::deny_all(),
+            memory: TurnMemoryAccess::deny_all(),
             web_search: false,
             web_fetch: false,
+        }
+    }
+}
+
+/// The per-turn memory authority: one row per granted pool, per-operation
+/// (a recall-only grant never exposes `learn_memory`). Replaces the inert
+/// arm MEM-5 eliminates — a memory grant either bites here or is refused,
+/// never silently dropped.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TurnMemoryAccess {
+    pools: Vec<TurnMemoryPool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TurnMemoryPool {
+    pool: String,
+    recall: bool,
+    learn: bool,
+    /// Curate stays effect-plane in v1 (no turn tool); recorded so a
+    /// curate grant still counts as governed-resource use.
+    curate: bool,
+}
+
+impl TurnMemoryAccess {
+    fn deny_all() -> Self {
+        Self { pools: Vec::new() }
+    }
+
+    fn grants_recall(&self) -> bool {
+        self.pools.iter().any(|pool| pool.recall)
+    }
+
+    fn grants_learn(&self) -> bool {
+        self.pools.iter().any(|pool| pool.learn)
+    }
+
+    fn pool(&self, name: &str) -> Option<&TurnMemoryPool> {
+        self.pools.iter().find(|pool| pool.pool == name)
+    }
+
+    fn grant(&mut self, pool_name: &str, operation: &str) {
+        let entry = match self.pools.iter_mut().find(|pool| pool.pool == pool_name) {
+            Some(entry) => entry,
+            None => {
+                self.pools.push(TurnMemoryPool {
+                    pool: pool_name.to_owned(),
+                    recall: false,
+                    learn: false,
+                    curate: false,
+                });
+                self.pools.last_mut().expect("just pushed")
+            }
+        };
+        match operation {
+            "recall" => entry.recall = true,
+            "learn" => entry.learn = true,
+            "curate" => entry.curate = true,
+            _ => {}
         }
     }
 }
@@ -774,6 +883,7 @@ impl FileToolExecutor {
             web_search_granted: false,
             web_fetch_granted: false,
             tracker_access: None,
+            memory_access: None,
             workflow_tools: Vec::new(),
             store_path: None,
             max_child_iterations: 8,
@@ -860,6 +970,7 @@ impl FileToolExecutor {
         self.file_policy = Some(access.scopes);
         self.command_run_granted = Some(false);
         self.tracker_access = Some(TurnTrackerAccess::deny_all());
+        self.memory_access = Some(TurnMemoryAccess::deny_all());
         self
     }
 
@@ -869,6 +980,7 @@ impl FileToolExecutor {
         self.web_search_granted = access.web_search;
         self.web_fetch_granted = access.web_fetch;
         self.tracker_access = Some(access.tracker);
+        self.memory_access = Some(access.memory);
         self
     }
 
@@ -980,6 +1092,8 @@ impl FileToolExecutor {
             TOOL_BASH => self.bash(args),
             TOOL_WEB_SEARCH => self.web_search(args),
             TOOL_WEB_FETCH => self.web_fetch(args),
+            TOOL_RECALL_MEMORY => self.recall_memory(args),
+            TOOL_LEARN_MEMORY => self.learn_memory(args),
             TOOL_READ => self.read(args),
             TOOL_WRITE => self.write(args),
             TOOL_EDIT => self.edit(args),
@@ -1628,6 +1742,125 @@ impl FileToolExecutor {
                 "tracker {action} is not granted for this turn ({expected} required)"
             ))
         }
+    }
+
+    /// The turn's memory-pool authority for `operation` on `pool`, or the
+    /// refusal message. Deny-all default: a direct/test executor (no
+    /// installed access) refuses, and a granted pool exposes exactly the
+    /// operations its grant named (MEM-5).
+    fn memory_pool_policy(&self, pool: &str, operation: &str) -> Option<String> {
+        let denied = |expected: &str| {
+            Some(format!(
+                "memory {operation} on `{pool}` is not granted for this turn \
+                 (`with access to {pool} {{ {expected} }}` required)"
+            ))
+        };
+        let Some(access) = &self.memory_access else {
+            return denied(operation);
+        };
+        let Some(entry) = access.pool(pool) else {
+            return denied(operation);
+        };
+        let granted = match operation {
+            "recall" => entry.recall,
+            "learn" => entry.learn,
+            _ => false,
+        };
+        if granted {
+            None
+        } else {
+            denied(operation)
+        }
+    }
+
+    /// The workspace memory store (the same `<store>.memory.sqlite` the
+    /// std.memory `local` provider writes; `WHIPPLESCRIPT_MEMORY_STORE`
+    /// overrides).
+    fn memory_store(&self) -> Result<whipplescript_store::memory::SqliteMemoryStore, String> {
+        let path = match std::env::var(whipplescript_store::memory::MEMORY_STORE_ENV) {
+            Ok(path) if !path.is_empty() => PathBuf::from(path),
+            _ => self
+                .store_path
+                .as_ref()
+                .ok_or_else(|| {
+                    "memory tools are not enabled for this turn (no store configured)".to_string()
+                })?
+                .with_extension("memory.sqlite"),
+        };
+        whipplescript_store::memory::SqliteMemoryStore::open(&path)
+            .map_err(|error| format!("memory store: {error:?}"))
+    }
+
+    fn recall_memory(&self, args: &Value) -> Result<String, String> {
+        use whipplescript_store::memory::MemoryStore;
+        let pool = str_arg(args, "pool")?;
+        if let Some(reason) = self.memory_pool_policy(pool, "recall") {
+            return Err(reason);
+        }
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|limit| limit as usize);
+        let store = self.memory_store()?;
+        let rows = store
+            .query(pool, query, limit)
+            .map_err(|error| format!("memory query: {error:?}"))?;
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "memory_id": row.memory_id,
+                    "text": row.text,
+                    "source": row.source,
+                    "note": row.note,
+                    "created_at": row.created_at,
+                })
+            })
+            .collect();
+        Ok(json!({ "pool": pool, "count": items.len(), "items": items }).to_string())
+    }
+
+    fn learn_memory(&self, args: &Value) -> Result<String, String> {
+        use whipplescript_store::memory::{MemoryStore, NewMemoryEntry};
+        let pool = str_arg(args, "pool")?;
+        if let Some(reason) = self.memory_pool_policy(pool, "learn") {
+            return Err(reason);
+        }
+        let text = str_arg(args, "text")?;
+        let note = args.get("note").and_then(Value::as_str);
+        // Turn-plane write: tool calls are turn evidence, not replayed
+        // effects, so a real timestamp is honest here (epoch seconds —
+        // lexicographic order matches time order well past this store's
+        // lifetime).
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs().to_string())
+            .unwrap_or_default();
+        let author = format!("agent:{}", self.holder);
+        let run = if self.work_unit.is_empty() {
+            None
+        } else {
+            Some(self.work_unit.as_str())
+        };
+        let mut store = self.memory_store()?;
+        let memory_id = store
+            .write(&NewMemoryEntry {
+                pool,
+                text,
+                created_at: &created_at,
+                source_instance_id: None,
+                source_effect_id: None,
+                source_run_id: run,
+                author_actor: Some(&author),
+                source: None,
+                note,
+            })
+            .map_err(|error| format!("memory write: {error:?}"))?;
+        Ok(json!({ "pool": pool, "memory_id": memory_id, "stored": true }).to_string())
     }
 
     /// File a new tracker item (shared-state participation, refined I3): produces
@@ -3100,6 +3333,7 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
     let mut file_resources = Vec::<String>::new();
     let mut command_run = false;
     let mut tracker = TurnTrackerAccess::deny_all();
+    let mut memory = TurnMemoryAccess::deny_all();
     let mut web_search = false;
     let mut web_fetch = false;
     for (grant_index, grant) in grants.iter().enumerate() {
@@ -3142,6 +3376,17 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
                 "release" | "reopen" if resource == TRACKER_RESOURCE => tracker.release = true,
                 "update" if resource == TRACKER_RESOURCE => tracker.grant_update(),
                 "write" if resource == TRACKER_RESOURCE => tracker.grant_write(),
+                // Memory-pool grants (MEM-5): the pool NAME is the resource;
+                // the operations are the memory verbs. This replaces the
+                // inert-arm behavior — a memory grant now bites (tools +
+                // governance) instead of vanishing into the catch-all.
+                "recall" | "learn" | "curate"
+                    if resource != TRACKER_RESOURCE
+                        && resource != WEB_RESOURCE
+                        && resource != "command" =>
+                {
+                    memory.grant(resource, operation_name)
+                }
                 _ => {}
             }
         }
@@ -3187,6 +3432,7 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
         file_resources,
         command_run,
         tracker,
+        memory,
         web_search,
         web_fetch,
     })
@@ -3210,6 +3456,12 @@ fn enforce_turn_access_governance(access: &TurnToolAccess) -> Result<(), String>
             // a governed envelope must govern the `web` resource.
             if access.web_search || access.web_fetch {
                 resources.push(WEB_RESOURCE.to_owned());
+            }
+            // Memory pools are labeled resources (MEM-5): a governed
+            // envelope must govern each granted pool BY NAME — an
+            // ungoverned-pool grant is a refusal, never a silent pass.
+            for pool in &access.memory.pools {
+                resources.push(pool.pool.clone());
             }
             let missing = resources
                 .into_iter()
@@ -3491,6 +3743,8 @@ pub fn run_owned_agent_turn(
     let mut tools = file_tool_specs_for_turn(&profile_policy, &turn_tool_access);
     // Web tools (accepted 2026-07-07 design notes): granted-only egress doors.
     tools.extend(web_tool_specs_for_turn(&turn_tool_access));
+    // Memory tools (MEM-5): granted-only, per-pool, per-operation.
+    tools.extend(memory_tool_specs_for_turn(&turn_tool_access));
     // Tracker tools (slice 4): offered only when a tracker queue is configured.
     if let Some(queue) = std::env::var("WHIPPLESCRIPT_HARNESS_TRACKER")
         .ok()
@@ -4636,6 +4890,137 @@ mod tests {
             vec!["project_files".to_owned(), "docs".to_owned()]
         );
         assert!(access.command_run);
+    }
+
+    /// MEM-5: memory grants bite instead of vanishing — deny-all default,
+    /// per-operation tool exposure, per-pool authority, and the pool name
+    /// counted as a governed resource.
+    #[test]
+    fn memory_grants_gate_the_memory_tools_per_pool_and_operation() {
+        // Deny-all default: no grants → no memory tools, dispatch refused.
+        let none = turn_tool_access_from_input(r#"{"prompt":"work"}"#).expect("no grants");
+        assert!(memory_tool_specs_for_turn(&none).is_empty());
+        let executor = FileToolExecutor::new(Path::new("/tmp")).with_turn_tool_access(none);
+        let refused = executor
+            .recall_memory(&json!({"pool": "project_memory", "query": "x"}))
+            .expect_err("ungranted recall refuses");
+        assert!(refused.contains("not granted"), "{refused}");
+
+        // Recall-only grant: recall_memory offered, learn_memory not; a
+        // learn on the recall-only pool refuses; an UNGRANTED pool refuses
+        // even though another pool is granted.
+        let recall_only = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "project_memory",
+                        "operations": [{"operation": "recall"}]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("recall grant parses");
+        let names: Vec<String> = memory_tool_specs_for_turn(&recall_only)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(names, vec![TOOL_RECALL_MEMORY.to_owned()]);
+        let executor = FileToolExecutor::new(Path::new("/tmp")).with_turn_tool_access(recall_only);
+        let refused = executor
+            .learn_memory(&json!({"pool": "project_memory", "text": "x"}))
+            .expect_err("learn on a recall-only grant refuses");
+        assert!(refused.contains("learn"), "{refused}");
+        let refused = executor
+            .recall_memory(&json!({"pool": "other_pool", "query": "x"}))
+            .expect_err("an ungranted pool refuses");
+        assert!(refused.contains("other_pool"), "{refused}");
+
+        // Both operations granted → both tools; the pool is a governed
+        // resource for the envelope check.
+        let both = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "project_memory",
+                        "operations": [{"operation": "recall"}, {"operation": "learn"}]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("both grants parse");
+        let names: Vec<String> = memory_tool_specs_for_turn(&both)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![TOOL_RECALL_MEMORY.to_owned(), TOOL_LEARN_MEMORY.to_owned()]
+        );
+        assert_eq!(
+            both.memory
+                .pools
+                .iter()
+                .map(|p| p.pool.as_str())
+                .collect::<Vec<_>>(),
+            vec!["project_memory"],
+            "the granted pool is tracked for governance by name"
+        );
+    }
+
+    /// MEM-5 end-to-end at the executor: a granted turn learns then
+    /// recalls through the real SQLite store.
+    #[test]
+    fn granted_memory_tools_learn_and_recall_through_the_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "whip-memory-tools-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        // Route the tools at a private store via the env override (the
+        // executor has no run store configured in this unit test).
+        std::env::set_var(
+            whipplescript_store::memory::MEMORY_STORE_ENV,
+            dir.join("memory.sqlite"),
+        );
+        let access = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "project_memory",
+                        "operations": [{"operation": "recall"}, {"operation": "learn"}]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("grants parse");
+        let executor = FileToolExecutor::new(&dir).with_turn_tool_access(access);
+        let stored = executor
+            .learn_memory(&json!({
+                "pool": "project_memory",
+                "text": "the deploy checklist lives in ops/deploy.md",
+                "note": "from turn"
+            }))
+            .expect("learn succeeds");
+        assert!(stored.contains("\"stored\":true"), "{stored}");
+        let recalled = executor
+            .recall_memory(&json!({"pool": "project_memory", "query": "deploy checklist"}))
+            .expect("recall succeeds");
+        let value: Value = serde_json::from_str(&recalled).expect("json");
+        assert_eq!(value.get("count").and_then(Value::as_u64), Some(1));
+        let items = value.get("items").and_then(Value::as_array).expect("items");
+        assert_eq!(
+            items[0].get("text").and_then(Value::as_str),
+            Some("the deploy checklist lives in ops/deploy.md")
+        );
+        std::env::remove_var(whipplescript_store::memory::MEMORY_STORE_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
