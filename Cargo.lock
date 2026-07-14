@@ -2047,6 +2047,7 @@ dependencies = [
  "hex",
  "p256",
  "rusqlite",
+ "serde",
  "serde_json",
  "wasm-bindgen",
  "whipplescript-core",

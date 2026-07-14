@@ -8093,6 +8093,18 @@ pub fn do_load_agent_snapshot<Sql: DoSql>(
     Ok(rows.first().map(|row| as_text(&row[0])))
 }
 
+/// Remove a suspended machine snapshot before an out-of-band human answer is
+/// admitted. The durable transcript is the resume authority for that boundary;
+/// the next provider round will persist a fresh snapshot in the usual way.
+pub fn do_delete_agent_snapshot<Sql: DoSql>(sql: &Sql, effect_id: &str) -> StoreResult<()> {
+    sql.execute(
+        "DELETE FROM agent_turn_snapshots WHERE effect_id = ?1",
+        &[text(effect_id)],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8100,6 +8112,25 @@ mod tests {
     /// Backs `DoSql` with real in-memory SQLite, so the ported store SQL is
     /// checked against an actual engine.
     use super::test_support::store;
+
+    #[test]
+    fn human_resume_discards_only_the_suspended_agent_snapshot() {
+        let store = store();
+        do_save_agent_snapshot(&store.sql, "turn-1", r#"{"step":1}"#).expect("save first snapshot");
+        do_save_agent_snapshot(&store.sql, "turn-2", r#"{"step":2}"#)
+            .expect("save second snapshot");
+
+        do_delete_agent_snapshot(&store.sql, "turn-1").expect("delete suspended snapshot");
+
+        assert_eq!(
+            do_load_agent_snapshot(&store.sql, "turn-1").expect("load deleted snapshot"),
+            None
+        );
+        assert_eq!(
+            do_load_agent_snapshot(&store.sql, "turn-2").expect("load unrelated snapshot"),
+            Some(r#"{"step":2}"#.to_owned())
+        );
+    }
 
     /// P1: the production `DoSqlStorage` drives the file plane over REAL DO
     /// SQLite (the `files` table) through the `FileStore` seam — write, read,

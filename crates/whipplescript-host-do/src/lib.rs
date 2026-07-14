@@ -42,6 +42,9 @@ pub mod do_wasm;
 pub mod do_worker;
 /// GaugeDesk-compatible governance verification for hosted placements.
 pub mod governance;
+/// Placement-neutral projection of one governed hosted turn into the public
+/// host protocol's body-free pointers and terminal receipt.
+pub mod host_projection;
 
 #[cfg(test)]
 mod governed_host_tests {
@@ -62,7 +65,7 @@ mod governed_host_tests {
     };
     use whipplescript_store::RuntimeStore;
 
-    use crate::do_store::test_support;
+    use crate::do_store::{test_support, DoSql, SqlValue};
     use crate::governance::{GaugeDeskGovernanceRoot, GAUGEDESK_ATTESTATION_ALGORITHM};
 
     fn package() -> AuthoredAgentPackage {
@@ -205,6 +208,45 @@ workflow Method {
             .expect("effects");
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].effect_id, turn.command_id);
+
+        let run_id = whipplescript_kernel::idempotency_key(&[
+            &turn.instance_ref,
+            &turn.command_id,
+            "projection-run",
+        ]);
+        let sql = &host.kernel().store().sql;
+        sql.execute(
+            "UPDATE effects SET status = 'completed' WHERE effect_id = ?1",
+            &[SqlValue::Text(turn.command_id.clone())],
+        )
+        .expect("effect completed");
+        sql.execute(
+            "INSERT INTO runs (run_id, instance_id, effect_id, provider, worker_id, status, \
+             completed_at, exit_code, summary, metadata_json) \
+             VALUES (?1, ?2, ?3, 'agent', 'worker', 'completed', CURRENT_TIMESTAMP, 0, \
+             'done', '{\"usage\":{\"input_tokens\":3}}')",
+            &[
+                SqlValue::Text(run_id),
+                SqlValue::Text(turn.instance_ref.clone()),
+                SqlValue::Text(turn.command_id.clone()),
+            ],
+        )
+        .expect("run completed");
+        let projection = crate::host_projection::project_host_turn(
+            host.kernel_mut().store_mut(),
+            &turn.instance_ref,
+            &turn.command_id,
+        )
+        .expect("runtime projection");
+        let receipt = projection.receipt.expect("terminal receipt");
+        assert_eq!(receipt.command_id, turn.command_id);
+        assert!(receipt.guarantee_report_ref.starts_with("whip:evidence:"));
+        assert!(projection.runtime_evidence_pointers.iter().any(|pointer| {
+            matches!(
+                pointer,
+                whipplescript_kernel::host_protocol::RuntimeEvidencePointer::TurnReceipt(_)
+            )
+        }));
     }
 }
 

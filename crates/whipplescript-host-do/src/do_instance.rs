@@ -37,8 +37,8 @@ use whipplescript_kernel::exec_http::{
 };
 use whipplescript_kernel::harness_loop::{
     provider_result_from_brokered_turn, BrokeredTurnInput, BrokeredTurnMachine,
-    BrokeredTurnOutcome, BrokeredTurnSnapshot, ChatMessage, HttpModelClient, NoopCompactor,
-    ToolExecutor, TurnStatus,
+    BrokeredTurnOutcome, BrokeredTurnSnapshot, ChatMessage, HttpModelClient, ImageBlock,
+    NoopCompactor, ToolExecutor, TurnStatus,
 };
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::rule_lowering::json_from_str;
@@ -113,6 +113,81 @@ fn agent_prompt(input: &serde_json::Value) -> Result<String, StoreError> {
                 "agent.tell input omitted both host input.text and workflow prompt".to_owned(),
             )
         })
+}
+
+fn resolve_host_images<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    command_id: &str,
+    command: &serde_json::Value,
+) -> Result<Vec<ImageBlock>, StoreError> {
+    let refs = command
+        .get("input")
+        .and_then(|input| input.get("images"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    refs.iter()
+        .enumerate()
+        .map(|(index, image)| {
+            let selector = image
+                .get("selector")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| StoreError::Conflict("host image ref has no selector".to_owned()))?;
+            if image.get("handle").and_then(serde_json::Value::as_str) != Some("turn_images")
+                || image.get("kind").and_then(serde_json::Value::as_str) != Some("image")
+                || selector != index.to_string()
+            {
+                return Err(StoreError::Conflict(
+                    "host image ref is outside the admitted turn-image capability".to_owned(),
+                ));
+            }
+            let rows = sql
+                .query(
+                    "SELECT media_type, data_base64 FROM host_turn_images \
+                     WHERE instance_id = ?1 AND command_id = ?2 AND selector = ?3",
+                    &[
+                        crate::do_store::SqlValue::Text(instance_id.to_owned()),
+                        crate::do_store::SqlValue::Text(command_id.to_owned()),
+                        crate::do_store::SqlValue::Text(selector.to_owned()),
+                    ],
+                )
+                .map_err(StoreError::Conflict)?;
+            let row = rows.first().ok_or_else(|| {
+                StoreError::Conflict("admitted host image body is unavailable".to_owned())
+            })?;
+            let text = |value: &crate::do_store::SqlValue| match value {
+                crate::do_store::SqlValue::Text(value) => Ok(value.clone()),
+                _ => Err(StoreError::Conflict(
+                    "admitted host image body has an invalid SQL shape".to_owned(),
+                )),
+            };
+            Ok(ImageBlock {
+                media_type: text(&row[0])?,
+                data_base64: text(&row[1])?,
+            })
+        })
+        .collect()
+}
+
+fn latest_effect_transcript<S: RuntimeStore>(
+    store: &S,
+    instance_id: &str,
+    effect_id: &str,
+) -> Result<Vec<ChatMessage>, StoreError> {
+    let events = store.list_events(instance_id)?;
+    for event in events.into_iter().rev() {
+        if event.event_type != "agent.turn.brokered.transcript" {
+            continue;
+        }
+        let payload: serde_json::Value = serde_json::from_str(&event.payload_json)?;
+        if payload.get("effect_id").and_then(serde_json::Value::as_str) == Some(effect_id) {
+            return Ok(whipplescript_kernel::harness_loop::chat_messages_from_json(
+                payload.get("messages").unwrap_or(&serde_json::Value::Null),
+            ));
+        }
+    }
+    Ok(Vec::new())
 }
 
 /// Drives a workflow instance's rule pass + effect discovery on the durable object.
@@ -277,6 +352,12 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 let cfg = self.turn.expect("guarded by arm pattern");
                 let input = json_from_str(&effect.input_json);
                 let prompt = agent_prompt(&input)?;
+                let user_images = resolve_host_images(
+                    &self.kernel.store().sql,
+                    self.instance_id,
+                    &effect.effect_id,
+                    &input,
+                )?;
                 let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "agent-run"]);
                 let lease_id =
                     idempotency_key(&[self.instance_id, &effect.effect_id, "agent-lease"]);
@@ -305,6 +386,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                 "turn_id": effect.effect_id,
                                 "provider": cfg.provider,
                                 "user": prompt,
+                                "images": user_images,
                                 "tools": "file",
                                 "max_steps": cfg.max_steps,
                             }),
@@ -404,6 +486,50 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 })?;
                 let input = json_from_str(&effect.input_json);
                 let prompt = agent_prompt(&input)?;
+                let agent = effect.target.as_deref().unwrap_or("agent");
+                let answered_human = self
+                    .kernel
+                    .store()
+                    .list_inbox_items(Some("answered"))?
+                    .into_iter()
+                    .any(|item| item.effect_id.as_deref() == Some(effect.effect_id.as_str()));
+                let loaded = do_load_agent_snapshot(&self.kernel.store().sql, &effect.effect_id)?;
+                let resuming_human = answered_human && loaded.is_none();
+                // Image bodies are message-scoped. A restored/suspended machine
+                // already contains the exact first-round input in its snapshot,
+                // so resumption must not retain or replay the broker cache.
+                let resolved_images = if loaded.is_some() || resuming_human {
+                    Vec::new()
+                } else {
+                    resolve_host_images(
+                        &self.kernel.store().sql,
+                        self.instance_id,
+                        &effect.effect_id,
+                        &input,
+                    )?
+                };
+                let mut resume_from = if resuming_human {
+                    latest_effect_transcript(
+                        self.kernel.store(),
+                        self.instance_id,
+                        &effect.effect_id,
+                    )?
+                } else if loaded.is_none() {
+                    self.kernel
+                        .snapshot_agent_thread(self.instance_id, agent, None)?
+                } else {
+                    Vec::new()
+                };
+                if !resuming_human && loaded.is_none() && !resume_from.is_empty() {
+                    resume_from.push(ChatMessage::User {
+                        text: prompt.clone(),
+                        images: resolved_images.clone(),
+                    });
+                }
+                let user_images = resume_from
+                    .is_empty()
+                    .then_some(resolved_images)
+                    .unwrap_or_default();
                 // Store-backed project instructions (context-assembly Phase 3
                 // item 4): the DO has no filesystem, so AGENTS.md/CLAUDE.md
                 // content registered at deploy resolves from the store — the
@@ -442,15 +568,14 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     // brokered by the `DoToolExecutor` over the DO file plane.
                     tools: crate::do_tools::do_tool_specs(),
                     max_steps: 8,
-                    resume_from: Vec::new(),
-                    user_images: Vec::new(),
+                    resume_from,
+                    user_images,
                     context_bundles,
                     pinned_skills: Vec::new(),
                 };
                 let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "agent-run"]);
                 let lease_id =
                     idempotency_key(&[self.instance_id, &effect.effect_id, "agent-lease"]);
-                let loaded = do_load_agent_snapshot(&self.kernel.store().sql, &effect.effect_id)?;
                 if loaded.is_none() {
                     self.kernel.start_run(RunStart {
                         instance_id: self.instance_id,
@@ -529,7 +654,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             worker_id: "whip-worker",
                             lease_id: &lease_id,
                             lease_expires_at: "2030-01-01T00:00:00Z",
-                            agent: "agent",
+                            agent,
                             profile: None,
                             input_json: &effect.input_json,
                             skill_names: &[],
@@ -957,6 +1082,51 @@ mod tests {
         );
         assert!(agent_prompt(&serde_json::json!({"input": {}})).is_err());
         assert!(agent_prompt(&serde_json::json!({"prompt": "  "})).is_err());
+    }
+
+    #[test]
+    fn governed_host_images_resolve_only_from_the_admitted_broker_cache() {
+        let store = store();
+        store
+            .sql
+            .execute(
+                "CREATE TABLE host_turn_images (instance_id TEXT, command_id TEXT, \
+                 selector TEXT, media_type TEXT, data_base64 TEXT)",
+                &[],
+            )
+            .expect("image table");
+        store
+            .sql
+            .execute(
+                "INSERT INTO host_turn_images VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    crate::do_store::SqlValue::Text("instance-1".into()),
+                    crate::do_store::SqlValue::Text("turn-1".into()),
+                    crate::do_store::SqlValue::Text("0".into()),
+                    crate::do_store::SqlValue::Text("image/png".into()),
+                    crate::do_store::SqlValue::Text("aGVsbG8=".into()),
+                ],
+            )
+            .expect("image body");
+        let command = serde_json::json!({
+            "input": { "images": [{
+                "handle": "turn_images", "kind": "image", "selector": "0"
+            }] }
+        });
+        assert_eq!(
+            resolve_host_images(&store.sql, "instance-1", "turn-1", &command)
+                .expect("resolved image"),
+            vec![ImageBlock {
+                media_type: "image/png".into(),
+                data_base64: "aGVsbG8=".into(),
+            }]
+        );
+        let wrong = serde_json::json!({
+            "input": { "images": [{
+                "handle": "other", "kind": "image", "selector": "0"
+            }] }
+        });
+        assert!(resolve_host_images(&store.sql, "instance-1", "turn-1", &wrong).is_err());
     }
 
     // The DO drives an effect-free workflow's rule pass to its terminal through the

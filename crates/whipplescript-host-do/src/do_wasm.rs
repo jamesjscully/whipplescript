@@ -30,9 +30,13 @@ use crate::do_worker::{
 };
 use crate::governance::GaugeDeskGovernanceRoot;
 use whipplescript_kernel::host_facade::{GovernedHostFacade, ProviderRealization};
-use whipplescript_kernel::host_package::AuthoredAgentPackage;
-use whipplescript_kernel::host_protocol::{OpenInstanceCommand, StartTurnCommand};
-use whipplescript_store::{EffectCancellationRequest, RuntimeStore};
+use whipplescript_kernel::host_package::{AuthoredAgentPackage, PackageResolver};
+use whipplescript_kernel::host_protocol::{
+    AnswerHumanAskCommand, EventPosition, ForkInstanceCommand, ForkedInstance, HumanAnswerReceipt,
+    OpenInstanceCommand, PolicyEpochRef, StartTurnCommand, HOST_PROTOCOL,
+};
+use whipplescript_kernel::AgentThreadSeed;
+use whipplescript_store::{EffectCancellationRequest, NewEvent, RuntimeStore};
 
 /// Verify and normalize one GaugeDesk-signed hosted policy epoch. This is a
 /// direct wasm export so the Worker shell can fail closed before persisting a
@@ -216,6 +220,482 @@ pub fn host_cancel_turn(
         "status": request.status,
     })
     .to_string())
+}
+
+/// Fold one admitted hosted turn through WhippleScript's runtime-owned pointer
+/// and receipt schema. The Worker shell merges this body-free projection with
+/// its transcript transport; it does not reinterpret runtime SQL itself.
+#[wasm_bindgen]
+pub fn host_project_turn(
+    bridge: DoSqlBridge,
+    instance_id: &str,
+    command_id: &str,
+) -> Result<String, JsValue> {
+    let mut store = crate::do_store::DoSqliteStore::new(std::rc::Rc::new(JsDoSql { bridge }));
+    let projection = crate::host_projection::project_host_turn(&mut store, instance_id, command_id)
+        .map_err(|error| JsValue::from_str(&error))?;
+    serde_json::to_string(&projection).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Current durable event coordinate for exact turn/fork cuts.
+#[wasm_bindgen]
+pub fn host_current_position(bridge: DoSqlBridge, instance_id: &str) -> Result<String, JsValue> {
+    let store = crate::do_store::DoSqliteStore::new(std::rc::Rc::new(JsDoSql { bridge }));
+    let position = crate::host_projection::current_position(&store, instance_id)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    serde_json::to_string(&position).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Validate an attributable answer against the exact suspended turn and return
+/// only the opaque provider capability ids the Worker may resolve next. This
+/// phase performs no inbox mutation and no credential lookup.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn host_validate_human_answer(
+    bridge: DoSqlBridge,
+    epoch: u64,
+    signed_envelope: &str,
+    expected_signer: &str,
+    public_key_hex: &str,
+    answer_json: &str,
+    package_manifest: &str,
+    package_source: &str,
+    system_prompt: &str,
+) -> Result<String, JsValue> {
+    let facade = hosted_facade(
+        bridge,
+        epoch,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+    )?;
+    let answer: AnswerHumanAskCommand =
+        serde_json::from_str(answer_json).map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    let context =
+        crate::host_projection::validate_human_answer_context(facade.kernel().store(), &answer)
+            .map_err(|error| JsValue::from_str(&error))?;
+    let admission = facade
+        .validate_turn(&context.command, &package)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    serde_json::to_string(&admission).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Consume an attributable answer and emit its runtime-owned receipt. Provider
+/// realization is rechecked before mutation, so unavailable credentials leave
+/// the original ask pending exactly as on the native host.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn host_answer_human_ask(
+    bridge: DoSqlBridge,
+    epoch: u64,
+    signed_envelope: &str,
+    expected_signer: &str,
+    public_key_hex: &str,
+    answer_json: &str,
+    package_manifest: &str,
+    package_source: &str,
+    system_prompt: &str,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+) -> Result<String, JsValue> {
+    let mut facade = hosted_facade(
+        bridge,
+        epoch,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+    )?;
+    let answer: AnswerHumanAskCommand =
+        serde_json::from_str(answer_json).map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    let context =
+        crate::host_projection::validate_human_answer_context(facade.kernel().store(), &answer)
+            .map_err(|error| JsValue::from_str(&error))?;
+    facade
+        .begin_turn(
+            &context.command,
+            &package,
+            ProviderRealization {
+                provider,
+                model,
+                base_url,
+            },
+        )
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    crate::do_store::do_delete_agent_snapshot(
+        &facade.kernel().store().sql,
+        &context.command.command_id,
+    )
+    .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let answered = facade
+        .kernel_mut()
+        .answer_brokered_human_ask(
+            &answer.instance_ref,
+            &context.command.command_id,
+            &answer.ask_ref,
+            &context.call_id,
+            &answer.answer,
+            &answer.respondent_ref,
+            &answer.answer_id,
+        )
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let receipt = HumanAnswerReceipt {
+        protocol: HOST_PROTOCOL.to_owned(),
+        answer_id: answer.answer_id.clone(),
+        ask_ref: answer.ask_ref.clone(),
+        turn_command_id: context.command.command_id,
+        instance_ref: answer.instance_ref.clone(),
+        policy: answer.policy.clone(),
+        respondent_ref: answer.respondent_ref.clone(),
+        answered_at: EventPosition {
+            instance_ref: answer.instance_ref.clone(),
+            sequence: u64::try_from(answered.sequence)
+                .ok()
+                .filter(|sequence| *sequence > 0)
+                .ok_or_else(|| JsValue::from_str("human answer event position must be positive"))?,
+        },
+    };
+    receipt
+        .validate_for(&answer)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let payload =
+        serde_json::to_string(&receipt).map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let already_recorded = facade
+        .kernel()
+        .store()
+        .list_events(&answer.instance_ref)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
+        .into_iter()
+        .any(|event| {
+            event.event_type == "host.human.answer.receipt" && event.payload_json == payload
+        });
+    if !already_recorded {
+        facade
+            .kernel()
+            .store()
+            .append_event(NewEvent {
+                instance_id: &answer.instance_ref,
+                event_type: "host.human.answer.receipt",
+                payload_json: &payload,
+                source: "host-do",
+                causation_id: Some(&receipt.turn_command_id),
+                correlation_id: Some(&answer.answer_id),
+                idempotency_key: Some(&whipplescript_kernel::idempotency_key(&[
+                    &answer.instance_ref,
+                    &answer.answer_id,
+                    "host-human-answer-receipt",
+                ])),
+            })
+            .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    }
+    Ok(payload)
+}
+
+/// Export the source agent's live thread at one exact event coordinate. The
+/// source package/policy binding and quiescence are revalidated before any
+/// transcript projection leaves its placement.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn host_export_thread(
+    bridge: DoSqlBridge,
+    epoch: u64,
+    signed_envelope: &str,
+    expected_signer: &str,
+    public_key_hex: &str,
+    source_position_json: &str,
+    package_manifest: &str,
+    package_source: &str,
+    system_prompt: &str,
+) -> Result<String, JsValue> {
+    let facade = hosted_facade(
+        bridge,
+        epoch,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+    )?;
+    let source: EventPosition = serde_json::from_str(source_position_json)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    if source.sequence == 0 {
+        return Err(JsValue::from_str("fork source position must be nonzero"));
+    }
+    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    let resolved = package
+        .resolve_package(package.version_ref())
+        .map_err(|error| JsValue::from_str(&error))?;
+    let instance = facade
+        .kernel()
+        .store()
+        .get_instance(&source.instance_ref)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
+        .ok_or_else(|| JsValue::from_str("fork source instance was not found"))?;
+    let metadata: serde_json::Value = serde_json::from_str(&instance.input_json)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let source_policy: PolicyEpochRef = serde_json::from_value(metadata["policy"].clone())
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    if source_policy != *facade.policy_ref()
+        || metadata
+            .get("package_version_ref")
+            .and_then(serde_json::Value::as_str)
+            != Some(package.version_ref())
+    {
+        return Err(JsValue::from_str(
+            "fork source package/policy binding does not match the admitted export",
+        ));
+    }
+    let current =
+        crate::host_projection::current_position(facade.kernel().store(), &source.instance_ref)
+            .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    if source.sequence > current.sequence {
+        return Err(JsValue::from_str(
+            "fork source position is beyond the runtime head",
+        ));
+    }
+    let running = facade
+        .kernel()
+        .store()
+        .list_effects(&source.instance_ref)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
+        .into_iter()
+        .any(|effect| effect.status == "running");
+    if running {
+        return Err(JsValue::from_str("fork source instance is not quiescent"));
+    }
+    let source_sequence = i64::try_from(source.sequence)
+        .map_err(|_| JsValue::from_str("fork source position exceeds runtime range"))?;
+    let messages = facade
+        .kernel()
+        .snapshot_agent_thread(&source.instance_ref, &resolved.agent, Some(source_sequence))
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    Ok(serde_json::json!({
+        "protocol": HOST_PROTOCOL,
+        "source": source,
+        "package_version_ref": package.version_ref(),
+        "policy": facade.policy_ref(),
+        "messages": whipplescript_kernel::harness_loop::chat_messages_to_json(&messages),
+    })
+    .to_string())
+}
+
+/// Import a validated source-thread projection into a distinct target instance.
+/// This records one idempotent seed plus the public fork receipt; it never
+/// pretends the target executed the source effects.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn host_import_fork(
+    bridge: DoSqlBridge,
+    epoch: u64,
+    signed_envelope: &str,
+    expected_signer: &str,
+    public_key_hex: &str,
+    command_json: &str,
+    export_json: &str,
+    package_manifest: &str,
+    package_source: &str,
+    system_prompt: &str,
+) -> Result<String, JsValue> {
+    let mut facade = hosted_facade(
+        bridge,
+        epoch,
+        signed_envelope,
+        expected_signer,
+        public_key_hex,
+    )?;
+    let command: ForkInstanceCommand = serde_json::from_str(command_json)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    command
+        .validate()
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    if command.policy != *facade.policy_ref() {
+        return Err(JsValue::from_str(
+            "fork target policy epoch does not match runtime",
+        ));
+    }
+    let export: serde_json::Value =
+        serde_json::from_str(export_json).map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let exported_source: EventPosition = serde_json::from_value(export["source"].clone())
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let exported_policy: PolicyEpochRef = serde_json::from_value(export["policy"].clone())
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    if export.get("protocol").and_then(serde_json::Value::as_str) != Some(HOST_PROTOCOL)
+        || exported_source != command.source
+        || exported_policy != command.policy
+    {
+        return Err(JsValue::from_str(
+            "fork export does not match its admitted command",
+        ));
+    }
+    let package = authored_package(package_manifest, package_source, system_prompt)?;
+    let target_package = package
+        .resolve_package(&command.package_version_ref)
+        .map_err(|error| JsValue::from_str(&error))?;
+    if export
+        .get("package_version_ref")
+        .and_then(serde_json::Value::as_str)
+        != Some(command.package_version_ref.as_str())
+    {
+        return Err(JsValue::from_str(
+            "fork export package does not match its admitted command",
+        ));
+    }
+    let source_instance = facade
+        .kernel()
+        .store()
+        .get_instance(&command.source.instance_ref)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
+        .ok_or_else(|| JsValue::from_str("fork source instance was not found"))?;
+    let source_metadata: serde_json::Value = serde_json::from_str(&source_instance.input_json)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let source_policy: PolicyEpochRef = serde_json::from_value(source_metadata["policy"].clone())
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    if source_policy != command.policy
+        || source_metadata
+            .get("package_version_ref")
+            .and_then(serde_json::Value::as_str)
+            != Some(command.package_version_ref.as_str())
+    {
+        return Err(JsValue::from_str(
+            "fork source package/policy binding does not match the admitted import",
+        ));
+    }
+    let source_head = crate::host_projection::current_position(
+        facade.kernel().store(),
+        &command.source.instance_ref,
+    )
+    .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    if command.source.sequence > source_head.sequence {
+        return Err(JsValue::from_str(
+            "fork source position is beyond the runtime head",
+        ));
+    }
+    let source_running = facade
+        .kernel()
+        .store()
+        .list_effects(&command.source.instance_ref)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
+        .into_iter()
+        .any(|effect| effect.status == "running");
+    if source_running {
+        return Err(JsValue::from_str("fork source instance is not quiescent"));
+    }
+    let source_sequence = i64::try_from(command.source.sequence)
+        .map_err(|_| JsValue::from_str("fork source position exceeds runtime range"))?;
+    // The export document is an admission token, not transcript authority. Both
+    // instances are pinned to this placement, so import re-reads the exact cut
+    // from the source DO store and ignores caller-echoed message bytes.
+    let messages = facade
+        .kernel()
+        .snapshot_agent_thread(
+            &command.source.instance_ref,
+            &target_package.agent,
+            Some(source_sequence),
+        )
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let target = facade
+        .open_instance(&command.target_open_command(), &package)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    if target.instance_ref == command.source.instance_ref {
+        return Err(JsValue::from_str("fork target identity must be distinct"));
+    }
+    if let Some(event) = facade
+        .kernel()
+        .store()
+        .list_events(&target.instance_ref)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
+        .into_iter()
+        .find(|event| {
+            event.event_type == "host.instance.forked"
+                && serde_json::from_str::<serde_json::Value>(&event.payload_json)
+                    .ok()
+                    .and_then(|payload| {
+                        payload
+                            .get("request_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some(command.request_id.as_str())
+        })
+    {
+        let target_instance_ref = target.instance_ref.clone();
+        let replay = ForkedInstance {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: command.request_id.clone(),
+            source: command.source.clone(),
+            target,
+            forked_at: EventPosition {
+                instance_ref: target_instance_ref,
+                sequence: u64::try_from(event.sequence)
+                    .ok()
+                    .filter(|sequence| *sequence > 0)
+                    .ok_or_else(|| {
+                        JsValue::from_str("fork receipt event position must be positive")
+                    })?,
+            },
+        };
+        return serde_json::to_string(&replay)
+            .map_err(|error| JsValue::from_str(&error.to_string()));
+    }
+    facade
+        .kernel_mut()
+        .seed_agent_thread(AgentThreadSeed {
+            instance_id: &target.instance_ref,
+            agent: &target_package.agent,
+            messages: &messages,
+            source_instance_id: &command.source.instance_ref,
+            source_sequence,
+            idempotency_key: &whipplescript_kernel::idempotency_key(&[
+                &target.instance_ref,
+                &command.request_id,
+                "host-instance-thread-seed",
+            ]),
+        })
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let payload = serde_json::json!({
+        "request_id": command.request_id,
+        "source": command.source,
+        "target_request_id": command.target_request_id,
+        "package_version_ref": command.package_version_ref,
+        "policy": command.policy,
+        "target_instance_ref": target.instance_ref,
+    })
+    .to_string();
+    let event = facade
+        .kernel()
+        .store()
+        .append_event(NewEvent {
+            instance_id: &target.instance_ref,
+            event_type: "host.instance.forked",
+            payload_json: &payload,
+            source: "host-do",
+            causation_id: None,
+            correlation_id: Some(&command.request_id),
+            idempotency_key: Some(&whipplescript_kernel::idempotency_key(&[
+                &target.instance_ref,
+                &command.request_id,
+                "host-instance-forked",
+            ])),
+        })
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let result = ForkedInstance {
+        protocol: HOST_PROTOCOL.to_owned(),
+        request_id: command.request_id.clone(),
+        source: command.source.clone(),
+        target: target.clone(),
+        forked_at: EventPosition {
+            instance_ref: target.instance_ref,
+            sequence: u64::try_from(event.sequence)
+                .ok()
+                .filter(|sequence| *sequence > 0)
+                .ok_or_else(|| JsValue::from_str("fork receipt event position must be positive"))?,
+        },
+    };
+    result
+        .validate_for(&command)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    serde_json::to_string(&result).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 #[wasm_bindgen]

@@ -66,6 +66,19 @@ native and DO; non-bash external capabilities remain explicit brokered effects.
 The same wrapper and script semantics run in the native owned harness, native
 governed host, and DO governed host. Tracked by the design note and DR-0039.
 
+**GaugeDesk governed-host local closure — DONE 2026-07-13.** The Worker now
+accepts image bodies through a post-admission broker cache; validates
+attributable human answers against and resumes the exact suspended command;
+exports/imports same-placement forks at an exact durable event coordinate while
+re-reading transcript authority from the source DO store; and projects
+runtime-owned evidence pointers, terminal receipts, guarantee evidence, and
+field-flow signatures. Caught-up SSE plus hibernatable WebSockets expose durable
+progress. Evidence: `governed_host_images_resolve_only_from_the_admitted_broker_cache`,
+`gaugedesk_host_protocol_admits_the_same_package_on_the_do_store`, 72 host-DO
+tests, the wasm32 no-default-features build, and Worker `tsc --noEmit`. A live
+GaugeDesk-to-deployed-Worker pass remains deployment/secret infrastructure, not
+open local host work.
+
 Out of scope (intentional asymmetries): `exec.command` is native-only by design
 (DR-0033 Decision 7, re-expressed as the Class-A executor HTTP effect); the
 coordination-state snapshot for the checkpoint cut is deferred on *both* hosts

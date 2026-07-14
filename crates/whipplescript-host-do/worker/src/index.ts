@@ -89,6 +89,63 @@ const hostFunctions = bindings as unknown as {
     commandId: string,
     requestedBy: string,
   ) => string;
+  host_project_turn: (
+    bridge: unknown,
+    instanceId: string,
+    commandId: string,
+  ) => string;
+  host_current_position: (
+    bridge: unknown,
+    instanceId: string,
+  ) => string;
+  host_validate_human_answer: (
+    bridge: unknown,
+    epoch: bigint,
+    signedEnvelope: string,
+    expectedSigner: string,
+    publicKeyHex: string,
+    answerJson: string,
+    packageManifest: string,
+    packageSource: string,
+    systemPrompt: string,
+  ) => string;
+  host_answer_human_ask: (
+    bridge: unknown,
+    epoch: bigint,
+    signedEnvelope: string,
+    expectedSigner: string,
+    publicKeyHex: string,
+    answerJson: string,
+    packageManifest: string,
+    packageSource: string,
+    systemPrompt: string,
+    provider: string,
+    model: string,
+    baseUrl: string,
+  ) => string;
+  host_export_thread: (
+    bridge: unknown,
+    epoch: bigint,
+    signedEnvelope: string,
+    expectedSigner: string,
+    publicKeyHex: string,
+    sourcePositionJson: string,
+    packageManifest: string,
+    packageSource: string,
+    systemPrompt: string,
+  ) => string;
+  host_import_fork: (
+    bridge: unknown,
+    epoch: bigint,
+    signedEnvelope: string,
+    expectedSigner: string,
+    publicKeyHex: string,
+    commandJson: string,
+    exportJson: string,
+    packageManifest: string,
+    packageSource: string,
+    systemPrompt: string,
+  ) => string;
 };
 
 export interface Env {
@@ -177,13 +234,22 @@ function ensureSchema(sql: SqlStorage): void {
   const marker = sql
     .exec(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'`)
     .toArray();
-  if (marker.length > 0) {
-    return;
+  if (marker.length === 0) {
+    sql.exec(DO_SCHEMA);
+    for (const seed of BUILTIN_SEEDS) {
+      sql.exec(seed);
+    }
   }
-  sql.exec(DO_SCHEMA);
-  for (const seed of BUILTIN_SEEDS) {
-    sql.exec(seed);
-  }
+  // Message-scoped image bodies are a broker cache, not part of the admitted
+  // command. Existing objects acquire this additive table lazily.
+  sql.exec(`CREATE TABLE IF NOT EXISTS host_turn_images (
+    instance_id TEXT NOT NULL,
+    command_id TEXT NOT NULL,
+    selector TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    data_base64 TEXT NOT NULL,
+    PRIMARY KEY (instance_id, command_id, selector)
+  )`);
 }
 
 // Row objects from `sql.exec` are column-name keyed; the Rust `DoSql` contract
@@ -406,6 +472,7 @@ interface HostPackageDocuments {
 interface HostCommandRequest {
   command: Record<string, unknown>;
   package: HostPackageDocuments;
+  image_bodies: unknown[];
 }
 
 interface HostTurnAdmission {
@@ -438,6 +505,22 @@ export class WorkflowInstance implements DurableObject {
     }
     const url = new URL(request.url);
     if (request.method === "GET") {
+      const eventStream = url.pathname.match(/^\/host\/instances\/([^/]+)\/events\/stream$/);
+      if (eventStream) {
+        return this.hostEventStream(decodeURIComponent(eventStream[1]), url);
+      }
+      const eventSocket = url.pathname.match(/^\/host\/instances\/([^/]+)\/events\/live$/);
+      if (eventSocket) {
+        return this.openHostEventSocket(
+          request,
+          decodeURIComponent(eventSocket[1]),
+          url,
+        );
+      }
+      const forkExport = url.pathname.match(/^\/host\/instances\/([^/]+)\/fork-export$/);
+      if (forkExport) {
+        return this.exportHostFork(decodeURIComponent(forkExport[1]), url);
+      }
       return this.hostProjection(url);
     }
     if (request.method !== "POST") {
@@ -463,6 +546,10 @@ export class WorkflowInstance implements DurableObject {
         return Response.json({ error: `cancellation rejected: ${String(error)}` }, { status: 400 });
       }
     }
+    const answer = url.pathname.match(/^\/host\/instances\/([^/]+)\/human\/answer$/);
+    if (answer) {
+      return this.answerHostTurn(decodeURIComponent(answer[1]), parsed);
+    }
     const fileSync = url.pathname.match(/^\/host\/instances\/([^/]+)\/files\/sync$/);
     if (fileSync) {
       return this.syncHostFiles(decodeURIComponent(fileSync[1]), parsed);
@@ -485,6 +572,9 @@ export class WorkflowInstance implements DurableObject {
     }
     if (url.pathname === "/host/turns") {
       return this.beginHostTurn(parsed);
+    }
+    if (url.pathname === "/host/forks/import") {
+      return this.importHostFork(parsed);
     }
     const body = parsed as Partial<Bootstrap> & { command?: string; cut_id?: string };
     // Operator commands (P3): checkpoint / restore an existing instance. The
@@ -548,6 +638,34 @@ export class WorkflowInstance implements DurableObject {
 
   private hostProjection(url: URL): Response {
     ensureSchema(this.ctx.storage.sql);
+    const pendingTurn = url.pathname.match(/^\/host\/instances\/([^/]+)\/pending$/);
+    if (pendingTurn) {
+      const instanceId = decodeURIComponent(pendingTurn[1]);
+      const rows = this.ctx.storage.sql
+        .exec(
+          `SELECT effect_id AS command_id FROM inbox_items
+            WHERE instance_id = ?1 AND status = 'pending'
+            ORDER BY created_at DESC LIMIT 1`,
+          instanceId,
+        )
+        .toArray() as { command_id: string }[];
+      if (!rows.length) return Response.json({ pending: null });
+      try {
+        const projection = JSON.parse(hostFunctions.host_project_turn(
+          makeBridge(this.ctx.storage.sql),
+          instanceId,
+          rows[0].command_id,
+        )) as Record<string, unknown>;
+        return Response.json({
+          pending: {
+            command_id: rows[0].command_id,
+            ask: projection.pending_human,
+          },
+        });
+      } catch (error) {
+        return Response.json({ error: `pending turn projection failed: ${String(error)}` }, { status: 409 });
+      }
+    }
     const result = url.pathname.match(
       /^\/host\/instances\/([^/]+)\/turns\/([^/]+)\/result$/,
     );
@@ -603,20 +721,51 @@ export class WorkflowInstance implements DurableObject {
           commandId,
         )
         .toArray();
+      let runtimeProjection: Record<string, unknown>;
+      try {
+        runtimeProjection = JSON.parse(
+          hostFunctions.host_project_turn(
+            makeBridge(this.ctx.storage.sql),
+            instanceId,
+            commandId,
+          ),
+        ) as Record<string, unknown>;
+      } catch (error) {
+        return Response.json(
+          { error: `turn projection failed: ${String(error)}` },
+          { status: 409 },
+        );
+      }
       return Response.json({
         ...turns[0],
+        ...runtimeProjection,
         transcript_sequence: transcripts[0]?.sequence ?? 0,
         messages: transcript.messages ?? [],
-        pending_human: pending
+        pending_human: runtimeProjection.pending_human ?? (pending
           ? {
               ask_ref: pending.ask_ref,
               question: pending.question,
               choices: JSON.parse(pending.choices_json),
               freeform_allowed: Boolean(pending.freeform_allowed),
             }
-          : null,
+          : null),
         evidence,
       });
+    }
+    const position = url.pathname.match(/^\/host\/instances\/([^/]+)\/position$/);
+    if (position) {
+      const instanceId = decodeURIComponent(position[1]);
+      if (!this.instanceExists(instanceId)) {
+        return Response.json({ error: "instance not found" }, { status: 404 });
+      }
+      try {
+        return Response.json(JSON.parse(hostFunctions.host_current_position(
+          makeBridge(this.ctx.storage.sql),
+          instanceId,
+        )));
+      } catch (error) {
+        return Response.json({ error: `position projection failed: ${String(error)}` }, { status: 409 });
+      }
     }
     const turn = url.pathname.match(/^\/host\/instances\/([^/]+)\/turns\/([^/]+)$/);
     if (turn) {
@@ -717,6 +866,98 @@ export class WorkflowInstance implements DurableObject {
       return Response.json({ files: rows });
     }
     return Response.json({ error: "not found" }, { status: 404 });
+  }
+
+  private hostEvents(instanceId: string, after: number): Record<string, unknown>[] {
+    ensureSchema(this.ctx.storage.sql);
+    return this.ctx.storage.sql
+      .exec(
+        `SELECT event_id AS evidence_ref, sequence, event_type AS kind,
+                occurred_at, correlation_id AS command_id
+           FROM events WHERE instance_id = ?1 AND sequence > ?2
+          ORDER BY sequence LIMIT 500`,
+        instanceId,
+        after,
+      )
+      .toArray();
+  }
+
+  private hostEventStream(instanceId: string, url: URL): Response {
+    if (!this.instanceExists(instanceId)) {
+      return Response.json({ error: "instance not found" }, { status: 404 });
+    }
+    const after = Math.max(0, Number(url.searchParams.get("after") ?? "0") || 0);
+    const events = this.hostEvents(instanceId, after);
+    const body = events
+      .map((event) => `id: ${String(event.sequence)}\nevent: runtime\ndata: ${JSON.stringify(event)}\n\n`)
+      .join("") + ": caught-up\n\n";
+    return new Response(body, {
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        "x-accel-buffering": "no",
+      },
+    });
+  }
+
+  private openHostEventSocket(request: Request, instanceId: string, url: URL): Response {
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+      return Response.json({ error: "websocket upgrade required" }, { status: 426 });
+    }
+    if (!this.instanceExists(instanceId)) {
+      return Response.json({ error: "instance not found" }, { status: 404 });
+    }
+    const after = Math.max(0, Number(url.searchParams.get("after") ?? "0") || 0);
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.ctx.acceptWebSocket(server, [instanceId]);
+    server.serializeAttachment({ instanceId, after });
+    this.sendHostProgress(server, instanceId, after);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private sendHostProgress(socket: WebSocket, instanceId: string, after: number): void {
+    const events = this.hostEvents(instanceId, after);
+    if (!events.length) return;
+    socket.send(JSON.stringify({ type: "runtime_events", events }));
+    const next = Number(events.at(-1)?.sequence ?? after);
+    socket.serializeAttachment({ instanceId, after: next });
+  }
+
+  private broadcastHostProgress(instanceId: string): void {
+    for (const socket of this.ctx.getWebSockets(instanceId)) {
+      const attachment = socket.deserializeAttachment() as
+        | { instanceId?: string; after?: number }
+        | null;
+      this.sendHostProgress(
+        socket,
+        attachment?.instanceId ?? instanceId,
+        attachment?.after ?? 0,
+      );
+    }
+  }
+
+  webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): void {
+    try {
+      const parsed = JSON.parse(
+        typeof message === "string" ? message : new TextDecoder().decode(message),
+      ) as { after?: unknown };
+      const attachment = socket.deserializeAttachment() as
+        | { instanceId?: string; after?: number }
+        | null;
+      const instanceId = attachment?.instanceId;
+      if (!instanceId) throw new Error("socket has no instance attachment");
+      const after = Number.isSafeInteger(parsed.after)
+        ? Number(parsed.after)
+        : attachment?.after ?? 0;
+      this.sendHostProgress(socket, instanceId, Math.max(0, after));
+    } catch (error) {
+      socket.send(JSON.stringify({ type: "error", error: String(error) }));
+    }
+  }
+
+  webSocketClose(socket: WebSocket, code: number, reason: string): void {
+    socket.close(code, reason);
   }
 
   private syncHostFiles(instanceId: string, parsed: Record<string, unknown>): Response {
@@ -869,7 +1110,81 @@ export class WorkflowInstance implements DurableObject {
     return {
       command: command as Record<string, unknown>,
       package: candidate as HostPackageDocuments,
+      image_bodies: Array.isArray(parsed.image_bodies) ? parsed.image_bodies : [],
     };
+  }
+
+  private storeAdmittedImages(request: HostCommandRequest): Response | undefined {
+    const command = request.command;
+    const instanceId = typeof command.instance_ref === "string" ? command.instance_ref : "";
+    const commandId = typeof command.command_id === "string" ? command.command_id : "";
+    const input = command.input;
+    const refs = input && typeof input === "object" && !Array.isArray(input)
+      ? (input as { images?: unknown }).images
+      : undefined;
+    const imageRefs = Array.isArray(refs) ? refs : [];
+    if (imageRefs.length !== request.image_bodies.length || imageRefs.length > 16) {
+      return Response.json(
+        { error: "image bodies must exactly match at most 16 admitted image refs" },
+        { status: 400 },
+      );
+    }
+    let totalBytes = 0;
+    const normalized: { selector: string; mediaType: string; data: string }[] = [];
+    for (let index = 0; index < imageRefs.length; index += 1) {
+      const ref = imageRefs[index];
+      const body = request.image_bodies[index];
+      if (!ref || typeof ref !== "object" || Array.isArray(ref)
+        || !body || typeof body !== "object" || Array.isArray(body)) {
+        return Response.json({ error: "invalid admitted image broker entry" }, { status: 400 });
+      }
+      const admitted = ref as { handle?: unknown; kind?: unknown; selector?: unknown };
+      const candidate = body as { media_type?: unknown; data_base64?: unknown };
+      if (admitted.handle !== "turn_images" || admitted.kind !== "image"
+        || admitted.selector !== String(index)
+        || typeof candidate.media_type !== "string"
+        || !["image/png", "image/jpeg", "image/webp", "image/gif"].includes(candidate.media_type)
+        || typeof candidate.data_base64 !== "string"
+        || !/^[A-Za-z0-9+/]*={0,2}$/.test(candidate.data_base64)) {
+        return Response.json(
+          { error: "image body does not match its admitted ref or supported media type" },
+          { status: 400 },
+        );
+      }
+      let bytes: number;
+      try {
+        bytes = atob(candidate.data_base64).length;
+      } catch {
+        return Response.json({ error: "image body is not valid base64" }, { status: 400 });
+      }
+      totalBytes += bytes;
+      if (bytes > 16 * 1024 * 1024 || totalBytes > 32 * 1024 * 1024) {
+        return Response.json({ error: "admitted image body limit exceeded" }, { status: 413 });
+      }
+      normalized.push({
+        selector: String(index),
+        mediaType: candidate.media_type,
+        data: candidate.data_base64,
+      });
+    }
+    this.ctx.storage.sql.exec(
+      "DELETE FROM host_turn_images WHERE instance_id = ?1 AND command_id = ?2",
+      instanceId,
+      commandId,
+    );
+    for (const image of normalized) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO host_turn_images
+          (instance_id, command_id, selector, media_type, data_base64)
+         VALUES (?1, ?2, ?3, ?4, ?5)`,
+        instanceId,
+        commandId,
+        image.selector,
+        image.mediaType,
+        image.data,
+      );
+    }
+    return undefined;
   }
 
   private async openHostInstance(parsed: Record<string, unknown>): Promise<Response> {
@@ -983,6 +1298,10 @@ export class WorkflowInstance implements DurableObject {
       ) as HostTurnAdmission;
       const binding = this.resolveAdmittedProvider(admission);
       if (binding instanceof Response) return binding;
+      // Resolve image bodies only after WhippleScript admits their opaque refs
+      // and the corresponding provider capability is available.
+      const imageError = this.storeAdmittedImages(request);
+      if (imageError) return imageError;
       const created = hostFunctions.host_begin_turn(
         makeBridge(this.ctx.storage.sql),
         ...common,
@@ -1009,7 +1328,12 @@ export class WorkflowInstance implements DurableObject {
           max_tokens: 4096,
         }),
       );
-      const driven = await this.driveInstance(instance);
+      const driven = await this.driveInstance(instance, instanceId);
+      this.ctx.storage.sql.exec(
+        "DELETE FROM host_turn_images WHERE instance_id = ?1 AND command_id = ?2",
+        instanceId,
+        String(request.command.command_id ?? ""),
+      );
       return Response.json(
         {
           admitted: true,
@@ -1021,10 +1345,172 @@ export class WorkflowInstance implements DurableObject {
         { status: driven.outcome === "failed" ? 502 : 200 },
       );
     } catch (error) {
+      const instanceId = typeof request.command.instance_ref === "string"
+        ? request.command.instance_ref
+        : "";
+      const commandId = typeof request.command.command_id === "string"
+        ? request.command.command_id
+        : "";
+      if (instanceId && commandId) {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM host_turn_images WHERE instance_id = ?1 AND command_id = ?2",
+          instanceId,
+          commandId,
+        );
+      }
       return Response.json(
         { error: `turn rejected: ${error instanceof Error ? error.message : String(error)}` },
         { status: 400 },
       );
+    }
+  }
+
+  private async answerHostTurn(
+    instanceId: string,
+    parsed: Record<string, unknown>,
+  ): Promise<Response> {
+    const request = this.hostCommandRequest(parsed);
+    if (request instanceof Response) return request;
+    if (request.command.instance_ref !== instanceId) {
+      return Response.json({ error: "human answer instance does not match route" }, { status: 400 });
+    }
+    const policy = await this.hostPolicy(request.command);
+    if (policy instanceof Response) return policy;
+    const root = this.pinnedGovernanceRoot();
+    if (root instanceof Response) return root;
+    ensureSchema(this.ctx.storage.sql);
+    const common = [
+      BigInt(policy.epoch),
+      policy.signed_envelope,
+      root.signer,
+      root.key,
+      JSON.stringify(request.command),
+      request.package.manifest,
+      request.package.source,
+      request.package.system_prompt,
+    ] as const;
+    try {
+      const admission = JSON.parse(
+        hostFunctions.host_validate_human_answer(makeBridge(this.ctx.storage.sql), ...common),
+      ) as HostTurnAdmission;
+      const binding = this.resolveAdmittedProvider(admission);
+      if (binding instanceof Response) return binding;
+      const secret = this.env[binding.secret];
+      if (typeof secret !== "string") {
+        return Response.json({ error: "admitted human answer has no runtime credential" }, { status: 503 });
+      }
+      const receipt = JSON.parse(hostFunctions.host_answer_human_ask(
+        makeBridge(this.ctx.storage.sql),
+        ...common,
+        binding.provider,
+        binding.model,
+        binding.base_url,
+      ));
+      const instance = WasmDurableInstance.attach_host(
+        makeBridge(this.ctx.storage.sql),
+        instanceId,
+        request.package.manifest,
+        request.package.source,
+        request.package.system_prompt,
+        JSON.stringify({
+          provider: binding.provider,
+          base_url: binding.base_url,
+          api_key: secret,
+          model: binding.model,
+          max_tokens: 4096,
+        }),
+      );
+      const driven = await this.driveInstance(instance, instanceId);
+      return Response.json({
+        admitted: true,
+        answer_receipt: receipt,
+        command_id: receipt.turn_command_id,
+        status: driven.status,
+        outcome: driven.outcome,
+      }, { status: driven.outcome === "failed" ? 502 : 200 });
+    } catch (error) {
+      return Response.json(
+        { error: `human answer rejected: ${error instanceof Error ? error.message : String(error)}` },
+        { status: 400 },
+      );
+    }
+  }
+
+  private async exportHostFork(instanceId: string, url: URL): Promise<Response> {
+    ensureSchema(this.ctx.storage.sql);
+    const sequence = Number(url.searchParams.get("sequence"));
+    if (!Number.isSafeInteger(sequence) || sequence <= 0) {
+      return Response.json({ error: "fork export requires a positive exact sequence" }, { status: 400 });
+    }
+    const packageDocs = await this.ctx.storage.get<HostPackageDocuments>(
+      `host-package:${instanceId}`,
+    );
+    if (!packageDocs) return Response.json({ error: "host package not found" }, { status: 404 });
+    const rows = this.ctx.storage.sql
+      .exec("SELECT input_json FROM instances WHERE instance_id = ?1", instanceId)
+      .toArray() as { input_json: string }[];
+    if (!rows.length) return Response.json({ error: "instance not found" }, { status: 404 });
+    const metadata = JSON.parse(rows[0].input_json) as { policy?: { epoch?: number; envelope_hash?: string } };
+    const epoch = metadata.policy?.epoch;
+    const envelopeHash = metadata.policy?.envelope_hash;
+    if (!Number.isSafeInteger(epoch) || typeof envelopeHash !== "string") {
+      return Response.json({ error: "source instance has no host policy binding" }, { status: 409 });
+    }
+    const policy = await this.ctx.storage.get<HostPolicyBootstrap>(
+      `host-policy:${String(epoch)}:${envelopeHash}`,
+    );
+    if (!policy) return Response.json({ error: "source policy bootstrap not found" }, { status: 409 });
+    const root = this.pinnedGovernanceRoot();
+    if (root instanceof Response) return root;
+    try {
+      return Response.json(JSON.parse(hostFunctions.host_export_thread(
+        makeBridge(this.ctx.storage.sql),
+        BigInt(epoch as number),
+        policy.signed_envelope,
+        root.signer,
+        root.key,
+        JSON.stringify({ instance_ref: instanceId, sequence }),
+        packageDocs.manifest,
+        packageDocs.source,
+        packageDocs.system_prompt,
+      )));
+    } catch (error) {
+      return Response.json({ error: `fork export rejected: ${String(error)}` }, { status: 409 });
+    }
+  }
+
+  private async importHostFork(parsed: Record<string, unknown>): Promise<Response> {
+    const request = this.hostCommandRequest(parsed);
+    if (request instanceof Response) return request;
+    const exported = parsed.export;
+    if (!exported || typeof exported !== "object" || Array.isArray(exported)) {
+      return Response.json({ error: "fork import requires a source export" }, { status: 400 });
+    }
+    const policy = await this.hostPolicy(request.command);
+    if (policy instanceof Response) return policy;
+    const root = this.pinnedGovernanceRoot();
+    if (root instanceof Response) return root;
+    ensureSchema(this.ctx.storage.sql);
+    try {
+      const forked = JSON.parse(hostFunctions.host_import_fork(
+        makeBridge(this.ctx.storage.sql),
+        BigInt(policy.epoch),
+        policy.signed_envelope,
+        root.signer,
+        root.key,
+        JSON.stringify(request.command),
+        JSON.stringify(exported),
+        request.package.manifest,
+        request.package.source,
+        request.package.system_prompt,
+      ));
+      await this.ctx.storage.put(
+        `host-package:${String(forked.target?.instance_ref ?? "")}`,
+        request.package,
+      );
+      return Response.json(forked, { status: 201 });
+    } catch (error) {
+      return Response.json({ error: `fork import rejected: ${String(error)}` }, { status: 409 });
     }
   }
 
@@ -1149,6 +1635,7 @@ export class WorkflowInstance implements DurableObject {
 
   private async driveInstance(
     instance: WasmDurableInstance,
+    hostedInstanceId?: string,
   ): Promise<{ status: string; outcome: string }> {
 
     // The sans-IO loop: step -> maybe fetch -> step, until a terminal or a park.
@@ -1159,6 +1646,7 @@ export class WorkflowInstance implements DurableObject {
     let responseJson: string | undefined = undefined;
     for (;;) {
       const outcome = JSON.parse(instance.step(responseJson, Date.now())) as StepOutcome;
+      if (hostedInstanceId) this.broadcastHostProgress(hostedInstanceId);
       if (outcome.kind === "needs_http") {
         responseJson = await performFetch(outcome.request, this.env);
         continue;
@@ -1209,7 +1697,11 @@ export default {
         url.pathname === "/host/policy" ||
         url.pathname === "/host/instances/open" ||
         url.pathname === "/host/turns" ||
-        /^\/host\/instances\/[^/]+\/(events|evidence|files|checkpoint|restore)$/.test(url.pathname) ||
+        url.pathname === "/host/forks/import" ||
+        /^\/host\/instances\/[^/]+\/(events|evidence|files|position|pending|checkpoint|restore)$/.test(url.pathname) ||
+        /^\/host\/instances\/[^/]+\/events\/(stream|live)$/.test(url.pathname) ||
+        /^\/host\/instances\/[^/]+\/human\/answer$/.test(url.pathname) ||
+        /^\/host\/instances\/[^/]+\/fork-export$/.test(url.pathname) ||
         /^\/host\/instances\/[^/]+\/files\/sync$/.test(url.pathname) ||
         /^\/host\/instances\/[^/]+\/turns\/[^/]+(?:\/transcript|\/result|\/cancel)?$/.test(url.pathname);
       if (!legacy) return Response.json({ error: "not found" }, { status: 404 });
