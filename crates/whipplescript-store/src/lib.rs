@@ -10,6 +10,7 @@ pub mod files;
 pub mod improve;
 pub mod items;
 pub mod materialize;
+pub mod memory;
 pub mod merge;
 #[cfg(feature = "native")]
 pub mod native_stores;
