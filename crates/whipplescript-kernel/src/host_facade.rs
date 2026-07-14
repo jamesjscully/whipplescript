@@ -219,6 +219,12 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             }
             return Ok(false);
         }
+        let profile = package
+            .program
+            .agents
+            .iter()
+            .find(|agent| agent.name == package.agent)
+            .and_then(|agent| agent.profile.as_deref());
         self.kernel
             .commit_rule(RuleCommit {
                 instance_id: &command.instance_ref,
@@ -238,7 +244,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                         "host-turn-effect",
                     ]),
                     required_capabilities_json: "[]",
-                    profile: None,
+                    profile,
                     correlation_id: Some(&command.run_ref),
                     source_span_json: None,
                     timeout_seconds: None,

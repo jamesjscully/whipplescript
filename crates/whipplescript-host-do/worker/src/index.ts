@@ -240,6 +240,19 @@ function ensureSchema(sql: SqlStorage): void {
       sql.exec(seed);
     }
   }
+  // Existing placement objects predate GaugeDesk's writer profile. Keep
+  // additive runtime policy seeds outside the first-touch branch so a deploy
+  // upgrades those objects lazily without rewriting operator-owned rows.
+  sql.exec(`INSERT OR IGNORE INTO profiles
+    (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json)
+    VALUES (
+      'profile_repo_writer',
+      'repo-writer',
+      'Allow governed workspace reads, writes, Bashkit commands, human asks, and agent turns.',
+      'enforce',
+      '["agent.tell","workspace.read","workspace.write","command.run","human.ask"]',
+      '{}'
+    )`);
   // Message-scoped image bodies are a broker cache, not part of the admitted
   // command. Existing objects acquire this additive table lazily.
   sql.exec(`CREATE TABLE IF NOT EXISTS host_turn_images (

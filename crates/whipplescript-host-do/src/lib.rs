@@ -49,13 +49,18 @@ pub mod host_projection;
 #[cfg(test)]
 mod governed_host_tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::rc::Rc;
 
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
     use serde_json::json;
+    use whipplescript_kernel::coerce_native::CoerceProvider;
     use whipplescript_kernel::gov::{external_signing_bytes, SignedEnvelope};
+    use whipplescript_kernel::harness_model::MessagesApiClient;
     use whipplescript_kernel::host_facade::{GovernedHostFacade, ProviderRealization};
-    use whipplescript_kernel::host_package::{AuthoredAgentPackage, AGENT_PACKAGE_SCHEMA};
+    use whipplescript_kernel::host_package::{
+        AuthoredAgentPackage, PackageResolver, AGENT_PACKAGE_SCHEMA,
+    };
     use whipplescript_kernel::host_policy::{
         HostGovernancePolicy, PlacementPolicy, ProviderBindingPolicy, ResourcePolicy,
     };
@@ -63,9 +68,11 @@ mod governed_host_tests {
         CredentialRef, OpenInstanceCommand, ProviderBindingRef, StartTurnCommand, TurnInput,
         HOST_PROTOCOL,
     };
+    use whipplescript_kernel::sansio::HttpResponse;
     use whipplescript_store::RuntimeStore;
 
-    use crate::do_store::{test_support, DoSql, SqlValue};
+    use crate::do_store::{test_support, DoSql, DoSqliteStore};
+    use crate::do_worker::{DurableEffectPorts, DurableInstance, DurableStepOutcome};
     use crate::governance::{GaugeDeskGovernanceRoot, GAUGEDESK_ATTESTATION_ALGORITHM};
 
     fn package() -> AuthoredAgentPackage {
@@ -84,7 +91,7 @@ mod governed_host_tests {
 workflow Method {
   agent assistant {
     provider owned
-    profile "plain"
+    profile "repo-reader"
     capacity 1
     capabilities []
   }
@@ -158,9 +165,25 @@ workflow Method {
     fn gaugedesk_host_protocol_admits_the_same_package_on_the_do_store() {
         let (root, signed) = signed_policy();
         let verified = root.verify_epoch(7, &signed).expect("verified");
-        let mut host =
-            GovernedHostFacade::from_verified_store(test_support::store(), 7, verified.envelope)
-                .expect("host");
+        let sql = Rc::new(test_support::store().sql);
+        for statement in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('agent.tell', 'Run an agent turn.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+            "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) \
+             VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
+        ] {
+            sql.execute(statement, &[]).expect("seed hosted agent policy");
+        }
+        let mut host = GovernedHostFacade::from_verified_store(
+            DoSqliteStore::new(Rc::clone(&sql)),
+            7,
+            verified.envelope,
+        )
+        .expect("host");
         let package = package();
         let open = OpenInstanceCommand {
             protocol: HOST_PROTOCOL.to_owned(),
@@ -209,29 +232,56 @@ workflow Method {
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].effect_id, turn.command_id);
 
-        let run_id = whipplescript_kernel::idempotency_key(&[
-            &turn.instance_ref,
-            &turn.command_id,
-            "projection-run",
-        ]);
-        let sql = &host.kernel().store().sql;
-        sql.execute(
-            "UPDATE effects SET status = 'completed' WHERE effect_id = ?1",
-            &[SqlValue::Text(turn.command_id.clone())],
-        )
-        .expect("effect completed");
-        sql.execute(
-            "INSERT INTO runs (run_id, instance_id, effect_id, provider, worker_id, status, \
-             completed_at, exit_code, summary, metadata_json) \
-             VALUES (?1, ?2, ?3, 'agent', 'worker', 'completed', CURRENT_TIMESTAMP, 0, \
-             'done', '{\"usage\":{\"input_tokens\":3}}')",
-            &[
-                SqlValue::Text(run_id),
-                SqlValue::Text(turn.instance_ref.clone()),
-                SqlValue::Text(turn.command_id.clone()),
-            ],
-        )
-        .expect("run completed");
+        let resolved = package
+            .resolve_package(package.version_ref())
+            .expect("package IR");
+        let ports = DurableEffectPorts {
+            agent_model: Some(Box::new(MessagesApiClient::new(
+                CoerceProvider::OpenAi,
+                "test-key",
+                "gpt-test",
+                "https://provider.invalid",
+                1024,
+                None,
+            ))),
+            ..DurableEffectPorts::default()
+        };
+        let mut attached =
+            DurableInstance::attach(Rc::clone(&sql), resolved.program, &turn.instance_ref, ports)
+                .expect("attach hosted instance");
+        let first_step = attached.step(None, 1_767_225_600_000);
+        let instance_status = attached.status().expect("instance status");
+        let after_step = host
+            .kernel()
+            .store()
+            .list_effects(&turn.instance_ref)
+            .expect("effects after step");
+        assert!(
+            matches!(first_step, DurableStepOutcome::NeedsHttp(_)),
+            "an admitted hosted turn must be claimed and driven, got {first_step:?}; status: {instance_status:?}; effects: {after_step:?}"
+        );
+        let resumed = attached.step(
+            Some(Ok(HttpResponse {
+                status: 200,
+                body: json!({
+                    "choices": [{
+                        "message": { "role": "assistant", "content": "done" },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 3, "completion_tokens": 0 }
+                }),
+            })),
+            1_767_225_600_000,
+        );
+        assert!(
+            matches!(
+                resumed,
+                DurableStepOutcome::Parked {
+                    next_due_unix_ms: None
+                }
+            ),
+            "the hosted turn settles and leaves the reusable instance open, got {resumed:?}"
+        );
         let projection = crate::host_projection::project_host_turn(
             host.kernel_mut().store_mut(),
             &turn.instance_ref,
