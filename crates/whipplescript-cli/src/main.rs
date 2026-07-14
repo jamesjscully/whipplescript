@@ -18993,7 +18993,8 @@ fn step_instance(
         resolved_coordination_store(side_stores),
         resolved_items_store(side_stores),
     )?;
-    let mut kernel = RuntimeKernel::new(stores);
+    let mut kernel = RuntimeKernel::new(stores)
+        .with_coercion_config_fingerprint(coerce_runtime::native_coercion_config_fingerprint());
     step_instance_generic(
         &mut kernel,
         instance_id,
@@ -47795,6 +47796,7 @@ rule finish
             "ins_test",
             "ver_test",
             "0",
+            "fixture",
             &ir,
             &ir.rules[0],
             &ready.contexts[0],
@@ -47805,6 +47807,92 @@ rule finish
 
         assert_eq!(lowering.consumed_fact_ids, vec!["fact-task"]);
         assert_eq!(lowering.facts.len(), 1);
+    }
+
+    /// DR-0014 amendment (modeled in models/maude/effect-key.maude): the
+    /// `schema.coerce` admission key commits to the coercion name, declared
+    /// prompt template, synthesized output schema, and the host-supplied
+    /// config fingerprint — and ONLY schema.coerce keys see the fingerprint.
+    #[test]
+    fn schema_coerce_admission_key_commits_to_template_and_config_fingerprint() {
+        let source_template_a = r#"
+workflow CoerceKeyCommitments
+
+class Review {
+  accepted bool
+}
+
+output result Review
+
+coerce reviewArtifact() -> Review {
+  prompt """
+  Review the artifact.
+  """
+}
+
+agent scribe {
+  provider fixture
+  profile "issue-triager"
+  capacity 1
+}
+
+rule start
+  when started
+=> {
+  coerce reviewArtifact() as review
+  tell scribe as note """
+  Note the review.
+  """
+
+  after review succeeds as r {
+    complete result { accepted r.accepted }
+  }
+}
+"#;
+        let source_template_b =
+            source_template_a.replace("Review the artifact.", "Audit the artifact.");
+        let lower = |source: &str, fingerprint: &str| {
+            let ir = whipplescript_parser::compile_program(source)
+                .ir
+                .expect("compile");
+            let lowering = lower_rule(
+                "ins_test",
+                "ver_test",
+                "0",
+                fingerprint,
+                &ir,
+                &ir.rules[0],
+                &RuleContext::default(),
+                &[],
+                &[],
+                None,
+            );
+            let key_of = |kind: &str| {
+                lowering
+                    .effects
+                    .iter()
+                    .find(|effect| effect.kind == kind)
+                    .map(|effect| effect.idempotency_key.clone())
+                    .expect(kind)
+            };
+            (key_of("schema.coerce"), key_of("agent.tell"))
+        };
+
+        let (coerce_a1, tell_a1) = lower(source_template_a, "fixture");
+        let (coerce_a2, tell_a2) = lower(source_template_a, "fixture");
+        // Unchanged program + config dedups (same key both lowerings).
+        assert_eq!(coerce_a1, coerce_a2);
+        assert_eq!(tell_a1, tell_a2);
+
+        // A changed prompt template is a distinct coercion even under the SAME
+        // pinned program version literal (the prefix-replay hazard).
+        let (coerce_b, _) = lower(&source_template_b, "fixture");
+        assert_ne!(coerce_a1, coerce_b);
+
+        // A changed coercion config re-keys schema.coerce — and nothing else.
+        let (coerce_c, tell_c) = lower(source_template_a, "key_anthropic_sonnet");
+        assert_ne!(coerce_a1, coerce_c);
+        assert_eq!(tell_a1, tell_c);
     }
 
     #[test]
@@ -47850,6 +47938,7 @@ rule run
                 "ins_test",
                 version,
                 epoch,
+                "fixture",
                 &ir,
                 &ir.rules[0],
                 context,
@@ -48090,6 +48179,7 @@ rule start
             "ins_test",
             "ver_test",
             "0",
+            "fixture",
             &ir,
             &ir.rules[0],
             &RuleContext::default(),
@@ -48138,6 +48228,7 @@ rule start
             "ins_test",
             "ver_test",
             "0",
+            "fixture",
             &ir,
             &ir.rules[0],
             &RuleContext::default(),
@@ -48186,6 +48277,7 @@ rule start
             args: Vec::new(),
             prompt: Some("Summarize this.".to_owned()),
             prompt_content_type: Some("markdown".to_owned()),
+            prompt_template: Some("Summarize this.".to_owned()),
             required_capabilities: Vec::new(),
             after: None,
             timeout_seconds: None,
@@ -48264,6 +48356,7 @@ rule start
             "ins_test",
             "ver_test",
             "0",
+            "fixture",
             &ir,
             &ir.rules[0],
             &RuleContext::default(),
@@ -48362,6 +48455,7 @@ workflow Child {
             "ins_test",
             "ver_test",
             "0",
+            "fixture",
             &ir,
             &ir.rules[0],
             &RuleContext::default(),
@@ -48414,6 +48508,7 @@ rule start
             "ins_test",
             "ver_test",
             "0",
+            "fixture",
             &ir,
             &ir.rules[0],
             &RuleContext::default(),

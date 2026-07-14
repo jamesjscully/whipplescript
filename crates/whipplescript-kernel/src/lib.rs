@@ -80,6 +80,9 @@ use whipplescript_store::SqliteStore;
 pub struct RuntimeKernel<S: RuntimeStore = SqliteStore> {
     store: S,
     trace: Vec<TraceRecord>,
+    /// Folded into `schema.coerce` effect admission keys by the rule pass —
+    /// see [`RuntimeKernel::with_coercion_config_fingerprint`].
+    coercion_config_fingerprint: String,
 }
 
 /// wasm / no-native form: no default backend (rusqlite `SqliteStore` is absent).
@@ -87,6 +90,9 @@ pub struct RuntimeKernel<S: RuntimeStore = SqliteStore> {
 pub struct RuntimeKernel<S: RuntimeStore> {
     store: S,
     trace: Vec<TraceRecord>,
+    /// Folded into `schema.coerce` effect admission keys by the rule pass —
+    /// see [`RuntimeKernel::with_coercion_config_fingerprint`].
+    coercion_config_fingerprint: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,7 +281,25 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         Self {
             store,
             trace: Vec::new(),
+            coercion_config_fingerprint: "fixture".to_owned(),
         }
+    }
+
+    /// Supply the coercion-config fingerprint the rule pass folds into
+    /// `schema.coerce` effect admission keys (DR-0014 amendment):
+    /// H(provider_kind, provider_id, backend, model) of the host's resolved
+    /// coercion config — native derives it from the resolved coerce config,
+    /// the durable object from `coerce_config_json`, and the fixture path
+    /// keeps the constructor's literal `"fixture"` so tests stay
+    /// deterministic. Switching backend/model re-runs future coercions
+    /// instead of replaying a stale terminal.
+    pub fn with_coercion_config_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.coercion_config_fingerprint = fingerprint.into();
+        self
+    }
+
+    pub fn coercion_config_fingerprint(&self) -> &str {
+        &self.coercion_config_fingerprint
     }
 
     /// Borrow the underlying store. The lifted rule pass holds one kernel across a

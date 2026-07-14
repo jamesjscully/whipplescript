@@ -67,6 +67,24 @@ pub struct CoerceProviderConfig {
     pub max_tokens: u32,
 }
 
+/// The coercion-config fingerprint this DO's kernel folds into `schema.coerce`
+/// effect admission keys (DR-0014 amendment) — derived from `coerce_config_json`
+/// exactly as the native host derives it from its resolved config (same
+/// combinator, same "fixture" literal when coerce is unconfigured), so an
+/// identical config yields the identical fingerprint on either host.
+pub fn do_coercion_config_fingerprint(coerce: Option<&CoerceProviderConfig>) -> String {
+    coerce
+        .map(|cfg| {
+            whipplescript_kernel::coerce::coercion_config_fingerprint(
+                "schema_coercer",
+                &cfg.provider_name,
+                &cfg.provider_name,
+                &cfg.model,
+            )
+        })
+        .unwrap_or_else(|| "fixture".to_owned())
+}
+
 use crate::do_store::{do_load_agent_snapshot, do_save_agent_snapshot, DoSql, DoSqliteStore};
 
 /// Projected executor-sidecar wiring (compute plane P8): where Class-A exec

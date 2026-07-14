@@ -373,26 +373,32 @@ Rules may retry, ask a human, or block based on those facts.
 outcome is recorded once with its evidence, and replay reads the recorded fact
 without re-invoking the model.
 
-Because `coerce` is model-backed, its idempotency key (or its companion
-execution fingerprint) must commit to every input that changes the result, so a
-changed model, prompt, or schema is a different key and a stale outcome is never
-reused:
+Because `coerce` is model-backed, the commitments split across the admission
+key and the run-time execution fingerprint (DR-0014 amendment,
+[std-coercion.md](std-coercion.md) "Idempotency And Replay"; modeled in
+`models/maude/effect-key.maude`):
 
 ```text
-instance_id
-program_version
-function_name
-normalized_named_args_hash
-trigger_event_or_fact_correlation
-provider_or_model_id
-prompt_or_coercion_artifact_hash
-output_schema_hash
+key (admission-time; on top of the shared effect-id commitments —
+instance, program version, revision epoch/branch, rule, node, identity):
+  coercion_name
+  prompt_template_hash        H(declared prompt template source)
+  output_schema_hash          H(synthesized output JSON Schema)
+  coercion_config_fingerprint H(provider_kind, provider_id, backend, model)
+execution fingerprint (run-time, recorded on the run):
+  normalized named-args hash + upstream ids
 ```
 
-If a successful output already exists for the key, the runtime reuses it and
-does not call the model again. A change to the provider/model id, the
-prompt/coercion-artifact hash, or the output-schema hash yields a different key,
-so a recorded outcome from a different contract is never reused.
+The first three are compile-time facts of the program.
+`coercion_config_fingerprint` is runtime config: the host supplies it at
+kernel construction (native: resolved-config record; DO: `coerce_config_json`;
+fixture: literal `"fixture"`) and the kernel folds it into `schema.coerce`
+keys only. If a successful output already exists for the key, the runtime
+reuses it and does not call the model again. A change to the backend/model,
+the declared prompt template, or the output schema yields a different key, so
+a recorded outcome from a different contract is never reused — switching
+config re-runs future coercions instead of replaying a stale terminal, and
+the constant fixture fingerprint keeps tests deterministic.
 
 ## Policy
 

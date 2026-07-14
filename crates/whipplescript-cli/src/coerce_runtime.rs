@@ -66,6 +66,32 @@ pub(crate) fn codex_config_model() -> Option<String> {
     None
 }
 
+/// The coercion-config fingerprint the step machine folds into `schema.coerce`
+/// effect admission keys (DR-0014 amendment): H(provider_kind, provider_id,
+/// backend, model) over the same provider/model resolution the dispatch path
+/// uses, or the literal `"fixture"` when the fixture path is selected — so
+/// switching backend or model re-runs future coercions instead of replaying a
+/// stale terminal, while fixture runs stay deterministic. Credential
+/// resolution is deliberately NOT consulted: a missing or rotated key must
+/// fail at dispatch, never rekey admissions.
+pub fn native_coercion_config_fingerprint() -> String {
+    let Some(provider_name) = env_nonempty("WHIPPLESCRIPT_COERCE_PROVIDER") else {
+        return "fixture".to_owned();
+    };
+    if provider_name.eq_ignore_ascii_case("fixture") {
+        return "fixture".to_owned();
+    }
+    let model = env_nonempty("WHIPPLESCRIPT_COERCE_MODEL")
+        .or_else(codex_config_model)
+        .unwrap_or_default();
+    whipplescript_kernel::coerce::coercion_config_fingerprint(
+        "schema_coercer",
+        &provider_name,
+        &provider_name,
+        &model,
+    )
+}
+
 /// Resolve native coerce configuration from the environment. `Ok(None)` selects
 /// the fixture path; `Err` is a binding-time credential failure.
 pub fn resolve_native_coerce_config() -> Result<Option<NativeCoerceConfig>, String> {

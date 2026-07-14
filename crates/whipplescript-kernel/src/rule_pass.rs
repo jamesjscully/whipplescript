@@ -126,6 +126,7 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                     instance_id,
                     &active_version_id,
                     &active_revision_epoch_key,
+                    kernel.coercion_config_fingerprint(),
                     ir,
                     rule,
                     &context,

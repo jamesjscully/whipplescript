@@ -10,6 +10,28 @@
 
 use serde_json::{json, Value};
 
+/// The coercion-config fingerprint folded into `schema.coerce` effect
+/// admission keys (DR-0014 amendment; spec/std-coercion.md "Idempotency And
+/// Replay"): H(provider_kind, provider_id, backend, model). Hosts compute it
+/// at kernel construction — native from the resolved coerce config, the
+/// durable object from `coerce_config_json` — and the fixture path uses the
+/// literal `"fixture"` instead so tests stay deterministic. Credentials are
+/// deliberately excluded: a rotated key must not rekey admissions.
+pub fn coercion_config_fingerprint(
+    provider_kind: &str,
+    provider_id: &str,
+    backend: &str,
+    model: &str,
+) -> String {
+    crate::idempotency_key(&[
+        "coercion-config",
+        provider_kind,
+        provider_id,
+        backend,
+        model,
+    ])
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoerceRequest {
     pub function_name: String,

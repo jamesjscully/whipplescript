@@ -1001,6 +1001,11 @@ pub fn lower_rule(
     // branch/cut ref once the timeline forked) — see
     // rule_pass::revision_branch_key. A key part only, never parsed.
     revision_epoch_key: &str,
+    // Host-supplied at kernel construction (native: resolved coerce config;
+    // DO: `coerce_config_json`; fixture: literal "fixture") and folded into
+    // `schema.coerce` effect keys only — switching the coercion backend or
+    // model re-runs future coercions instead of replaying a stale terminal.
+    coercion_config_fingerprint: &str,
     ir: &IrProgram,
     rule: &IrRule,
     context: &RuleContext,
@@ -1181,7 +1186,13 @@ pub fn lower_rule(
             .as_deref()
             .and_then(|target| ir.agents.iter().find(|agent| agent.name == target))
             .and_then(|agent| agent.profile.clone());
-        let effect_idempotency_key = idempotency_key(&[&effect_id, "effect"]);
+        let effect_idempotency_key = effect_admission_key(
+            ir,
+            &rule.name,
+            parsed,
+            &effect_id,
+            coercion_config_fingerprint,
+        );
         lowering.effects.push(OwnedEffect {
             effect_id,
             kind: parsed.kind.clone(),
@@ -1410,7 +1421,13 @@ pub fn lower_rule(
                 .as_deref()
                 .and_then(|target| ir.agents.iter().find(|agent| agent.name == target))
                 .and_then(|agent| agent.profile.clone());
-            let effect_idempotency_key = idempotency_key(&[&effect_id, "effect"]);
+            let effect_idempotency_key = effect_admission_key(
+                ir,
+                &rule.name,
+                parsed,
+                &effect_id,
+                coercion_config_fingerprint,
+            );
             lowering.effects.push(OwnedEffect {
                 effect_id,
                 kind: parsed.kind.clone(),
@@ -2070,6 +2087,12 @@ pub struct ParsedEffect {
     pub args: Vec<String>,
     pub prompt: Option<String>,
     pub prompt_content_type: Option<String>,
+    /// The DECLARED prompt template source, before interpolation — only for
+    /// the inline `decide`/`prompt` schema.coerce forms (named `coerce`
+    /// functions keep their template in `IrProgram::coerces`). The admission
+    /// key commits to the template, never the interpolated text (DR-0014
+    /// amendment): inputs are already keyed by the firing identity.
+    pub prompt_template: Option<String>,
     pub required_capabilities: Vec<String>,
     pub after: Option<AfterScope>,
     pub timeout_seconds: Option<i64>,
@@ -2213,6 +2236,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![body],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2241,6 +2265,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![format, store, path],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 // v0: the `file store` declaration's `root` is the scope boundary;
                 // a `files.read` capability-grant layer is a documented follow-up
                 // (spec/std-library/files.md). Requiring it here without a grantor
@@ -2301,6 +2326,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![channel, text_expr, markdown_expr, thread_expr],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: vec![target],
                 after: current_after,
             });
@@ -2361,6 +2387,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![format, store, path, body_expr, mode],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 // v0: the `file store` `root` is the scope boundary (mirrors
                 // `read`); a `files.write` capability-grant layer is a follow-up.
                 required_capabilities: Vec::new(),
@@ -2395,6 +2422,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![format, schema, store, path],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2453,6 +2481,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![format, schema, store, path, predicate, mode],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2480,6 +2509,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![deadline],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2497,6 +2527,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![duration.to_owned()],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2519,6 +2550,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![body],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2540,6 +2572,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![item],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2558,6 +2591,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![item],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2590,6 +2624,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 ],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2614,6 +2649,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![item, body],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2640,6 +2676,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![shape],
                 prompt: Some(interpolate_prompt(&prompt, context)),
                 prompt_content_type: None,
+                prompt_template: Some(prompt.clone()),
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2707,6 +2744,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args,
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2745,6 +2783,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![target_expr, event, fields],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2796,6 +2835,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 ],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2831,6 +2871,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![schema, fields],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2873,6 +2914,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![key_expr, amount_expr],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2888,6 +2930,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: Vec::new(),
                 prompt: Some(interpolate_prompt(&prompt.text, context)),
                 prompt_content_type: prompt.content_type,
+                prompt_template: None,
                 required_capabilities: parse_required_capabilities(trimmed),
                 after: current_after,
             });
@@ -2913,6 +2956,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                     args: Vec::new(),
                     prompt: Some(interpolate_prompt(&prompt.text, context)),
                     prompt_content_type: prompt.content_type,
+                    prompt_template: Some(prompt.text.clone()),
                     required_capabilities: parse_required_capabilities(&statement),
                     after: current_after,
                 });
@@ -2938,6 +2982,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args,
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2971,6 +3016,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: choices,
                 prompt: Some(interpolate_prompt(&prompt.text, context)),
                 prompt_content_type: prompt.content_type,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2986,6 +3032,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![pool, query],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: vec![target],
                 after: current_after,
             });
@@ -3029,6 +3076,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![source_expr, pool, note_expr],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: vec![target],
                 after: current_after,
             });
@@ -3070,6 +3118,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![pool, reason_expr],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: vec![target],
                 after: current_after,
             });
@@ -3089,6 +3138,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: Vec::new(),
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: vec![target],
                 after: current_after,
             });
@@ -3107,6 +3157,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: Vec::new(),
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -3947,6 +3998,80 @@ pub fn effect_turn_skills_json(rule: &IrRule, effect: &ParsedEffect, kind: IrEff
             .map(|skill| Value::String(skill.clone()))
             .collect(),
     )
+}
+
+/// Admission-time key commitments for a `schema.coerce` effect (DR-0014
+/// amendment; spec/std-coercion.md "Idempotency And Replay"; modeled in
+/// models/maude/effect-key.maude): the effect idempotency key additionally
+/// commits to the coercion name, the DECLARED prompt template source, and
+/// the synthesized output JSON Schema — a changed prompt or schema re-runs
+/// future coercions instead of replaying a stale terminal, while an
+/// unchanged program keeps deduping. Inputs stay out of the key: the firing
+/// identity already keys them, and the run-time execution fingerprint keeps
+/// carrying the normalized-argument hash.
+pub fn schema_coerce_key_commitments(
+    ir: &IrProgram,
+    rule_name: &str,
+    parsed: &ParsedEffect,
+) -> [String; 3] {
+    let coercion_name = parsed.name.as_deref().unwrap_or("coerce");
+    let template = match coercion_name {
+        "decide" | "prompt" => parsed.prompt_template.clone().unwrap_or_default(),
+        _ => coerce_prompt_from_ir(ir, coercion_name)
+            .map(|prompt| prompt.text)
+            .unwrap_or_default(),
+    };
+    let output_type = match coercion_name {
+        "decide" => Some(IrType::Ref(
+            whipplescript_parser::inline_decide_schema_name(
+                rule_name,
+                parsed.binding.as_deref().unwrap_or_default(),
+            ),
+        )),
+        "prompt" => Some(IrType::Primitive(IrPrimitiveType::String)),
+        _ => ir
+            .coerces
+            .iter()
+            .find(|coerce| coerce.name == coercion_name)
+            .map(|coerce| coerce.output.clone()),
+    };
+    let output_schema = output_type
+        .map(|ty| {
+            crate::coerce_native::output_schema_envelope(&ty, &ir.schemas)
+                .0
+                .to_string()
+        })
+        .unwrap_or_else(|| "json".to_owned());
+    [
+        format!("coercion={coercion_name}"),
+        format!("prompt_template_hash={}", stable_hash_hex(&template)),
+        format!("output_schema_hash={}", stable_hash_hex(&output_schema)),
+    ]
+}
+
+/// The effect admission key. `schema.coerce` effects fold in the coercion
+/// commitments plus the host-supplied config fingerprint — schema.coerce
+/// keys only, so no other kind ever rekeys on a coerce config change.
+fn effect_admission_key(
+    ir: &IrProgram,
+    rule_name: &str,
+    parsed: &ParsedEffect,
+    effect_id: &str,
+    coercion_config_fingerprint: &str,
+) -> String {
+    if parsed.kind == "schema.coerce" {
+        let [name, template, schema] = schema_coerce_key_commitments(ir, rule_name, parsed);
+        idempotency_key(&[
+            effect_id,
+            "effect",
+            &name,
+            &template,
+            &schema,
+            &format!("coercion_config_fingerprint={coercion_config_fingerprint}"),
+        ])
+    } else {
+        idempotency_key(&[effect_id, "effect"])
+    }
 }
 
 pub fn coerce_prompt_from_ir(ir: &IrProgram, function_name: &str) -> Option<ParsedPrompt> {

@@ -30,7 +30,8 @@ use whipplescript_store::{
 };
 
 use crate::do_instance::{
-    CoerceProviderConfig, DoInstanceDriver, ExecutorSidecarConfig, TurnContainerConfig,
+    do_coercion_config_fingerprint, CoerceProviderConfig, DoInstanceDriver, ExecutorSidecarConfig,
+    TurnContainerConfig,
 };
 use crate::do_store::{DoSql, DoSqlStorage, DoSqliteStore};
 use crate::DoFileStore;
@@ -140,7 +141,8 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         let sql = Rc::new(sql);
         let kernel = RuntimeKernel::new(DoSqliteStore {
             sql: Rc::clone(&sql),
-        });
+        })
+        .with_coercion_config_fingerprint(do_coercion_config_fingerprint(ports.coerce.as_ref()));
         let exists = kernel
             .store()
             .list_instances()
@@ -196,7 +198,8 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         let sql = Rc::new(sql);
         let mut kernel = RuntimeKernel::new(DoSqliteStore {
             sql: Rc::clone(&sql),
-        });
+        })
+        .with_coercion_config_fingerprint(do_coercion_config_fingerprint(ports.coerce.as_ref()));
         let version = kernel
             .create_program_version_for_program(
                 ProgramVersionInput {
