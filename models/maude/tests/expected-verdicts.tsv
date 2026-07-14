@@ -21,6 +21,7 @@ construct-grammar.maude	SSSSSSSSSNNNNNNNNNNNSSSNNNNNSSSNNN
 construct-graph.maude	SSSNNNNSSSSNSNNNNNNSNSNNNSNNNNNN
 construct-interop-examples.maude	SNSNSNSNSNSNSN
 construct-lowering.maude	SSSSSNNNNNNNNNNNNNNNNNSNSSSSSS
+contradiction-reopener.maude	NSSNS
 delegated-settings-authority.maude	SSNN
 delegated-wire-lifecycle.maude	SSSNNN
 discriminant-schema.maude	SSSSSNNN
@@ -78,6 +79,7 @@ restore-replay.maude	SNSN
 script-capability-seeding.maude	SNN
 seam-crossing.maude	SSNNSS
 selective-undo.maude	SNSSN
+settle-stopping.maude	NSSSN
 skills-never-grant.maude	SSNN
 stat-cache.maude	SNSNSSNS
 std-construct-authorization.maude	SSSNNNNSN
