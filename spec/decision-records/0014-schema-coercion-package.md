@@ -17,9 +17,25 @@ Amended per spec/std-coercion.md ("Idempotency And Replay"): the
 and `coercion_config_fingerprint` (host-supplied at kernel construction), so
 a changed prompt/schema/backend re-runs future coercions instead of replaying
 a stale terminal. The "provider configuration as library concepts" exclusion
-is superseded for the OPERATOR plane only: `std.coercion` is an
-operator-config package (registry rows + CLI surface), never a source
-construct — the core "should not own" list stands unchanged.
+is superseded for the OPERATOR plane only — i.e. narrowed to
+"workflow-visible library concepts": `std.coercion` is an operator-config
+package (registry rows + CLI surface), never a source construct — the core
+"should not own" list stands unchanged.
+
+Further amendments per spec/std-coercion.md ("Spec amendments"):
+
+- **"coerce Backend Modes" + "Responsibilities":** interop mode (`.coerce`
+  include/bind for existing backend artifacts) is OBSOLETE — it was BAML-era
+  surface and the backend was purged; a new interop demand is a new design,
+  not a re-entry. Artifact generation ("generated mode") moves to the
+  deferred list with its re-entry condition: a `schema_coercer` backend
+  that genuinely compiles artifacts (native structured outputs synthesize
+  the schema per call, so there is no artifact plane to lock today).
+- **"Naming" + "Core Surface":** the required capability is `schema.coerce`
+  (id == kind per the capability-planes rule; the never-enforced
+  `model.invoke` dies — the kernel and the seeded registry rows already
+  said `schema.coerce`), and `prompt` is recorded as the third core source
+  form lowering to the same effect (source_forms: coerce, decide, prompt).
 
 ## Decision
 
