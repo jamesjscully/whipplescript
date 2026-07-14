@@ -181,12 +181,16 @@ libraries[]:        std.coercion, standard:true
 capabilities[]:     schema.coerce
 providers[]:        {id fixture, kind schema_coercer} + {id native, ...}
 profiles[]:         default allowlist row containing schema.coerce
-bindings[]:         schema.coerce -> fixture (default)
+bindings[]:         schema.coerce -> fixture (default; shipped shape per the
+                    manifest validator: binding `provider` names the declared
+                    provider KIND `schema_coercer`, and `config.provider_id:
+                    "fixture"` selects the fixture path — the drift test pins
+                    the semantics)
 ```
 
 The lock-time subset check (capability-planes rule) holds by construction
 under id==kind. Migration-0001 seed rows (`coerce`, `builtin-coerce`,
-0001_runtime_store.sql:377-429) and DO bootstrap seeds (do_instance.rs:541-552)
+0001_runtime_store.sql:427-470) and DO bootstrap seeds (do_instance.rs:541-552)
 are renamed in S2; the manifest supersedes them once S6 lands. Import bite:
 advisory missing-import lint only (graduated ladder; not std.script).
 
