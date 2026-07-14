@@ -1,6 +1,25 @@
 # 0014: Schema Coercion Package
 
-Status: proposed
+Status: accepted (amended 2026-07-13 — see Amendment)
+
+## Amendment (2026-07-13, std.coercion concrete design + substrate S2)
+
+The target conceptual names below are now the SHIPPED names: the effect
+kind/capability is `schema.coerce` (S2 rename landed; `coerce` sits in the
+retired-kind store guard), the provider kind enum carries `schema_coercer`,
+and the standard package is `std.coercion`. `coerce` remains the AUTHORING
+keyword (core grammar) and the concrete backend/provider id — per this
+record's own naming table — and is no longer implementation debt.
+
+Amended per spec/std-coercion.md ("Idempotency And Replay"): the
+`schema.coerce` idempotency key additionally commits to
+`coercion_name`, `prompt_template_hash`, `output_schema_hash` (compile-time)
+and `coercion_config_fingerprint` (host-supplied at kernel construction), so
+a changed prompt/schema/backend re-runs future coercions instead of replaying
+a stale terminal. The "provider configuration as library concepts" exclusion
+is superseded for the OPERATOR plane only: `std.coercion` is an
+operator-config package (registry rows + CLI surface), never a source
+construct — the core "should not own" list stands unchanged.
 
 ## Decision
 

@@ -30,6 +30,17 @@ mod WHIPPLESCRIPT-EFFECT-KEY is
   --- instance_id and rule_commit identity are fixed context, abstracted away.
   op key : Version Node -> Key [ctor] .
 
+  --- schema.coerce key commitments, S2 rider per spec/std-coercion.md
+  --- "Idempotency And Replay": one abstract commitment stands for the four
+  --- committed values -- coercion_name, prompt_template_hash,
+  --- output_schema_hash, coercion_config_fingerprint. A coerce key JOINS the
+  --- commitment to identity, so a changed prompt/schema/backend re-runs the
+  --- coercion instead of replaying a stale terminal; the execution
+  --- fingerprint stays OUT of identity exactly as for ordinary effects.
+  sort Commit .
+  ops c1 c2 : -> Commit [ctor] .
+  op ckey : Version Node Commit -> Key [ctor] .
+
   --- The created-key set abstracts the store unique index on
   --- instance_id and idempotency_key. Union is idempotent, so it is a set.
   op mtKeys : -> KeySet [ctor] .
@@ -62,4 +73,15 @@ mod WHIPPLESCRIPT-EFFECT-KEY is
   crl [create-dup] : create(V, N, F) created(KS)
       => created(KS)
       if member(key(V, N), KS) = true .
+
+  --- schema.coerce creation: the commitment joins the key; the fingerprint
+  --- still does not.
+  var C : Commit .
+  op ccreate : Version Node Commit Fp -> Cfg [ctor] .
+  crl [ccreate-new] : ccreate(V, N, C, F) created(KS)
+      => effect(ckey(V, N, C), F) created(ckey(V, N, C) ; KS)
+      if member(ckey(V, N, C), KS) = false .
+  crl [ccreate-dup] : ccreate(V, N, C, F) created(KS)
+      => created(KS)
+      if member(ckey(V, N, C), KS) = true .
 endm

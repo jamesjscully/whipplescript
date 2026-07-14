@@ -3562,6 +3562,335 @@ fn otel_export_rekeys_cursor_per_endpoint() {
     let _ = fs::remove_file(coordination);
 }
 
+/// A workflow with a schema-typed effect run: the coerce output (`Verdict`)
+/// is the effect-run output content the T4 allowlist can declassify.
+const COERCE_OTEL_SOURCE: &str = r#"
+workflow CoerceOtel
+
+output result Done
+failure error Failed
+
+class Done {
+  note string
+}
+
+class Failed {
+  reason string
+}
+
+class Verdict {
+  label string
+  score float
+}
+
+coerce judge(text string) -> Verdict {
+  prompt """markdown
+  Judge this text: {{ text }}
+
+  {{ ctx.output_format }}
+  """
+}
+
+rule seed
+  when started
+=> {
+  coerce judge("hello world") as v
+
+  after v succeeds {
+    complete result {
+      note v.label
+    }
+  }
+  after v fails {
+    fail error {
+      reason "could not judge"
+    }
+  }
+}
+"#;
+
+/// Stand up an instance with one completed schema-typed (coerce) run, for the
+/// T4 content-allowlist tests below.
+fn otel_allowlist_fixture(bin: &str, label: &str) -> (PathBuf, PathBuf, String) {
+    let store = temp_path(label, "sqlite");
+    let source = temp_path(label, "whip");
+    fs::write(&source, COERCE_OTEL_SOURCE).expect("write source");
+    let dev = dev_until_idle(
+        bin,
+        store.to_str().expect("utf-8"),
+        source.to_str().expect("utf-8"),
+        &[],
+    );
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+    (store, source, instance)
+}
+
+/// Run `otel-export --dry-run` and parse the printed OTLP payload.
+fn otel_dry_run_payload(output: &std::process::Output) -> Value {
+    assert!(
+        output.status.success(),
+        "otel-export --dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&stdout[stdout.find('{').expect("payload json")..])
+        .expect("payload parses")
+}
+
+/// Collect every `whipplescript.field.*` attribute key/value across the
+/// payload's spans.
+fn otel_field_attributes(payload: &Value) -> Vec<(String, String)> {
+    payload
+        .pointer("/resourceSpans/0/scopeSpans/0/spans")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|span| span.get("attributes").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|attr| {
+            let key = attr.get("key").and_then(Value::as_str)?;
+            key.starts_with("whipplescript.field.").then(|| {
+                (
+                    key.to_owned(),
+                    attr.pointer("/value/stringValue")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// T4: an allowlisted `<Schema>.<field>` exports as span attribute
+/// `whipplescript.field.<Schema>.<field>` on the producing run's span; the
+/// env carrier works too, and the flag wins over the env.
+#[test]
+fn otel_export_allowlisted_field_exports_as_attribute() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, instance) = otel_allowlist_fixture(bin, "otel-allow");
+    let store_str = store.to_str().expect("utf-8");
+
+    let flagged = Command::new(bin)
+        .args([
+            "--store",
+            store_str,
+            "otel-export",
+            &instance,
+            "--dry-run",
+            "--telemetry-allowlist",
+            "Verdict.label",
+        ])
+        .env_remove("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
+        .output()
+        .expect("otel-export runs");
+    let fields = otel_field_attributes(&otel_dry_run_payload(&flagged));
+    assert_eq!(
+        fields.len(),
+        1,
+        "exactly the allowlisted field exports: {fields:?}"
+    );
+    assert_eq!(fields[0].0, "whipplescript.field.Verdict.label");
+    assert!(
+        !fields[0].1.is_empty(),
+        "the coerce output value rides the attribute"
+    );
+
+    // The env variable is the second carrier.
+    let from_env = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
+        .env("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST", "Verdict.score")
+        .output()
+        .expect("otel-export runs");
+    let fields = otel_field_attributes(&otel_dry_run_payload(&from_env));
+    assert_eq!(fields.len(), 1, "{fields:?}");
+    assert_eq!(fields[0].0, "whipplescript.field.Verdict.score");
+
+    // The flag wins over the env.
+    let both = Command::new(bin)
+        .args([
+            "--store",
+            store_str,
+            "otel-export",
+            &instance,
+            "--dry-run",
+            "--telemetry-allowlist",
+            "Verdict.score",
+        ])
+        .env("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST", "Verdict.label")
+        .output()
+        .expect("otel-export runs");
+    let fields = otel_field_attributes(&otel_dry_run_payload(&both));
+    assert_eq!(fields.len(), 1, "flag replaces env entirely: {fields:?}");
+    assert_eq!(fields[0].0, "whipplescript.field.Verdict.score");
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// T4: a field that is NOT on the allowlist never exports, and with no
+/// allowlist at all no content attribute exists anywhere in the payload.
+#[test]
+fn otel_export_non_allowlisted_field_never_exports() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, instance) = otel_allowlist_fixture(bin, "otel-deny");
+    let store_str = store.to_str().expect("utf-8");
+
+    let partial = Command::new(bin)
+        .args([
+            "--store",
+            store_str,
+            "otel-export",
+            &instance,
+            "--dry-run",
+            "--telemetry-allowlist",
+            "Verdict.label",
+        ])
+        .env_remove("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
+        .output()
+        .expect("otel-export runs");
+    let keys = otel_field_attributes(&otel_dry_run_payload(&partial))
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    assert!(
+        !keys.iter().any(|key| key.contains("score")),
+        "non-allowlisted `Verdict.score` must never export: {keys:?}"
+    );
+    assert_eq!(keys, ["whipplescript.field.Verdict.label"]);
+
+    let structural = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
+        .env_remove("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
+        .output()
+        .expect("otel-export runs");
+    let stdout = String::from_utf8_lossy(&structural.stdout);
+    assert!(
+        !stdout.contains("whipplescript.field."),
+        "no allowlist => no content attributes at all"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// T4: an unknown schema/field or a malformed entry is a config error (exit 2,
+/// no payload), and an allowlist whose program schemas are unreachable is
+/// refused (fail closed).
+#[test]
+fn otel_export_rejects_bad_allowlist_entries() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, instance) = otel_allowlist_fixture(bin, "otel-badlist");
+    let store_str = store.to_str().expect("utf-8");
+
+    let cases: [(&str, &str, &str); 4] = [
+        ("Nope.field", &instance, "does not name a declared schema"),
+        ("Verdict.nope", &instance, "does not name a declared schema"),
+        ("Verdictlabel", &instance, "malformed"),
+        // Valid shape, but no reachable program/schema info: fail closed.
+        ("Verdict.label", "no-such-instance", "refused"),
+    ];
+    for (entry, target, expected) in cases {
+        let out = Command::new(bin)
+            .args([
+                "--store",
+                store_str,
+                "otel-export",
+                target,
+                "--dry-run",
+                "--telemetry-allowlist",
+                entry,
+            ])
+            .env_remove("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
+            .output()
+            .expect("otel-export runs");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`{entry}` against `{target}` must be a config error"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(expected),
+            "`{entry}`: expected `{expected}` in: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("resourceSpans"),
+            "a config error must abort before emitting any payload: {stdout}"
+        );
+    }
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// T4: with no allowlist the export is byte-identical to the structural
+/// export — an allowlisted run differs ONLY by the added content attributes.
+#[test]
+fn otel_export_no_allowlist_is_byte_identical_structural() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, instance) = otel_allowlist_fixture(bin, "otel-ident");
+    let store_str = store.to_str().expect("utf-8");
+
+    let structural = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
+        .env_remove("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
+        .output()
+        .expect("otel-export runs");
+    let structural_payload = otel_dry_run_payload(&structural);
+
+    let allowlisted = Command::new(bin)
+        .args([
+            "--store",
+            store_str,
+            "otel-export",
+            &instance,
+            "--dry-run",
+            "--telemetry-allowlist",
+            "Verdict.label,Verdict.score",
+        ])
+        .env_remove("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
+        .output()
+        .expect("otel-export runs");
+    let mut stripped = otel_dry_run_payload(&allowlisted);
+    assert_eq!(
+        otel_field_attributes(&stripped).len(),
+        2,
+        "the allowlisted run carries both content attributes before stripping"
+    );
+
+    // Dropping the content attributes from the allowlisted payload must give
+    // back the structural payload byte-for-byte.
+    if let Some(spans) = stripped
+        .pointer_mut("/resourceSpans/0/scopeSpans/0/spans")
+        .and_then(Value::as_array_mut)
+    {
+        for span in spans {
+            if let Some(attributes) = span.get_mut("attributes").and_then(Value::as_array_mut) {
+                attributes.retain(|attr| {
+                    !attr
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .is_some_and(|key| key.starts_with("whipplescript.field."))
+                });
+            }
+        }
+    }
+    assert_eq!(
+        structural_payload.to_string(),
+        stripped.to_string(),
+        "no-allowlist spans must be byte-identical to the structural export"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
 const EVENT_SOURCE: &str = r#"
 workflow EventDemo
 

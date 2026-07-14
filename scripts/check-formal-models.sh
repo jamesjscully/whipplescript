@@ -105,7 +105,7 @@ PY
 declare -A EXPECTED_NO_SOLUTION=(
   ["trace-lifecycle-conformance.maude"]=3
   ["action-expansion.maude"]=3
-  ["effect-key.maude"]=2
+  ["effect-key.maude"]=4
   ["merge-slice.maude"]=4
   ["merge-confluence.maude"]=4
   ["text-merge-compose.maude"]=4
@@ -206,7 +206,7 @@ declare -A EXPECTED_NO_SOLUTION=(
 declare -A EXPECTED_SOLUTION=(
   ["trace-lifecycle-conformance.maude"]=10
   ["action-expansion.maude"]=2
-  ["effect-key.maude"]=3
+  ["effect-key.maude"]=4
   ["merge-slice.maude"]=6
   ["merge-confluence.maude"]=2
   ["text-merge-compose.maude"]=7

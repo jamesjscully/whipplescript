@@ -1,0 +1,14 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.time",
+  "name": "std.time",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.time",
+      "version": "0.1.0",
+      "standard": true
+    }
+  ],
+  "capabilities": []
+}

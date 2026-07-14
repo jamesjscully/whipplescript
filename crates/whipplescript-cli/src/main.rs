@@ -669,7 +669,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "artifacts" => "usage: whip artifacts <run-id>",
         "inbox" => "usage: whip inbox [<instance>|show <item>|answer <item> (--choice X|--text X) [--by NAME]]",
         "signal" => "usage: whip signal <instance> --name <name> --data <json> --program <workflow.whip> [--root <workflow>]",
-        "otel-export" => "usage: whip otel-export <instance> [--dry-run] (reads OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME)",
+        "otel-export" => "usage: whip otel-export <instance> [--dry-run] [--telemetry-allowlist <Schema.field,...>] (reads OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME, WHIPPLESCRIPT_TELEMETRY_ALLOWLIST)",
         "telemetry" => "usage: whip telemetry <status|reset-cursor> [<instance>] (export-cursor management for otel-export)",
         "leases" => "usage: whip leases [<resource>]",
         "ledger" => "usage: whip ledger [<ledger>] [--partition <value>]",
@@ -16428,6 +16428,10 @@ const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
         "std.telemetry",
         include_str!("../../../std/manifests/telemetry.json"),
     ),
+    // Identity-only (std-time.md T1): the `timer.wait` contract is compiled
+    // into the parser, so this manifest carries library identity and nothing
+    // an enforcement point reads (no capabilities, no contracts).
+    ("std.time", include_str!("../../../std/manifests/time.json")),
 ];
 
 /// Whether `name` claims the reserved `std.*` package namespace. Std packages
@@ -30419,12 +30423,23 @@ fn telemetry(options: &CliOptions) -> ExitCode {
 }
 
 fn otel_export(options: &CliOptions) -> ExitCode {
-    let usage = "usage: whip otel-export <instance> [--dry-run]\n  env: OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL (http/json), OTEL_EXPORTER_OTLP_HEADERS, OTEL_RESOURCE_ATTRIBUTES, OTEL_SERVICE_NAME";
+    let usage = "usage: whip otel-export <instance> [--dry-run] [--telemetry-allowlist <Schema.field,...>]\n  env: OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL (http/json), OTEL_EXPORTER_OTLP_HEADERS, OTEL_RESOURCE_ATTRIBUTES, OTEL_SERVICE_NAME, WHIPPLESCRIPT_TELEMETRY_ALLOWLIST";
     let mut instance_id = None;
     let mut dry_run = false;
-    for arg in &options.args {
+    let mut allowlist_flag: Option<String> = None;
+    let mut args = options.args.iter();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
+            "--telemetry-allowlist" => {
+                let Some(value) = args.next() else {
+                    eprintln!(
+                        "otel-export: --telemetry-allowlist requires a value: <Schema.field,Schema.field,...>"
+                    );
+                    return ExitCode::from(2);
+                };
+                allowlist_flag = Some(value.clone());
+            }
             other if other.starts_with('-') => {
                 eprintln!("unknown otel-export option `{other}`");
                 return ExitCode::from(2);
@@ -30450,6 +30465,25 @@ fn otel_export(options: &CliOptions) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // T4 content allowlist carrier: the flag wins over the env variable
+    // (spec/std-telemetry.md "Allowlist mechanism v1"). Shape errors are
+    // config errors before any store or network I/O.
+    let allowlist_raw = allowlist_flag.or_else(|| {
+        env::var("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    });
+    let allowlist = match allowlist_raw
+        .as_deref()
+        .map(parse_telemetry_allowlist)
+        .transpose()
+    {
+        Ok(allowlist) => allowlist,
+        Err(error) => {
+            eprintln!("otel-export: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let store = match open_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
@@ -30461,6 +30495,60 @@ fn otel_export(options: &CliOptions) -> ExitCode {
     let effects = match store.list_effects(&instance_id) {
         Ok(effects) => effects,
         Err(error) => return report_store_error("failed to list effects", error),
+    };
+    // T4 allowlist validation + content collection, before any network I/O.
+    // Validation strength (honest statement): entries validate against the
+    // *compiled program's* declared class schemas — the instance row gives
+    // its program version, whose `analysis_summary` carries the full
+    // schema/field lists the compiler recorded (kernel
+    // `program_analysis_summary_json`). This is real IR-derived schema
+    // knowledge, not a shape heuristic. An allowlist whose instance,
+    // program version, or schema catalog is unreachable is refused (fail
+    // closed); an unknown schema or field is a config error, no export.
+    let content_facts = if let Some(allowlist) = &allowlist {
+        let catalog = match otel_schema_catalog(&store, &instance_id) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                eprintln!("otel-export: {error}");
+                return ExitCode::from(2);
+            }
+        };
+        for (schema, field) in allowlist {
+            let known = catalog
+                .get(schema)
+                .is_some_and(|fields| fields.contains(field));
+            if !known {
+                eprintln!(
+                    "otel-export: telemetry allowlist entry `{schema}.{field}` does not name a declared schema field of this instance's program"
+                );
+                return ExitCode::from(2);
+            }
+        }
+        // Where allowlisted content genuinely exists on the export path
+        // (honest statement): only runs and effects export, and neither
+        // carries schema-typed field values directly — effect `input_json`
+        // is a kind-specific envelope (rule/key/path/arguments, no declared
+        // schema payload) and run `metadata_json` redacts values by design.
+        // Effect-run OUTPUT fields typed by a declared schema DO exist as
+        // completion facts (`schema.coerce.succeeded` and kin) carrying
+        // `output_type` + `value` + the producing `run_id`, so those attach
+        // to the run's span below. Plain recorded facts have no spans of
+        // their own yet (drift D8), so they do not export.
+        match store.list_facts_including_consumed(&instance_id) {
+            Ok(facts) => facts
+                .iter()
+                .filter_map(|fact| {
+                    let value = json_from_str(&fact.value_json);
+                    let run_id = value.get("run_id")?.as_str()?.to_owned();
+                    let schema = value.get("output_type")?.as_str()?.to_owned();
+                    let fields = value.get("value")?.as_object()?.clone();
+                    Some((run_id, schema, fields))
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => return report_store_error("failed to list facts", error),
+        }
+    } else {
+        Vec::new()
     };
     drop(store);
 
@@ -30531,6 +30619,34 @@ fn otel_export(options: &CliOptions) -> ExitCode {
             // model-backed spans, so fleets land in LLM dashboards natively.
             if effect.kind == "agent.tell" || effect.kind == "schema.coerce" {
                 attributes.push(otel_attr("gen_ai.system", &run.provider));
+            }
+        }
+        // T4 allowlisted content: an allowlisted `<Schema>.<field>` exports as
+        // span attribute `whipplescript.field.<Schema>.<field>` on the span of
+        // the run whose schema-typed output carried it; everything else stays
+        // structural. With no allowlist this loop never runs and the payload
+        // is byte-identical to the structural export.
+        if let Some(allowlist) = &allowlist {
+            for (fact_run_id, schema, fields) in &content_facts {
+                if fact_run_id != &run.run_id {
+                    continue;
+                }
+                for (entry_schema, field) in allowlist {
+                    if entry_schema != schema {
+                        continue;
+                    }
+                    let Some(value) = fields.get(field) else {
+                        continue;
+                    };
+                    let rendered = match value {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    attributes.push(otel_attr(
+                        &format!("whipplescript.field.{schema}.{field}"),
+                        &rendered,
+                    ));
+                }
             }
         }
         spans.push(json!({
@@ -30612,6 +30728,97 @@ fn otel_export(options: &CliOptions) -> ExitCode {
 
 fn otel_attr(key: &str, value: &str) -> Value {
     json!({"key": key, "value": {"stringValue": value}})
+}
+
+/// Parse the T4 telemetry content allowlist carrier: comma-separated
+/// `<Schema>.<field>` entries. A shape error (not exactly one dot, an empty
+/// half, or no entries at all) is a config error; whether the schema and
+/// field actually exist validates later against the instance's compiled
+/// program (spec/std-telemetry.md "Allowlist mechanism v1").
+fn parse_telemetry_allowlist(
+    raw: &str,
+) -> Result<std::collections::BTreeSet<(String, String)>, String> {
+    let mut entries = std::collections::BTreeSet::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let malformed = || {
+            format!(
+                "telemetry allowlist entry `{entry}` is malformed: expected exactly `<Schema>.<field>`"
+            )
+        };
+        let Some((schema, field)) = entry.split_once('.') else {
+            return Err(malformed());
+        };
+        if schema.is_empty() || field.is_empty() || field.contains('.') {
+            return Err(malformed());
+        }
+        entries.insert((schema.to_owned(), field.to_owned()));
+    }
+    if entries.is_empty() {
+        return Err("telemetry allowlist is empty (expected <Schema>.<field>[,...])".to_owned());
+    }
+    Ok(entries)
+}
+
+/// The declared class schemas (name -> field names) of the instance's compiled
+/// program, read from the stored program version's `analysis_summary` — the
+/// schema knowledge the export path genuinely has. Any missing link
+/// (instance, program version, or schema catalog) is an error so an allowlist
+/// can fail closed instead of silently skipping validation.
+fn otel_schema_catalog(
+    store: &SqliteStore,
+    instance_id: &str,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, String> {
+    let instance = store
+        .get_instance(instance_id)
+        .map_err(|error| {
+            format!("telemetry allowlist refused: failed to read instance: {error:?}")
+        })?
+        .ok_or_else(|| {
+            format!(
+                "telemetry allowlist refused: instance `{instance_id}` not found, so no program schemas are reachable to validate against"
+            )
+        })?;
+    let version = store
+        .get_program_version(&instance.version_id)
+        .map_err(|error| {
+            format!("telemetry allowlist refused: failed to read program version: {error:?}")
+        })?
+        .ok_or_else(|| {
+            format!(
+                "telemetry allowlist refused: program version `{}` not found, so no program schemas are reachable to validate against",
+                instance.version_id
+            )
+        })?;
+    let summary = json_from_str(&version.analysis_summary_json);
+    let Some(schemas) = summary.get("schemas").and_then(Value::as_array) else {
+        return Err(
+            "telemetry allowlist refused: this program version carries no schema catalog to validate against"
+                .to_owned(),
+        );
+    };
+    let mut catalog = std::collections::BTreeMap::new();
+    for schema in schemas {
+        let Some(name) = schema.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let fields = schema
+            .get("fields")
+            .and_then(Value::as_array)
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter_map(|field| field.get("name").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        catalog.insert(name.to_owned(), fields);
+    }
+    Ok(catalog)
 }
 
 /// `YYYY-MM-DD HH:MM:SS` (store timestamps) to Unix nanoseconds, best-effort.
@@ -41833,6 +42040,10 @@ workflow EmbeddedMemory
 
 use std.memory
 
+memory pool project_memory {
+  context limit 8
+}
+
 class Task {
   title string
 }
@@ -42206,6 +42417,10 @@ workflow PackageGraph
 
 use std.memory
 
+memory pool project_memory {
+  context limit 8
+}
+
 class Task {
   title string
 }
@@ -42230,6 +42445,10 @@ rule start
 workflow PackageGraph
 
 use std.memory
+
+memory pool project_memory {
+  context limit 8
+}
 
 class Task {
   title string

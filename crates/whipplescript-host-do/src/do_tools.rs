@@ -964,7 +964,10 @@ mod tests {
         let second = DoToolExecutor::for_instance(sql, "instance-b");
         assert_eq!(
             first
-                .execute(&call("write", json!({ "path": "same.txt", "content": "a" })))
+                .execute(&call(
+                    "write",
+                    json!({ "path": "same.txt", "content": "a" })
+                ))
                 .status,
             ToolStatus::Ok,
         );
@@ -974,13 +977,20 @@ mod tests {
                 .status,
             ToolStatus::Error,
         );
-        second.execute(&call("write", json!({ "path": "same.txt", "content": "b" })));
+        second.execute(&call(
+            "write",
+            json!({ "path": "same.txt", "content": "b" }),
+        ));
         assert_eq!(
-            first.execute(&call("read", json!({ "path": "same.txt" }))).content,
+            first
+                .execute(&call("read", json!({ "path": "same.txt" })))
+                .content,
             "a",
         );
         assert_eq!(
-            second.execute(&call("read", json!({ "path": "same.txt" }))).content,
+            second
+                .execute(&call("read", json!({ "path": "same.txt" })))
+                .content,
             "b",
         );
     }

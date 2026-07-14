@@ -29,3 +29,21 @@ search [1] in WHIPPLESCRIPT-EFFECT-KEY :
 search [1] in WHIPPLESCRIPT-EFFECT-KEY :
   create(v1, n1, fpA) create(v1, n1, fpB) created(mtKeys)
   =>* effect(key(v1, n1), fpA) effect(key(v1, n1), fpB) RESIDUAL:Cfg .
+
+--- Coverage of the S2 coerce commitments: the SAME version-node under a
+--- CHANGED commitment (prompt/schema/backend moved) is a DISTINCT effect --
+--- the coercion re-runs instead of replaying a stale terminal.
+search [1] in WHIPPLESCRIPT-EFFECT-KEY :
+  ccreate(v1, n1, c1, fpA) ccreate(v1, n1, c2, fpA) created(mtKeys)
+  =>! C:Cfg effect(ckey(v1, n1, c1), fpA) effect(ckey(v1, n1, c2), fpA) .
+
+--- Bite: an UNCHANGED commitment repeated dedups to one effect.
+search [1] in WHIPPLESCRIPT-EFFECT-KEY :
+  ccreate(v1, n1, c1, fpA) ccreate(v1, n1, c1, fpA) created(mtKeys)
+  =>* effect(ckey(v1, n1, c1), F1:Fp) effect(ckey(v1, n1, c1), F2:Fp) RESIDUAL:Cfg .
+
+--- Bite: the execution fingerprint stays OUT of coerce identity too -- same
+--- commitment, different fingerprint still yields exactly one effect.
+search [1] in WHIPPLESCRIPT-EFFECT-KEY :
+  ccreate(v1, n1, c1, fpA) ccreate(v1, n1, c1, fpB) created(mtKeys)
+  =>* effect(ckey(v1, n1, c1), fpA) effect(ckey(v1, n1, c1), fpB) RESIDUAL:Cfg .

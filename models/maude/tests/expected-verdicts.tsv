@@ -27,7 +27,7 @@ delegated-wire-lifecycle.maude	SSSNNN
 discriminant-schema.maude	SSSSSNNN
 effect-dependencies.maude	NSNSSS
 effect-error.maude	SSSSNNN
-effect-key.maude	SSSNN
+effect-key.maude	SSSNNSNN
 expression-kernel.maude	NNSSNNSNSSNSSSSSNNSNSNSSNNSSNSNSNS
 external-event-loop.maude	NSS
 flow-autofail.maude	SSSNNN

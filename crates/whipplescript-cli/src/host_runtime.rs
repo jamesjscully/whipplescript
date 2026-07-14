@@ -5133,10 +5133,7 @@ workflow HostChat {
             "virtual bash preserves the complete workspace witness"
         );
         let guarantee4 = guarantee_metadata(&runtime, &command4);
-        assert_eq!(
-            dynamic_outcome(&guarantee4, "writes_within:src").0,
-            "held"
-        );
+        assert_eq!(dynamic_outcome(&guarantee4, "writes_within:src").0, "held");
 
         drop(runtime);
         let _ = fs::remove_dir_all(&workspace);

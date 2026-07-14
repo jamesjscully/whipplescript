@@ -4,6 +4,7 @@ use whipplescript_kernel::{
     coerce::{CoerceRequest, FakeCoerceClient},
     harness::MockAgentHarness,
     idempotency_key,
+    time_pass::resolve_due_clock_sources,
     trace::check_trace,
     AgentTurnExecution, CoerceExecution, HumanAskExecution, ProgramVersionInput, RuntimeKernel,
 };
@@ -1109,6 +1110,88 @@ fn e2e_child_revision_parent_observes_terminal_output() {
         .expect("child loads")
         .expect("child exists");
     assert_eq!(child.status, "completed");
+}
+
+#[test]
+fn e2e_at_form_clock_source_fires_once_then_stays_quiet() {
+    // `at <hh:mm>` is one scheduled occurrence (spec/std-time.md "Recurrence
+    // Forms", slice T3): the first upcoming occurrence of that time-of-day
+    // fires exactly once, then the source stays quiet — later worker passes,
+    // including one a full day later (past the next occurrence of the same
+    // time-of-day), must not refire it.
+    let source = r#"@service
+workflow ClockAtOnce
+
+signal wake.tick {
+  scheduled_at time
+  observed_at time
+  occurrence_id string
+  missed_count int
+  schedule_name string
+}
+
+source clock as wake_once {
+  at 09:00
+
+  observe as tick
+  emit wake.tick {
+    scheduled_at tick.scheduled_at
+    observed_at tick.observed_at
+    occurrence_id tick.occurrence_id
+    missed_count tick.missed_count
+    schedule_name tick.schedule_name
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    assert_eq!(compiled.diagnostics, Vec::new());
+    let ir = compiled.ir.expect("clock source compiles");
+    let (mut kernel, instance_id) = kernel_from_source("ClockAtOnce", source);
+
+    let first = resolve_due_clock_sources(&mut kernel, &instance_id, "2030-01-02T12:00:00Z", &ir)
+        .expect("first worker pass resolves");
+    assert_eq!(first, 1, "the at-form source fires exactly once when due");
+    let second = resolve_due_clock_sources(&mut kernel, &instance_id, "2030-01-03T12:00:00Z", &ir)
+        .expect("second worker pass resolves");
+    assert_eq!(
+        second, 0,
+        "a pass past the next day's occurrence of the same time-of-day must not refire"
+    );
+    let much_later =
+        resolve_due_clock_sources(&mut kernel, &instance_id, "2031-06-01T12:00:00Z", &ir)
+            .expect("much later worker pass resolves");
+    assert_eq!(much_later, 0, "the one-shot source stays quiet forever");
+
+    // Exactly one durable signal fact was admitted, carrying the full declared
+    // ClockObservation field set including `schedule_name` (slice T2).
+    let store = kernel.into_store();
+    let facts = store.list_facts(&instance_id).expect("facts list");
+    let ticks: Vec<_> = facts
+        .iter()
+        .filter(|fact| fact.name == "wake.tick")
+        .collect();
+    assert_eq!(ticks.len(), 1, "exactly one admitted occurrence: {ticks:?}");
+    let payload: serde_json::Value =
+        serde_json::from_str(&ticks[0].value_json).expect("tick payload is JSON");
+    for field in [
+        "scheduled_at",
+        "observed_at",
+        "occurrence_id",
+        "missed_count",
+        "schedule_name",
+    ] {
+        assert!(
+            !payload.get(field).map_or(true, serde_json::Value::is_null),
+            "observation field `{field}` missing from payload: {payload}"
+        );
+    }
+    assert_eq!(
+        payload
+            .get("schedule_name")
+            .and_then(serde_json::Value::as_str),
+        Some("wake_once"),
+        "schedule_name carries the source's declared name: {payload}"
+    );
 }
 
 fn kernel_from_source(name: &str, source: &str) -> (RuntimeKernel, String) {

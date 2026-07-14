@@ -7950,6 +7950,10 @@ workflow CapabilityCall
 
 use std.memory
 
+memory pool project_memory {
+  context limit 8
+}
+
 class WorkItem {
   title string
 }
@@ -9498,10 +9502,12 @@ signal heartbeat.tick {
   observed_at time
   occurrence_id string
   missed_count int
+  schedule_name string
 }
 
 class Beat {
   id string
+  schedule string
 }
 
 source clock as beat {
@@ -9514,6 +9520,7 @@ source clock as beat {
     observed_at tick.observed_at
     occurrence_id tick.occurrence_id
     missed_count tick.missed_count
+    schedule_name tick.schedule_name
   }
 }
 
@@ -9522,6 +9529,7 @@ rule on_beat
 => {
   record Beat {
     id tick.occurrence_id
+    schedule tick.schedule_name
   }
 }
 
@@ -9531,6 +9539,7 @@ test "interval clock fires when due" {
   run until idle
   expect rule on_beat fired
   expect Beat count where id != "" is 1
+  expect Beat count where schedule == "beat" is 1
 }
 
 test "interval clock holds before the first tick" {
@@ -12431,6 +12440,10 @@ fn check_resolves_embedded_memory_then_coexists_with_discovered_lock() {
 workflow LockDiscovery
 
 use std.memory
+
+memory pool project_memory {
+  context limit 8
+}
 
 class WorkItem {
   title string

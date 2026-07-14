@@ -1772,6 +1772,9 @@ struct SemanticContext {
     counters: BTreeSet<String>,
     /// Declared `channel` names (std.messaging); `send via <channel>` must name one.
     channels: BTreeSet<String>,
+    /// Declared `memory pool` names (std.memory); `recall`/`learn`/`curate`
+    /// must name one (MEM-1 check 1).
+    memory_pools: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3036,6 +3039,9 @@ impl IrProgram {
         }
         if !self.channels.is_empty() {
             register_standard_library(&mut libraries, "std.messaging");
+        }
+        if self.sources.iter().any(|source| source.is_clock) {
+            register_standard_library(&mut libraries, "std.time");
         }
         if !self.coerces.is_empty() {
             register_standard_library(&mut libraries, "std.coercion");
@@ -5668,6 +5674,7 @@ impl SemanticContext {
         let mut ledgers = BTreeSet::new();
         let mut counters = BTreeSet::new();
         let mut channels = BTreeSet::new();
+        let mut memory_pools = BTreeSet::new();
 
         for item in &program.items {
             schemas.insert_item(item);
@@ -5705,6 +5712,9 @@ impl SemanticContext {
                 Item::Channel(channel) => {
                     channels.insert(channel.name.name.clone());
                 }
+                Item::MemoryPool(pool) => {
+                    memory_pools.insert(pool.name.name.clone());
+                }
                 _ => {}
             }
         }
@@ -5724,6 +5734,7 @@ impl SemanticContext {
             ledgers,
             counters,
             channels,
+            memory_pools,
         }
     }
 }
@@ -8241,6 +8252,26 @@ fn validate_send_channels(
                                         ),
                                         suggestion: Some(
                                             "declare it with `channel <name> { provider … }`, or correct the channel name"
+                                                .to_owned(),
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        // MEM-1 check 1: the memory operations must name a
+                        // DECLARED pool — the twin of the send-channel check.
+                        if matches!(keyword.as_str(), "recall" | "learn" | "curate") {
+                            if let Some(pool) = fields.iter().find(|field| field.name == "pool") {
+                                if !semantic.memory_pools.contains(&pool.source) {
+                                    diagnostics.push(Diagnostic {
+                                        related: Vec::new(),
+                                        span: effect.span,
+                                        message: format!(
+                                            "`{keyword}` names unknown memory pool `{}`",
+                                            pool.source
+                                        ),
+                                        suggestion: Some(
+                                            "declare it with `memory pool <name> { … }`, or correct the pool name"
                                                 .to_owned(),
                                         ),
                                     });
@@ -15294,6 +15325,7 @@ fn validate_source_emit_signal_declared(
             "observed_at",
             "occurrence_id",
             "missed_count",
+            "schedule_name",
         ]),
         "file" => Some(&["line", "line_index", "path"]),
         "http" => Some(&["item", "item_index", "url"]),
@@ -22545,6 +22577,10 @@ workflow PackageRecall
 
 use memory
 
+memory pool project_memory {
+  context limit 8
+}
+
 class Task {
   title string
 }
@@ -22588,6 +22624,10 @@ rule start
         r#"
 workflow B1gMatrix {
   use memory
+
+  memory pool project_memory {
+    context limit 8
+  }
 
   output result Done
   failure error Failed
@@ -30826,6 +30866,18 @@ source clock as daily_triage {
             }
             other => panic!("expected calendar recurrence, got {other:?}"),
         }
+        // T1 (spec/std-time.md): declaring a clock source registers the
+        // std.time standard library, exactly as a channel declaration
+        // registers std.messaging.
+        let registry = ir.contract_registry();
+        assert!(
+            registry
+                .libraries
+                .iter()
+                .any(|library| library.id == "std.time" && library.standard),
+            "clock source registers std.time: {:?}",
+            registry.libraries
+        );
     }
 
     #[test]

@@ -150,11 +150,9 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         if !exists {
             return Err(format!("no governed host instance `{instance_id}`"));
         }
-        let default_files: Box<dyn FileStore> =
-            Box::new(DoFileStore::new(DoSqlStorage::for_instance(
-                Rc::clone(&sql),
-                instance_id,
-            )));
+        let default_files: Box<dyn FileStore> = Box::new(DoFileStore::new(
+            DoSqlStorage::for_instance(Rc::clone(&sql), instance_id),
+        ));
         Ok(Self {
             kernel: Some(kernel),
             ir,
@@ -163,14 +161,12 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             files: ports.files.unwrap_or(default_files),
             coerce: ports.coerce,
             agent_model: ports.agent_model,
-            agent_tools: ports
-                .agent_tools
-                .unwrap_or_else(|| {
-                    Box::new(crate::do_tools::DoToolExecutor::for_instance(
-                        Rc::clone(&sql),
-                        instance_id,
-                    ))
-                }),
+            agent_tools: ports.agent_tools.unwrap_or_else(|| {
+                Box::new(crate::do_tools::DoToolExecutor::for_instance(
+                    Rc::clone(&sql),
+                    instance_id,
+                ))
+            }),
             exec: ports.exec,
             turn: ports.turn,
         })
