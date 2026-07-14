@@ -290,6 +290,10 @@ Other analyses:
   everything under the root (`**` / `**/*`): broader than any concrete call needs.
 - **`lint.deep_after_nesting`** (`info`) — a rule nesting `after` blocks ≥4 levels
   deep; a long effect chain reads more clearly as a `flow`.
+- **`lint.mark_off_consumption_boundary`** — a `mark` whose frozen prefix carries a
+  settled effect from a rule that never consumes its trigger: replaying a changed
+  candidate re-derives the effect (a refire), so prefix replay refuses pre-flight
+  and the pin degrades to input replay. Consume the trigger or move the mark.
 - **`lint.tool_grant_requires_owned_harness`** — an agent with a `tools [...]`
   grant (DR-0025) that does not use the owned harness (`provider owned`, or a
   harness of kind `owned`); the grant is dead because sub-workflow tools are only
@@ -1105,9 +1109,38 @@ frozen prefix; the recorded run is scored in place as the paired control;
 output is per-gauge `recorded → regenerated` with pass verdicts, replay
 accounting (events replayed, refires), and honesty tags
 (`prefix-replay`, `replay-refire`, `clock-sensitive`, `replay-fallback`).
-Every suppose lands in the evidence ledger. A candidate program that is
-not revision-compatible with the frozen prefix degrades honestly to input
-replay.
+Each gauge line carries `p_better` — the Bayesian sign test over the
+(recorded, regenerated) pair under a Jeffreys prior — when both sides
+carry bar verdicts (a single continuous delta has no scale, so the
+t-family stays silent at N=1). Every suppose lands in the evidence
+ledger. A candidate program that is not revision-compatible with the
+frozen prefix degrades honestly to input replay.
+
+### `settle`
+
+```
+whip [--json] settle <gauge> [--certify] [--threshold <k>] [--spend-cap $<n>]
+     [--program <workflow.whip>] [--root <workflow>]
+     [--provider <name>] [--provider-config <path>]
+```
+
+Names the decision (the gauge's declared bar — a gauge without one is
+refused) and lets the system stop itself: regenerations race round-robin
+over the pinned scenarios, each bar-passing observation raising the
+evidence level and each contrary one lowering it (floored at zero), until
+the level crosses the threshold (`bar-cleared`) or a full pass over the
+pool adds no net evidence — an honest `undetermined`, never an
+operator-chosen sample size. The crossing is anytime-valid (sequential
+e-process shape), so stopping at it is sound. `--certify` records the
+crossing observation with a `certificate` tag and mints a certificate id.
+`--spend-cap` is a guardrail in currency, never a sample size: it stops
+the race (an honest `undetermined`, reason `spend-cap-reached`) when the
+**priced** cost of regenerations crosses it, rated by the provider
+config's `prices` block; unpriced usage cannot bind it. Every settle
+regeneration lands in the evidence ledger tagged `settle`. Alongside
+the walk, `p_bar_met` reads out the Jeffreys Beta posterior that a
+regeneration clears the bar (referenced at the chance bar's own rate) —
+a readout, never the stopping rule.
 
 ### `gauges`
 
@@ -1117,7 +1150,14 @@ whip [--json] gauges [<gauge>]
 
 The accumulated gauge evidence: mean, N with the regen/live decomposition,
 and pass counts. Ambient rows land from `whip dev` automatically for
-deterministic judges (exec + builtins).
+deterministic judges (exec + builtins). The output also carries
+**standing-contradiction flags**: for every accepted tradeoff answer,
+live evidence under the accepted candidate's program hash folds into a
+contradiction posterior against the answer-time operating point, and a ⚠
+line (JSON `contradictions`) is raised only when the posterior sits at
+≥ 0.8 and has not receded over the last three informative observations —
+sustained, never a spike. The flag is advisory and cites the precedent;
+revoking the answer stays `whip answer --revoke`.
 
 ### `improve`
 
@@ -1131,9 +1171,22 @@ whip [--json] improve [<gauge>[>=<target>] ... [then ...] | <campaign>]
 Runs an improvement campaign. The partition is expressed by which gauges
 you name: named gauges ascend, unnamed gauges are guarded within
 indifference bands, `--sacrifice` releases, declared bars are always hard.
+`--spend-cap` is enforced against **priced** recorded cost: rates come
+from the provider config's `prices` block (USD per million tokens, per
+provider/model, input and output separately — config-only, no shipped
+defaults); usage with no matching rate records honestly as `unpriced`
+with cost 0 and cannot bind the cap. A campaign that crosses its cap
+**parks** (`campaign.parked` in the record, `"parked": true` in the
+report); `whip improve --resume <campaign-id>` continues it under a
+fresh per-invocation allowance (the spec, program, and candidate
+numbering come from the record; a changed program refuses on the
+baseline-hash guard).
 Inline targets (`extract_quality>=0.9`) become reach bounds; `then`
-separates lexicographic stages (v1 executes the first; later stages are
-recorded). A single positional naming a declared `campaign` adopts its
+separates lexicographic stages with ratchet semantics: a stage whose
+reach targets the baseline already meets advances at invocation time —
+its achieved levels become hard guard floors for later stages (recorded
+as `stage.advanced` campaign events), and a target-less stage is
+open-ended maximization that never auto-advances. A single positional naming a declared `campaign` adopts its
 spec. Bare `whip improve` is repair mode. The loop: seal a holdout
 (20% / floor 2 of pinned scenarios; below 4 scenarios the campaign runs
 tagged `unheld-out`), evaluate the baseline, then propose → static-gate →

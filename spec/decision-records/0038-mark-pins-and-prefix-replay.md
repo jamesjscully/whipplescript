@@ -131,7 +131,10 @@ mode-aware identity lands).
   the live store (and egress-door diversion) remains the
   versioned-workspace dependency.
 - Refire detection is post-hoc tagging; the pre-flight refusal and
-  consumption-boundary lint are follow-ons.
+  consumption-boundary lint are follow-ons. *(Both landed 2026-07-14: a
+  refire-shaped candidate is refused before any suffix work runs and
+  degrades to input replay; `lint.mark_off_consumption_boundary` flags
+  the mark placement statically.)*
 - `mark.reached` stamps inside the rule-commit transaction (native and
   DO), so a durable commit can never lose its cut coordinate; rule-level
   `cancels` still land after the commit, which is why the cancel scan

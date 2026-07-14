@@ -209,7 +209,7 @@ fn main() -> ExitCode {
         Some("counters") => coordination_list(&options, "counters"),
         Some("issue") => issue(&options),
         Some("memory") => memory_command(&options),
-        Some("evidence") => evidence(&options),
+        Some("evidence") => evidence_router(&options),
         Some("improve") => improve::improve_command(&options),
         Some("campaigns") => improve::campaigns_command(&options),
         Some("campaign") => improve::campaign_detail_command(&options),
@@ -217,6 +217,7 @@ fn main() -> ExitCode {
         Some("answer") => improve::answer_command(&options),
         Some("pin") => improve::pin_command(&options),
         Some("suppose") => improve::suppose_command(&options),
+        Some("settle") => improve::settle_command(&options),
         Some("gauges") => improve::gauges_command(&options),
         Some("diagnostics") => diagnostics(&options),
         Some("trace") => trace(&options),
@@ -630,7 +631,7 @@ fn print_usage() {
         "          artifacts, inbox, signal, issue, leases, ledger, counters, evidence, diagnostics, trace"
     );
     println!("          otel-export, pause, resume, cancel, checkpoint, restore, fork, retry, recover, doctor, deploy");
-    println!("          improve, campaigns, campaign, adopt, answer, pin, suppose, gauges");
+    println!("          improve, campaigns, campaign, adopt, answer, pin, suppose, settle, gauges");
     println!("run `whip <command> --help` or `whip help <command>` for command usage");
 }
 
@@ -638,13 +639,14 @@ fn command_usage(command: &str) -> Option<&'static str> {
     Some(match command {
         "check" => "usage: whip check [--model-search] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--package-lock <path>] <workflow.whip>...",
         "lint" => "usage: whip [--json] lint [--root <workflow>] <workflow.whip>",
-        "improve" => "usage: whip [--json] improve [<gauge>[><=<target>] ... [then ...] | <campaign>] [--program <workflow.whip>] [--sacrifice <gauge>] [--within <gauge>=<band>%] [--spend-cap $<n>] [--proposer fixture|native] [--provider <name>] [--redacted-view]\n  bare `whip improve` = repair mode (restore violated bars, touch nothing else)",
+        "improve" => "usage: whip [--json] improve [<gauge>[><=<target>] ... [then ...] | <campaign> | --resume <campaign-id>] [--program <workflow.whip>] [--sacrifice <gauge>] [--within <gauge>=<band>%] [--spend-cap $<n>] [--proposer fixture|native] [--provider <name>] [--provider-config <path>] [--redacted-view]\n  bare `whip improve` = repair mode (restore violated bars, touch nothing else); --resume continues a campaign parked on its spend cap (fresh per-invocation allowance)\n  spend prices from the provider config's `prices` block (USD per Mtok per provider/model); unpriced usage records cost 0 and cannot bind the cap",
         "campaigns" => "usage: whip [--json] campaigns",
         "campaign" => "usage: whip [--json] campaign <id>",
         "adopt" => "usage: whip [--json] adopt <campaign>:<candidate> [--program <workflow.whip>]",
         "answer" => "usage: whip [--json] answer <campaign>:<candidate> --accept|--reject|--revoke [--by <who>]\n  answers a surfaced tradeoff; the answer is a precedent that auto-resolves future tradeoffs it Pareto-dominates",
         "pin" => "usage: whip [--json] pin <instance> [at <mark>] --as <name>",
         "suppose" => "usage: whip [--json] suppose <scenario> [--program <workflow.whip>] [--root <workflow>] [--provider <name>] [--provider-config <path>]\n  one what-if regeneration of the pinned scenario; mark pins replay the frozen prefix and re-execute only the suffix",
+        "settle" => "usage: whip [--json] settle <gauge> [--certify] [--threshold <k>] [--spend-cap $<n>] [--program <workflow.whip>] [--root <workflow>] [--provider <name>] [--provider-config <path>]\n  name the decision and let the system stop itself: races regenerations over the pinned scenarios until the gauge's bar is cleared or evidence is exhausted (an honest undetermined) — never an operator-chosen N\n  --spend-cap is a guardrail in currency over PRICED regeneration cost (provider config `prices` block); unpriced usage cannot bind it",
         "gauges" => "usage: whip [--json] gauges [<gauge>]",
         "lsp" => "usage: whip lsp   (Language Server over stdio; launched by an editor)",
         "compile" => "usage: whip compile [--model-search] [--root <workflow>] [--package-lock <path>] <workflow.whip>",
@@ -674,7 +676,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "counters" => "usage: whip counters [<counter>]",
         "issue" => ISSUE_USAGE,
         "memory" => "usage: whip memory <pools|entries <pool> [--limit <n>]> (the workspace memory store; WHIPPLESCRIPT_MEMORY_STORE overrides the path)",
-        "evidence" => "usage: whip evidence <instance>",
+        "evidence" => "usage: whip [--json] evidence [<gauge>] | whip evidence instance <instance-id>\n  bare/gauge form = the gauge evidence view (estimates + standing-contradiction flags; same as `whip gauges`); `instance` = a run's provider evidence chain",
         "diagnostics" => "usage: whip diagnostics [--grouped] <instance>",
         "trace" => "usage: whip trace <instance> [--check]",
         "pause" => "usage: whip pause <instance>",
@@ -1790,6 +1792,83 @@ fn lint_tool_grant_requires_owned_harness(ir: &IrProgram) -> Vec<LintFinding> {
         .collect()
 }
 
+/// Marks placed off a consumption boundary (DR-0038's replay hazard): a mark
+/// whose frozen prefix can carry a settled effect from a rule that never
+/// consumes its trigger. Under a textually-different candidate the replay
+/// driver activates a revision, the still-live trigger re-derives the effect
+/// with a fresh id (a refire), and prefix replay refuses pre-flight —
+/// degrading the pin to input replay. The pre-cut set is exact (only the
+/// site's transitive fact producers, which commit before the mark in any run
+/// that reaches it) and the trigger must be consumed by NO rule at all, so a
+/// flagged mark degrades in every changed-candidate replay: no false
+/// positives.
+fn lint_mark_consumption_boundaries(ir: &IrProgram) -> Vec<LintFinding> {
+    let mut writers: std::collections::BTreeMap<&str, Vec<&whipplescript_parser::IrRule>> =
+        std::collections::BTreeMap::new();
+    for rule in &ir.rules {
+        for written in &rule.metadata.fact_writes {
+            writers.entry(written.as_str()).or_default().push(rule);
+        }
+    }
+    let consumed_somewhere: std::collections::BTreeSet<&str> = ir
+        .rules
+        .iter()
+        .flat_map(|rule| rule.metadata.fact_consumes.iter().map(String::as_str))
+        .collect();
+    let mut findings = Vec::new();
+    for mark in &ir.marks {
+        let Some(site) = ir.rules.iter().find(|rule| rule.name == mark.site) else {
+            continue;
+        };
+        let mut pre_cut: std::collections::BTreeMap<&str, &whipplescript_parser::IrRule> =
+            std::collections::BTreeMap::new();
+        let mut frontier = vec![site];
+        while let Some(rule) = frontier.pop() {
+            if pre_cut.insert(rule.name.as_str(), rule).is_some() {
+                continue;
+            }
+            for read in &rule.metadata.fact_reads {
+                for producer in writers.get(read.as_str()).into_iter().flatten() {
+                    if !pre_cut.contains_key(producer.name.as_str()) {
+                        frontier.push(producer);
+                    }
+                }
+            }
+        }
+        for rule in pre_cut.values() {
+            if rule.metadata.effects.is_empty() {
+                continue;
+            }
+            let unconsumed: Vec<&str> = rule
+                .metadata
+                .fact_reads
+                .iter()
+                .filter(|read| !consumed_somewhere.contains(read.as_str()))
+                .filter_map(|read| read.strip_prefix("schema:"))
+                .collect();
+            if unconsumed.is_empty() {
+                continue;
+            }
+            findings.push(LintFinding {
+                code: "lint.mark_off_consumption_boundary",
+                severity: Severity::Warning,
+                message: format!(
+                    "mark `{}` sits off a consumption boundary: pre-cut rule `{}` creates \
+                     effects and its trigger `{}` is never consumed, so replaying a changed \
+                     candidate would refire the effect (prefix replay refuses pre-flight and \
+                     degrades to input replay); consume the trigger or move the mark",
+                    mark.name,
+                    rule.name,
+                    unconsumed.join("`, `"),
+                ),
+                name: None,
+                span: Some(mark.span),
+            });
+        }
+    }
+    findings
+}
+
 fn lint_program(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
     let mut findings = lint_unused_coerces(ir);
     findings.extend(lint_unused_coerce_results(ir));
@@ -1799,6 +1878,7 @@ fn lint_program(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
     findings.extend(lint_broad_file_grants(ir));
     findings.extend(lint_deep_after_nesting(ir));
     findings.extend(lint_tool_grant_requires_owned_harness(ir));
+    findings.extend(lint_mark_consumption_boundaries(ir));
     // Resolve each finding's declaration name to its source span. Top-level names are
     // program-unique, so a single `document_symbols` match is the declaration site.
     let symbols = whipplescript_parser::document_symbols(source);
@@ -12108,6 +12188,7 @@ fn execute_scenario(
         coerce_outputs: scenario_coerce_outputs(&test.clauses),
         virtual_now: scenario_virtual_now(&test.clauses),
         work_unit_root: None,
+        side_stores: None,
     };
     let run_kind = scenario_run_kind(&test.clauses);
     let (max_rounds, drive_to_fixed_point) = match run_kind {
@@ -12116,8 +12197,15 @@ fn execute_scenario(
     };
     let mut previous_event_count = 0usize;
     for _ in 0..max_rounds {
-        step_instance(&store_path, &instance_id, ir, Some(Path::new(path)), None)
-            .map_err(store_error)?;
+        step_instance(
+            &store_path,
+            &instance_id,
+            ir,
+            Some(Path::new(path)),
+            None,
+            None,
+        )
+        .map_err(store_error)?;
         run_worker_once(&store_path, &worker_options).map_err(store_error)?;
         let store = SqliteStore::open(&store_path).map_err(store_error)?;
         let status = store
@@ -18663,6 +18751,7 @@ fn step(options: &CliOptions) -> ExitCode {
         &ir,
         Some(Path::new(&step_options.program_path)),
         Some(&active_version_id),
+        None,
     ) {
         Ok(report) if options.json => emit_json(step_report_to_json(&report)),
         Ok(report) => {
@@ -18893,8 +18982,13 @@ fn step_instance(
     ir: &IrProgram,
     source_path: Option<&Path>,
     active_version_guard: Option<&str>,
+    side_stores: Option<&SideStorePaths>,
 ) -> Result<StepReport, StoreError> {
-    let stores = NativeStores::open(store_path, coordination_store_path(), items_store_path())?;
+    let stores = NativeStores::open(
+        store_path,
+        resolved_coordination_store(side_stores),
+        resolved_items_store(side_stores),
+    )?;
     let mut kernel = RuntimeKernel::new(stores);
     step_instance_generic(
         &mut kernel,
@@ -19120,6 +19214,10 @@ struct WorkerOptions {
     /// root's lease (keyed on `root`, so a parent and its descendants never
     /// contend) and does not release it — only the root does.
     work_unit_root: Option<String>,
+    /// Explicit coordination/items store overrides (the improve loop's
+    /// per-evaluation containment). `None` resolves from env/workspace as
+    /// always. Child workflow drives inherit the parent's overrides.
+    side_stores: Option<SideStorePaths>,
 }
 
 impl WorkerOptions {
@@ -19252,6 +19350,7 @@ impl WorkerOptions {
             coerce_outputs: std::collections::BTreeMap::new(),
             virtual_now: None,
             work_unit_root: None,
+            side_stores: None,
         })
     }
 }
@@ -19326,11 +19425,7 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
         fs::read_to_string(program_path)
             .ok()
             .and_then(|source_text| {
-                whipplescript_parser::compile_program_with_root(
-                    &source_text,
-                    options.root.as_deref(),
-                )
-                .ir
+                compile_program_with_root_cached(&source_text, options.root.as_deref()).ir
             })
     });
     // Fire due `every <duration>` clock-source occurrences (spec/std-time.md), like
@@ -19533,6 +19628,7 @@ fn run_claimable_effect(
                 instance_id,
                 effect,
                 options.virtual_now.as_deref().unwrap_or("now"),
+                options.side_stores.as_ref(),
             )
         }
         "signal.emit" => run_notify_effect(store_path, instance_id, effect),
@@ -19627,6 +19723,26 @@ where
         }
     }
     Ok(terminals)
+}
+
+/// Explicit side-store overrides for one evaluation: the improve loop's
+/// per-evaluation containment. Previously env-var redirection
+/// (process-global, so evaluations could not run in parallel); explicit
+/// paths make each evaluation's coordination/items state its own. The
+/// content store stays process-level (content-addressed, so sharing is
+/// pairing-safe).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SideStorePaths {
+    pub(crate) coordination: PathBuf,
+    pub(crate) items: PathBuf,
+}
+
+fn resolved_coordination_store(side_stores: Option<&SideStorePaths>) -> PathBuf {
+    side_stores.map_or_else(coordination_store_path, |paths| paths.coordination.clone())
+}
+
+fn resolved_items_store(side_stores: Option<&SideStorePaths>) -> PathBuf {
+    side_stores.map_or_else(items_store_path, |paths| paths.items.clone())
 }
 
 /// Workspace-scoped coordination state (spec/coordination.md): shared
@@ -22922,11 +23038,12 @@ fn run_coordination_effect(
     instance_id: &str,
     effect: &ClaimableEffect,
     now: &str,
+    side_stores: Option<&SideStorePaths>,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(NativeStores::open(
         store_path,
-        coordination_store_path(),
-        items_store_path(),
+        resolved_coordination_store(side_stores),
+        resolved_items_store(side_stores),
     )?);
     run_coordination_effect_generic(&mut kernel, instance_id, effect, now)
 }
@@ -23557,8 +23674,8 @@ fn run_queue_effect(
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(NativeStores::open(
         store_path,
-        coordination_store_path(),
-        items_store_path(),
+        resolved_coordination_store(options.side_stores.as_ref()),
+        resolved_items_store(options.side_stores.as_ref()),
     )?);
     run_queue_effect_generic(&mut kernel, instance_id, effect, &options.effect_config())
 }
@@ -23755,6 +23872,7 @@ fn run_workflow_invoke_effect(
             &child_ir,
             Some(program_path),
             None,
+            options.side_stores.as_ref(),
         )?;
         let child_worker = WorkerOptions {
             instance_id: child_instance_id.clone(),
@@ -23772,6 +23890,7 @@ fn run_workflow_invoke_effect(
             coerce_outputs: options.coerce_outputs.clone(),
             virtual_now: options.virtual_now.clone(),
             work_unit_root: options.work_unit_root.clone(),
+            side_stores: None,
         };
         let worker_report = run_worker_once(store_path, &child_worker)?;
         let child = SqliteStore::open(store_path)?
@@ -24213,6 +24332,7 @@ struct SubworkflowProviderContext {
     agent_outcomes: std::collections::BTreeMap<String, FixtureOutcome>,
     coerce_outputs: std::collections::BTreeMap<String, String>,
     virtual_now: Option<String>,
+    side_stores: Option<SideStorePaths>,
 }
 
 impl SubworkflowProviderContext {
@@ -24226,6 +24346,7 @@ impl SubworkflowProviderContext {
             agent_outcomes: options.agent_outcomes.clone(),
             coerce_outputs: options.coerce_outputs.clone(),
             virtual_now: options.virtual_now.clone(),
+            side_stores: options.side_stores.clone(),
         }
     }
 }
@@ -24258,6 +24379,7 @@ fn drive_subworkflow_tool(
             &child_ir,
             Some(program_path),
             None,
+            provider_ctx.side_stores.as_ref(),
         )?;
         let child_worker = WorkerOptions {
             instance_id: child_instance_id.clone(),
@@ -24278,6 +24400,7 @@ fn drive_subworkflow_tool(
             // workspace lease (DR-0025), so a nested owned turn re-enters the
             // lease the still-running parent holds rather than self-deadlocking.
             work_unit_root: Some(work_unit_root.to_owned()),
+            side_stores: provider_ctx.side_stores.clone(),
         };
         let worker_report = run_worker_once(store_path, &child_worker)?;
         let child = SqliteStore::open(store_path)?
@@ -24677,7 +24800,7 @@ fn dev(options: &CliOptions) -> ExitCode {
     // harness can offer them in its `<available_skills>` catalogue. Idempotent
     // (UPSERT by name); a missing skills directory loads nothing.
     load_workspace_skills(&options.store_path);
-    let (_source, ir) =
+    let (source, ir) =
         match compile_source_path_with_root(&dev_options.program_path, dev_options.root.as_deref())
         {
             Ok(compiled) => compiled,
@@ -24718,6 +24841,7 @@ fn dev(options: &CliOptions) -> ExitCode {
             &ir,
             Some(Path::new(&dev_options.program_path)),
             None,
+            None,
         ) {
             Ok(report) => report,
             Err(error) => return report_store_error("failed to step instance", error),
@@ -24754,6 +24878,7 @@ fn dev(options: &CliOptions) -> ExitCode {
                 coerce_outputs: std::collections::BTreeMap::new(),
                 virtual_now: None,
                 work_unit_root: None,
+                side_stores: None,
             },
         ) {
             Ok(report) => report,
@@ -24798,7 +24923,14 @@ fn dev(options: &CliOptions) -> ExitCode {
     }
     // Ambient measurement (experimentation surface): gauges score every dev
     // run; the primary evidence source has no verb at all.
-    improve::ambient_score_after_dev(&options.store_path, &started.instance_id, &ir, options.json);
+    improve::ambient_score_after_dev(
+        &options.store_path,
+        &started.instance_id,
+        &ir,
+        options.json,
+        &dev_options.provider_config_paths,
+        &sha256_hex(source.as_bytes()),
+    );
     let store = match SqliteStore::open(&options.store_path) {
         Ok(store) => store,
         Err(error) => return report_store_error("failed to open store", error),
@@ -25667,6 +25799,7 @@ fn acceptance_dev_report(
             &ir,
             Some(Path::new(&dev_options.program_path)),
             None,
+            None,
         ) {
             Ok(report) => report,
             Err(error) => return Err(report_store_error("failed to step instance", error)),
@@ -25689,6 +25822,7 @@ fn acceptance_dev_report(
                 coerce_outputs: std::collections::BTreeMap::new(),
                 virtual_now: None,
                 work_unit_root: None,
+                side_stores: None,
             },
         ) {
             Ok(report) => report,
@@ -30712,8 +30846,27 @@ fn otel_traces_url(endpoint: &str) -> Result<String, String> {
     Ok(format!("{}/v1/traces", endpoint.trim_end_matches('/')))
 }
 
+/// `whip evidence` routes by first positional (naming settled 2026-07-14):
+/// bare or `<gauge>` = the gauge evidence view (the experimentation
+/// surface's estimate view — same as `whip gauges`); `instance <id>` = a
+/// run's provider evidence chain (the former whole-verb meaning).
+fn evidence_router(options: &CliOptions) -> ExitCode {
+    if options.args.first().map(String::as_str) == Some("instance") {
+        let shifted = CliOptions {
+            command: options.command.clone(),
+            args: options.args[1..].to_vec(),
+            store_path: options.store_path.clone(),
+            json: options.json,
+            input_json: options.input_json.clone(),
+        };
+        return evidence(&shifted);
+    }
+    improve::gauges_command(options)
+}
+
 fn evidence(options: &CliOptions) -> ExitCode {
-    let Some(instance_id) = single_arg(options, "usage: whip evidence <instance>") else {
+    let Some(instance_id) = single_arg(options, "usage: whip evidence instance <instance-id>")
+    else {
         return ExitCode::from(2);
     };
     let store = match open_store_or_exit(options) {
@@ -33956,12 +34109,51 @@ enum CompileFailure {
     },
 }
 
+/// Byte-identical recompiles resolve from a process-lifetime cache: the
+/// improve evaluation loop drives every scenario through
+/// `start_workflow_instance` plus up to 16 `run_worker_once` passes, each
+/// of which previously re-lowered an unchanged program (DR-0037's recorded
+/// efficiency follow-on). Keyed by (root, source hash), so any changed
+/// byte — including in a resolved include, which changes the bundled
+/// source — recompiles; only successful compilations cache (diagnostics
+/// always re-derive), and warnings are cached so every caller prints
+/// exactly what a fresh compile would have printed.
+fn compile_program_with_root_cached(
+    source: &str,
+    root: Option<&str>,
+) -> whipplescript_parser::CompileOutput {
+    type CacheEntry = (IrProgram, Vec<whipplescript_parser::Diagnostic>);
+    type CacheMap = std::collections::HashMap<(Option<String>, String), CacheEntry>;
+    static CACHE: std::sync::Mutex<Option<CacheMap>> = std::sync::Mutex::new(None);
+    let key = (root.map(str::to_owned), sha256_hex(source.as_bytes()));
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((ir, warnings)) = guard.as_ref().and_then(|map| map.get(&key)) {
+            return whipplescript_parser::CompileOutput {
+                ir: Some(ir.clone()),
+                diagnostics: Vec::new(),
+                warnings: warnings.clone(),
+            };
+        }
+    }
+    let compiled = whipplescript_parser::compile_program_with_root(source, root);
+    if let Some(ir) = compiled.ir.as_ref() {
+        if let Ok(mut guard) = CACHE.lock() {
+            let map = guard.get_or_insert_with(CacheMap::new);
+            if map.len() >= 32 {
+                map.clear();
+            }
+            map.insert(key, (ir.clone(), compiled.warnings.clone()));
+        }
+    }
+    compiled
+}
+
 fn compile_source_path_with_root(
     path: &str,
     root: Option<&str>,
 ) -> Result<(String, IrProgram), CompileFailure> {
     let bundle = resolve_source_bundle(Path::new(path))?;
-    let compiled = whipplescript_parser::compile_program_with_root(&bundle.source, root);
+    let compiled = compile_program_with_root_cached(&bundle.source, root);
     for warning in &compiled.warnings {
         eprint!(
             "{}",
@@ -49142,6 +49334,7 @@ workflow Child {
             coerce_outputs: BTreeMap::new(),
             virtual_now: None,
             work_unit_root: None,
+            side_stores: None,
         };
 
         run_workflow_invoke_effect(&store_path, &parent_instance_id, &claimable, &options)
@@ -49283,6 +49476,7 @@ workflow Child {
             coerce_outputs: BTreeMap::new(),
             virtual_now: None,
             work_unit_root: None,
+            side_stores: None,
         };
 
         run_workflow_invoke_effect(&store_path, &parent_instance_id, &claimable, &options)
@@ -49453,6 +49647,7 @@ workflow Child {
             coerce_outputs: BTreeMap::new(),
             virtual_now: None,
             work_unit_root: None,
+            side_stores: None,
         };
 
         let _terminal =

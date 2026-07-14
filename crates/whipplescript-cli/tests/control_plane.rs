@@ -2752,6 +2752,7 @@ fn starts_and_inspects_two_instances_independently() {
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "evidence",
+            "instance",
             first_id,
             "--json",
         ],
@@ -4771,6 +4772,7 @@ rule noop
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
             "evidence",
+            "instance",
             instance_id,
         ],
     );
@@ -5219,6 +5221,7 @@ fn dev_owned_harness_completes_turn_with_leaf_invariants() {
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
             "evidence",
+            "instance",
             instance_id,
         ],
     );
@@ -5350,6 +5353,7 @@ workflow SkillCatalogueSmoke {
             store_path.to_str().expect("utf-8 store path"),
             "--json",
             "evidence",
+            "instance",
             instance_id,
         ],
     );
@@ -5495,6 +5499,7 @@ workflow SkillPinSmoke {
             store_path.to_str().expect("utf-8 store path"),
             "--json",
             "evidence",
+            "instance",
             instance_id,
         ],
     );
@@ -5594,7 +5599,17 @@ workflow ProjCtxSmoke {
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let evidence = run_json(bin, &["--store", store, "--json", "evidence", instance_id]);
+    let evidence = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "evidence",
+            "instance",
+            instance_id,
+        ],
+    );
     let evidence = evidence
         .get("evidence")
         .and_then(Value::as_array)
@@ -5926,6 +5941,7 @@ rule start_delegated_work
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
             "evidence",
+            "instance",
             instance_id,
         ],
     );
@@ -14887,6 +14903,7 @@ fn dev_provider_language_rehydrates_after_bound_coerce_arguments() {
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
             "evidence",
+            "instance",
             instance_id,
         ],
     );
@@ -16565,6 +16582,7 @@ rule review
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
             "evidence",
+            "instance",
             instance_id,
         ],
     );
@@ -21224,4 +21242,95 @@ fn workstream_members_auto_admit_and_promote() {
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn lint_flags_marks_off_consumption_boundaries() {
+    // `whip lint` flags a mark whose frozen prefix carries a settled effect
+    // from a rule that never consumes its trigger (DR-0038's refire shape:
+    // a changed candidate re-derives the effect under prefix replay), and
+    // does not flag the same mark once the trigger is consumed.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("lint-mark-boundary");
+    let program = |consume_line: &str| {
+        format!(
+            r#"use std.script
+workflow MarkLint
+
+input ticket Ticket
+
+class Ticket {{
+  id string
+}}
+
+class CheckOut {{
+  kind string
+}}
+
+class Classified {{
+  ticket string
+}}
+
+class Assessment {{
+  ticket string
+}}
+
+mark "cut" after triage
+
+rule classify
+  when Ticket as ticket
+=> {{
+  exec "python3 classify.py" -> CheckOut as chk
+{consume_line}
+  after chk succeeds as c {{
+    record Classified {{
+      ticket ticket.id
+    }}
+  }}
+}}
+
+rule triage
+  when Classified as c
+=> {{
+  record Assessment {{
+    ticket c.ticket
+  }}
+}}
+"#
+        )
+    };
+    for (label, consume_line, expected) in [
+        ("off-boundary", "", 1usize),
+        ("at-boundary", "  consume ticket", 0usize),
+    ] {
+        let wf = dir.join(format!("{label}.whip"));
+        fs::write(&wf, program(consume_line)).expect("write workflow");
+        let output = Command::new(bin)
+            .args(["--json", "lint", wf.to_str().expect("present")])
+            .output()
+            .expect("whip lint runs");
+        assert!(output.status.success(), "lint exits 0 on warnings");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint JSON");
+        let marks: Vec<&Value> = report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter(|finding| {
+                finding["code"].as_str() == Some("lint.mark_off_consumption_boundary")
+            })
+            .collect();
+        assert_eq!(
+            marks.len(),
+            expected,
+            "{label}: unexpected mark-boundary findings: {report}"
+        );
+        if expected == 1 {
+            let message = marks[0]["message"].as_str().expect("message");
+            assert!(
+                message.contains("`cut`") && message.contains("`classify`"),
+                "the finding names the mark and the refire site: {message}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
 }

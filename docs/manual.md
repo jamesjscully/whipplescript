@@ -417,7 +417,8 @@ whip facts <instance>         # current fact state
 whip effects <instance>       # effect status + policy_block_reason
 whip runs <instance>          # provider attempts
 whip diagnostics <instance>   # recorded errors
-whip evidence <instance>      # provider payloads and artifacts
+whip evidence instance <id>   # provider payloads and artifacts
+whip evidence [<gauge>]       # gauge evidence view (estimates + contradiction flags)
 whip trace <instance> --check # lifecycle conformance
 ```
 

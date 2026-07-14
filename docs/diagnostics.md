@@ -304,7 +304,7 @@ whip status <instance>
 whip effects <instance>
 whip runs <instance>
 whip diagnostics <instance>
-whip evidence <instance>
+whip evidence instance <instance-id>
 whip trace <instance> --check
 ```
 

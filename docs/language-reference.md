@@ -1422,13 +1422,22 @@ gauge extract_quality on summarize.extract {
 }
 ```
 
-- `judge via coerce <Name> | prompt "<template>" | exec "<command>" |
-  labels "<source>"` — one judge slot, four ground-truth granularities.
-  `exec` judges are deterministic validators (the det-validation pattern:
-  run context JSON on stdin, a JSON object on stdout; governed by
-  `WHIPPLESCRIPT_EXEC_ALLOW`); `labels` reads a user-owned JSON file keyed
-  by scenario name. Exec/labels gauges are Goodhart-resistant by
-  construction — you can't sweet-talk a validator.
+- `judge via coerce <Name>(<args>) | prompt "<template>" | exec
+  "<command>" | labels "<source>"` — one judge slot, four ground-truth
+  granularities. `exec` judges are deterministic validators (the
+  det-validation pattern: run context JSON on stdin, a JSON object on
+  stdout; governed by `WHIPPLESCRIPT_EXEC_ALLOW`); `labels` reads a
+  user-owned JSON file keyed by scenario name. Exec/labels gauges are
+  Goodhart-resistant by construction — you can't sweet-talk a validator.
+  A `coerce` judge binds its parameters **explicitly**: each argument
+  names the record value feeding the parameter at its position —
+  `input.<path>` or `facts.<Class>.<field>` (the class's last recorded
+  fact) — or the single reserved `record` passes the whole judge-input
+  record to a one-parameter coerce. Arity and path shape are check
+  errors, so a drifted signature can never silently rebind a judge; a
+  coerce judge declared without arguments parses but is honestly
+  unscoreable. Coerce/prompt judges run at campaign/settle time (they
+  need a native provider), never ambiently.
 - `expect` bars are chance-shaped (`P(<field>)` — the judge's boolean
   output field, `expect P(ok) at least 0.9`) or stat-shaped over the score
   distribution (`expect p90 at most 800`, `expect mean at least 0.7`).

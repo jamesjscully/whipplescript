@@ -206,6 +206,30 @@ scripts/check-native-provider-configs.sh
 The checker records redacted results only; it never prints secret values,
 prompts, or raw provider responses.
 
+### Spend prices (`prices` block)
+
+A provider-config file may carry a top-level `prices` array — the spend
+price table the improve subsystem consumes (`--spend-cap`, `std.spend`):
+
+```json
+{
+  "providers": [...],
+  "prices": [
+    {"provider": "anthropic", "model": "claude-sonnet-5",
+     "input_per_mtok_usd": 3.0, "output_per_mtok_usd": 15.0}
+  ]
+}
+```
+
+Rates are USD per million tokens, per (provider, model), input and output
+separately. Pricing is **config-only**: whip ships no built-in rates (a
+stale built-in would misprice spend silently). Usage with no matching
+entry records honestly as `unpriced` with cost 0 — visible in the spend
+events, and unable to bind a spend cap. Pricing happens at record time;
+history is never repriced. The maintained example lives at
+`examples/provider-configs/native/native.example.json` — verify its rates
+against your provider's current price sheet before relying on the cap.
+
 ## Native providers
 
 Native adapters for Codex and Claude are experimental: setup,

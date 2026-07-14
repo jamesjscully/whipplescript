@@ -171,22 +171,58 @@ tier keying engages when the evidence-plane IFC build lands.
 - `coerce` judges declared-but-unscoreable (parameter binding needs
   program context); `prompt` judges need a configured provider and are
   campaign-time only; both surface as `judge unscored — <reason>`.
+  *(Coerce judges landed 2026-07-14, design pass with Jack: EXPLICIT
+  argument binding — `judge via coerce Assess(input.ticket.title,
+  facts.Assessment.priority)`, positional against the coerce's
+  parameters, arity- and path-checked at compile time so a drifted
+  signature is a check error, never a silently rebound judge; the single
+  reserved `record` passes the whole judge-input record to a
+  one-parameter coerce; scoring renders the SAME prompt/schema the
+  runtime's `build_coerce_call_parts` would and reads the verdict off
+  the coerce's own output. Bare `judge via coerce X` still parses and
+  stays honestly unscoreable. Same day, the `evidence` naming residual
+  settled as a subcommand split: bare `whip evidence [<gauge>]` is the
+  gauge evidence view, `whip evidence instance <id>` the runtime
+  evidence chain.)*
 - `std.spend` has no priced observable yet (absent, never fabricated);
   the spend cap is enforced per proposal round against recorded cost and
   parks the campaign when reached, but token-only usage records cost 0
   (the `campaign.spend` events carry the tokens), so the cap cannot yet
   bind on unpriced usage. Provider price tables are the follow-on.
+  *(Landed 2026-07-14, design pass with Jack: config-only price tables in
+  the provider config's `prices` block — USD/Mtok per (provider, model),
+  input/output separate, no shipped defaults, maintained example config;
+  record-time pricing on spend events with an honest `priced: false` for
+  unmatched usage; `std.spend` scores the priced run total in USD and
+  skips with the reason when any usage-bearing run is unpriceable.)*
 - `mark` (prefix cuts) and `suppose`/`settle` are not built — scenarios
   are whole-run input replays until the checkpoint-substrate integration;
   `then` stages beyond the first are recorded in the campaign record and
-  run in later invocations (ratchet execution follow-on).
+  run in later invocations (ratchet execution follow-on). *(All landed:
+  marks/suppose 2026-07-13 (DR-0038), settle 2026-07-14 (DR-0040), and
+  ratchet execution 2026-07-14 — a stage whose reach targets the baseline
+  meets advances at invocation time, its achieved levels held as hard
+  guard floors, recorded as `stage.advanced` events.)*
 - No slice-hash transfer: evidence keys per program hash (whole-program
   fail-closed — per-version evidence islands, trivially sound per the
   research note §7).
 - The v1 loop runs to its internal stopping rule (or the spend cap)
   within one invocation; resuming a parked campaign across invocations is
   a follow-on (`campaign.resumed` exists in the record vocabulary).
+  *(Landed 2026-07-14 with priced spend, which made parked campaigns
+  reachable: a park now ends the invocation on the `campaign.parked`
+  event (no `campaign.closed` after it, so the record folds to `parked`);
+  `whip improve --resume <id>` continues under a fresh per-invocation
+  allowance — Jack's call — with the spec, program, proposer, and
+  candidate numbering from the record, guarded by the baseline hash.)*
 - Evaluation recompiles the program per scenario (correct, wasteful);
   hoisting a precompiled-IR path through `start_workflow_instance` /
   `run_worker_once` and parallelizing the per-scenario evaluations over
-  the bounded thread pool are recorded efficiency follow-ons.
+  the bounded thread pool are recorded efficiency follow-ons. *(Both
+  landed 2026-07-14: the recompile hoist as a (root, source-hash)-keyed
+  process-lifetime compile cache, and parallel evaluation once the
+  env-var side-store containment was replaced by explicit
+  `SideStorePaths` threaded through the drive — evaluations pool on a
+  bounded `thread::scope`, results keep input order (the pairing), and
+  child workflow drives inherit the parent's overrides. Judge turns also
+  became recorded `campaign.spend` like proposer turns the same day.)*

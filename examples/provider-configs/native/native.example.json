@@ -26,5 +26,19 @@
       "artifact_policy": "required",
       "health_checks": ["claude_sdk", "api_key", "tool_policy"]
     }
+  ],
+  "prices": [
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "input_per_mtok_usd": 3.0,
+      "output_per_mtok_usd": 15.0
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.4-mini",
+      "input_per_mtok_usd": 0.25,
+      "output_per_mtok_usd": 2.0
+    }
   ]
 }

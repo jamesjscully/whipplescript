@@ -84,6 +84,311 @@ fn program_hash(source: &str) -> String {
     crate::sha256_hex(source.as_bytes())
 }
 
+// ---------------------------------------------------------------------------
+// Priced spend: the provider-config `prices` block (record-time, config-only)
+// ---------------------------------------------------------------------------
+
+/// One provider turn's token usage, carried to the spend ledger. The split
+/// is what pricing needs; `total_tokens` is the provider's own total when
+/// reported, else input+output — never an overlapping sum.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TurnUsage {
+    provider: String,
+    model: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+}
+
+impl TurnUsage {
+    fn from_usage_json(provider: &str, model: &str, usage: &Value) -> Self {
+        let input_tokens = usage
+            .get("input_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let output_tokens = usage
+            .get("output_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let total_tokens = usage
+            .get("total_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(input_tokens + output_tokens);
+        Self {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            input_tokens,
+            output_tokens,
+            total_tokens,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Belief-update estimator (DR-0041): two families over paired evidence,
+// Jeffreys priors. The certification rule stays the settle walk
+// (settle-stopping.maude); these posteriors are the READOUT.
+// ---------------------------------------------------------------------------
+
+/// ln Γ(x) (Lanczos), the workhorse under both families.
+fn ln_gamma(x: f64) -> f64 {
+    const COEFFS: [f64; 6] = [
+        76.180_091_729_471_46,
+        -86.505_320_329_416_77,
+        24.014_098_240_830_91,
+        -1.231_739_572_450_155,
+        0.120_865_097_386_617_9e-2,
+        -0.539_523_938_495_3e-5,
+    ];
+    let mut y = x;
+    let tmp = x + 5.5;
+    let tmp = tmp - (x + 0.5) * tmp.ln();
+    let mut series = 1.000_000_000_190_015;
+    for coeff in COEFFS {
+        y += 1.0;
+        series += coeff / y;
+    }
+    -tmp + (2.506_628_274_631_000_5 * series / x).ln()
+}
+
+/// The incomplete-beta continued fraction (Lentz's method).
+fn betacf(a: f64, b: f64, x: f64) -> f64 {
+    const EPS: f64 = 3e-14;
+    const FPMIN: f64 = 1e-300;
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < FPMIN {
+        d = FPMIN;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+    for m in 1..=200 {
+        let m = m as f64;
+        let m2 = 2.0 * m;
+        let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+        let aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        let delta = d * c;
+        h *= delta;
+        if (delta - 1.0).abs() < EPS {
+            break;
+        }
+    }
+    h
+}
+
+/// Regularized incomplete beta I_x(a, b) — the Beta posterior CDF.
+fn betainc(a: f64, b: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let ln_front = ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln();
+    let front = ln_front.exp();
+    if x < (a + 1.0) / (a + b + 2.0) {
+        front * betacf(a, b, x) / a
+    } else {
+        1.0 - front * betacf(b, a, 1.0 - x) / b
+    }
+}
+
+/// Student-t CDF via the incomplete beta.
+fn student_t_cdf(t: f64, df: f64) -> f64 {
+    let tail = 0.5 * betainc(df / 2.0, 0.5, df / (df + t * t));
+    if t >= 0.0 {
+        1.0 - tail
+    } else {
+        tail
+    }
+}
+
+/// Family A (pass/fail evidence): the Bayesian sign test over paired
+/// verdicts, Jeffreys prior. `pairs` = (control passed, treatment
+/// passed); concordant pairs are uninformative about the sign, exactly
+/// as a sign test wants. P(better) = P(θ > ½), θ ~ Beta(½+wins, ½+losses).
+fn p_better_sign(pairs: &[(bool, bool)]) -> Option<f64> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let wins = pairs
+        .iter()
+        .filter(|(control, treat)| *treat && !control)
+        .count() as f64;
+    let losses = pairs
+        .iter()
+        .filter(|(control, treat)| !treat && *control)
+        .count() as f64;
+    Some(1.0 - betainc(0.5 + wins, 0.5 + losses, 0.5))
+}
+
+/// Family B (continuous evidence): posterior P(the mean paired delta
+/// favors the gauge's better direction) under the Jeffreys prior on
+/// (μ, σ²) — the Student-t posterior. Needs ≥ 2 deltas (one delta has no
+/// scale — the honest refusal); zero variance is the deterministic case.
+fn p_better_t(deltas: &[f64], direction_up: bool) -> Option<f64> {
+    if deltas.len() < 2 {
+        return None;
+    }
+    let n = deltas.len() as f64;
+    let signed: Vec<f64> = deltas
+        .iter()
+        .map(|delta| if direction_up { *delta } else { -*delta })
+        .collect();
+    let mean = signed.iter().sum::<f64>() / n;
+    let variance = signed.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    if variance == 0.0 {
+        return Some(if mean > 0.0 {
+            1.0
+        } else if mean < 0.0 {
+            0.0
+        } else {
+            0.5
+        });
+    }
+    Some(student_t_cdf(mean / (variance / n).sqrt(), n - 1.0))
+}
+
+/// The reopener's contradiction posterior, family A: P(the pass rate
+/// sits BELOW `reference`) from Jeffreys + verdicts. The reference (the
+/// answer-time operating point) is clamped off the degenerate endpoints
+/// so a perfect recorded rate still leaves a contradiction expressible.
+fn p_rate_below(passes: usize, fails: usize, reference: f64) -> f64 {
+    betainc(
+        0.5 + passes as f64,
+        0.5 + fails as f64,
+        reference.clamp(0.01, 0.99),
+    )
+}
+
+/// The reopener's contradiction posterior, family B: P(the mean sits on
+/// the WORSE side of `reference`), Student-t posterior over raw scores.
+fn p_mean_worse(scores: &[f64], reference: f64, direction_up: bool) -> Option<f64> {
+    if scores.len() < 2 {
+        return None;
+    }
+    let n = scores.len() as f64;
+    let mean = scores.iter().sum::<f64>() / n;
+    let variance = scores.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    if variance == 0.0 {
+        let worse = if direction_up {
+            mean < reference
+        } else {
+            mean > reference
+        };
+        return Some(if worse {
+            1.0
+        } else if mean == reference {
+            0.5
+        } else {
+            0.0
+        });
+    }
+    let t = (mean - reference) / (variance / n).sqrt();
+    Some(if direction_up {
+        student_t_cdf(-t, n - 1.0)
+    } else {
+        student_t_cdf(t, n - 1.0)
+    })
+}
+
+/// Price rates from the provider-config `prices` block: USD per million
+/// tokens, per (provider, model), input and output priced separately.
+/// Config-only by decision (Jack, 2026-07-14): no shipped defaults — a
+/// stale built-in number would misprice spend silently, while an absent
+/// table degrades to the honest `unpriced` posture (cost 0, tokens
+/// recorded, the cap unable to bind). Pricing happens at RECORD time: the
+/// spend event stores the computed cost and history is never repriced.
+#[derive(Clone, Debug, Default)]
+struct PriceTable {
+    /// (provider, model) → (input USD/Mtok, output USD/Mtok).
+    rates: BTreeMap<(String, String), (f64, f64)>,
+}
+
+impl PriceTable {
+    /// Load the union of every `--provider-config` file's `prices` block.
+    /// A malformed entry is an error, never a silent unpriced: the user
+    /// wrote a table and deserves to know it isn't being used.
+    fn load(paths: &[PathBuf]) -> Result<Self, String> {
+        let mut table = PriceTable::default();
+        for path in paths {
+            let raw = std::fs::read_to_string(path).map_err(|error| {
+                format!("cannot read provider config {}: {error}", path.display())
+            })?;
+            let parsed: Value = serde_json::from_str(&raw)
+                .map_err(|error| format!("invalid provider config {}: {error}", path.display()))?;
+            for entry in parsed
+                .get("prices")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let provider = entry.get("provider").and_then(Value::as_str);
+                let model = entry.get("model").and_then(Value::as_str);
+                let input = entry.get("input_per_mtok_usd").and_then(Value::as_f64);
+                let output = entry.get("output_per_mtok_usd").and_then(Value::as_f64);
+                match (provider, model, input, output) {
+                    (Some(provider), Some(model), Some(input), Some(output))
+                        if input >= 0.0
+                            && output >= 0.0
+                            && input.is_finite()
+                            && output.is_finite() =>
+                    {
+                        table
+                            .rates
+                            .insert((provider.to_owned(), model.to_owned()), (input, output));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "invalid price entry in {} (need provider, model, \
+                             input_per_mtok_usd, output_per_mtok_usd, all non-negative): {entry}",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(table)
+    }
+
+    /// Record-time cost in USD micros; `None` = unpriced (no table entry
+    /// for this provider/model, or no input/output split to price).
+    fn cost_micros(&self, usage: &TurnUsage) -> Option<i64> {
+        if usage.input_tokens == 0 && usage.output_tokens == 0 {
+            return None;
+        }
+        let (input_rate, output_rate) = self
+            .rates
+            .get(&(usage.provider.clone(), usage.model.clone()))?;
+        let usd = (usage.input_tokens as f64 * input_rate
+            + usage.output_tokens as f64 * output_rate)
+            / 1_000_000.0;
+        Some((usd * 1_000_000.0).round() as i64)
+    }
+}
+
 /// The standalone coerce request shell for judge/proposer turns: the
 /// NativeCoerceClient carries the real prompt/schema; these identity fields
 /// exist for effect-shaped callers and are unused on this path.
@@ -118,7 +423,7 @@ enum JudgeSpec {
     Exec(String),
     Labels(String),
     Prompt(String),
-    Coerce(String),
+    Coerce(String, Vec<String>),
     Builtin,
 }
 
@@ -166,7 +471,7 @@ fn collect_gauge_specs(ir: &IrProgram) -> Vec<GaugeSpec> {
                     "exec" => JudgeSpec::Exec(gauge.judge_target.clone()),
                     "labels" => JudgeSpec::Labels(gauge.judge_target.clone()),
                     "prompt" => JudgeSpec::Prompt(gauge.judge_target.clone()),
-                    _ => JudgeSpec::Coerce(gauge.judge_target.clone()),
+                    _ => JudgeSpec::Coerce(gauge.judge_target.clone(), gauge.judge_args.clone()),
                 },
                 bar,
                 inputs: gauge.inputs.clone(),
@@ -202,11 +507,17 @@ struct ReachTarget {
 #[derive(Clone, Debug, Default)]
 struct CampaignSpec {
     /// Named (ascending) gauges of the ACTIVE stage, with optional reach
-    /// targets. Later `then` stages are recorded (names only — exactly what
-    /// the campaign record keeps); v1 executes the first stage, ratchet
-    /// execution across stages is a recorded follow-on.
+    /// targets. Later `then` stages are recorded as raw target tokens and
+    /// EXECUTE with ratchet semantics: when every ascend gauge in the
+    /// active stage has a reach target the baseline already meets, the
+    /// stage's achieved levels become hard guard floors and the next
+    /// stage's gauges become the ascend set (improve note §3).
     ascend: Vec<(String, Option<ReachTarget>)>,
     later_stages: Vec<Vec<String>>,
+    /// Stage-ratchet floors from completed earlier stages: gauge → (higher
+    /// -is-better, achieved level). A floored gauge regressing past its
+    /// floor refuses the candidate even inside the indifference band.
+    floors: BTreeMap<String, (bool, f64)>,
     sacrifice: Vec<String>,
     /// Band overrides in percent of the baseline operating point.
     within_percent: BTreeMap<String, f64>,
@@ -233,6 +544,11 @@ impl CampaignSpec {
                 })),
             })).collect::<Vec<_>>(),
             "later_stages": self.later_stages,
+            "floors": self.floors.iter().map(|(gauge, (ge, floor))| json!({
+                "gauge": gauge,
+                "ge": ge,
+                "floor": floor,
+            })).collect::<Vec<_>>(),
             "sacrifice": self.sacrifice,
             "within_percent": self.within_percent,
             "spend_cap_micros": self.spend_cap_micros,
@@ -241,6 +557,117 @@ impl CampaignSpec {
             "declared": self.declared,
         })
     }
+}
+
+/// Rehydrate a CampaignSpec from its `to_json` record (the campaign.opened
+/// payload) — what `--resume` continues from. Fallible on purpose: a field
+/// this converter cannot read must never silently become a default that
+/// weakens a guard.
+fn campaign_spec_from_json(value: &Value) -> Result<CampaignSpec, String> {
+    let mut spec = CampaignSpec::default();
+    for entry in value
+        .get("ascend")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = entry
+            .get("gauge")
+            .and_then(Value::as_str)
+            .ok_or("malformed campaign record: ascend entry without a gauge")?;
+        let reach = match entry.get("reach") {
+            None | Some(Value::Null) => None,
+            Some(reach) => Some(ReachTarget {
+                ge: reach.get("op").and_then(Value::as_str) == Some(">="),
+                threshold: reach
+                    .get("threshold")
+                    .and_then(Value::as_f64)
+                    .ok_or("malformed campaign record: reach without a threshold")?,
+                raw: reach
+                    .get("raw")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            }),
+        };
+        spec.ascend.push((name.to_owned(), reach));
+    }
+    for stage in value
+        .get("later_stages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        spec.later_stages.push(
+            stage
+                .as_array()
+                .ok_or("malformed campaign record: later stage is not a list")?
+                .iter()
+                .map(|token| {
+                    token
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or("malformed campaign record: stage token is not a string")
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+    for floor in value
+        .get("floors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let gauge = floor
+            .get("gauge")
+            .and_then(Value::as_str)
+            .ok_or("malformed campaign record: floor without a gauge")?;
+        let ge = floor
+            .get("ge")
+            .and_then(Value::as_bool)
+            .ok_or("malformed campaign record: floor without a direction")?;
+        let level = floor
+            .get("floor")
+            .and_then(Value::as_f64)
+            .ok_or("malformed campaign record: floor without a level")?;
+        spec.floors.insert(gauge.to_owned(), (ge, level));
+    }
+    for gauge in value
+        .get("sacrifice")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        spec.sacrifice.push(
+            gauge
+                .as_str()
+                .ok_or("malformed campaign record: sacrifice is not a string")?
+                .to_owned(),
+        );
+    }
+    if let Some(bands) = value.get("within_percent").and_then(Value::as_object) {
+        for (gauge, band) in bands {
+            spec.within_percent.insert(
+                gauge.clone(),
+                band.as_f64()
+                    .ok_or("malformed campaign record: band is not a number")?,
+            );
+        }
+    }
+    spec.spend_cap_micros = value.get("spend_cap_micros").and_then(Value::as_i64);
+    spec.redacted_view = value
+        .get("redacted_view")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    spec.repair = value
+        .get("repair")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    spec.declared = value
+        .get("declared")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok(spec)
 }
 
 /// Parse a positional improve target: `name`, `name>=0.9`, `name<=800ms`.
@@ -292,6 +719,9 @@ struct ImproveArgs {
     provider: String,
     provider_config_paths: Vec<PathBuf>,
     root: Option<String>,
+    /// `--resume <campaign-id>`: continue a parked campaign under a fresh
+    /// per-invocation spend allowance (the spec comes from the record).
+    resume: Option<String>,
 }
 
 fn parse_improve_args(
@@ -300,6 +730,7 @@ fn parse_improve_args(
 ) -> Result<ImproveArgs, String> {
     let mut spec = CampaignSpec::default();
     let mut stages: Vec<Vec<(String, Option<ReachTarget>)>> = vec![Vec::new()];
+    let mut resume: Option<String> = None;
     let mut proposer = std::env::var("WHIPPLESCRIPT_IMPROVE_PROPOSER").unwrap_or_default();
     let mut provider = "fixture".to_owned();
     let mut provider_config_paths: Vec<PathBuf> = Vec::new();
@@ -367,6 +798,14 @@ fn parse_improve_args(
                 ));
             }
             "then" => stages.push(Vec::new()),
+            "--resume" => {
+                index += 1;
+                resume = Some(
+                    args.get(index)
+                        .ok_or("--resume requires a campaign id")?
+                        .clone(),
+                );
+            }
             flag if flag.starts_with("--") => {
                 return Err(format!("unknown improve flag `{flag}`"));
             }
@@ -412,13 +851,33 @@ fn parse_improve_args(
     } else {
         let mut stages_iter = stages.into_iter().filter(|stage| !stage.is_empty());
         spec.ascend = stages_iter.next().unwrap_or_default();
+        // Later stages keep their raw target tokens so activation
+        // re-parses them faithfully (a `then std.latency<=800ms` target
+        // survives until its stage runs).
         spec.later_stages = stages_iter
-            .map(|stage| stage.into_iter().map(|(name, _)| name).collect())
+            .map(|stage| {
+                stage
+                    .into_iter()
+                    .map(|(name, reach)| match reach {
+                        Some(reach) => {
+                            format!("{name}{}{}", if reach.ge { ">=" } else { "<=" }, reach.raw)
+                        }
+                        None => name,
+                    })
+                    .collect()
+            })
             .collect();
-        spec.repair = spec.ascend.is_empty() && spec.later_stages.is_empty();
+        spec.repair = resume.is_none() && spec.ascend.is_empty() && spec.later_stages.is_empty();
     }
     if proposer.is_empty() {
         proposer = "native".to_owned();
+    }
+    if resume.is_some() && (!spec.ascend.is_empty() || !spec.later_stages.is_empty()) {
+        return Err(
+            "--resume continues the parked campaign's own spec; it cannot be combined with \
+             inline gauge targets or a declared campaign"
+                .to_owned(),
+        );
     }
     Ok(ImproveArgs {
         spec,
@@ -426,6 +885,7 @@ fn parse_improve_args(
         provider,
         provider_config_paths,
         root,
+        resume,
     })
 }
 
@@ -492,21 +952,78 @@ struct RunObservation {
     scenario: Option<String>,
     readings: BTreeMap<String, GaugeReading>,
     skipped: Vec<(String, String)>,
+    /// Provider usage of the judge turns that scored this observation
+    /// (prompt/coerce judges): priced into spend accounting by the
+    /// caller that holds the campaign record.
+    judge_usage: Vec<TurnUsage>,
 }
 
 /// Score every scoreable gauge against one completed instance in `store`.
 /// `ambient` restricts to judges that are free and deterministic (exec +
 /// labels-with-scenario + builtins); campaign evaluation also scores prompt
 /// judges when a native coerce provider is configured.
+/// `std.spend`'s priced observable: Σ price(run usage) over the runs that
+/// carry usage, in USD. Strict by design (DR-0037: absent, never
+/// fabricated) — if ANY usage-bearing run cannot price (no table entry,
+/// no recorded model, no input/output split), the reading is skipped with
+/// the reason rather than reported as a partial total wearing a full one.
+fn total_spend_usd(
+    runs: &[whipplescript_store::RunView],
+    prices: &PriceTable,
+) -> Result<Option<f64>, String> {
+    let mut total_micros: i64 = 0;
+    let mut any = false;
+    for run in runs {
+        let Ok(metadata) = serde_json::from_str::<Value>(&run.metadata_json) else {
+            continue;
+        };
+        let Some(usage) = metadata
+            .get("usage")
+            .or_else(|| metadata.get("usage_json"))
+            .filter(|usage| !usage.is_null())
+        else {
+            continue;
+        };
+        let model = metadata
+            .get("model")
+            .and_then(Value::as_str)
+            .or_else(|| usage.get("model").and_then(Value::as_str))
+            .unwrap_or("");
+        let turn = TurnUsage::from_usage_json(&run.provider, model, usage);
+        if turn.total_tokens == 0 {
+            continue;
+        }
+        any = true;
+        match prices.cost_micros(&turn) {
+            Some(cost) => total_micros += cost,
+            None => {
+                return Err(format!(
+                    "unpriced usage (no price for provider `{}` model `{}`)",
+                    run.provider,
+                    if model.is_empty() {
+                        "<unrecorded>"
+                    } else {
+                        model
+                    }
+                ))
+            }
+        }
+    }
+    Ok(any.then(|| total_micros as f64 / 1_000_000.0))
+}
+
 fn score_instance(
     store: &SqliteStore,
     instance_id: &str,
     specs: &[GaugeSpec],
     scenario: Option<&str>,
     ambient: bool,
+    ir: &IrProgram,
+    prices: &PriceTable,
 ) -> RunObservation {
     let mut readings: BTreeMap<String, GaugeReading> = BTreeMap::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
+    let mut judge_usage: Vec<TurnUsage> = Vec::new();
     let instance = store.get_instance(instance_id).ok().flatten();
     // Consumed facts are still facts the run produced; judges must see
     // the whole record, not the un-consumed residue.
@@ -563,7 +1080,20 @@ fn score_instance(
                     );
                 }
             }
-            // std.spend: no priced observable yet — absent, never fabricated.
+            "std.spend" => match total_spend_usd(&runs, prices) {
+                Ok(Some(usd)) => {
+                    readings.insert(
+                        spec.name.clone(),
+                        GaugeReading {
+                            score: usd,
+                            passed: None,
+                            tags: Vec::new(),
+                        },
+                    );
+                }
+                Ok(None) => {}
+                Err(reason) => skipped.push((spec.name.clone(), reason)),
+            },
             _ => {}
         }
     }
@@ -587,8 +1117,10 @@ fn score_instance(
                 &judge_input,
                 scenario,
                 ambient,
+                ir,
                 &mut readings,
                 &mut skipped,
+                &mut judge_usage,
             );
         }
     }
@@ -599,6 +1131,7 @@ fn score_instance(
         scenario: scenario.map(str::to_owned),
         readings,
         skipped,
+        judge_usage,
     }
 }
 
@@ -609,8 +1142,10 @@ fn score_one_gauge(
     judge_input: &Value,
     scenario: Option<&str>,
     ambient: bool,
+    ir: &IrProgram,
     readings: &mut BTreeMap<String, GaugeReading>,
     skipped: &mut Vec<(String, String)>,
+    judge_usage: &mut Vec<TurnUsage>,
 ) {
     {
         let mut input = judge_input.clone();
@@ -645,17 +1180,31 @@ fn score_one_gauge(
                     ));
                 } else {
                     match run_prompt_judge(template, &input, spec) {
-                        Ok(reading) => {
+                        Ok((reading, usage)) => {
                             readings.insert(spec.name.clone(), reading);
+                            judge_usage.push(usage);
                         }
                         Err(reason) => skipped.push((spec.name.clone(), reason)),
                     }
                 }
             }
-            JudgeSpec::Coerce(target) => skipped.push((
-                spec.name.clone(),
-                format!("coerce judge `{target}` is not yet scoreable (v1)"),
-            )),
+            JudgeSpec::Coerce(target, args) => {
+                if ambient {
+                    skipped.push((
+                        spec.name.clone(),
+                        "coerce judges are scored during campaigns/settle, not ambiently (v1)"
+                            .to_owned(),
+                    ));
+                } else {
+                    match run_coerce_judge(target, args, &input, ir, spec) {
+                        Ok((reading, usage)) => {
+                            readings.insert(spec.name.clone(), reading);
+                            judge_usage.push(usage);
+                        }
+                        Err(reason) => skipped.push((spec.name.clone(), reason)),
+                    }
+                }
+            }
             JudgeSpec::Builtin => {}
         }
     }
@@ -847,7 +1396,7 @@ fn scorer_label(judge: &JudgeSpec) -> String {
         JudgeSpec::Exec(command) => format!("exec:{command}"),
         JudgeSpec::Labels(source) => format!("labels:{source}"),
         JudgeSpec::Prompt(_) => "prompt".to_owned(),
-        JudgeSpec::Coerce(name) => format!("coerce:{name}"),
+        JudgeSpec::Coerce(name, _) => format!("coerce:{name}"),
         JudgeSpec::Builtin => "builtin".to_owned(),
     }
 }
@@ -860,7 +1409,8 @@ fn native_coerce_turn(
     schema: Value,
     schema_name: &str,
     codex_label: &str,
-) -> Result<(Value, i64), String> {
+    wrapped: bool,
+) -> Result<(Value, TurnUsage), String> {
     let config = crate::coerce_runtime::resolve_native_coerce_config()
         .map_err(|error| format!("{purpose} provider: {error}"))?
         .ok_or_else(|| {
@@ -877,7 +1427,7 @@ fn native_coerce_turn(
         model: config.model.clone(),
         prompt,
         output_schema: schema,
-        wrapped: false,
+        wrapped,
         schema_name: schema_name.to_owned(),
         max_tokens: config.max_tokens,
         codex: config
@@ -894,26 +1444,103 @@ fn native_coerce_turn(
     ) {
         return Err(format!("{purpose} failed: {}", result.summary));
     }
-    let usage: Value = serde_json::from_str(&result.usage_json).unwrap_or(Value::Null);
-    let tokens = ["input_tokens", "output_tokens", "total_tokens"]
-        .iter()
-        .filter_map(|key| usage.get(key).and_then(Value::as_i64))
-        .sum();
+    let usage_json: Value = serde_json::from_str(&result.usage_json).unwrap_or(Value::Null);
+    // Price-table provider names match what the operator configures in
+    // WHIPPLESCRIPT_COERCE_PROVIDER (`openai-generic`, not a synonym).
+    let provider_name = match client.provider {
+        whipplescript_kernel::coerce_native::CoerceProvider::OpenAi => "openai",
+        whipplescript_kernel::coerce_native::CoerceProvider::OpenAiCompat => "openai-generic",
+        whipplescript_kernel::coerce_native::CoerceProvider::Anthropic => "anthropic",
+    };
+    let usage = TurnUsage::from_usage_json(provider_name, &client.model, &usage_json);
     let value: Value = result
         .value_json
         .as_deref()
         .and_then(|raw| serde_json::from_str(raw).ok())
         .ok_or_else(|| format!("{purpose} returned no value"))?;
-    Ok((value, tokens))
+    Ok((value, usage))
 }
 
 /// LLM prompt judge via the native coerce path; requires a configured
 /// provider (WHIPPLESCRIPT_COERCE_PROVIDER / `whip auth`).
+/// Resolve one declared judge-argument path against the judge-input
+/// record: `record` (the whole record), `input.<path>`, or
+/// `facts.<Class>.<field...>` (the LAST recorded fact of the class — the
+/// run's final state). None = the path names nothing on this record.
+fn resolve_judge_argument(path: &str, record: &Value) -> Option<Value> {
+    if path == "record" {
+        return Some(record.clone());
+    }
+    let mut segments = path.split('.');
+    let mut current = match segments.next()? {
+        "input" => record.get("input")?.clone(),
+        "facts" => {
+            let class = segments.next()?;
+            record
+                .get("facts")?
+                .as_array()?
+                .iter()
+                .rev()
+                .find(|fact| fact.get("name").and_then(Value::as_str) == Some(class))?
+                .get("value")?
+                .clone()
+        }
+        _ => return None,
+    };
+    for segment in segments {
+        current = current.get(segment)?.clone();
+    }
+    Some(current)
+}
+
+/// Execute a coerce judge (explicit-argument binding, settled
+/// 2026-07-14): resolve each declared path against the record, render
+/// the SAME prompt and schema the runtime would for a `coerce` call
+/// (`build_coerce_call_parts`), run one native turn, and read the
+/// verdict off the coerce's own output value.
+fn run_coerce_judge(
+    name: &str,
+    args: &[String],
+    input: &Value,
+    ir: &IrProgram,
+    spec: &GaugeSpec,
+) -> Result<(GaugeReading, TurnUsage), String> {
+    if args.is_empty() {
+        return Err(format!(
+            "coerce judge `{name}` declares no arguments; bind its parameters \
+             (`judge via coerce {name}(input.…, facts.<Class>.<field>)`, or `{name}(record)`)"
+        ));
+    }
+    let mut arguments = serde_json::Map::new();
+    for (index, arg) in args.iter().enumerate() {
+        let value = resolve_judge_argument(arg, input)
+            .ok_or_else(|| format!("judge argument `{arg}` resolves to nothing on this record"))?;
+        arguments.insert(format!("arg{index}"), value);
+    }
+    let (prompt, schema, wrapped, schema_name) =
+        whipplescript_kernel::coerce_native::build_coerce_call_parts(
+            ir,
+            name,
+            &Value::Object(arguments),
+        )?;
+    let (value, usage) = native_coerce_turn(
+        "coerce judge",
+        prompt,
+        schema,
+        &schema_name,
+        &format!("improve-judge-{}", spec.name),
+        wrapped,
+    )?;
+    let mut reading = reading_from_judge_output(&value, spec)?;
+    reading.tags.push("judge-unanchored".to_owned());
+    Ok((reading, usage))
+}
+
 fn run_prompt_judge(
     template: &str,
     input: &Value,
     spec: &GaugeSpec,
-) -> Result<GaugeReading, String> {
+) -> Result<(GaugeReading, TurnUsage), String> {
     let prompt = format!(
         "{template}\n\nJudge the following run record. Respond with the JSON schema \
          provided.\n\n{input}"
@@ -928,16 +1555,17 @@ fn run_prompt_judge(
         "required": ["passed", "score", "rationale"],
         "additionalProperties": false,
     });
-    let (value, _tokens) = native_coerce_turn(
+    let (value, usage) = native_coerce_turn(
         "prompt judge",
         prompt,
         schema,
         "GaugeJudgeVerdict",
         &format!("improve-judge-{}", spec.name),
+        false,
     )?;
     let mut reading = reading_from_judge_output(&value, spec)?;
     reading.tags.push("judge-unanchored".to_owned());
-    Ok(reading)
+    Ok((reading, usage))
 }
 
 /// The v1 MI lower bound at the review surface (leakage policy, improve
@@ -1029,7 +1657,8 @@ fn evaluate_scenario(
     scenario: &ScenarioRow,
     specs: &[GaugeSpec],
     ir: &IrProgram,
-    seq: &mut usize,
+    seq: usize,
+    prices: &PriceTable,
 ) -> Result<RunObservation, String> {
     // Mark-pinned scenarios regenerate from the frozen prefix (paired at
     // the cut); a replay failure degrades honestly to input replay with a
@@ -1044,6 +1673,7 @@ fn evaluate_scenario(
             specs,
             ir,
             seq,
+            prices,
         ) {
             // Mid-drive errors are HARD: suffix provider work already ran,
             // so a fallback would execute it twice.
@@ -1062,6 +1692,7 @@ fn evaluate_scenario(
                     specs,
                     ir,
                     seq,
+                    prices,
                 )?;
                 for reading in observation.readings.values_mut() {
                     reading.tags.push("replay-fallback".to_owned());
@@ -1079,6 +1710,7 @@ fn evaluate_scenario(
         specs,
         ir,
         seq,
+        prices,
     )
 }
 
@@ -1094,6 +1726,7 @@ fn drive_to_idle(
     provider_config_paths: &[PathBuf],
     ir: &IrProgram,
     version_guard: Option<&str>,
+    side_stores: &crate::SideStorePaths,
 ) -> Result<(), String> {
     for _ in 0..16 {
         let step_report = crate::step_instance(
@@ -1102,6 +1735,7 @@ fn drive_to_idle(
             ir,
             Some(Path::new(program_path)),
             version_guard,
+            Some(side_stores),
         )
         .map_err(|error| format!("evaluation step failed: {error:?}"))?;
         let worker_report = crate::run_worker_once(
@@ -1122,6 +1756,7 @@ fn drive_to_idle(
                 coerce_outputs: BTreeMap::new(),
                 virtual_now: None,
                 work_unit_root: None,
+                side_stores: Some(side_stores.clone()),
             },
         )
         .map_err(|error| format!("evaluation worker failed: {error:?}"))?;
@@ -1143,10 +1778,10 @@ fn input_replay_scenario(
     scenario: &ScenarioRow,
     specs: &[GaugeSpec],
     ir: &IrProgram,
-    seq: &mut usize,
+    seq: usize,
+    prices: &PriceTable,
 ) -> Result<RunObservation, String> {
-    *seq += 1;
-    contain_side_stores_for_eval(*seq);
+    let side_stores = eval_side_stores(seq);
     let store_path = eval_scratch_dir().join(format!("eval-{seq}.sqlite"));
     let _ = std::fs::remove_file(&store_path);
     let eval_options = CliOptions {
@@ -1178,6 +1813,7 @@ fn input_replay_scenario(
         provider_config_paths,
         ir,
         None,
+        &side_stores,
     )?;
     let store = SqliteStore::open(&store_path)
         .map_err(|error| format!("failed to reopen evaluation store: {error:?}"))?;
@@ -1187,6 +1823,8 @@ fn input_replay_scenario(
         specs,
         Some(&scenario.name),
         false,
+        ir,
+        prices,
     );
     // A run that never settled (wedged effect, exhausted drive budget)
     // must not pass for a finished regeneration.
@@ -1231,7 +1869,8 @@ fn replay_scenario(
     scenario: &ScenarioRow,
     specs: &[GaugeSpec],
     ir: &IrProgram,
-    seq: &mut usize,
+    seq: usize,
+    prices: &PriceTable,
 ) -> Result<Result<RunObservation, String>, String> {
     // Outer Err = pre-drive (fallback-safe); inner Err = mid-drive (hard).
     let cut = scenario
@@ -1244,8 +1883,7 @@ fn replay_scenario(
     if !Path::new(source_store).exists() {
         return Err(format!("source store `{source_store}` no longer exists"));
     }
-    *seq += 1;
-    contain_side_stores_for_eval(*seq);
+    let side_stores = eval_side_stores(seq);
     let store_path = eval_scratch_dir().join(format!("replay-{seq}.sqlite"));
     let _ = std::fs::remove_file(&store_path);
     // A transactionally-consistent snapshot (VACUUM INTO): a plain file
@@ -1346,6 +1984,14 @@ fn replay_scenario(
             )
         })
         .collect();
+    // Live (unconsumed) fact names at the cut, for the pre-flight refire
+    // check below (the store moves into the kernel next).
+    let live_fact_names: BTreeSet<String> = store
+        .list_facts(&scenario.instance_id)
+        .map_err(|error| format!("failed to read live facts: {error:?}"))?
+        .into_iter()
+        .map(|fact| fact.name)
+        .collect();
     let replayed_events = prefix_events.len();
     let instance = store
         .get_instance(&scenario.instance_id)
@@ -1360,8 +2006,8 @@ fn replay_scenario(
     let snapshot = ir.to_snapshot();
     let stores = whipplescript_store::native_stores::NativeStores {
         runtime: store,
-        coord: open_scratch_coord(*seq)?,
-        items: open_scratch_items(*seq)?,
+        coord: open_scratch_coord(seq)?,
+        items: open_scratch_items(seq)?,
     };
     let mut kernel = whipplescript_kernel::RuntimeKernel::new(stores);
     let version = kernel
@@ -1376,6 +2022,40 @@ fn replay_scenario(
         )
         .map_err(|error| format!("failed to register the candidate version: {error:?}"))?;
     if version.version_id != instance.version_id {
+        // Pre-flight refire refusal (DR-0038's recorded upgrade):
+        // activation bumps the revision epoch, and a pre-cut
+        // NON-consuming rule whose trigger facts are still live
+        // re-derives its settled effects under fresh ids — refiring
+        // provider work the recorded run already paid for. Detect the
+        // shape BEFORE any suffix work runs and refuse; the caller
+        // degrades to input replay.
+        let refire_shaped: Vec<String> = ir
+            .rules
+            .iter()
+            .filter(|rule| {
+                effects
+                    .iter()
+                    .any(|effect| effect.created_by_rule == rule.name)
+            })
+            .filter(|rule| {
+                rule.metadata.fact_reads.iter().any(|read| {
+                    read.strip_prefix("schema:").is_some_and(|fact| {
+                        live_fact_names.contains(fact)
+                            && !rule.metadata.fact_consumes.contains(read)
+                    })
+                })
+            })
+            .map(|rule| rule.name.clone())
+            .collect();
+        if !refire_shaped.is_empty() {
+            return Err(format!(
+                "candidate activation would refire pre-cut effect site{} `{}` (non-consuming \
+                 rule with live trigger facts at the cut); place the mark at a consumption \
+                 boundary",
+                if refire_shaped.len() == 1 { "" } else { "s" },
+                refire_shaped.join("`, `"),
+            ));
+        }
         use whipplescript_store::RuntimeStore as _;
         let report = kernel
             .store()
@@ -1419,6 +2099,8 @@ fn replay_scenario(
         &prefix_ids,
         &prefix_triples,
         replayed_events,
+        prices,
+        &side_stores,
     ))
 }
 
@@ -1437,6 +2119,8 @@ fn replay_drive_and_score(
     prefix_ids: &BTreeSet<String>,
     prefix_triples: &BTreeSet<(String, String, String)>,
     replayed_events: usize,
+    prices: &PriceTable,
+    side_stores: &crate::SideStorePaths,
 ) -> Result<RunObservation, String> {
     drive_to_idle(
         store_path,
@@ -1447,6 +2131,7 @@ fn replay_drive_and_score(
         provider_config_paths,
         ir,
         Some(version_id),
+        side_stores,
     )?;
     let store = SqliteStore::open(store_path)
         .map_err(|error| format!("failed to reopen replay store: {error:?}"))?;
@@ -1456,6 +2141,8 @@ fn replay_drive_and_score(
         specs,
         Some(&scenario.name),
         false,
+        ir,
+        prices,
     );
     // std.latency is unmeasurable under prefix replay: folded prefix runs
     // carry fold-time timestamps, so the prefix's real duration is gone.
@@ -1516,19 +2203,33 @@ fn replay_drive_and_score(
 /// Per-evaluation coordination/items scratch: one shared file would let
 /// coordination state (counters, breakers, claims) leak between scenarios
 /// and between the baseline and candidate arms, breaking the pairing.
-fn contain_side_stores_for_eval(seq: usize) {
-    std::env::set_var(
-        "WHIPPLESCRIPT_COORDINATION_STORE",
-        eval_scratch_dir().join(format!("coordination-{seq}.sqlite")),
-    );
-    std::env::set_var(
-        "WHIPPLESCRIPT_ITEMS_STORE",
-        eval_scratch_dir().join(format!("items-{seq}.sqlite")),
-    );
-    std::env::set_var(
-        "WHIPPLESCRIPT_CONTENT_STORE",
-        eval_scratch_dir().join(format!("content-{seq}.sqlite")),
-    );
+/// Scenario-evaluation concurrency: `WHIPPLESCRIPT_EVAL_CONCURRENCY`
+/// overrides; the default stays modest (each evaluation drives a full
+/// workflow with its own stores and possibly provider turns).
+fn eval_concurrency() -> usize {
+    if let Ok(value) = std::env::var("WHIPPLESCRIPT_EVAL_CONCURRENCY") {
+        if let Ok(parsed) = value.trim().parse::<usize>() {
+            return parsed.max(1);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .min(4)
+}
+
+/// Per-evaluation side-store paths, passed EXPLICITLY through the drive
+/// (previously env-var redirection, which was process-global and made
+/// parallel evaluation impossible). One shared file would let
+/// coordination state (counters, breakers, claims) leak between
+/// scenarios and between the baseline and candidate arms, breaking the
+/// pairing. The content store stays process-level (redirected once by
+/// `contain_side_stores`; content-addressed, so sharing is pairing-safe).
+fn eval_side_stores(seq: usize) -> crate::SideStorePaths {
+    crate::SideStorePaths {
+        coordination: eval_scratch_dir().join(format!("coordination-{seq}.sqlite")),
+        items: eval_scratch_dir().join(format!("items-{seq}.sqlite")),
+    }
 }
 
 fn open_scratch_coord(
@@ -1705,6 +2406,10 @@ struct GaugeVerdictLine {
     /// The gauge's better-direction, carried onto the card so answered
     /// tradeoffs are self-contained precedents.
     direction_up: bool,
+    /// The belief-update readout (DR-0041) over the comparable pairs:
+    /// paired sign test when every pair carries bar verdicts, Student-t
+    /// on paired deltas otherwise. None below the family's floor.
+    p_better: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -1864,6 +2569,25 @@ fn dominance_verdict(
             role = "sacrifice";
         } else {
             role = "guard";
+            // Stage-ratchet floor (improve note §3): a completed earlier
+            // stage's achieved level is a hard bound for later stages —
+            // regression past it refuses even inside the band.
+            if let Some((ge, floor)) = campaign.floors.get(&spec.name) {
+                if let Some(point) = cand_aggregate.operating_point() {
+                    let held = if *ge {
+                        point >= *floor
+                    } else {
+                        point <= *floor
+                    };
+                    if !held {
+                        bar_violated = true;
+                        reasons.push(format!(
+                            "`{}` fell past its stage-ratchet floor (achieved by a completed `then` stage)",
+                            spec.name
+                        ));
+                    }
+                }
+            }
             if delta == Delta::Worse {
                 guard_broken = true;
                 reasons.push(format!(
@@ -1882,6 +2606,30 @@ fn dominance_verdict(
                 ));
             }
         }
+        // The belief-update readout over the comparable pairs: family A
+        // (paired sign test) when every pair carries bar verdicts,
+        // family B (Student-t on paired deltas) otherwise.
+        let verdict_pairs: Vec<(bool, bool)> = base
+            .iter()
+            .zip(cand.iter())
+            .filter_map(|(b, c)| {
+                let control = b.readings.get(&spec.name)?.passed?;
+                let treatment = c.readings.get(&spec.name)?.passed?;
+                Some((control, treatment))
+            })
+            .collect();
+        let score_deltas: Vec<f64> = base
+            .iter()
+            .zip(cand.iter())
+            .filter_map(|(b, c)| {
+                Some(c.readings.get(&spec.name)?.score - b.readings.get(&spec.name)?.score)
+            })
+            .collect();
+        let p_better = if !verdict_pairs.is_empty() && verdict_pairs.len() == score_deltas.len() {
+            p_better_sign(&verdict_pairs)
+        } else {
+            p_better_t(&score_deltas, spec.direction_up)
+        };
         lines.push(GaugeVerdictLine {
             gauge: spec.name.clone(),
             role,
@@ -1892,6 +2640,7 @@ fn dominance_verdict(
             bar_met: bar_status,
             reach_met,
             direction_up: spec.direction_up,
+            p_better,
         });
     }
     // Repair mode: proposable iff a bar the BASELINE violated is restored
@@ -2149,6 +2898,9 @@ struct Proposal {
     /// Provider token usage of the proposing turn (0 for fixture), recorded
     /// as a `campaign.spend` event.
     tokens: i64,
+    /// The turn's provider/model/split, when the proposer knows it: what
+    /// record-time pricing consumes. `None` prices as `unpriced`.
+    usage: Option<TurnUsage>,
 }
 
 /// Deterministic test/dev proposer: colon-separated candidate source paths
@@ -2177,10 +2929,29 @@ impl Proposer for FixtureProposer {
         let path = self.remaining.remove(0);
         let source = std::fs::read_to_string(&path)
             .map_err(|error| format!("fixture proposal `{path}`: {error}"))?;
+        // Test lever mirroring WHIPPLESCRIPT_IMPROVE_PROPOSALS: a synthetic
+        // `provider/model/input/output` usage so priced-spend paths (cap,
+        // park, resume) are exercisable without a live provider.
+        let usage = std::env::var("WHIPPLESCRIPT_IMPROVE_PROPOSAL_USAGE")
+            .ok()
+            .and_then(|raw| {
+                let parts: Vec<&str> = raw.split('/').collect();
+                match parts.as_slice() {
+                    [provider, model, input, output] => Some(TurnUsage {
+                        provider: (*provider).to_owned(),
+                        model: (*model).to_owned(),
+                        input_tokens: input.parse().ok()?,
+                        output_tokens: output.parse().ok()?,
+                        total_tokens: input.parse::<i64>().ok()? + output.parse::<i64>().ok()?,
+                    }),
+                    _ => None,
+                }
+            });
         Ok(Some(Proposal {
             source,
             rationale: format!("fixture proposal from {path}"),
-            tokens: 0,
+            tokens: usage.as_ref().map_or(0, |usage| usage.total_tokens),
+            usage,
         }))
     }
     fn name(&self) -> &'static str {
@@ -2205,12 +2976,13 @@ impl Proposer for NativeProposer {
             "required": ["rationale", "source"],
             "additionalProperties": false,
         });
-        let (value, tokens) = native_coerce_turn(
+        let (value, usage) = native_coerce_turn(
             "the native proposer",
             reflection.to_owned(),
             schema,
             "ImproveProposal",
             "improve-proposer",
+            false,
         )
         .map_err(|error| format!("{error}, or use --proposer fixture"))?;
         let source = value
@@ -2226,7 +2998,8 @@ impl Proposer for NativeProposer {
         Ok(Some(Proposal {
             source,
             rationale,
-            tokens,
+            tokens: usage.total_tokens,
+            usage: Some(usage),
         }))
     }
     fn name(&self) -> &'static str {
@@ -2421,20 +3194,59 @@ pub(crate) fn improve_command(options: &CliOptions) -> ExitCode {
     }
 }
 
+/// Look up a campaign the operator asked to resume: it must exist and be
+/// parked. Returns the folded summary and the campaign.opened payload.
+fn resumable_campaign(
+    store: &ImproveStore,
+    campaign_id: &str,
+) -> Result<(CampaignSummary, Value), String> {
+    let summary = store
+        .list_campaigns()
+        .map_err(|error| format!("failed to read campaigns: {error:?}"))?
+        .into_iter()
+        .find(|campaign| campaign.campaign_id == campaign_id)
+        .ok_or_else(|| format!("unknown campaign `{campaign_id}`"))?;
+    if summary.status != "parked" {
+        return Err(format!(
+            "campaign `{campaign_id}` is not parked (status: {}); --resume continues parked \
+             campaigns only",
+            summary.status
+        ));
+    }
+    let payload = summary.spec.clone();
+    Ok((summary, payload))
+}
+
 fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
     // Compile first (gauge declarations live in the program).
     let (probe_path, probe_root) = {
-        // Peek --program/--root before full arg parsing so declared
-        // campaigns can inform positional-arg interpretation and a
-        // multi-workflow program compiles under its root.
+        // Peek --program/--root/--resume before full arg parsing so
+        // declared campaigns can inform positional-arg interpretation, a
+        // multi-workflow program compiles under its root, and a resumed
+        // campaign resolves its own recorded program.
         let mut path = None;
         let mut probe_root = None;
+        let mut resume_probe = None;
         let mut iter = options.args.iter();
         while let Some(arg) = iter.next() {
             if arg == "--program" {
                 path = iter.next().cloned();
             } else if arg == "--root" {
                 probe_root = iter.next().cloned();
+            } else if arg == "--resume" {
+                resume_probe = iter.next().cloned();
+            }
+        }
+        if path.is_none() {
+            if let Some(campaign_id) = &resume_probe {
+                path = Some(
+                    resumable_campaign(&open_improve_store()?, campaign_id)?
+                        .1
+                        .get("program")
+                        .and_then(Value::as_str)
+                        .ok_or("malformed campaign record: no program path")?
+                        .to_owned(),
+                );
             }
         }
         (resolve_program_path(path)?, probe_root)
@@ -2456,18 +3268,6 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 .to_owned(),
         );
     }
-    for (name, _) in &args.spec.ascend {
-        if !specs.iter().any(|spec| &spec.name == name) {
-            return Err(format!(
-                "unknown gauge `{name}` (declared gauges: {})",
-                specs
-                    .iter()
-                    .map(|spec| spec.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-    }
     let baseline_hash = program_hash(&source);
     let mut store = open_improve_store()?;
     let scenarios = store
@@ -2479,14 +3279,75 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 .to_owned(),
         );
     }
-    let campaign_id = store
-        .open_campaign(&json!({
-            "spec": args.spec.to_json(),
-            "program": program_path,
-            "baseline_hash": baseline_hash,
-            "proposer": args.proposer,
-        }))
-        .map_err(|error| format!("failed to open campaign: {error:?}"))?;
+    let prices = PriceTable::load(&args.provider_config_paths)?;
+    let (campaign_id, candidate_seq_start, campaign_spec, proposer_name) =
+        if let Some(resume_id) = &args.resume {
+            let (summary, payload) = resumable_campaign(&store, resume_id)?;
+            let recorded_hash = payload
+                .get("baseline_hash")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            // The same guard adoption uses: a campaign's verdicts are
+            // paired against ITS baseline; a drifted program needs a new
+            // campaign, not a silently re-based old one.
+            if recorded_hash != baseline_hash {
+                return Err(format!(
+                    "the program changed since campaign `{resume_id}` parked (recorded baseline \
+                     {}…, current {}…); open a new campaign",
+                    &recorded_hash[..12.min(recorded_hash.len())],
+                    &baseline_hash[..12]
+                ));
+            }
+            let mut spec = campaign_spec_from_json(payload.get("spec").unwrap_or(&Value::Null))?;
+            // The allowance is per invocation (decision 2026-07-14): an
+            // unchanged cap buys a fresh round of proposals; --spend-cap
+            // refines it.
+            spec.spend_cap_micros = args.spec.spend_cap_micros.or(spec.spend_cap_micros);
+            let proposer_name = if options.args.iter().any(|arg| arg == "--proposer") {
+                args.proposer.clone()
+            } else {
+                payload
+                    .get("proposer")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&args.proposer)
+                    .to_owned()
+            };
+            store
+                .append_campaign_event(
+                    resume_id,
+                    "campaign.resumed",
+                    &json!({"cumulative_spent_micros": summary.spent_micros}),
+                )
+                .map_err(|error| format!("failed to record resume: {error:?}"))?;
+            (
+                resume_id.clone(),
+                summary.candidates.max(0) as usize,
+                spec,
+                proposer_name,
+            )
+        } else {
+            let campaign_id = store
+                .open_campaign(&json!({
+                    "spec": args.spec.to_json(),
+                    "program": program_path,
+                    "baseline_hash": baseline_hash,
+                    "proposer": args.proposer,
+                }))
+                .map_err(|error| format!("failed to open campaign: {error:?}"))?;
+            (campaign_id, 0, args.spec.clone(), args.proposer.clone())
+        };
+    for (name, _) in &campaign_spec.ascend {
+        if !specs.iter().any(|spec| &spec.name == name) {
+            return Err(format!(
+                "unknown gauge `{name}` (declared gauges: {})",
+                specs
+                    .iter()
+                    .map(|spec| spec.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
     let (open, sealed, sealing_engaged) = seal_scenarios(&campaign_id, &scenarios);
     let unheld_out = !sealing_engaged;
     contain_side_stores();
@@ -2501,146 +3362,336 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
     if args.spec.redacted_view {
         campaign_tags.push("proposer:redacted-view".to_owned());
     }
-    let outcome = (|store: &mut ImproveStore| -> Result<(Vec<Value>, bool, usize), String> {
-        store
-            .append_campaign_event(
-                &campaign_id,
-                "campaign.sealed",
-                &json!({
-                    "sealed": sealed.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
-                    "open": open.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
-                    "unheld_out": unheld_out,
-                }),
-            )
-            .map_err(|error| format!("failed to record sealing: {error:?}"))?;
+    let outcome =
+        (|store: &mut ImproveStore| -> Result<(Vec<Value>, bool, usize, usize, bool), String> {
+            store
+                .append_campaign_event(
+                    &campaign_id,
+                    "campaign.sealed",
+                    &json!({
+                        "sealed": sealed.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+                        "open": open.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+                        "unheld_out": unheld_out,
+                    }),
+                )
+                .map_err(|error| format!("failed to record sealing: {error:?}"))?;
 
-        // Baseline evaluation (paired regeneration: same scenarios, both arms).
-        let mut seq = 0usize;
-        let evaluate_all = |path: &str,
-                            ir: &IrProgram,
-                            rows: &[&ScenarioRow],
-                            seq: &mut usize|
-         -> Result<Vec<RunObservation>, String> {
-            rows.iter()
-                .map(|scenario| {
-                    evaluate_scenario(
-                        path,
-                        args.root.as_deref(),
-                        &args.provider,
-                        &args.provider_config_paths,
-                        scenario,
-                        &specs,
-                        ir,
-                        seq,
-                    )
-                })
-                .collect()
-        };
-        let baseline_open = evaluate_all(&program_path, &ir, &open, &mut seq)?;
-        let baseline_sealed = evaluate_all(&program_path, &ir, &sealed, &mut seq)?;
-        let mut baseline_tags = campaign_tags.clone();
-        baseline_tags.push("baseline".to_owned());
-        record_observations(
-            store,
-            &baseline_open,
-            &specs,
-            "regen",
-            &baseline_hash,
-            Some(&campaign_id),
-            Some("baseline"),
-            &baseline_tags,
-        );
-        record_observations(
-            store,
-            &baseline_sealed,
-            &specs,
-            "regen",
-            &baseline_hash,
-            Some(&campaign_id),
-            Some("baseline"),
-            &baseline_tags,
-        );
-        let unscored: BTreeSet<String> = baseline_open
-            .iter()
-            .flat_map(|observation| observation.skipped.iter().cloned())
-            .map(|(gauge, reason)| format!("{gauge}: {reason}"))
-            .collect();
-        if !unscored.is_empty() && !options.json {
-            for line in &unscored {
-                eprintln!("gauge unscored — {line}");
-            }
-        }
-
-        let mut proposer: Box<dyn Proposer> = match args.proposer.as_str() {
-            "fixture" => Box::new(FixtureProposer::from_env()),
-            "native" => Box::new(NativeProposer),
-            other => return Err(format!("unknown proposer `{other}` (fixture|native)")),
-        };
-        // Answered tradeoffs from every prior campaign: the only source of
-        // auto-resolution authority (default-on, locality-bounded).
-        let precedents = load_precedents(store)?;
-        let mut prior_failures: Vec<String> = Vec::new();
-        let mut cards: Vec<Value> = Vec::new();
-        let mut proposed_any = false;
-        let mut candidate_seq = 0usize;
-        let mut spent_micros: i64 = 0;
-        for _round in 0..MAX_PROPOSAL_ROUNDS {
-            // The spend cap is a hard ceiling over RECORDED cost. Provider
-            // price tables are a follow-on: token-only usage records cost 0,
-            // so today the cap binds only where priced costs exist — stated in
-            // DR-0037, never silent (the spend events carry the tokens).
-            if let Some(cap) = args.spec.spend_cap_micros {
-                if spent_micros >= cap {
-                    store
-                        .append_campaign_event(
-                            &campaign_id,
-                            "campaign.parked",
-                            &json!({"reason": "spend-cap", "spent_micros": spent_micros}),
-                        )
-                        .map_err(|error| format!("failed to park campaign: {error:?}"))?;
-                    break;
+            // Baseline evaluation (paired regeneration: same scenarios,
+            // both arms). Evaluations run concurrently over a bounded
+            // pool: each is fully contained (its own run store + explicit
+            // side stores), the only shared state is read-only refs and
+            // the mutexed compile cache, and results keep input order
+            // (the pairing).
+            let mut seq = 0usize;
+            let evaluate_all = |path: &str,
+                                ir: &IrProgram,
+                                rows: &[&ScenarioRow],
+                                seq: &mut usize|
+             -> Result<Vec<RunObservation>, String> {
+                let base = *seq;
+                *seq += rows.len();
+                let limit = eval_concurrency().min(rows.len().max(1));
+                if limit <= 1 {
+                    return rows
+                        .iter()
+                        .enumerate()
+                        .map(|(index, scenario)| {
+                            evaluate_scenario(
+                                path,
+                                args.root.as_deref(),
+                                &args.provider,
+                                &args.provider_config_paths,
+                                scenario,
+                                &specs,
+                                ir,
+                                base + index + 1,
+                                &prices,
+                            )
+                        })
+                        .collect();
                 }
-            }
-            let reflection = build_reflection(
-                &source,
-                &args.spec,
-                &specs,
-                &baseline_open,
-                &baseline_sealed,
-                &open,
-                &prior_failures,
-                sealing_engaged,
-            );
-            let Some(proposal) = proposer.propose(&reflection)? else {
-                break;
+                let mut results: Vec<Result<RunObservation, String>> =
+                    Vec::with_capacity(rows.len());
+                std::thread::scope(|scope| {
+                    for chunk_start in (0..rows.len()).step_by(limit) {
+                        let chunk_end = (chunk_start + limit).min(rows.len());
+                        let handles: Vec<_> = (chunk_start..chunk_end)
+                            .map(|index| {
+                                let scenario = rows[index];
+                                let root = args.root.as_deref();
+                                let provider = args.provider.as_str();
+                                let provider_config_paths = &args.provider_config_paths;
+                                let specs = &specs;
+                                let prices = &prices;
+                                scope.spawn(move || {
+                                    evaluate_scenario(
+                                        path,
+                                        root,
+                                        provider,
+                                        provider_config_paths,
+                                        scenario,
+                                        specs,
+                                        ir,
+                                        base + index + 1,
+                                        prices,
+                                    )
+                                })
+                            })
+                            .collect();
+                        for handle in handles {
+                            results.push(handle.join().expect("evaluation thread panicked"));
+                        }
+                    }
+                });
+                results.into_iter().collect()
             };
-            if proposal.tokens > 0 {
-                let cost_micros = 0i64; // unpriced until provider price tables land
+            // Judge turns are provider spend like proposer turns: recorded
+            // per evaluation batch at record-time prices, counting toward
+            // the cap.
+            let judge_spend = |store: &mut ImproveStore,
+                               observations: &[RunObservation],
+                               what: &str,
+                               spent: &mut i64|
+             -> Result<(), String> {
+                let turns: Vec<&TurnUsage> = observations
+                    .iter()
+                    .flat_map(|observation| observation.judge_usage.iter())
+                    .collect();
+                if turns.is_empty() {
+                    return Ok(());
+                }
+                let mut tokens = 0i64;
+                let mut cost = 0i64;
+                let mut unpriced = 0usize;
+                for turn in &turns {
+                    tokens += turn.total_tokens;
+                    match prices.cost_micros(turn) {
+                        Some(micros) => cost += micros,
+                        None => unpriced += 1,
+                    }
+                }
                 store
                     .append_campaign_event(
                         &campaign_id,
                         "campaign.spend",
-                        &json!({"cost_micros": cost_micros, "tokens": proposal.tokens,
-                            "what": "proposer turn"}),
+                        &json!({
+                            "cost_micros": cost,
+                            "priced": unpriced == 0,
+                            "tokens": tokens,
+                            "turns": turns.len(),
+                            "unpriced_turns": unpriced,
+                            "what": what,
+                        }),
+                    )
+                    .map_err(|error| format!("failed to record judge spend: {error:?}"))?;
+                *spent += cost;
+                Ok(())
+            };
+            let mut spent_micros: i64 = 0;
+            let baseline_open = evaluate_all(&program_path, &ir, &open, &mut seq)?;
+            let baseline_sealed = evaluate_all(&program_path, &ir, &sealed, &mut seq)?;
+            judge_spend(
+                store,
+                &baseline_open,
+                "judge turns (baseline)",
+                &mut spent_micros,
+            )?;
+            judge_spend(
+                store,
+                &baseline_sealed,
+                "judge turns (baseline, sealed)",
+                &mut spent_micros,
+            )?;
+            let mut baseline_tags = campaign_tags.clone();
+            baseline_tags.push("baseline".to_owned());
+            record_observations(
+                store,
+                &baseline_open,
+                &specs,
+                "regen",
+                &baseline_hash,
+                Some(&campaign_id),
+                Some("baseline"),
+                &baseline_tags,
+            );
+            record_observations(
+                store,
+                &baseline_sealed,
+                &specs,
+                "regen",
+                &baseline_hash,
+                Some(&campaign_id),
+                Some("baseline"),
+                &baseline_tags,
+            );
+            let unscored: BTreeSet<String> = baseline_open
+                .iter()
+                .flat_map(|observation| observation.skipped.iter().cloned())
+                .map(|(gauge, reason)| format!("{gauge}: {reason}"))
+                .collect();
+            if !unscored.is_empty() && !options.json {
+                for line in &unscored {
+                    eprintln!("gauge unscored — {line}");
+                }
+            }
+
+            // Ratchet execution of later `then` stages (improve note §3): a
+            // stage is complete when EVERY ascend gauge in it carries a reach
+            // target the baseline already meets — a target-less gauge is
+            // open-ended maximization, so its stage never auto-advances, and
+            // the final stage always executes. Advancing turns the completed
+            // stage's ACHIEVED levels into hard guard floors and activates the
+            // next recorded stage; each advance is a campaign event.
+            let mut spec_active = campaign_spec.clone();
+            let mut stages_advanced = 0usize;
+            while !spec_active.ascend.is_empty() && !spec_active.later_stages.is_empty() {
+                let complete = spec_active.ascend.iter().all(|(name, reach)| {
+                    reach.as_ref().is_some_and(|reach| {
+                        aggregate(&baseline_open, name)
+                            .operating_point()
+                            .is_some_and(|point| {
+                                if reach.ge {
+                                    point >= reach.threshold
+                                } else {
+                                    point <= reach.threshold
+                                }
+                            })
+                    })
+                });
+                if !complete {
+                    break;
+                }
+                let mut floors = Vec::new();
+                for (name, _) in &spec_active.ascend {
+                    if let Some(point) = aggregate(&baseline_open, name).operating_point() {
+                        let ge = specs
+                            .iter()
+                            .find(|spec| &spec.name == name)
+                            .map(|spec| spec.direction_up)
+                            .unwrap_or(true);
+                        spec_active.floors.insert(name.clone(), (ge, point));
+                        floors.push(json!({"gauge": name, "ge": ge, "floor": point}));
+                    }
+                }
+                let mut next_stage = Vec::new();
+                for token in &spec_active.later_stages.remove(0) {
+                    let (name, reach) = parse_target(token)?;
+                    if !specs.iter().any(|spec| spec.name == name) {
+                        return Err(format!("unknown gauge `{name}` in a `then` stage"));
+                    }
+                    next_stage.push((name, reach));
+                }
+                stages_advanced += 1;
+                store
+                    .append_campaign_event(
+                        &campaign_id,
+                        "stage.advanced",
+                        &json!({
+                            "completed": spec_active
+                                .ascend
+                                .iter()
+                                .map(|(name, _)| name.clone())
+                                .collect::<Vec<_>>(),
+                            "floors": floors,
+                            "next": next_stage
+                                .iter()
+                                .map(|(name, _)| name.clone())
+                                .collect::<Vec<_>>(),
+                        }),
+                    )
+                    .map_err(|error| format!("failed to record stage advance: {error:?}"))?;
+                spec_active.ascend = next_stage;
+            }
+
+            let mut proposer: Box<dyn Proposer> = match proposer_name.as_str() {
+                "fixture" => Box::new(FixtureProposer::from_env()),
+                "native" => Box::new(NativeProposer),
+                other => return Err(format!("unknown proposer `{other}` (fixture|native)")),
+            };
+            // Answered tradeoffs from every prior campaign: the only source of
+            // auto-resolution authority (default-on, locality-bounded).
+            let precedents = load_precedents(store)?;
+            let mut prior_failures: Vec<String> = Vec::new();
+            let mut cards: Vec<Value> = Vec::new();
+            let mut proposed_any = false;
+            // Resume continues the record's numbering: K-ids stay unique
+            // across invocations of one campaign.
+            let mut candidate_seq = candidate_seq_start;
+            let mut parked = false;
+            for _round in 0..MAX_PROPOSAL_ROUNDS {
+                // The spend cap is a hard ceiling over RECORDED cost. Provider
+                // price tables are a follow-on: token-only usage records cost 0,
+                // so today the cap binds only where priced costs exist — stated in
+                // DR-0037, never silent (the spend events carry the tokens).
+                if let Some(cap) = spec_active.spend_cap_micros {
+                    if spent_micros >= cap {
+                        store
+                            .append_campaign_event(
+                                &campaign_id,
+                                "campaign.parked",
+                                &json!({"reason": "spend-cap", "spent_micros": spent_micros}),
+                            )
+                            .map_err(|error| format!("failed to park campaign: {error:?}"))?;
+                        parked = true;
+                        break;
+                    }
+                }
+                let reflection = build_reflection(
+                    &source,
+                    &spec_active,
+                    &specs,
+                    &baseline_open,
+                    &baseline_sealed,
+                    &open,
+                    &prior_failures,
+                    sealing_engaged,
+                );
+                let Some(proposal) = proposer.propose(&reflection)? else {
+                    break;
+                };
+                if proposal.tokens > 0 {
+                    // Record-time pricing: the event stores the computed cost
+                    // and history is never repriced. No table entry (or no
+                    // split) is an honest `priced: false` with cost 0 — the
+                    // tokens are still the record.
+                    let cost_micros = proposal
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| prices.cost_micros(usage));
+                    store
+                    .append_campaign_event(
+                        &campaign_id,
+                        "campaign.spend",
+                        &json!({
+                            "cost_micros": cost_micros.unwrap_or(0),
+                            "priced": cost_micros.is_some(),
+                            "tokens": proposal.tokens,
+                            "input_tokens": proposal.usage.as_ref().map(|usage| usage.input_tokens),
+                            "output_tokens": proposal.usage.as_ref().map(|usage| usage.output_tokens),
+                            "provider": proposal.usage.as_ref().map(|usage| usage.provider.clone()),
+                            "model": proposal.usage.as_ref().map(|usage| usage.model.clone()),
+                            "what": "proposer turn",
+                        }),
                     )
                     .map_err(|error| format!("failed to record spend: {error:?}"))?;
-                spent_micros += cost_micros;
-            }
-            candidate_seq += 1;
-            let candidate_id = format!("K-{candidate_seq}");
-            let candidate_path = eval_scratch_dir().join(format!("candidate-{candidate_seq}.whip"));
-            std::fs::write(&candidate_path, &proposal.source)
-                .map_err(|error| format!("failed to stage candidate: {error}"))?;
-            let candidate_path_str = candidate_path.to_string_lossy().into_owned();
-            // The static gate battery is a free feasibility oracle: candidates
-            // that break invariants die before a sample is spent.
-            let candidate_ir = match crate::compile_source_path_with_root(
-                &candidate_path_str,
-                args.root.as_deref(),
-            ) {
-                Ok((_, candidate_ir)) => candidate_ir,
-                Err(error) => {
-                    store
+                    spent_micros += cost_micros.unwrap_or(0);
+                }
+                candidate_seq += 1;
+                let candidate_id = format!("K-{candidate_seq}");
+                let candidate_path =
+                    eval_scratch_dir().join(format!("candidate-{candidate_seq}.whip"));
+                std::fs::write(&candidate_path, &proposal.source)
+                    .map_err(|error| format!("failed to stage candidate: {error}"))?;
+                let candidate_path_str = candidate_path.to_string_lossy().into_owned();
+                // The static gate battery is a free feasibility oracle: candidates
+                // that break invariants die before a sample is spent.
+                let candidate_ir = match crate::compile_source_path_with_root(
+                    &candidate_path_str,
+                    args.root.as_deref(),
+                ) {
+                    Ok((_, candidate_ir)) => candidate_ir,
+                    Err(error) => {
+                        store
                     .append_campaign_event(
                         &campaign_id,
                         "candidate.rejected",
@@ -2651,40 +3702,47 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                         }),
                     )
                     .map_err(|error| format!("failed to record rejection: {error:?}"))?;
-                    prior_failures.push(format!("{candidate_id}: does not compile"));
-                    continue;
-                }
-            };
-            let candidate_open = evaluate_all(&candidate_path_str, &candidate_ir, &open, &mut seq)?;
-            let candidate_hash = program_hash(&proposal.source);
-            record_observations(
-                store,
-                &candidate_open,
-                &specs,
-                "regen",
-                &candidate_hash,
-                Some(&campaign_id),
-                Some(&candidate_id),
-                &campaign_tags,
-            );
-            store
-                .append_campaign_event(
-                    &campaign_id,
-                    "candidate.recorded",
-                    &json!({
-                        "candidate": candidate_id,
-                        "hash": candidate_hash,
-                        "rationale": proposal.rationale,
-                        "source": proposal.source,
-                        "baseline_hash": baseline_hash,
-                        "proposer": proposer.name(),
-                    }),
-                )
-                .map_err(|error| format!("failed to record candidate: {error:?}"))?;
-            let (paired_base, paired_cand, dropped_pairs) =
-                comparable_pairs(&baseline_open, &candidate_open);
-            if paired_base.is_empty() {
+                        prior_failures.push(format!("{candidate_id}: does not compile"));
+                        continue;
+                    }
+                };
+                let candidate_open =
+                    evaluate_all(&candidate_path_str, &candidate_ir, &open, &mut seq)?;
+                judge_spend(
+                    store,
+                    &candidate_open,
+                    &format!("judge turns ({candidate_id})"),
+                    &mut spent_micros,
+                )?;
+                let candidate_hash = program_hash(&proposal.source);
+                record_observations(
+                    store,
+                    &candidate_open,
+                    &specs,
+                    "regen",
+                    &candidate_hash,
+                    Some(&campaign_id),
+                    Some(&candidate_id),
+                    &campaign_tags,
+                );
                 store
+                    .append_campaign_event(
+                        &campaign_id,
+                        "candidate.recorded",
+                        &json!({
+                            "candidate": candidate_id,
+                            "hash": candidate_hash,
+                            "rationale": proposal.rationale,
+                            "source": proposal.source,
+                            "baseline_hash": baseline_hash,
+                            "proposer": proposer.name(),
+                        }),
+                    )
+                    .map_err(|error| format!("failed to record candidate: {error:?}"))?;
+                let (paired_base, paired_cand, dropped_pairs) =
+                    comparable_pairs(&baseline_open, &candidate_open);
+                if paired_base.is_empty() {
+                    store
                     .append_campaign_event(
                         &campaign_id,
                         "candidate.rejected",
@@ -2695,148 +3753,162 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                         }),
                     )
                     .map_err(|error| format!("failed to record rejection: {error:?}"))?;
-                prior_failures.push(format!("{candidate_id}: no comparable scenario pairs"));
-                continue;
-            }
-            let open_verdict = dominance_verdict(&specs, &args.spec, &paired_base, &paired_cand);
-            let mut verdict = open_verdict.clone();
-            let mut gate_tags = campaign_tags.clone();
-            if dropped_pairs > 0 {
-                gate_tags.push(format!("pairs-dropped:{dropped_pairs}"));
-            }
-            if verdict.proposable && sealing_engaged {
-                // Promotion gate: score the sealed holdout on BOTH arms and
-                // re-check dominance over the combined evidence. Every gate
-                // exposure wears the seal (cumulative, k=3).
-                let candidate_sealed =
-                    evaluate_all(&candidate_path_str, &candidate_ir, &sealed, &mut seq)?;
-                record_observations(
-                    store,
-                    &candidate_sealed,
-                    &specs,
-                    "regen",
-                    &candidate_hash,
-                    Some(&campaign_id),
-                    Some(&candidate_id),
-                    &campaign_tags,
+                    prior_failures.push(format!("{candidate_id}: no comparable scenario pairs"));
+                    continue;
+                }
+                let open_verdict =
+                    dominance_verdict(&specs, &spec_active, &paired_base, &paired_cand);
+                let mut verdict = open_verdict.clone();
+                let mut gate_tags = campaign_tags.clone();
+                if dropped_pairs > 0 {
+                    gate_tags.push(format!("pairs-dropped:{dropped_pairs}"));
+                }
+                if verdict.proposable && sealing_engaged {
+                    // Promotion gate: score the sealed holdout on BOTH arms and
+                    // re-check dominance over the combined evidence. Every gate
+                    // exposure wears the seal (cumulative, k=3).
+                    let candidate_sealed =
+                        evaluate_all(&candidate_path_str, &candidate_ir, &sealed, &mut seq)?;
+                    judge_spend(
+                        store,
+                        &candidate_sealed,
+                        &format!("judge turns ({candidate_id}, sealed)"),
+                        &mut spent_micros,
+                    )?;
+                    record_observations(
+                        store,
+                        &candidate_sealed,
+                        &specs,
+                        "regen",
+                        &candidate_hash,
+                        Some(&campaign_id),
+                        Some(&candidate_id),
+                        &campaign_tags,
+                    );
+                    for scenario in &sealed {
+                        let _ = store.bump_scenario_wear(&scenario.name, WEAR_OUT_AT);
+                    }
+                    let (sealed_base, sealed_cand, sealed_dropped) =
+                        comparable_pairs(&baseline_sealed, &candidate_sealed);
+                    if sealed_dropped > 0 {
+                        gate_tags.push(format!("sealed-pairs-dropped:{sealed_dropped}"));
+                    }
+                    let combined_base: Vec<RunObservation> = paired_base
+                        .iter()
+                        .chain(sealed_base.iter())
+                        .cloned()
+                        .collect();
+                    let combined_cand: Vec<RunObservation> = paired_cand
+                        .iter()
+                        .chain(sealed_cand.iter())
+                        .cloned()
+                        .collect();
+                    verdict =
+                        dominance_verdict(&specs, &spec_active, &combined_base, &combined_cand);
+                    if !verdict.proposable {
+                        verdict
+                            .reasons
+                            .push("failed the sealed promotion gate".to_owned());
+                        gate_tags.push("holdout-refused".to_owned());
+                    }
+                }
+                // The v1 MI lower bound: verbatim scenario-payload fragments
+                // newly present in the candidate. Flag, never block.
+                let all_scenarios: Vec<&ScenarioRow> =
+                    open.iter().chain(sealed.iter()).copied().collect();
+                let overlap = leakage_overlap(&proposal.source, &source, &all_scenarios);
+                if !overlap.is_empty() {
+                    gate_tags.push("leakage-overlap".to_owned());
+                }
+                let mut card = evidence_card(
+                    &campaign_id,
+                    &candidate_id,
+                    &proposal.rationale,
+                    &verdict,
+                    &gate_tags,
+                    unheld_out,
                 );
-                for scenario in &sealed {
-                    let _ = store.bump_scenario_wear(&scenario.name, WEAR_OUT_AT);
+                if !overlap.is_empty() {
+                    card["overlap"] = json!(overlap
+                        .iter()
+                        .map(|fragment| fragment.chars().take(48).collect::<String>())
+                        .collect::<Vec<_>>());
                 }
-                let (sealed_base, sealed_cand, sealed_dropped) =
-                    comparable_pairs(&baseline_sealed, &candidate_sealed);
-                if sealed_dropped > 0 {
-                    gate_tags.push(format!("sealed-pairs-dropped:{sealed_dropped}"));
-                }
-                let combined_base: Vec<RunObservation> = paired_base
-                    .iter()
-                    .chain(sealed_base.iter())
-                    .cloned()
-                    .collect();
-                let combined_cand: Vec<RunObservation> = paired_cand
-                    .iter()
-                    .chain(sealed_cand.iter())
-                    .cloned()
-                    .collect();
-                verdict = dominance_verdict(&specs, &args.spec, &combined_base, &combined_cand);
-                if !verdict.proposable {
-                    verdict
-                        .reasons
-                        .push("failed the sealed promotion gate".to_owned());
-                    gate_tags.push("holdout-refused".to_owned());
-                }
-            }
-            // The v1 MI lower bound: verbatim scenario-payload fragments
-            // newly present in the candidate. Flag, never block.
-            let all_scenarios: Vec<&ScenarioRow> =
-                open.iter().chain(sealed.iter()).copied().collect();
-            let overlap = leakage_overlap(&proposal.source, &source, &all_scenarios);
-            if !overlap.is_empty() {
-                gate_tags.push("leakage-overlap".to_owned());
-            }
-            let mut card = evidence_card(
-                &campaign_id,
-                &candidate_id,
-                &proposal.rationale,
-                &verdict,
-                &gate_tags,
-                unheld_out,
-            );
-            if !overlap.is_empty() {
-                card["overlap"] = json!(overlap
-                    .iter()
-                    .map(|fragment| fragment.chars().take(48).collect::<String>())
-                    .collect::<Vec<_>>());
-            }
-            // A tradeoff first consults the precedent set: the Pareto-safe
-            // closure of the human's actual answers may resolve it
-            // (`improve-precedent.maude`); anything else asks as before.
-            let resolution = if verdict.tradeoff {
-                precedent_resolution(&precedents, &verdict.lines)
-            } else {
-                None
-            };
-            if let Some(resolution) = &resolution {
-                let (tag, citation) = match resolution {
-                    PrecedentResolution::AutoAccept(citation) => {
-                        ("auto-resolved:precedent", citation)
-                    }
-                    PrecedentResolution::AutoReject(citation) => {
-                        ("auto-rejected:precedent", citation)
-                    }
+                // A tradeoff first consults the precedent set: the Pareto-safe
+                // closure of the human's actual answers may resolve it
+                // (`improve-precedent.maude`); anything else asks as before.
+                let resolution = if verdict.tradeoff {
+                    precedent_resolution(&precedents, &verdict.lines)
+                } else {
+                    None
                 };
-                card["precedent"] = json!(citation);
-                card["tags"]
-                    .as_array_mut()
-                    .expect("cards always carry a tags array")
-                    .push(json!(tag));
+                if let Some(resolution) = &resolution {
+                    let (tag, citation) = match resolution {
+                        PrecedentResolution::AutoAccept(citation) => {
+                            ("auto-resolved:precedent", citation)
+                        }
+                        PrecedentResolution::AutoReject(citation) => {
+                            ("auto-rejected:precedent", citation)
+                        }
+                    };
+                    card["precedent"] = json!(citation);
+                    card["tags"]
+                        .as_array_mut()
+                        .expect("cards always carry a tags array")
+                        .push(json!(tag));
+                }
+                if verdict.proposable
+                    || matches!(resolution, Some(PrecedentResolution::AutoAccept(_)))
+                {
+                    proposed_any = true;
+                    store
+                        .append_campaign_event(&campaign_id, "candidate.proposed", &card)
+                        .map_err(|error| format!("failed to record proposal: {error:?}"))?;
+                    cards.push(card);
+                    // Propose-don't-apply: first undominated candidate ends the
+                    // stage; adoption is the human's move (`whip adopt`).
+                    break;
+                } else if matches!(resolution, Some(PrecedentResolution::AutoReject(_))) {
+                    store
+                        .append_campaign_event(&campaign_id, "candidate.rejected", &card)
+                        .map_err(|error| format!("failed to record rejection: {error:?}"))?;
+                    prior_failures.push(format!(
+                        "{candidate_id}: auto-rejected by precedent ({})",
+                        verdict.reasons.join("; ")
+                    ));
+                    cards.push(card);
+                } else if verdict.tradeoff {
+                    store
+                        .append_campaign_event(&campaign_id, "candidate.tradeoff", &card)
+                        .map_err(|error| format!("failed to record tradeoff: {error:?}"))?;
+                    prior_failures.push(format!(
+                        "{candidate_id}: genuine tradeoff ({}) — escalated, not accepted",
+                        verdict.reasons.join("; ")
+                    ));
+                    cards.push(card);
+                } else {
+                    store
+                        .append_campaign_event(&campaign_id, "candidate.rejected", &card)
+                        .map_err(|error| format!("failed to record rejection: {error:?}"))?;
+                    prior_failures.push(format!("{candidate_id}: {}", verdict.reasons.join("; ")));
+                    cards.push(card);
+                }
             }
-            if verdict.proposable || matches!(resolution, Some(PrecedentResolution::AutoAccept(_)))
-            {
-                proposed_any = true;
+            // A parked campaign's invocation ends on the park event so the
+            // record folds to `parked` and `--resume` can continue it; every
+            // other outcome closes as before (never linger open).
+            if !parked {
                 store
-                    .append_campaign_event(&campaign_id, "candidate.proposed", &card)
-                    .map_err(|error| format!("failed to record proposal: {error:?}"))?;
-                cards.push(card);
-                // Propose-don't-apply: first undominated candidate ends the
-                // stage; adoption is the human's move (`whip adopt`).
-                break;
-            } else if matches!(resolution, Some(PrecedentResolution::AutoReject(_))) {
-                store
-                    .append_campaign_event(&campaign_id, "candidate.rejected", &card)
-                    .map_err(|error| format!("failed to record rejection: {error:?}"))?;
-                prior_failures.push(format!(
-                    "{candidate_id}: auto-rejected by precedent ({})",
-                    verdict.reasons.join("; ")
-                ));
-                cards.push(card);
-            } else if verdict.tradeoff {
-                store
-                    .append_campaign_event(&campaign_id, "candidate.tradeoff", &card)
-                    .map_err(|error| format!("failed to record tradeoff: {error:?}"))?;
-                prior_failures.push(format!(
-                    "{candidate_id}: genuine tradeoff ({}) — escalated, not accepted",
-                    verdict.reasons.join("; ")
-                ));
-                cards.push(card);
-            } else {
-                store
-                    .append_campaign_event(&campaign_id, "candidate.rejected", &card)
-                    .map_err(|error| format!("failed to record rejection: {error:?}"))?;
-                prior_failures.push(format!("{candidate_id}: {}", verdict.reasons.join("; ")));
-                cards.push(card);
+                    .append_campaign_event(
+                        &campaign_id,
+                        "campaign.closed",
+                        &json!({"proposed": proposed_any}),
+                    )
+                    .map_err(|error| format!("failed to close campaign: {error:?}"))?;
             }
-        }
-        store
-            .append_campaign_event(
-                &campaign_id,
-                "campaign.closed",
-                &json!({"proposed": proposed_any}),
-            )
-            .map_err(|error| format!("failed to close campaign: {error:?}"))?;
-        Ok((cards, proposed_any, candidate_seq))
-    })(&mut store);
-    let (cards, proposed_any, candidate_seq) = match outcome {
+            Ok((cards, proposed_any, candidate_seq, stages_advanced, parked))
+        })(&mut store);
+    let (cards, proposed_any, candidate_seq, stages_advanced, parked) = match outcome {
         Ok(parts) => parts,
         Err(message) => {
             // A campaign must never linger "open" after a crash: the record
@@ -2858,9 +3930,17 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
             "unheld_out": unheld_out,
             "cards": cards,
             "proposed": proposed_any,
+            "stages_advanced": stages_advanced,
+            "parked": parked,
         })));
     }
     println!("campaign {campaign_id} on `{program_path}`");
+    if stages_advanced > 0 {
+        println!(
+            "  ratchet: {stages_advanced} completed `then` stage{} — achieved levels held as guard floors",
+            if stages_advanced == 1 { "" } else { "s" }
+        );
+    }
     if unheld_out {
         println!("  tags: unheld-out (fewer than {MIN_SCENARIOS_FOR_SEALING} pinned scenarios)");
     }
@@ -2869,6 +3949,9 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
     }
     for card in &cards {
         print_card(card);
+    }
+    if parked {
+        println!("  parked: spend cap reached — resume with: whip improve --resume {campaign_id}");
     }
     if proposed_any {
         println!("adopt with: whip adopt {campaign_id}:K-{candidate_seq} --program {program_path}");
@@ -2910,6 +3993,7 @@ fn evidence_card(
             "band": line.band,
             "bar_met": line.bar_met,
             "reach_met": line.reach_met,
+            "p_better": line.p_better,
             "direction": if line.direction_up { "up" } else { "down" },
         })).collect::<Vec<_>>(),
     })
@@ -3555,6 +4639,7 @@ fn run_suppose(options: &CliOptions) -> Result<ExitCode, String> {
     // Never create a store while looking for the control: an unresolvable
     // path yields an honest "no recorded control", not judge scores over a
     // blank record.
+    let prices = PriceTable::load(&provider_config_paths)?;
     let recorded = source_store_path
         .exists()
         .then(|| SqliteStore::open(&source_store_path).ok())
@@ -3566,9 +4651,10 @@ fn run_suppose(options: &CliOptions) -> Result<ExitCode, String> {
                 &specs,
                 Some(&scenario.name),
                 false,
+                &ir,
+                &prices,
             )
         });
-    let mut seq = 0usize;
     let regenerated = evaluate_scenario(
         &program_path,
         root.as_deref(),
@@ -3577,7 +4663,8 @@ fn run_suppose(options: &CliOptions) -> Result<ExitCode, String> {
         &scenario,
         &specs,
         &ir,
-        &mut seq,
+        1,
+        &prices,
     )?;
     let mode = if regenerated
         .readings
@@ -3608,12 +4695,21 @@ fn run_suppose(options: &CliOptions) -> Result<ExitCode, String> {
             let before = recorded
                 .as_ref()
                 .and_then(|observation| observation.readings.get(&spec.name));
+            // The belief-update readout (DR-0041): the paired sign test
+            // over the (recorded, regenerated) pair when both carry bar
+            // verdicts. A single continuous delta has no scale, so
+            // family B stays honestly silent at N=1.
+            let p_better = match (before.and_then(|reading| reading.passed), after.passed) {
+                (Some(control), Some(treatment)) => p_better_sign(&[(control, treatment)]),
+                _ => None,
+            };
             Some(json!({
                 "gauge": spec.name,
                 "recorded": before.map(|reading| reading.score),
                 "regenerated": after.score,
                 "recorded_passed": before.and_then(|reading| reading.passed),
                 "regenerated_passed": after.passed,
+                "p_better": p_better,
                 "tags": after.tags,
             }))
         })
@@ -3638,7 +4734,7 @@ fn run_suppose(options: &CliOptions) -> Result<ExitCode, String> {
             .map(|value| format!("{value:.4}"))
             .unwrap_or_else(|| "—".to_owned());
         println!(
-            "  {}: {} -> {:.4}{}",
+            "  {}: {} -> {:.4}{}{}",
             line["gauge"].as_str().unwrap_or("?"),
             recorded,
             line["regenerated"].as_f64().unwrap_or(f64::NAN),
@@ -3646,13 +4742,479 @@ fn run_suppose(options: &CliOptions) -> Result<ExitCode, String> {
                 Some(true) => " ✓",
                 Some(false) => " ✗",
                 None => "",
-            }
+            },
+            line["p_better"]
+                .as_f64()
+                .map(|p| format!(" · P(better)={:.0}% · N=1 pair", p * 100.0))
+                .unwrap_or_default()
         );
     }
     for (gauge, reason) in &regenerated.skipped {
         println!("  · {gauge}: {reason}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// whip settle — racing + stopping (models/maude/settle-stopping.maude)
+// ---------------------------------------------------------------------------
+
+/// The sound certifier from `settle-stopping.maude`: a strong (bar-passing)
+/// observation raises the evidence level, a contrary one lowers it (floored
+/// at zero), and the decision closes exactly at the threshold crossing —
+/// anytime-valid, so crossing once suffices. Exhaustion below the threshold
+/// is an honest `undetermined`, never a certificate.
+struct SettleWalk {
+    level: u32,
+    threshold: u32,
+    /// All-time high-water mark: the racing loop declares evidence
+    /// exhausted when a full pass over the pinned pool fails to raise it.
+    high_water: u32,
+    /// Informative observations folded (the N the system chose).
+    n: usize,
+}
+
+impl SettleWalk {
+    fn new(threshold: u32) -> Self {
+        Self {
+            level: 0,
+            threshold,
+            high_water: 0,
+            n: 0,
+        }
+    }
+
+    /// Fold one observation; `true` exactly when this observation crosses
+    /// the threshold.
+    fn observe(&mut self, strong: bool) -> bool {
+        self.n += 1;
+        if strong {
+            self.level += 1;
+        } else {
+            self.level = self.level.saturating_sub(1);
+        }
+        self.high_water = self.high_water.max(self.level);
+        self.level >= self.threshold
+    }
+}
+
+pub(crate) fn settle_command(options: &CliOptions) -> ExitCode {
+    match run_settle(options) {
+        Ok(code) => code,
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `whip settle <gauge>`: name the decision (the gauge's bar) and let the
+/// system stop itself — racing regenerations over the pinned scenario pool
+/// until the evidence level crosses the threshold (bar cleared) or a full
+/// pass adds no net evidence (an honest `undetermined`). Never an
+/// operator-chosen N. `--certify` records the crossing as a certificate on
+/// the crossing observation's evidence row.
+fn run_settle(options: &CliOptions) -> Result<ExitCode, String> {
+    let usage = "usage: whip [--json] settle <gauge> [--certify] [--threshold <k>] [--program <workflow.whip>] [--root <workflow>] [--provider <name>] [--provider-config <path>]";
+    let mut gauge_name = None;
+    let mut certify = false;
+    let mut spend_cap_micros: Option<i64> = None;
+    let mut threshold = 3u32;
+    let mut program = None;
+    let mut root = None;
+    let mut provider = "fixture".to_owned();
+    let mut provider_config_paths: Vec<PathBuf> = Vec::new();
+    let mut index = 0;
+    while index < options.args.len() {
+        match options.args[index].as_str() {
+            "--certify" => certify = true,
+            "--spend-cap" => {
+                index += 1;
+                spend_cap_micros = Some(parse_spend_cap(
+                    options
+                        .args
+                        .get(index)
+                        .ok_or("--spend-cap requires an amount")?,
+                )?);
+            }
+            "--threshold" => {
+                index += 1;
+                threshold = options
+                    .args
+                    .get(index)
+                    .ok_or(usage)?
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|k| *k >= 1)
+                    .ok_or("invalid --threshold (use a positive integer)")?;
+            }
+            "--program" => {
+                index += 1;
+                program = options.args.get(index).cloned();
+            }
+            "--root" => {
+                index += 1;
+                root = options.args.get(index).cloned();
+            }
+            "--provider" => {
+                index += 1;
+                provider = options.args.get(index).ok_or(usage)?.clone();
+            }
+            "--provider-config" => {
+                index += 1;
+                provider_config_paths.push(PathBuf::from(options.args.get(index).ok_or(usage)?));
+            }
+            other if gauge_name.is_none() => gauge_name = Some(other.to_owned()),
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+        index += 1;
+    }
+    let gauge_name = gauge_name.ok_or(usage)?;
+    let program_path = resolve_program_path(program)?;
+    let (_, ir) =
+        crate::compile_source_path_with_root(&program_path, root.as_deref()).map_err(|error| {
+            format!(
+                "`{program_path}` does not compile: {}",
+                compile_failure_summary(&error)
+            )
+        })?;
+    let specs = collect_gauge_specs(&ir);
+    let spec = specs
+        .iter()
+        .find(|spec| spec.name == gauge_name)
+        .ok_or_else(|| format!("unknown gauge `{gauge_name}` (declare it in the program)"))?;
+    if spec.bar.is_none() {
+        return Err(format!(
+            "gauge `{gauge_name}` has no bar — settle needs a decision; declare an `expect` bar on the gauge"
+        ));
+    }
+    let mut improve_store = open_improve_store()?;
+    let scenarios: Vec<_> = improve_store
+        .list_scenarios()
+        .map_err(|error| format!("failed to read scenarios: {error:?}"))?
+        .into_iter()
+        .filter(|scenario| !scenario.retired)
+        .collect();
+    if scenarios.is_empty() {
+        return Err(
+            "no pinned scenarios to regenerate — pin one with `whip pin <instance> --as <name>`"
+                .to_owned(),
+        );
+    }
+    contain_side_stores();
+    let source = std::fs::read_to_string(&program_path).unwrap_or_default();
+    let hash = program_hash(&source);
+    let prices = PriceTable::load(&provider_config_paths)?;
+
+    // The belief-update readout alongside the certification walk
+    // (DR-0041): θ = per-regeneration bar-pass probability under a
+    // Jeffreys Beta posterior; the reference is the chance bar's own
+    // rate, or majority (1/2) for stat-shaped bars.
+    let bar_reference = spec
+        .bar
+        .as_ref()
+        .map(|bar| {
+            if bar.chance_field.is_some() {
+                (bar.threshold, bar.ge)
+            } else {
+                (0.5, true)
+            }
+        })
+        .unwrap_or((0.5, true));
+    let mut strongs = 0usize;
+    let mut contraries = 0usize;
+    let mut walk = SettleWalk::new(threshold);
+    let mut trail: Vec<Value> = Vec::new();
+    let mut seq = 0usize;
+    let mut crossed = false;
+    let mut any_informative = false;
+    let mut spent_micros: i64 = 0;
+    let mut capped = false;
+    'rounds: loop {
+        let high_before_round = walk.high_water;
+        let mut round_informative = false;
+        for scenario in &scenarios {
+            // The guardrail is currency, never a sample size (research
+            // note §4.3): it binds only on PRICED regeneration cost —
+            // unpriced usage keeps the honest posture (cost 0, no bite).
+            if let Some(cap) = spend_cap_micros {
+                if spent_micros >= cap {
+                    capped = true;
+                    break 'rounds;
+                }
+            }
+            seq += 1;
+            let observation = evaluate_scenario(
+                &program_path,
+                root.as_deref(),
+                &provider,
+                &provider_config_paths,
+                scenario,
+                &specs,
+                &ir,
+                seq,
+                &prices,
+            )?;
+            spent_micros += observation
+                .readings
+                .get("std.spend")
+                .map_or(0, |reading| (reading.score * 1_000_000.0).round() as i64);
+            spent_micros += observation
+                .judge_usage
+                .iter()
+                .filter_map(|turn| prices.cost_micros(turn))
+                .sum::<i64>();
+            let verdict = observation
+                .readings
+                .get(&gauge_name)
+                .and_then(|reading| reading.passed.map(|passed| (reading.score, passed)));
+            let mut tags = vec!["settle".to_owned()];
+            if let Some((score, strong)) = verdict {
+                round_informative = true;
+                any_informative = true;
+                if strong {
+                    strongs += 1;
+                } else {
+                    contraries += 1;
+                }
+                crossed = walk.observe(strong);
+                if crossed && certify {
+                    tags.push("certificate".to_owned());
+                }
+                trail.push(json!({
+                    "scenario": scenario.name,
+                    "score": score,
+                    "strong": strong,
+                    "level": walk.level,
+                }));
+            } else {
+                let reason = observation
+                    .skipped
+                    .iter()
+                    .find(|(gauge, _)| gauge == &gauge_name)
+                    .map(|(_, reason)| reason.clone())
+                    .unwrap_or_else(|| "no reading".to_owned());
+                trail.push(json!({
+                    "scenario": scenario.name,
+                    "uninformative": reason,
+                }));
+            }
+            // Every settle regeneration is evidence, crossing or not.
+            record_observations(
+                &mut improve_store,
+                std::slice::from_ref(&observation),
+                &specs,
+                "regen",
+                &hash,
+                None,
+                None,
+                &tags,
+            );
+            if crossed {
+                break 'rounds;
+            }
+        }
+        // Stopping is the system's: a full pass over the pool that set no
+        // new high-water mark cannot be expected to add net evidence.
+        if !round_informative || walk.high_water <= high_before_round {
+            break;
+        }
+    }
+
+    let (outcome, reason) = if crossed {
+        (
+            if certify { "certified" } else { "bar-cleared" },
+            "threshold-crossed",
+        )
+    } else if capped {
+        ("undetermined", "spend-cap-reached")
+    } else if any_informative {
+        ("undetermined", "evidence-exhausted")
+    } else {
+        ("undetermined", "no-informative-readings")
+    };
+    let certificate = (crossed && certify).then(|| {
+        format!(
+            "ct-{}",
+            &program_hash(&format!("{gauge_name}:{hash}:{}:{}", walk.n, walk.level))[..8]
+        )
+    });
+    let p_bar_met = (walk.n > 0).then(|| {
+        let below = betainc(
+            0.5 + strongs as f64,
+            0.5 + contraries as f64,
+            bar_reference.0,
+        );
+        if bar_reference.1 {
+            1.0 - below
+        } else {
+            below
+        }
+    });
+    if options.json {
+        return Ok(emit_json(json!({
+            "schema": "whipplescript.settle.v0",
+            "gauge": gauge_name,
+            "outcome": outcome,
+            "reason": reason,
+            "n": walk.n,
+            "level": walk.level,
+            "threshold": walk.threshold,
+            "scenarios": scenarios.len(),
+            "certificate": certificate,
+            "p_bar_met": p_bar_met,
+            "spent_micros": spent_micros,
+            "trail": trail,
+        })));
+    }
+    match outcome {
+        "certified" => println!(
+            "settle {gauge_name}: certified at N={} · level {}/{}{} · certificate {}",
+            walk.n,
+            walk.level,
+            walk.threshold,
+            p_bar_met
+                .map(|p| format!(" · P(bar met)={:.0}%", p * 100.0))
+                .unwrap_or_default(),
+            certificate.as_deref().unwrap_or("?"),
+        ),
+        "bar-cleared" => println!(
+            "settle {gauge_name}: bar cleared at N={} · level {}/{}{}",
+            walk.n,
+            walk.level,
+            walk.threshold,
+            p_bar_met
+                .map(|p| format!(" · P(bar met)={:.0}%", p * 100.0))
+                .unwrap_or_default()
+        ),
+        _ => {
+            println!(
+                "settle {gauge_name}: undetermined ({} at N={} · level {}/{})",
+                reason.replace('-', " "),
+                walk.n,
+                walk.level,
+                walk.threshold
+            );
+            if capped {
+                println!(
+                    "  · spent ${:.2} against the cap — raise --spend-cap to keep racing",
+                    spent_micros as f64 / 1_000_000.0
+                );
+            } else {
+                println!(
+                    "  · a full pass over {} pinned scenario{} added no net evidence — pin more scenarios (whip pin) or revisit the bar",
+                    scenarios.len(),
+                    if scenarios.len() == 1 { "" } else { "s" }
+                );
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One standing-contradiction flag: evidence recorded under the accepted
+/// candidate's own program hash contradicting what the answer accepted.
+struct ContradictionFlag {
+    gauge: String,
+    citation: String,
+    p_worse: f64,
+    n: usize,
+    reference: f64,
+}
+
+/// The standing-contradiction reopener (`contradiction-reopener.maude`,
+/// design pass 2026-07-14): for every ACCEPTED precedent, fold the
+/// evidence recorded under the accepted candidate's program hash since
+/// the answer into a per-gauge contradiction posterior against the
+/// answer-time operating point. The trigger is SUSTAINED — the posterior
+/// must sit at ≥ 0.8 AND be non-decreasing over the last three
+/// informative observations, so a single noisy day never nags — and the
+/// flag is ADVISORY ONLY: it cites the precedent; revocation stays
+/// `whip answer --revoke`. Rows are matched by the candidate's hash, so
+/// a program that has since moved on quiesces the flag naturally.
+fn standing_contradictions(
+    store: &ImproveStore,
+    gauge_filter: Option<&str>,
+) -> Result<Vec<ContradictionFlag>, String> {
+    const THRESHOLD: f64 = 0.8;
+    const SUSTAIN: usize = 3;
+    let precedents = load_precedents(store)?;
+    let recorded = store
+        .list_events_of_type("candidate.recorded")
+        .map_err(|error| format!("failed to read candidate records: {error:?}"))?;
+    let mut flags = Vec::new();
+    for precedent in precedents.iter().filter(|precedent| precedent.accepted) {
+        let Some(hash) = recorded
+            .iter()
+            .find(|event| {
+                event.campaign_id == precedent.campaign
+                    && event.payload.get("candidate").and_then(Value::as_str)
+                        == Some(precedent.candidate.as_str())
+            })
+            .and_then(|event| event.payload.get("hash").and_then(Value::as_str))
+        else {
+            continue;
+        };
+        for (gauge, line) in &precedent.gauges {
+            if gauge_filter.is_some_and(|filter| filter != gauge) {
+                continue;
+            }
+            let mut rows = store
+                .list_evidence(Some(gauge), None, None, Some(hash))
+                .map_err(|error| format!("failed to read evidence: {error:?}"))?;
+            // The reopener reads the AMBIENT stream: live rows accrued
+            // after the answer. The campaign's own regen rows were the
+            // evidence the answer already weighed — they reopen nothing.
+            rows.retain(|row| {
+                row.execution_mode == "live" && row.created_at > precedent.answered_at
+            });
+            rows.sort_by_key(|row| row.evidence_id);
+            // Family A when the rows carry bar verdicts and the answer-time
+            // operating point is rate-shaped (a chance gauge); family B
+            // over raw scores otherwise. Both build the posterior
+            // trajectory one informative observation at a time.
+            let verdict_shaped = rows.iter().all(|row| row.passed.is_some())
+                && (0.0..=1.0).contains(&line.candidate)
+                && !rows.is_empty();
+            let trajectory: Vec<f64> = if verdict_shaped {
+                let mut passes = 0usize;
+                let mut fails = 0usize;
+                rows.iter()
+                    .map(|row| {
+                        if row.passed == Some(true) {
+                            passes += 1;
+                        } else {
+                            fails += 1;
+                        }
+                        p_rate_below(passes, fails, line.candidate)
+                    })
+                    .collect()
+            } else {
+                let scores: Vec<f64> = rows.iter().map(|row| row.score).collect();
+                (2..=scores.len())
+                    .filter_map(|prefix| {
+                        p_mean_worse(&scores[..prefix], line.candidate, line.direction_up)
+                    })
+                    .collect()
+            };
+            if trajectory.len() < SUSTAIN {
+                continue;
+            }
+            let tail = &trajectory[trajectory.len() - SUSTAIN..];
+            let sustained =
+                tail.windows(2).all(|pair| pair[1] >= pair[0]) && tail[SUSTAIN - 1] >= THRESHOLD;
+            if sustained {
+                flags.push(ContradictionFlag {
+                    gauge: gauge.clone(),
+                    citation: precedent.citation(),
+                    p_worse: tail[SUSTAIN - 1],
+                    n: rows.len(),
+                    reference: line.candidate,
+                });
+            }
+        }
+    }
+    Ok(flags)
 }
 
 pub(crate) fn gauges_command(options: &CliOptions) -> ExitCode {
@@ -3671,6 +5233,15 @@ pub(crate) fn gauges_command(options: &CliOptions) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // The ledger reopening earlier calls on its own as evidence
+    // accumulates (research note §4.3) — advisory, precedent-citing.
+    let contradictions = match standing_contradictions(&store, filter) {
+        Ok(flags) => flags,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
     if options.json {
         return emit_json(json!({
             "schema": "whipplescript.gauges.v0",
@@ -3681,6 +5252,13 @@ pub(crate) fn gauges_command(options: &CliOptions) -> ExitCode {
                 "regen": row.regen,
                 "mean": if row.n > 0 { row.score_sum / row.n as f64 } else { 0.0 },
                 "passes": row.passes,
+            })).collect::<Vec<_>>(),
+            "contradictions": contradictions.iter().map(|flag| json!({
+                "gauge": flag.gauge,
+                "precedent": flag.citation,
+                "p_worse": flag.p_worse,
+                "n": flag.n,
+                "reference": flag.reference,
             })).collect::<Vec<_>>(),
         }));
     }
@@ -3698,6 +5276,15 @@ pub(crate) fn gauges_command(options: &CliOptions) -> ExitCode {
             row.live,
             row.passes
         );
+        for flag in contradictions.iter().filter(|flag| flag.gauge == row.gauge) {
+            println!(
+                "  ⚠ contradicts answered call {}: P(worse than {:.4})={:.0}% and tightening · N={} since the answer — reopen, or revoke with `whip answer`",
+                flag.citation,
+                flag.reference,
+                flag.p_worse * 100.0,
+                flag.n
+            );
+        }
     }
     ExitCode::SUCCESS
 }
@@ -3712,6 +5299,8 @@ pub(crate) fn ambient_score_after_dev(
     instance_id: &str,
     ir: &IrProgram,
     json: bool,
+    provider_config_paths: &[PathBuf],
+    program_hash: &str,
 ) {
     if ir.gauges.is_empty() {
         return;
@@ -3720,7 +5309,15 @@ pub(crate) fn ambient_score_after_dev(
         return;
     };
     let specs = collect_gauge_specs(ir);
-    let observation = score_instance(&store, instance_id, &specs, None, true);
+    // A malformed price table must not break the dev loop (ambient is
+    // silent-skip by design), but it should not be silent either.
+    let prices = PriceTable::load(provider_config_paths).unwrap_or_else(|error| {
+        if !json {
+            eprintln!("{error} (std.spend scores unpriced this run)");
+        }
+        PriceTable::default()
+    });
+    let observation = score_instance(&store, instance_id, &specs, None, true, ir, &prices);
     if observation.readings.is_empty() {
         return;
     }
@@ -3738,7 +5335,9 @@ pub(crate) fn ambient_score_after_dev(
             score: reading.score,
             passed: reading.passed,
             instance_id: Some(instance_id),
-            program_hash: None,
+            // Hash-attributed so same-hash consumers (the reopener, the
+            // warm scope) can fold ambient rows.
+            program_hash: Some(program_hash),
             branch_ref: None,
             execution_mode: "live",
             scorer: &scorer,
@@ -3805,6 +5404,7 @@ mod tests {
                     },
                 )]),
                 skipped: Vec::new(),
+                judge_usage: Vec::new(),
             })
             .collect()
     }
@@ -4028,6 +5628,7 @@ mod tests {
                 },
             )]),
             skipped: Vec::new(),
+            judge_usage: Vec::new(),
         }];
         let reflection = build_reflection(
             "workflow X",
@@ -4125,6 +5726,7 @@ mod tests {
                 },
             )]),
             skipped: Vec::new(),
+            judge_usage: Vec::new(),
         }];
         let row = ScenarioRow {
             name: "acme-outage-email".to_owned(),
@@ -4225,6 +5827,7 @@ mod tests {
             bar_met: None,
             reach_met: None,
             direction_up: true,
+            p_better: None,
         }
     }
 
@@ -4336,6 +5939,326 @@ mod tests {
             None,
             "conflicting precedents must fall back to the ask"
         );
+    }
+
+    #[test]
+    fn judge_arguments_resolve_against_the_record() {
+        let record = json!({
+            "input": {"ticket": {"id": "T-1", "title": "Fix login"}},
+            "facts": [
+                {"name": "Assessment", "key": "a1", "value": {"priority": "low"}},
+                {"name": "Assessment", "key": "a2", "value": {"priority": "high"}},
+                {"name": "Other", "key": "o1", "value": {"priority": "wrong"}},
+            ],
+        });
+        assert_eq!(
+            resolve_judge_argument("input.ticket.title", &record),
+            Some(json!("Fix login"))
+        );
+        // The LAST recorded fact of the class wins: the run's final state.
+        assert_eq!(
+            resolve_judge_argument("facts.Assessment.priority", &record),
+            Some(json!("high"))
+        );
+        assert_eq!(
+            resolve_judge_argument("record", &record),
+            Some(record.clone())
+        );
+        assert_eq!(
+            resolve_judge_argument("input.ticket.missing", &record),
+            None
+        );
+        assert_eq!(
+            resolve_judge_argument("facts.Missing.priority", &record),
+            None
+        );
+    }
+
+    // The estimator numerics (DR-0041): checked against independently
+    // computed reference values.
+
+    #[test]
+    fn incomplete_beta_and_t_cdf_match_reference_values() {
+        assert!((betainc(0.5, 0.5, 0.5) - 0.5).abs() < 1e-9);
+        assert!((betainc(1.0, 1.0, 0.25) - 0.25).abs() < 1e-9, "uniform CDF");
+        // Symmetry: I_x(a,b) = 1 - I_{1-x}(b,a).
+        let lhs = betainc(2.5, 1.5, 0.3);
+        let rhs = 1.0 - betainc(1.5, 2.5, 0.7);
+        assert!((lhs - rhs).abs() < 1e-9);
+        assert!((student_t_cdf(0.0, 5.0) - 0.5).abs() < 1e-9);
+        assert!((student_t_cdf(1.0, 10.0) - 0.829_553_4).abs() < 1e-6);
+        assert!(student_t_cdf(50.0, 3.0) > 0.999);
+    }
+
+    #[test]
+    fn sign_test_posterior_is_jeffreys_and_pairing_aware() {
+        assert_eq!(p_better_sign(&[]), None, "no pairs, no posterior");
+        // Concordant pairs are uninformative about the sign: dead even.
+        let even = p_better_sign(&[(true, true), (false, false)]).expect("posterior");
+        assert!((even - 0.5).abs() < 1e-9);
+        // One discordant win under Jeffreys.
+        let one_win = p_better_sign(&[(false, true)]).expect("posterior");
+        assert!((one_win - 0.818_309_9).abs() < 1e-6);
+        // Symmetric wins and losses cancel.
+        let split = p_better_sign(&[(false, true), (true, false)]).expect("posterior");
+        assert!((split - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn t_posterior_needs_scale_and_respects_direction() {
+        assert_eq!(p_better_t(&[1.0], true), None, "one delta has no scale");
+        // Deterministic improvement: certainty (up to float residue in
+        // the mean, which can leave a ~1e-34 variance on the t path).
+        assert!(p_better_t(&[0.2, 0.2, 0.2], true).expect("posterior") > 1.0 - 1e-9);
+        assert!(p_better_t(&[0.2, 0.2, 0.2], false).expect("posterior") < 1e-9);
+        let up = p_better_t(&[1.0, 1.2, 0.9, 1.1], true).expect("posterior");
+        assert!(up > 0.99, "consistent positive deltas: {up}");
+        let down = p_better_t(&[1.0, 1.2, 0.9, 1.1], false).expect("posterior");
+        assert!((up + down - 1.0).abs() < 1e-9, "direction flips the tail");
+    }
+
+    #[test]
+    fn contradiction_posterior_tightens_monotonically_on_sustained_failures() {
+        // The reopener's family-A trajectory: each failure against a 0.9
+        // answer-time operating point tightens the contradiction — the
+        // sound trigger's `up` movements (contradiction-reopener.maude).
+        let trajectory: Vec<f64> = (1..=3).map(|fails| p_rate_below(0, fails, 0.9)).collect();
+        assert!(
+            trajectory.windows(2).all(|pair| pair[1] > pair[0]),
+            "monotone: {trajectory:?}"
+        );
+        assert!(trajectory[2] > 0.99);
+        // A pass RECEDES the posterior — the streak reset.
+        assert!(p_rate_below(1, 3, 0.9) < p_rate_below(0, 3, 0.9));
+        // Degenerate references stay expressible (clamped off 1.0).
+        assert!(p_rate_below(0, 3, 1.0) < 1.0);
+    }
+
+    #[test]
+    fn price_table_prices_at_record_time_and_refuses_malformed_entries() {
+        let dir = std::env::temp_dir().join(format!("whip-prices-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("providers.json");
+        std::fs::write(
+            &path,
+            r#"{"providers": [], "prices": [
+                {"provider": "anthropic", "model": "claude-sonnet-5",
+                 "input_per_mtok_usd": 3.0, "output_per_mtok_usd": 15.0}
+            ]}"#,
+        )
+        .expect("write config");
+        let table = PriceTable::load(&[path.clone()]).expect("loads");
+        let usage = TurnUsage {
+            provider: "anthropic".to_owned(),
+            model: "claude-sonnet-5".to_owned(),
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            total_tokens: 1_100_000,
+        };
+        // 1 Mtok in at $3 + 0.1 Mtok out at $15 = $4.50 = 4_500_000 micros.
+        assert_eq!(table.cost_micros(&usage), Some(4_500_000));
+        // No table entry (or no split) is unpriced, never zero-priced.
+        let unknown = TurnUsage {
+            model: "other".to_owned(),
+            ..usage.clone()
+        };
+        assert_eq!(table.cost_micros(&unknown), None);
+        let unsplit = TurnUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 500,
+            ..usage
+        };
+        assert_eq!(table.cost_micros(&unsplit), None);
+        // A malformed entry is an error — the user wrote a table and
+        // deserves to know it is not being used.
+        std::fs::write(
+            &path,
+            r#"{"prices": [{"provider": "anthropic", "model": "m", "input_per_mtok_usd": 3.0}]}"#,
+        )
+        .expect("write config");
+        assert!(PriceTable::load(&[path]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spend_reading_is_strict_about_unpriced_usage() {
+        let run = |provider: &str, metadata: Value| whipplescript_store::RunView {
+            run_id: "r".to_owned(),
+            effect_id: "e".to_owned(),
+            provider: provider.to_owned(),
+            worker_id: "w".to_owned(),
+            status: "succeeded".to_owned(),
+            started_at: String::new(),
+            completed_at: None,
+            metadata_json: metadata.to_string(),
+            cancel_requested: false,
+        };
+        let mut table = PriceTable::default();
+        table.rates.insert(
+            ("anthropic".to_owned(), "claude-sonnet-5".to_owned()),
+            (3.0, 15.0),
+        );
+        let priced = run(
+            "anthropic",
+            json!({"model": "claude-sonnet-5",
+                   "usage": {"input_tokens": 1_000_000, "output_tokens": 0}}),
+        );
+        let no_usage = run("fixture", json!({"note": "no tokens"}));
+        assert_eq!(
+            total_spend_usd(&[priced.clone(), no_usage.clone()], &table).expect("prices"),
+            Some(3.0),
+            "usage-free runs do not block pricing"
+        );
+        assert_eq!(
+            total_spend_usd(&[no_usage], &table).expect("no usage at all"),
+            None,
+            "no usage anywhere = absent, never fabricated"
+        );
+        // One unpriceable usage-bearing run poisons the total: a partial
+        // sum must not wear a full one.
+        let unpriceable = run(
+            "anthropic",
+            json!({"usage": {"input_tokens": 5, "output_tokens": 5}}),
+        );
+        assert!(total_spend_usd(&[priced, unpriceable], &table).is_err());
+    }
+
+    #[test]
+    fn campaign_spec_roundtrips_through_the_record() {
+        let mut spec = CampaignSpec {
+            ascend: vec![
+                ("quality".to_owned(), None),
+                (
+                    "speed".to_owned(),
+                    Some(ReachTarget {
+                        ge: false,
+                        threshold: 800.0,
+                        raw: "800ms".to_owned(),
+                    }),
+                ),
+            ],
+            later_stages: vec![vec!["std.spend<=0.10".to_owned()]],
+            sacrifice: vec!["verbosity".to_owned()],
+            spend_cap_micros: Some(4_000_000),
+            redacted_view: true,
+            ..Default::default()
+        };
+        spec.floors.insert("held".to_owned(), (true, 0.9));
+        spec.within_percent.insert("tone".to_owned(), 2.0);
+        let roundtripped = campaign_spec_from_json(&spec.to_json()).expect("roundtrips");
+        assert_eq!(roundtripped.ascend.len(), 2);
+        assert_eq!(roundtripped.ascend[1].0, "speed");
+        let reach = roundtripped.ascend[1].1.as_ref().expect("reach");
+        assert!(!reach.ge);
+        assert!((reach.threshold - 800.0).abs() < 1e-9);
+        assert_eq!(roundtripped.later_stages, spec.later_stages);
+        assert_eq!(roundtripped.floors.get("held"), Some(&(true, 0.9)));
+        assert_eq!(roundtripped.within_percent.get("tone"), Some(&2.0));
+        assert_eq!(roundtripped.spend_cap_micros, Some(4_000_000));
+        assert!(roundtripped.redacted_view);
+        assert_eq!(roundtripped.sacrifice, spec.sacrifice);
+    }
+
+    #[test]
+    fn stage_ratchet_floor_refuses_regression_inside_the_band() {
+        // A completed `then` stage's achieved level is a HARD floor for
+        // later stages: a candidate slipping past it refuses even when the
+        // movement sits inside a generous indifference band.
+        let specs = vec![spec_quality_no_bar("focus"), spec_quality_no_bar("held")];
+        let campaign = CampaignSpec {
+            ascend: vec![("focus".to_owned(), None)],
+            floors: BTreeMap::from([("held".to_owned(), (true, 1.0))]),
+            within_percent: BTreeMap::from([("held".to_owned(), 50.0)]),
+            ..Default::default()
+        };
+        let base = merge(
+            observations("focus", &[false, false, false, false]),
+            observations("held", &[true, true, true, true]),
+        );
+        let cand = merge(
+            observations("focus", &[true, true, true, true]),
+            observations("held", &[true, true, true, false]),
+        );
+        let verdict = dominance_verdict(&specs, &campaign, &base, &cand);
+        assert!(
+            !verdict.proposable,
+            "the floor refuses in-band regression: {:?}",
+            verdict.reasons
+        );
+        assert!(
+            verdict
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("stage-ratchet floor")),
+            "the refusal names the floor: {:?}",
+            verdict.reasons
+        );
+
+        // Holding the floor exactly is not a violation.
+        let holding = merge(
+            observations("focus", &[true, true, true, true]),
+            observations("held", &[true, true, true, true]),
+        );
+        let verdict = dominance_verdict(&specs, &campaign, &base, &holding);
+        assert!(
+            verdict.proposable,
+            "holding the floor passes: {:?}",
+            verdict.reasons
+        );
+    }
+
+    #[test]
+    fn later_stage_tokens_keep_their_targets() {
+        let args: Vec<String> = ["extract_quality>=0.9", "then", "std.latency<=800ms"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = parse_improve_args(&args, &[]).expect("parses");
+        assert_eq!(parsed.spec.later_stages, vec![vec!["std.latency<=800ms"]]);
+        let (name, reach) = parse_target(&parsed.spec.later_stages[0][0]).expect("re-parses");
+        assert_eq!(name, "std.latency");
+        let reach = reach.expect("target survives to stage activation");
+        assert!(!reach.ge);
+        assert!((reach.threshold - 800.0).abs() < 1e-9);
+    }
+
+    // The SettleWalk tests mirror models/maude/settle-stopping.maude: the
+    // sound certifier never mints a certificate below the threshold, and
+    // exhaustion below it is an honest undetermined.
+
+    #[test]
+    fn settle_walk_contrary_bound_never_crosses() {
+        // strong;contrary;strong;contrary with K=3 — the model's bite
+        // stream: the level never reaches the threshold.
+        let mut walk = SettleWalk::new(3);
+        for strong in [true, false, true, false] {
+            assert!(!walk.observe(strong), "below-threshold stream certified");
+        }
+        assert_eq!(walk.level, 0);
+        assert_eq!(walk.high_water, 1);
+        assert_eq!(walk.n, 4);
+    }
+
+    #[test]
+    fn settle_walk_sustained_evidence_crosses_at_threshold() {
+        // The crossing is anytime-valid: it happens exactly at K, needing
+        // no exhaustion of the remaining stream.
+        let mut walk = SettleWalk::new(3);
+        assert!(!walk.observe(true));
+        assert!(!walk.observe(true));
+        assert!(walk.observe(true), "third strong observation crosses K=3");
+        assert_eq!(walk.n, 3);
+    }
+
+    #[test]
+    fn settle_walk_floors_contrary_evidence_at_zero() {
+        let mut walk = SettleWalk::new(2);
+        walk.observe(false);
+        walk.observe(false);
+        assert_eq!(walk.level, 0, "contrary evidence floors at zero");
+        walk.observe(true);
+        assert!(walk.observe(true), "the floor does not owe a debt");
     }
 
     #[test]
