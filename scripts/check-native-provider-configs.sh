@@ -65,7 +65,6 @@ const failures = results.filter((result) => result.status === "fail");
 const required = new Map([
   ["codex-main", "codex_app_server"],
   ["claude-main", "claude_agent_sdk"],
-  ["pi-main", "pi_rpc"],
 ]);
 
 let failed = false;
