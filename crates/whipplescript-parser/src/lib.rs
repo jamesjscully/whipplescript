@@ -326,11 +326,16 @@ pub struct GaugeDecl {
     pub span: SourceSpan,
 }
 
-/// The generalized judge slot: `judge via coerce <Name> | prompt "<t>" |
-/// exec "<cmd>" | labels "<source>"`.
+/// The generalized judge slot: `judge via coerce <Name>(<args>) |
+/// prompt "<t>" | exec "<cmd>" | labels "<source>"`. Coerce judges carry
+/// EXPLICIT argument paths (settled 2026-07-14): each names the record
+/// value feeding the parameter (`input.ticket.title`,
+/// `facts.Assessment.priority`), or the single reserved `record` passes
+/// the whole judge-input record — the binding is written down and
+/// versioned, never inferred.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GaugeJudge {
-    Coerce(Ident),
+    Coerce(Ident, Vec<String>),
     Prompt(StringLiteral),
     Exec(StringLiteral),
     Labels(StringLiteral),
@@ -1152,6 +1157,11 @@ pub struct IrGauge {
     /// The judge target: coerce name, prompt template, exec command, or
     /// labels source path.
     pub judge_target: String,
+    /// Coerce judges only: the explicit record paths feeding the coerce
+    /// function's parameters, in declaration order (`input.…`,
+    /// `facts.<Class>.<field>`, or the single reserved `record`). Empty =
+    /// declared without arguments (parses, but is not scoreable).
+    pub judge_args: Vec<String>,
     pub expect: Option<IrGaugeBar>,
     pub inputs: Vec<String>,
     pub span: SourceSpan,
@@ -3253,6 +3263,9 @@ impl IrProgram {
                     "  gauge {} judge={}:{}",
                     gauge.name, gauge.judge_kind, gauge.judge_target
                 );
+                if !gauge.judge_args.is_empty() {
+                    line.push_str(&format!(" args=({})", gauge.judge_args.join(",")));
+                }
                 if let Some(site) = &gauge.site {
                     line.push_str(&format!(" site={site}"));
                 }
@@ -6554,11 +6567,11 @@ fn lower_gauge(gauge: GaugeDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
         );
         return;
     }
-    let (judge_kind, judge_target) = match &gauge.judge {
-        GaugeJudge::Coerce(target) => ("coerce", target.name.clone()),
-        GaugeJudge::Prompt(template) => ("prompt", template.value.clone()),
-        GaugeJudge::Exec(command) => ("exec", command.value.clone()),
-        GaugeJudge::Labels(source) => ("labels", source.value.clone()),
+    let (judge_kind, judge_target, judge_args) = match &gauge.judge {
+        GaugeJudge::Coerce(target, args) => ("coerce", target.name.clone(), args.clone()),
+        GaugeJudge::Prompt(template) => ("prompt", template.value.clone(), Vec::new()),
+        GaugeJudge::Exec(command) => ("exec", command.value.clone(), Vec::new()),
+        GaugeJudge::Labels(source) => ("labels", source.value.clone(), Vec::new()),
     };
     let expect = gauge.expect.as_ref().map(|bar| IrGaugeBar {
         form: match &bar.subject {
@@ -6577,6 +6590,7 @@ fn lower_gauge(gauge: GaugeDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
         site: gauge.site,
         judge_kind: judge_kind.to_owned(),
         judge_target,
+        judge_args,
         expect,
         inputs: gauge.inputs.into_iter().map(|input| input.name).collect(),
         span: gauge.span,
@@ -6697,21 +6711,100 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
         });
     };
     for gauge in &ir.gauges {
-        if gauge.judge_kind == "coerce"
-            && !ir
+        if gauge.judge_kind == "coerce" {
+            match ir
                 .coerces
                 .iter()
-                .any(|coerce| coerce.name == gauge.judge_target)
-        {
-            diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span: gauge.span,
-                message: format!(
-                    "gauge `{}` judges via undeclared coerce `{}`",
-                    gauge.name, gauge.judge_target
-                ),
-                suggestion: Some("declare the coerce this gauge judges with".to_owned()),
-            });
+                .find(|coerce| coerce.name == gauge.judge_target)
+            {
+                None => {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: gauge.span,
+                        message: format!(
+                            "gauge `{}` judges via undeclared coerce `{}`",
+                            gauge.name, gauge.judge_target
+                        ),
+                        suggestion: Some("declare the coerce this gauge judges with".to_owned()),
+                    });
+                }
+                // Explicit-argument binding (settled 2026-07-14): the
+                // judge's data diet is written down, never inferred. The
+                // single reserved `record` passes the whole judge-input
+                // record to a one-parameter coerce; otherwise each path
+                // (`input.…` / `facts.<Class>.<field>`) feeds the
+                // parameter at its position, arity-checked here so a
+                // drifted signature is a check error, not a silently
+                // rebound judge.
+                Some(coerce) if !gauge.judge_args.is_empty() => {
+                    if gauge.judge_args.len() == 1 && gauge.judge_args[0] == "record" {
+                        if coerce.params.len() != 1 {
+                            diagnostics.push(Diagnostic {
+                                related: Vec::new(),
+                                span: gauge.span,
+                                message: format!(
+                                    "gauge `{}`: the reserved `(record)` form needs a \
+                                     single-parameter coerce; `{}` takes {}",
+                                    gauge.name,
+                                    gauge.judge_target,
+                                    coerce.params.len()
+                                ),
+                                suggestion: Some(
+                                    "give the coerce one record-shaped parameter, or bind each \
+                                     parameter to an explicit path"
+                                        .to_owned(),
+                                ),
+                            });
+                        }
+                    } else {
+                        for arg in &gauge.judge_args {
+                            let head = arg.split('.').next().unwrap_or_default();
+                            let valid = match head {
+                                "record" => false, // reserved: only alone
+                                "input" => true,
+                                "facts" => arg.splitn(3, '.').count() == 3,
+                                _ => false,
+                            };
+                            if !valid {
+                                diagnostics.push(Diagnostic {
+                                    related: Vec::new(),
+                                    span: gauge.span,
+                                    message: format!(
+                                        "gauge `{}`: judge argument `{arg}` is not a record \
+                                         path",
+                                        gauge.name
+                                    ),
+                                    suggestion: Some(
+                                        "arguments are `input.<path>`, \
+                                         `facts.<Class>.<field...>`, or the single reserved \
+                                         `record`"
+                                            .to_owned(),
+                                    ),
+                                });
+                            }
+                        }
+                        if gauge.judge_args.len() != coerce.params.len() {
+                            diagnostics.push(Diagnostic {
+                                related: Vec::new(),
+                                span: gauge.span,
+                                message: format!(
+                                    "gauge `{}`: judge passes {} argument{} but coerce `{}` \
+                                     takes {}",
+                                    gauge.name,
+                                    gauge.judge_args.len(),
+                                    if gauge.judge_args.len() == 1 { "" } else { "s" },
+                                    gauge.judge_target,
+                                    coerce.params.len()
+                                ),
+                                suggestion: Some(
+                                    "bind one path per coerce parameter, in order".to_owned(),
+                                ),
+                            });
+                        }
+                    }
+                }
+                Some(_) => {}
+            }
         }
         if !gauge.inputs.is_empty() && gauge.judge_kind != "exec" {
             diagnostics.push(Diagnostic {
@@ -17388,7 +17481,12 @@ fn format_item(item: Item, formatted: &mut String) {
             header.push_str(" {");
             push_line(formatted, header);
             let judge = match &gauge.judge {
-                GaugeJudge::Coerce(target) => format!("coerce {}", target.name),
+                GaugeJudge::Coerce(target, args) if args.is_empty() => {
+                    format!("coerce {}", target.name)
+                }
+                GaugeJudge::Coerce(target, args) => {
+                    format!("coerce {}({})", target.name, args.join(", "))
+                }
                 GaugeJudge::Prompt(template) => format!("prompt {:?}", template.value),
                 GaugeJudge::Exec(command) => format!("exec {:?}", command.value),
                 GaugeJudge::Labels(source) => format!("labels {:?}", source.value),
@@ -20100,8 +20198,22 @@ impl Parser<'_> {
                     continue;
                 }
                 let form = if self.consume_ident("coerce") {
-                    self.expect_ident("coerce judge name")
-                        .map(GaugeJudge::Coerce)
+                    self.expect_ident("coerce judge name").and_then(|name| {
+                        let mut args = Vec::new();
+                        if self.at_symbol('(') {
+                            self.expect_symbol('(');
+                            loop {
+                                let (path, _) = self.parse_dotted_name_spanned("judge argument")?;
+                                args.push(path);
+                                if !self.at_symbol(',') {
+                                    break;
+                                }
+                                self.expect_symbol(',')?;
+                            }
+                            self.expect_symbol(')')?;
+                        }
+                        Some(GaugeJudge::Coerce(name, args))
+                    })
                 } else if self.consume_ident("prompt") {
                     self.expect_string("prompt judge template")
                         .map(GaugeJudge::Prompt)
@@ -30866,6 +30978,98 @@ rule j
             format_program(&formatted).formatted.expect("reformats"),
             formatted
         );
+    }
+
+    #[test]
+    fn coerce_judge_explicit_arguments_parse_lower_and_validate() {
+        let program = |judge_line: &str| {
+            format!(
+                r##"
+@service
+workflow Improve
+
+output result R
+class R {{ v string }}
+class Ticket {{ title string }}
+signal go.now {{ x string }}
+
+coerce Assess(title string, priority string) -> R {{
+  prompt """markdown
+  Judge {{{{ title }}}} at {{{{ priority }}}}.
+
+  {{{{ ctx.output_format }}}}
+  """
+}}
+
+gauge quality {{
+  {judge_line}
+}}
+
+rule j
+  when go.now as g
+=> {{
+  complete result {{
+    v "ok"
+  }}
+}}
+"##
+            )
+        };
+        // Explicit paths parse, lower in order, and roundtrip through fmt.
+        let source =
+            program("judge via coerce Assess(input.ticket.title, facts.Assessment.priority)");
+        let compiled = compile_program(&source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("compiles");
+        assert_eq!(
+            ir.gauges[0].judge_args,
+            vec!["input.ticket.title", "facts.Assessment.priority"]
+        );
+        let formatted = format_program(&source).formatted.expect("formats");
+        assert!(
+            formatted
+                .contains("judge via coerce Assess(input.ticket.title, facts.Assessment.priority)"),
+            "fmt keeps the binding: {formatted}"
+        );
+        // Arity is checked: a drifted signature is a check error, never a
+        // silently rebound judge.
+        let compiled = compile_program(&program("judge via coerce Assess(input.ticket.title)"));
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("passes 1 argument")),
+            "{:?}",
+            compiled.diagnostics
+        );
+        // Paths must be record paths.
+        let compiled = compile_program(&program(
+            "judge via coerce Assess(whatever.title, facts.Assessment.priority)",
+        ));
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("not a record path")),
+            "{:?}",
+            compiled.diagnostics
+        );
+        // The reserved `(record)` form needs a single-parameter coerce.
+        let compiled = compile_program(&program("judge via coerce Assess(record)"));
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("single-parameter")),
+            "{:?}",
+            compiled.diagnostics
+        );
+        // Bare (no arguments) still parses — declared, honestly unscoreable.
+        let compiled = compile_program(&program("judge via coerce Assess"));
+        assert_eq!(compiled.diagnostics, Vec::new());
+        assert!(compiled.ir.expect("compiles").gauges[0]
+            .judge_args
+            .is_empty());
     }
 
     #[test]
