@@ -86,6 +86,7 @@ std-construct-authorization.maude	SSSNNNNSN
 subworkflow-attestation.maude	SSNSN
 subworkflow-convergence.maude	SSSSNNN
 subworkflow-lease.maude	SSSN
+telemetry-cursor.maude	SSSNSS
 terminal-payload-shape.maude	SSSSSSNN
 text-merge-compose.maude	SSSSSNNNSSN
 trace-lifecycle-conformance.maude	SSSNNSSSSSNSS
