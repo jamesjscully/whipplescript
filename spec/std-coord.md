@@ -271,14 +271,18 @@ core treatment, which this package inherits unchanged:
 Each independently gateable under the per-piece review discipline; order is
 the recommendation.
 
-1. **Models first for the shipped protocols** (model-first discipline). One
-   TLA+ spec per resource over the shipped atomic ops, refining the store
-   transactions per coordination.md "Formal modeling": lease
-   `MutualExclusion` (≤ N holders per key); counter `CapInvariant` +
-   `NoLostConsume`; ledger `AppendLinearizable` + `PartitionIsolation`.
-   `NoDeadlock`/`BoundedWait` explicitly out (their objects — lease order,
-   wait queue — are deferred). Gate: coverage AND bite (negative fixtures),
-   Apalache green.
+1. **Models first for the shipped protocols** (model-first discipline).
+   **BUILT 2026-07-14**: `models/tla/CoordLease.tla` (`MutualExclusion`,
+   ≤ N holders per key, attempt-and-branch deny + release + TTL expiry),
+   `CoordCounter.tla` (`CapInvariant` + `NoLostConsume` via a granted-sum
+   history variable + epoch-advancing reset), `CoordLedger.tla`
+   (`NoLostEntry` — the checkable residue of `AppendLinearizable` over an
+   inherently ordered sequence — + `PartitionIsolation` over projection
+   snapshots; retention pruning out: prefix-removal never reorders). All
+   three in the Apalache gate loop, each with a mutation bite in
+   `scripts/check-tla-models.sh` (slot guard / cap guard / idempotency
+   guard stripped ⇒ invariant violation). `NoDeadlock`/`BoundedWait`
+   explicitly out (their objects — lease order, wait queue — are deferred).
 2. **Handler honesty.** Remove the smuggled defaults for malformed input
    (slots=1/ttl=600s/retain=86400s/cap=0, effect_handlers.rs:1100-1195) —
    malformed input fails the effect with a typed DR-0032 error; drop the
