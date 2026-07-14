@@ -116,7 +116,7 @@ rule ship
 
 `std.coord.lease` does **not** implement leasing itself. It is a *surface* over
 the single kernel lease primitive (`acquire`/`renew`/`expire`/`recover`) that the
-kernel owns; `queue.claim` ([`work-queues.md`](work-queues.md)) and `std.tracker`
+kernel owns; `tracker.claim` ([`work-queues.md`](work-queues.md)) and `std.tracker`
 claims are sibling surfaces over the same primitive, sharing its TTL, recovery,
 and lease-event vocabulary. The package contributes the typed-key declaration,
 the branchable outcomes, and the static safety checks below; the durable lease
@@ -398,7 +398,7 @@ periodic-reset anchor of
 injection and ledger partition/barrier patterns compose with ingress;
 `std.coord.lease` is a surface over the **single kernel lease primitive**
 (`acquire`/`renew`/`expire`/`recover`) — the same primitive
-[`work-queues.md`](work-queues.md)'s `queue.claim` and `std.tracker` claims use,
+[`work-queues.md`](work-queues.md)'s `tracker.claim` and `std.tracker` claims use,
 not a second lease implementation; formal models reuse the TLA+/Maude rig and
 trace-conformance refinement. Coordination outcomes are recorded facts; the
 lease lifecycle is the kernel primitive (see

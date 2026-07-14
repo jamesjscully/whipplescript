@@ -432,7 +432,7 @@ done binding                -> alias for consume binding
 done binding -> record ...  -> consume plus result record in one commit
 tell agent ...              -> agent.tell effect with target/profile/skills
 coerce function(...)        -> schema.coerce effect with function and arguments
-claim item                  -> queue.claim effect
+claim item                  -> tracker.claim effect
 askHuman ...                -> human.ask effect
 call package.capability ... -> capability.call effect
 emit signal name to target  -> signal.emit effect

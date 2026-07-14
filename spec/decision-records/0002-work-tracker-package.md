@@ -440,7 +440,7 @@ events in one command transaction, for example `claim.acquired` and
 event and changes readiness through projection overlay, not durable issue
 status.
 
-The current `queue.claim` implementation mutates issue status and claim holder
+The current `tracker.claim` implementation mutates issue status and claim holder
 in the same row. The tracker replacement should split that state:
 
 ```text

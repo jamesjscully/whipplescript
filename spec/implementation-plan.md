@@ -1377,7 +1377,7 @@ Acceptance:
   runs a planner `tell` → `Plan` fact + `file item into backlog`; `escalate_plan_for_review`
   issues `askHuman as review`; and the added `record_review_decision` rule
   (`when human answered review as answer`) records a `ReviewDecision`. Verified
-  under `--provider fixture`: heartbeat/Plan/queue.file facts on the dev run, and
+  under `--provider fixture`: heartbeat/Plan/tracker.file facts on the dev run, and
   answering the inbox item (`inbox answer … --choice approve`) + a `step` records
   `ReviewDecision {decision: approve, decidedBy: alice}`. `whip fmt` idempotent;
   `.ir` golden regenerated; `whip lint` clean; docs-examples gate green.
@@ -1643,7 +1643,7 @@ providers. The remaining Rust work below is therefore incremental.
   (not a `list_facts` re-sort) because `list_facts` is widely consumed and the
   `(name, key)` order is already fully deterministic + replayable.
 - [-] Single lease engine (`acquire/renew/expire/recover`) used by core leases,
-  `std.coord.lease`, `queue.claim`, and tracker claims. **RESOLVED 2026-06-23
+  `std.coord.lease`, `tracker.claim`, and tracker claims. **RESOLVED 2026-06-23
   (Jack): closed as deferred-by-decision — keeping the four mechanisms separate,
   not building a unified engine now.** **DECIDED 2026-06-17: keep
   the four mechanisms SEPARATE for now** (Jack — "leave room for things to evolve,

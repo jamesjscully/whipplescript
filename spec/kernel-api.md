@@ -57,7 +57,7 @@ The semantic boundary is what matters: the instance-lifecycle transitions
 (pause/resume/cancel, revision activation) are kernel transactions the control
 plane *sequences*, not control-plane-private state mutations. There is **one**
 lease engine — `acquire/renew/expire_lease` — and `std.coord.lease`,
-`queue.claim`, and tracker claims are all surfaces over it; packages do not
+`tracker.claim`, and tracker claims are all surfaces over it; packages do not
 implement their own lease lifecycles. `admit_fact_batch` is the typed
 fact-batch admission primitive from
 [`admission-and-idempotency.md`](admission-and-idempotency.md).

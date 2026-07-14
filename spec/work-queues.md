@@ -97,8 +97,8 @@ finish item {
 | `release item` | Surrender the lease; item returns to `open`. | Unassign (+ transition back). |
 | `finish item [{ summary ... }]` | Mark done. Optional payload posted as a closing comment — the agent-work audit trail lands in the tracker, where humans look. | Close/complete (+ comment). |
 
-All four are durable effects (`queue.file`, `queue.claim`, `queue.release`,
-`queue.finish`) with the standard effect lifecycle, evidence, and `after`
+All four are durable effects (`tracker.file`, `tracker.claim`, `tracker.release`,
+`tracker.finish`) with the standard effect lifecycle, evidence, and `after`
 branching. Deferred to v1.5: `cancel item`, standalone `comment item` (both
 map to all surveyed trackers; neither is needed to prove the loop).
 
@@ -151,7 +151,7 @@ interface:
 - A successful claim takes a whip-side **lease** through the **single kernel
   lease primitive** (`acquire`/`renew`/`expire`/`recover`) — the same primitive
   `std.coord.lease` ([`coordination.md`](coordination.md)) surfaces — not a
-  separate queue lease engine. `queue.claim` is one *surface* over it; TTL,
+  separate queue lease engine. `tracker.claim` is one *surface* over it; TTL,
   renewal, expiry, and recovery are kernel-owned, and the claimed item's state is
   an ordinary fact. Lease expiry releases the item.
 - `claim` on an already-claimed item completes on the failure branch with a

@@ -53,7 +53,7 @@ Substrate spec: [`coordination.md`](coordination.md) (semantics, safety model, m
 
 spec/coordination.md says in three places ("Framing", the "lease" subsection,
 "Dependencies") that `std.coord.lease` is a surface over a **single kernel
-lease primitive** shared with `queue.claim` and std.tracker claims. Reality is
+lease primitive** shared with `tracker.claim` and std.tracker claims. Reality is
 the opposite, deliberately: the CoordinationStore keeps its own leases table
 with its own TTL/expiry (store/coordination.rs:95-410), separate from
 store.sqlite effect leases and items.sqlite claims (which carry no TTL at
@@ -317,7 +317,7 @@ the recommendation.
    seeded kind claimable); DO coordination suites stay green with the DO
    exemption intact.
 5. **Release disambiguation off string-matching.** Replace the textual
-   body-scan rewrite of `release <binding>` (queue.release → lease.release
+   body-scan rewrite of `release <binding>` (tracker.release → lease.release
    when the binding matches an `acquire ... as <binding>` line,
    kernel/rule_lowering.rs:2141-2163) with binding-typed resolution over the
    lowered binding table — the platform-catalog reserved-word design this
