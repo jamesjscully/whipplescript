@@ -4969,6 +4969,61 @@ mod tests {
         );
     }
 
+    /// MEM-3's IFC face: a memory pool is a governable resource under the
+    /// EXISTING envelope grammar — `grant memory <pool> -> memory:<pool>
+    /// <label>` governs it (handle→address binding), and a pool grant
+    /// under a governed envelope that does NOT name the pool fails closed.
+    #[test]
+    fn memory_pools_are_governable_envelope_resources() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous_envelope = std::env::var_os("WHIPPLESCRIPT_IFC_ENVELOPE");
+        let root = temp_root();
+        let envelope_path = root.join("env.policy");
+        std::fs::write(
+            &envelope_path,
+            "grant memory project_memory -> memory:project_memory public\n",
+        )
+        .expect("write envelope");
+        std::env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope_path);
+
+        let governed = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "project_memory",
+                        "operations": [{"operation": "recall"}]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("granted pool parses");
+        let governed_result = enforce_turn_access_governance(&governed);
+
+        let ungoverned = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "secret_memories",
+                        "operations": [{"operation": "recall"}]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("ungoverned pool parses");
+        let ungoverned_result = enforce_turn_access_governance(&ungoverned);
+
+        match previous_envelope {
+            Some(value) => std::env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", value),
+            None => std::env::remove_var("WHIPPLESCRIPT_IFC_ENVELOPE"),
+        }
+
+        governed_result.expect("the pool is governed");
+        let error = ungoverned_result.expect_err("an ungoverned pool fails closed");
+        assert!(error.contains("secret_memories"), "{error}");
+    }
+
     /// MEM-5 end-to-end at the executor: a granted turn learns then
     /// recalls through the real SQLite store.
     #[test]
