@@ -89,9 +89,12 @@ open local host work.
   `whipplescript.model-egress.v1` envelope, explicit `model-broker` provider
   realization, exact sentinel/credential-ref checks, auth-header stripping,
   fail-closed broker URL/token/response validation, and hermetic fake-broker
-  conformance. Worker TypeScript, host crate tests, wasm build, and a full
-  Wrangler dry-run bundle pass. This is the first slice replacing
-  deployment-wide BYOK secrets.
+  conformance. The verified turn admission now returns the complete signed
+  non-secret provider tuple, so brokered turns realize dynamically with no
+  deployment provider map; the static map remains only for an exact explicit
+  `worker-secret` transition. Worker TypeScript, host crate tests, wasm build,
+  and a full Wrangler dry-run bundle pass. This replaces deployment-wide BYOK
+  secrets and broker mapping.
 - [ ] **Outbound local broker session.** Bind the same envelope to an authenticated
   client-initiated session so a remote DO development turn can use a locally sealed
   Codex credential without uploading its refresh token. HTTP Home brokers do not

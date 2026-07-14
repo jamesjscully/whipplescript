@@ -54,5 +54,7 @@ command = "npm run build:wasm"
 # Secret-free governed turns instead configure the non-secret broker URL and
 # provider-binding map, then set only the broker-hop token as a Worker secret:
 #   WHIP_MODEL_BROKER_URL = "https://home.example/model-egress"
-#   WHIP_HOST_PROVIDER_BINDINGS_JSON = '{..."execution":"model-broker"...}'
+#   WHIP_HOST_PROVIDER_BINDINGS_JSON is only for explicit transitional
+#   worker-secret entries. Brokered turns derive their non-secret tuple from
+#   the verified signed policy epoch.
 #   wrangler secret put WHIP_MODEL_BROKER_TOKEN

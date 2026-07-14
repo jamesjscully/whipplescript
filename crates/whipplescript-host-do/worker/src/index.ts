@@ -28,10 +28,14 @@ import {
 } from "../pkg/whipplescript_host_do_bg.js";
 import { Container, getRandom } from "@cloudflare/containers";
 import {
-  MODEL_AUTH_SENTINEL,
   performModelBrokerFetch,
   type ModelBrokerBinding,
 } from "./model-broker";
+import {
+  type HostTurnAdmission,
+  type ResolvedHostProviderBinding,
+  resolveAdmittedProvider as resolveHostedProvider,
+} from "./provider-realization";
 
 const wasmInstance = new WebAssembly.Instance(wasmModule, {
   "./whipplescript_host_do_bg.js": bindings,
@@ -171,9 +175,9 @@ export interface Env {
   // epochs. Both are deployment configuration; a request may supply neither.
   GAUGEDESK_GOVERNANCE_SIGNER?: string;
   GAUGEDESK_GOVERNANCE_KEY?: string;
-  // Credential-free provider identities keyed by policy binding handle. Each
-  // entry explicitly selects the transitional Worker-secret realization or
-  // the secret-free model broker; resolution happens only after admission.
+  // Transitional Worker-secret realizations keyed by policy binding handle.
+  // Brokered provider identity is realized dynamically from signed admission
+  // and requires no entry here.
   WHIP_HOST_PROVIDER_BINDINGS_JSON?: string;
   // Secret-free provider egress (DR-0042). The URL is authenticated with this
   // broker-only token after WhippleScript admits the opaque credential ref.
@@ -496,26 +500,6 @@ interface HostCommandRequest {
   command: Record<string, unknown>;
   package: HostPackageDocuments;
   image_bodies: unknown[];
-}
-
-interface HostTurnAdmission {
-  provider_binding_id: string;
-  credential_id: string;
-  placement_ceiling_ref: string;
-}
-
-interface HostProviderBinding {
-  credential_id: string;
-  provider: "openai" | "openai-generic" | "anthropic" | "openai-codex";
-  model: string;
-  base_url: string;
-  execution: "worker-secret" | "model-broker";
-  secret?: "OPENAI_API_KEY" | "ANTHROPIC_API_KEY";
-}
-
-interface ResolvedHostProviderBinding extends HostProviderBinding {
-  execution: "worker-secret" | "model-broker";
-  api_key: string;
 }
 
 export class WorkflowInstance implements DurableObject {
@@ -1251,90 +1235,17 @@ export class WorkflowInstance implements DurableObject {
     }
   }
 
-  private providerBindings(): Record<string, HostProviderBinding> | Response {
-    try {
-      const parsed = JSON.parse(this.env.WHIP_HOST_PROVIDER_BINDINGS_JSON ?? "{}") as unknown;
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        throw new Error("binding map must be an object");
-      }
-      return parsed as Record<string, HostProviderBinding>;
-    } catch (error) {
-      return Response.json(
-        { error: `invalid WHIP_HOST_PROVIDER_BINDINGS_JSON: ${String(error)}` },
-        { status: 503 },
-      );
-    }
-  }
-
   private resolveAdmittedProvider(
     admission: HostTurnAdmission,
   ): ResolvedHostProviderBinding | Response {
-    const bindings = this.providerBindings();
-    if (bindings instanceof Response) return bindings;
-    const binding = bindings[admission.provider_binding_id];
-    const supportedProviders = new Set([
-      "openai",
-      "openai-generic",
-      "anthropic",
-      "openai-codex",
-    ]);
-    if (
-      !binding ||
-      binding.credential_id !== admission.credential_id ||
-      !supportedProviders.has(binding.provider) ||
-      typeof binding.model !== "string" || !binding.model.trim() ||
-      typeof binding.base_url !== "string" || !binding.base_url.trim()
-    ) {
+    try {
+      return resolveHostedProvider(admission, this.env);
+    } catch (error) {
       return Response.json(
-        { error: "admitted provider capability has no exact hosted realization" },
+        { error: error instanceof Error ? error.message : String(error) },
         { status: 503 },
       );
     }
-    const execution = binding.execution;
-    if (execution === "model-broker") {
-      if (binding.secret !== undefined) {
-        return Response.json(
-          { error: "model-broker realization may not name a provider secret" },
-          { status: 503 },
-        );
-      }
-      if (!this.env.WHIP_MODEL_BROKER_URL?.trim() || !this.env.WHIP_MODEL_BROKER_TOKEN?.trim()) {
-        return Response.json(
-          { error: `admitted provider credential ${binding.credential_id} has no model broker` },
-          { status: 503 },
-        );
-      }
-      if (binding.provider === "openai-codex") {
-        return Response.json(
-          { error: "openai-codex broker transport awaits the authenticated outbound session slice" },
-          { status: 503 },
-        );
-      }
-      return { ...binding, execution, api_key: MODEL_AUTH_SENTINEL };
-    }
-    if (
-      execution !== "worker-secret" ||
-      (binding.secret !== "OPENAI_API_KEY" && binding.secret !== "ANTHROPIC_API_KEY")
-    ) {
-      return Response.json(
-        { error: "admitted provider capability has an invalid hosted realization" },
-        { status: 503 },
-      );
-    }
-    if (binding.provider === "openai-codex") {
-      return Response.json(
-        { error: "openai-codex requires an explicitly brokered non-bash turn capability" },
-        { status: 503 },
-      );
-    }
-    const secret = this.env[binding.secret];
-    if (typeof secret !== "string" || !secret.trim()) {
-      return Response.json(
-        { error: `admitted provider credential ${binding.credential_id} is unavailable` },
-        { status: 503 },
-      );
-    }
-    return { ...binding, execution, api_key: secret };
   }
 
   private async beginHostTurn(parsed: Record<string, unknown>): Promise<Response> {

@@ -46,6 +46,9 @@ pub struct HostTurnAdmission {
     pub provider_binding_id: String,
     pub credential_id: String,
     pub placement_ceiling_ref: String,
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
 }
 
 /// The common governed facade over any WhippleScript runtime store.
@@ -272,10 +275,26 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
         packages: &P,
     ) -> Result<HostTurnAdmission, HostFacadeError> {
         self.admit_turn(command, packages)?;
+        let binding = self
+            .envelope
+            .resolve_provider_binding(
+                &command.provider_binding.binding_id,
+                &command.provider_binding.credential.credential_id,
+                &command.placement_ceiling_ref,
+            )
+            .ok_or_else(|| {
+                HostFacadeError::PolicyRejected(
+                    "provider binding has no exact realization in the verified policy epoch"
+                        .to_owned(),
+                )
+            })?;
         Ok(HostTurnAdmission {
             provider_binding_id: command.provider_binding.binding_id.clone(),
             credential_id: command.provider_binding.credential.credential_id.clone(),
             placement_ceiling_ref: command.placement_ceiling_ref.clone(),
+            provider: binding.provider.clone(),
+            model: binding.model.clone(),
+            base_url: binding.base_url.clone(),
         })
     }
 
@@ -617,6 +636,15 @@ workflow Method {
             model: "gpt-test",
             base_url: "https://provider.invalid",
         };
+        let admission = host
+            .validate_turn(&turn, &package)
+            .expect("verified policy realization");
+        assert_eq!(admission.provider_binding_id, "model");
+        assert_eq!(admission.credential_id, "credential:model");
+        assert_eq!(admission.placement_ceiling_ref, "do");
+        assert_eq!(admission.provider, provider.provider);
+        assert_eq!(admission.model, provider.model);
+        assert_eq!(admission.base_url, provider.base_url);
         assert!(host
             .begin_turn(&turn, &package, provider)
             .expect("new turn"));
@@ -627,6 +655,9 @@ workflow Method {
             .list_effects(&turn.instance_ref)
             .expect("effects");
         assert_eq!(effects.len(), 1);
-        assert_eq!(effects[0].input_json, serde_json::to_string(&turn).unwrap());
+        assert_eq!(
+            effects[0].input_json,
+            serde_json::to_string(&turn).expect("serialize admitted turn")
+        );
     }
 }

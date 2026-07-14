@@ -22,11 +22,17 @@ host-owned account system resolves credentials only after admission.
 
 ### 1. The DO supports two explicit provider realizations
 
-An operator binding declares either:
+After WhippleScript admission, the host realizes either:
 
 - `worker-secret` — the transitional/service-managed realization using a named
   Worker secret; or
 - `model-broker` — a secret-free realization using an authenticated host broker.
+
+The signed policy epoch is the complete non-secret declaration for
+`model-broker`: provider, model, endpoint, credential reference, and placement
+are returned by WhippleScript only after admission. No deployment-wide provider
+map repeats that tuple. The static Worker map remains only for an explicitly
+configured transitional `worker-secret` realization.
 
 The provider binding still must exactly match the WhippleScript-admitted binding
 id and credential ref before either realization is selected. The provider id
@@ -71,8 +77,8 @@ not runtime semantics or the broker envelope.
 ## Consequences
 
 - Account/project secrets no longer need to become Worker bindings.
-- The existing static map remains usable only when it explicitly declares the
-  transitional `worker-secret` realization.
+- The existing static map remains usable only when it exactly repeats and
+  explicitly declares the transitional `worker-secret` realization.
 - Managed upstream gateways and BYOK Home credentials share one runtime protocol
   while keeping different product funding/admission policies.
 - The Worker can be tested with a deterministic broker and no live credential.

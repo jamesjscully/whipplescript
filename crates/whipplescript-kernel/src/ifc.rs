@@ -1208,6 +1208,27 @@ impl VerifiedEnvelope {
         )
     }
 
+    /// Resolve the exact non-secret provider tuple carried by a verified epoch
+    /// after the command's binding, credential, and placement handles have
+    /// been admitted. Hosted drivers use this to realize brokered egress from
+    /// signed policy rather than deployment-wide provider maps.
+    pub fn resolve_provider_binding(
+        &self,
+        binding_handle: &str,
+        credential_ref: &str,
+        placement_handle: &str,
+    ) -> Option<&ProviderBindingPolicy> {
+        let binding = self.envelope.provider_bindings.get(binding_handle)?;
+        if binding.credential_ref != credential_ref {
+            return None;
+        }
+        self.envelope
+            .placements
+            .get(placement_handle)
+            .filter(|placement| placement.provider_bindings.contains(binding_handle))?;
+        Some(binding)
+    }
+
     /// Wrap a raw envelope as verified — TESTS ONLY (unit tests exercise the checker
     /// algebra directly, without the signing boundary), mirroring
     /// `gov::SignedEnvelope::sign_for_test`.

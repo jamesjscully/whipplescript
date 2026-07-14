@@ -37,31 +37,24 @@ reference:
    runtime store schema (`crates/whipplescript-store/migrations/0001_runtime_store.sql`,
    the same schema `do_store.rs` is ported against). Run it once on object init
    (embed the SQL and `sql.exec` it before `create`, or ship it as a DO migration).
-3. **Choose provider egress** (for governed host turns). The transitional
-   `worker-secret` realization resolves a named Worker secret only after
-   admission. Its binding must explicitly set `"execution":"worker-secret"`
-   and name `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in `secret`:
+3. **Choose provider egress** (for governed host turns). Brokered turns need no
+   provider map: after admission the Worker uses the exact provider, model,
+   endpoint, and credential ref from the signed policy epoch. Set only the
+   broker transport:
+   ```
+   wrangler secret put WHIP_MODEL_BROKER_TOKEN
+   # Set non-secret WHIP_MODEL_BROKER_URL in wrangler configuration.
+   ```
+   The transitional `worker-secret` realization resolves a named Worker secret
+   only after admission. Its `WHIP_HOST_PROVIDER_BINDINGS_JSON` entry must
+   exactly repeat the signed tuple, explicitly set
+   `"execution":"worker-secret"`, and name `OPENAI_API_KEY` or
+   `ANTHROPIC_API_KEY` in `secret`:
    ```
    wrangler secret put ANTHROPIC_API_KEY
    wrangler secret put OPENAI_API_KEY
    ```
-   The DR-0042 `model-broker` realization instead sets
-   `WHIP_MODEL_BROKER_URL`, stores only the broker-hop token as
-   `WHIP_MODEL_BROKER_TOKEN`, and declares no provider secret:
-   ```json
-   {
-     "binding_project_openai": {
-       "credential_id": "credential:project:alpha:v3",
-       "provider": "openai",
-       "model": "gpt-5",
-       "base_url": "https://api.openai.com",
-       "execution": "model-broker"
-     }
-   }
-   ```
-   This JSON is the non-secret `WHIP_HOST_PROVIDER_BINDINGS_JSON` deployment
-   variable. Set the hop token with
-   `wrangler secret put WHIP_MODEL_BROKER_TOKEN`. Broker failure is fail-closed;
+   A static `model-broker` entry is rejected. Broker failure is fail-closed;
    the Worker never falls back to direct provider egress.
 4. **Deploy**: `npm run deploy` (`wrangler deploy`).
 5. **Validate**: use the canonical managed route
@@ -75,9 +68,10 @@ reference:
 - **`DoSqlBridge` → `state.storage.sql`** — `makeBridge` in `index.ts`. Rows come
   back positionally (`Object.values`, column order preserved per Cloudflare docs).
 - **`DurableEffectPorts` → admitted provider realization** — governed host turns
-  resolve either a transitional Worker secret or the fixed non-secret broker
-  sentinel. The binding id + opaque credential ref must match exactly before
-  either is available.
+  dynamically resolve the signed provider tuple to the fixed non-secret broker
+  sentinel, or use an exact explicitly configured transitional Worker secret.
+  The binding id + opaque credential ref must match exactly before either is
+  available.
 - **`needs_http` → egress** — `performFetch` handles direct/container rounds;
   `performModelBrokerFetch` strips sentinel auth and sends the admitted request
   through the authenticated `whipplescript.model-egress.v1` broker envelope.
