@@ -656,10 +656,6 @@ impl Coordination for NativeStores {
             .consume_for_owner(owner, counter, key, amount, cap, period)
     }
 
-    fn current_period(&self, reset: &str) -> StoreResult<String> {
-        self.coord.current_period(reset)
-    }
-
     fn list_leases_for_owner(
         &self,
         owner: Option<&str>,

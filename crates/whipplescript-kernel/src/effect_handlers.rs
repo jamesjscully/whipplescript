@@ -1017,6 +1017,25 @@ pub fn run_file_import_effect_generic<S: RuntimeStore>(
 /// Host-agnostic core (DR-0033 chunk 3): the lease/ledger/counter op + its terminal
 /// over a held `RuntimeKernel<S>`; coordination is the DO's own store there, so
 /// `S: RuntimeStore + Coordination` unifies both surfaces.
+/// std.coord slice 3: the counter reset-period boundary, computed from the
+/// INJECTED `now` (never wall clock — the period an outcome resolves against
+/// is recorded on the outcome, so replay re-reads instead of re-deriving) in
+/// the counter's declared timezone, DST-correct via the same chrono-tz
+/// machinery the clock sources use. `None` = the timezone does not name an
+/// IANA zone or `now` does not parse — malformed input, failed typed.
+pub fn counter_period(reset: &str, timezone: &str, now: &str) -> Option<String> {
+    let instant = crate::time_pass::parse_clock_instant(now)?;
+    let tz: chrono_tz::Tz = timezone.parse().ok()?;
+    let local = instant.with_timezone(&tz);
+    let format = match reset {
+        "hourly" => "%Y-%m-%dT%H",
+        "weekly" => "%Y-W%W",
+        "monthly" => "%Y-%m",
+        _ => "%Y-%m-%d",
+    };
+    Some(local.format(format).to_string())
+}
+
 /// Fail a coordination effect with the DR-0032 typed base (handler honesty,
 /// spec/std-coord.md v1 slice 2): opens the run, fails it, and derives the
 /// `{kind}.failed` fact whose `value` is the uniform `EffectError` base — the
@@ -1325,7 +1344,28 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
             let key = field("key");
             let amount = require_i64!(input, "amount");
             let cap = require_i64!(input, "cap");
-            let period = kernel.store_mut().current_period(&field("reset"))?;
+            // The period comes from the INJECTED `now` in the counter's
+            // declared timezone (pre-slice-3 inputs carry no timezone: UTC),
+            // and is RECORDED on the outcome below — replay re-reads the
+            // resolved period instead of re-deriving one from a later `now`.
+            let timezone = {
+                let declared = field("timezone");
+                if declared.is_empty() {
+                    "UTC".to_owned()
+                } else {
+                    declared
+                }
+            };
+            let Some(period) = counter_period(&field("reset"), &timezone, now) else {
+                return fail_coordination_effect(
+                    kernel,
+                    instance_id,
+                    effect,
+                    &format!(
+                        "malformed `counter.consume` input: `{timezone}` is not an IANA timezone (or the pass instant `{now}` does not parse)"
+                    ),
+                );
+            };
             let outcome = kernel
                 .store_mut()
                 .consume_for_owner(&owner, &counter, &key, amount, cap, &period)?;
@@ -1335,12 +1375,14 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
                     "counter": counter,
                     "key": key,
                     "remaining": remaining,
+                    "period": period,
                 }),
                 ConsumeOutcome::Over { remaining } => json!({
                     "variant": "Over",
                     "counter": counter,
                     "key": key,
                     "remaining": remaining,
+                    "period": period,
                 }),
             }
         }

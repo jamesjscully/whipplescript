@@ -359,18 +359,6 @@ impl CoordinationStore {
         Ok(rows)
     }
 
-    pub fn current_period(&self, reset: &str) -> StoreResult<String> {
-        let format = match reset {
-            "hourly" => "%Y-%m-%dT%H",
-            "weekly" => "%Y-W%W",
-            "monthly" => "%Y-%m",
-            _ => "%Y-%m-%d",
-        };
-        Ok(self
-            .connection
-            .query_row("SELECT strftime(?1, 'now')", [format], |row| row.get(0))?)
-    }
-
     pub fn list_leases(&self, resource: Option<&str>) -> StoreResult<Vec<LeaseRow>> {
         self.list_leases_for_owner(None, resource)
     }
@@ -530,8 +518,6 @@ pub trait Coordination {
         cap: i64,
         period: &str,
     ) -> StoreResult<ConsumeOutcome>;
-
-    fn current_period(&self, reset: &str) -> StoreResult<String>;
 
     /// The workspace-plane HIGH-WATER positions of the monotone ledger
     /// stores: (owner, ledger, last minted seq). One half of the two-plane
@@ -711,10 +697,6 @@ impl Coordination for CoordinationStore {
         period: &str,
     ) -> StoreResult<ConsumeOutcome> {
         self.consume_for_owner(owner, counter, key, amount, cap, period)
-    }
-
-    fn current_period(&self, reset: &str) -> StoreResult<String> {
-        self.current_period(reset)
     }
 
     fn list_leases_for_owner(

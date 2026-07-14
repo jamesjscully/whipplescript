@@ -3722,6 +3722,9 @@ pub fn parsed_effect_input_json(
                 "amount": amount.as_i64().unwrap_or(0),
                 "cap": counter.map(|counter| counter.cap).unwrap_or(0),
                 "reset": counter.map(|counter| counter.reset.clone()).unwrap_or_else(|| "daily".to_owned()),
+                "timezone": counter
+                    .and_then(|counter| counter.timezone.clone())
+                    .unwrap_or_else(|| "UTC".to_owned()),
                 "rule": rule.name,
             })
         }

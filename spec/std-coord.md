@@ -295,18 +295,23 @@ the recommendation.
    contract, not a default. Pre-release one-way break per M4 posture. Gate:
    `e2e_malformed_coordination_input_fails_typed_instead_of_defaulting`
    (per-field negatives over forged inputs); kernel/store/DO suites green.
-3. **Counter timezone anchor + replay determinism.** Parse `timezone <tz>` on
-   counter; default-UTC `severity: warning` when omitted; period boundary
-   computed with the clock-source tz machinery and — the substantive fix —
-   the consume outcome RECORDS the period it resolved against so replay
-   re-reads rather than re-derives from `now` (closes the recorded
-   replay-determinism violation, store/coordination.rs:311-321; spec
-   amendment 5 rewords coordination.md's `counter.period_reset` sentence to
-   this mechanism, the distinct fact joining the deferred event vocabulary).
-   Gate: DST
-   boundary test; a replay test asserting a coordination outcome is re-read,
-   not re-run (also closes that standing test hole); e2e runtime
-   `ledger.append` test added alongside (the other standing hole).
+3. **Counter timezone anchor + replay determinism. BUILT 2026-07-14.**
+   `timezone "<IANA zone>"` clause on counter (grammar + CounterDecl/IrCounter
+   + default-UTC warning when omitted); the period is computed KERNEL-side
+   (`effect_handlers::counter_period`) from the pass's INJECTED instant in
+   the declared timezone via the clock-source chrono-tz machinery — the
+   store's wall-clock `current_period` is deleted from the Coordination
+   trait and all three impls (it read `strftime('now')`, the recorded
+   replay-determinism violation) — and the consume outcome RECORDS the
+   period it resolved against (`"period"` on Ok/Over) so replay re-reads
+   rather than re-derives. Unknown zone / unparseable instant fails typed
+   (slice 2's path). Spec amendment 5 applied: coordination.md's
+   `counter.period_reset` sentence now describes this mechanism, the
+   distinct fact joining the deferred event vocabulary. Gate: DST
+   spring-forward boundary test + west-of-UTC date test + injected-now
+   determinism + runtime `ledger.append` e2e
+   (`e2e_counter_period_is_timezone_anchored_and_replay_deterministic`);
+   `counter_timezone_clause_parses_and_default_utc_warns`.
 4. **Package identity** (rides/follows substrate slice S6): the embedded
    `std-coord.json` manifest of "Manifest" above; the
    privilege-authorizes-non-authorable-class validator extension plus the

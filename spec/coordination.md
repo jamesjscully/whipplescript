@@ -218,12 +218,15 @@ A period boundary like `reset daily` is meaningless without an anchor, so
 If omitted, the checker defaults to UTC and emits a diagnostic (one
 `severity: warning` from the canonical `error | warning | info | hint` enum)
 recommending an explicit anchor; without it the period boundary, and therefore
-the reset firing, would be non-deterministic on replay. When a consume rolls the
-period, the reset firing is recorded as a fact (`counter.period_reset`, below):
-replay **re-reads** that recorded reset rather than recomputing the period from
-wall-clock time, so the same consume sequence reproduces the same counts. The
-anchored period boundary is the only clock-derived input, and it is recorded
-once.
+the reset firing, would be non-deterministic on replay. The shipped mechanism
+(std-coord.md v1 slice 3): every consume outcome RECORDS the period it
+resolved against — computed from the pass's injected instant in the counter's
+declared timezone, never from wall-clock time — so replay **re-reads** the
+recorded boundary rather than recomputing one, and the same consume sequence
+reproduces the same counts. The anchored period boundary is the only
+clock-derived input, and it is recorded once per outcome. A distinct
+`counter.period_reset` fact remains part of the deferred event vocabulary
+(the ADR-0002-adjacent event-sourcing follow-on), not the shipped surface.
 
 All operations carry instance/run provenance (the work-queue mechanism), so
 `whip leases` / `whip ledger` / `whip counters` can answer "*who* holds the

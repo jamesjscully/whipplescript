@@ -48,6 +48,14 @@
                 "list": false,
                 "unknown_hint": "counter fields are `shared`, `key`, `cap`, and `reset`",
                 "missing_summary": "every counter is bounded: declare all three fields"
+              },
+              {
+                "name": "timezone",
+                "kind": "scalar",
+                "required": false,
+                "list": false,
+                "unknown_hint": "counter fields are `shared`, `key`, `cap`, `reset`, and `timezone`",
+                "missing_summary": "every counter is bounded: declare all three fields"
               }
             ]
           }

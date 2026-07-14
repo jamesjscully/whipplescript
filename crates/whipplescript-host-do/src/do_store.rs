@@ -7427,7 +7427,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
 // `coord_leases` / `coord_ledger_seq` / `coord_ledger_entries` / `coord_counters` tables. The native
 // atomic pairs used a rusqlite transaction; the DO single-writer per-invocation
 // model supplies that atomicity. Only the 9 required `*_for_owner` (+
-// `release_all_for_holder` / `current_period`) methods are ported; the 7
+// `release_all_for_holder`) methods are ported; the 7
 // shared-owner convenience forms are the trait's inherited defaults.
 
 /// Empty owner normalizes to the shared partition (mirrors `normalized_owner`).
@@ -7662,20 +7662,6 @@ impl<Sql: DoSql> Coordination for DoSqliteStore<Sql> {
         Ok(ConsumeOutcome::Over {
             remaining: cap - consumed,
         })
-    }
-
-    fn current_period(&self, reset: &str) -> StoreResult<String> {
-        let format = match reset {
-            "hourly" => "%Y-%m-%dT%H",
-            "weekly" => "%Y-W%W",
-            "monthly" => "%Y-%m",
-            _ => "%Y-%m-%d",
-        };
-        let rows = self
-            .sql
-            .query("SELECT strftime(?1, 'now')", &[text(format)])
-            .map_err(sql_err)?;
-        Ok(rows.first().map(|row| as_text(&row[0])).unwrap_or_default())
     }
 
     fn list_leases_for_owner(

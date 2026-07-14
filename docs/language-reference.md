@@ -177,7 +177,7 @@ table         ::= "table" Ident "as" TypeName "[" row* "]"
 queue         ::= "queue" Ident "{" "tracker" Ident "}"
 lease         ::= "lease" Ident "{" "shared"? "key" TypeName "slots" int "ttl" duration "}"
 ledger        ::= "ledger" Ident "{" "shared"? "entry" TypeName "partition" "by" Ident "retain" duration "}"
-counter       ::= "counter" Ident "{" "shared"? "key" TypeName "cap" int "reset" period "}"
+counter       ::= "counter" Ident "{" "shared"? "key" TypeName "cap" int "reset" period ("timezone" string)? "}"
 coerce        ::= "coerce" Ident "(" params? ")" "->" Type block
 rule          ::= "rule" Ident when* "=>" block
 flow          ::= "flow" Ident when* block
@@ -1835,7 +1835,10 @@ progression, exhaustive outcome handling (`held`/`contended`, `ok`/`over`),
 and must-release on every non-terminal path. Reaching any terminal
 auto-releases every lease the instance holds — a rule-driven `complete`/`fail`
 or an operator `whip cancel` — so holder lifetime bounds every lease, with TTL
-only as the crash net. Counter reset is lazy at the consume boundary. Inspect
+only as the crash net. Counter reset is lazy at the consume boundary; the
+period anchors to the counter's `timezone "<IANA zone>"` (DST-correct), or to
+UTC with a warning when omitted, and every consume outcome records the period
+it resolved against so replay re-reads the boundary. Inspect
 shared state with `whip leases`, `whip ledger`, and `whip counters`.
 
 By default, coordination rows are partitioned by workflow owner, so two

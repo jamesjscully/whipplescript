@@ -564,6 +564,9 @@ pub struct CounterDecl {
     pub key_type: Ident,
     pub cap: i64,
     pub reset: String,
+    /// IANA timezone anchoring the reset-period boundary (std.coord slice 3);
+    /// `None` anchors to UTC and draws a default-UTC warning.
+    pub timezone: Option<String>,
     pub shared: bool,
     pub span: SourceSpan,
 }
@@ -1340,6 +1343,8 @@ pub struct IrCounter {
     pub key_type: String,
     pub cap: i64,
     pub reset: String,
+    /// IANA timezone anchoring the reset-period boundary; `None` = UTC.
+    pub timezone: Option<String>,
     pub shared: bool,
     pub span: SourceSpan,
 }
@@ -4341,6 +4346,7 @@ fn lower_program(
                     key_type: counter.key_type.name,
                     cap: counter.cap,
                     reset: counter.reset,
+                    timezone: counter.timezone,
                     shared: counter.shared,
                     span: counter.span,
                 });
@@ -4410,6 +4416,7 @@ fn lower_program(
     validate_turn_access_grant_file_operations(&ir, &mut diagnostics);
     validate_turn_access_grant_memory_operations(&ir, &mut diagnostics);
     warn_inert_memory_grant_on_native_adapter(&ir, &mut warnings);
+    warn_counter_without_timezone(&ir, &mut warnings);
     validate_improve_declarations(&ir, &mut diagnostics);
 
     CompileOutput {
@@ -4496,6 +4503,28 @@ fn validate_turn_access_grant_memory_operations(ir: &IrProgram, diagnostics: &mu
                     }
                 }
             }
+        }
+    }
+}
+
+/// std.coord slice 3: a counter without a declared `timezone` anchors its
+/// reset-period boundary to UTC — legal, but a daily/weekly/monthly quota
+/// silently rolling over at an operator-surprising hour is worth a warning.
+fn warn_counter_without_timezone(ir: &IrProgram, warnings: &mut Vec<Diagnostic>) {
+    for counter in &ir.counters {
+        if counter.timezone.is_none() {
+            warnings.push(Diagnostic {
+                related: Vec::new(),
+                span: counter.span,
+                message: format!(
+                    "counter `{}` declares no `timezone`; its `{}` reset boundary anchors to UTC",
+                    counter.name, counter.reset
+                ),
+                suggestion: Some(
+                    "declare `timezone \"<IANA zone>\"` (e.g. `timezone \"America/New_York\"`) to anchor the period locally"
+                        .to_owned(),
+                ),
+            });
         }
     }
 }
@@ -19550,6 +19579,7 @@ impl Parser<'_> {
                     key_type,
                     cap,
                     reset,
+                    timezone: bag.text("timezone"),
                     shared,
                     span,
                 }))
@@ -29867,6 +29897,73 @@ rule work
                 .all(|warning| !warning.message.contains("inert")),
             "an owned-harness tell does not warn: {:?}",
             owned.warnings
+        );
+    }
+
+    #[test]
+    fn counter_timezone_clause_parses_and_default_utc_warns() {
+        // std.coord slice 3: `timezone "<IANA zone>"` anchors the counter's
+        // reset-period boundary; omitting it is legal but draws the
+        // default-UTC warning.
+        let program = |timezone_clause: &str| {
+            format!(
+                r#"
+@service
+workflow CounterTz
+
+class CallFailed {{ service string }}
+class Service {{ id string }}
+output result CallFailed
+failure trouble CallFailed
+
+counter failure_budget {{ key Service cap 3 reset daily {timezone_clause} }}
+
+rule strike
+  when CallFailed as f
+=> {{
+  consume failure_budget for f.service amount 1 as strike
+  after strike ok {{
+    complete result {{ service f.service }}
+  }}
+  after strike over {{
+    fail trouble {{ service f.service }}
+  }}
+}}
+"#
+            )
+        };
+        let anchored = compile_program(&program(r#"timezone "America/New_York""#));
+        assert!(
+            anchored.diagnostics.is_empty(),
+            "timezone clause parses: {:?}",
+            anchored.diagnostics
+        );
+        let ir = anchored.ir.expect("anchored program compiles");
+        assert_eq!(ir.counters[0].timezone.as_deref(), Some("America/New_York"));
+        assert!(
+            anchored
+                .warnings
+                .iter()
+                .all(|warning| !warning.message.contains("timezone")),
+            "an anchored counter does not warn: {:?}",
+            anchored.warnings
+        );
+
+        let unanchored = compile_program(&program(""));
+        assert!(
+            unanchored.diagnostics.is_empty(),
+            "omitting timezone stays legal: {:?}",
+            unanchored.diagnostics
+        );
+        let ir = unanchored.ir.expect("unanchored program compiles");
+        assert_eq!(ir.counters[0].timezone, None);
+        assert!(
+            unanchored
+                .warnings
+                .iter()
+                .any(|warning| warning.message.contains("anchors to UTC")),
+            "an unanchored counter draws the default-UTC warning: {:?}",
+            unanchored.warnings
         );
     }
 

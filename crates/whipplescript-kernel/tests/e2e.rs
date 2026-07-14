@@ -1456,3 +1456,174 @@ fn e2e_malformed_coordination_input_fails_typed_instead_of_defaulting() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn e2e_counter_period_is_timezone_anchored_and_replay_deterministic() {
+    // std.coord slice 3: the consume outcome records the period it resolved
+    // against, computed from the INJECTED pass instant in the counter's
+    // declared timezone -- never from the wall clock -- so replay re-reads
+    // the recorded boundary instead of re-deriving one.
+    use whipplescript_kernel::effect_handlers::{counter_period, run_coordination_effect_generic};
+    use whipplescript_store::native_stores::NativeStores;
+    use whipplescript_store::{ClaimableEffect, RuntimeStore};
+
+    // DST spring-forward, America/New_York 2026-03-08: 02:00 local is skipped.
+    // 06:30Z is 01:30 EST; 07:30Z is 03:30 EDT -- hourly periods must jump
+    // 01 -> 03 with no 02 period ever minted.
+    assert_eq!(
+        counter_period("hourly", "America/New_York", "2026-03-08T06:30:00Z"),
+        Some("2026-03-08T01".to_owned())
+    );
+    assert_eq!(
+        counter_period("hourly", "America/New_York", "2026-03-08T07:30:00Z"),
+        Some("2026-03-08T03".to_owned())
+    );
+    // A daily boundary anchored west of UTC: 05:00Z on Jan 1 is still Dec 31
+    // in Los Angeles.
+    assert_eq!(
+        counter_period("daily", "America/Los_Angeles", "2026-01-01T05:00:00Z"),
+        Some("2025-12-31".to_owned())
+    );
+    // Unknown zone or unparseable instant is malformed, not defaulted.
+    assert_eq!(
+        counter_period("daily", "Mars/Olympus", "2026-01-01T05:00:00Z"),
+        None
+    );
+    assert_eq!(counter_period("daily", "UTC", "not-a-time"), None);
+
+    let dir = std::env::temp_dir().join(format!("whip-e2e-coord-tz-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("temp dir creates");
+    let stores = NativeStores::open(
+        dir.join("rt.sqlite"),
+        dir.join("coord.sqlite"),
+        dir.join("items.sqlite"),
+    )
+    .expect("stores open");
+    let mut kernel = RuntimeKernel::new(stores);
+    let version = kernel
+        .create_program_version(ProgramVersionInput {
+            program_name: "CoordTz",
+            source_hash: "source",
+            ir_hash: "ir",
+            compiler_version: "e2e",
+        })
+        .expect("program version creates");
+    let instance_id = kernel
+        .create_instance(&version, "{}")
+        .expect("instance creates");
+
+    let consume_input = r#"{"counter":"quota","key":"k","amount":1,"cap":5,"reset":"daily","timezone":"America/Los_Angeles"}"#;
+    kernel
+        .commit_rule(whipplescript_store::RuleCommit {
+            instance_id: &instance_id,
+            rule: "spend",
+            trigger_event_id: None,
+            facts: &[],
+            consumed_fact_ids: &[],
+            effects: &[whipplescript_store::NewEffect {
+                timeout_seconds: None,
+                effect_id: "consume-1",
+                kind: "counter.consume",
+                target: None,
+                input_json: consume_input,
+                status: "queued",
+                idempotency_key: "consume-1",
+                required_capabilities_json: "[]",
+                profile: None,
+                correlation_id: None,
+                source_span_json: None,
+            }],
+            dependencies: &[],
+            terminal: None,
+            idempotency_key: Some("consume-1"),
+            marks: &[],
+        })
+        .expect("consume commits");
+    let claimable = ClaimableEffect {
+        effect_id: "consume-1".to_owned(),
+        kind: "counter.consume".to_owned(),
+        target: None,
+        profile: None,
+        input_json: consume_input.to_owned(),
+        required_capabilities_json: "[]".to_owned(),
+        declared_profiles_json: "[]".to_owned(),
+    };
+    // The injected instant deliberately disagrees with today's wall clock:
+    // the recorded period must come from it, proving no wall-clock read.
+    run_coordination_effect_generic(
+        &mut kernel,
+        &instance_id,
+        &claimable,
+        "2026-01-01T05:00:00Z",
+    )
+    .expect("consume settles");
+    let facts = kernel.store().list_facts(&instance_id).expect("facts list");
+    let completed = facts
+        .iter()
+        .find(|fact| fact.name == "counter.consume.completed")
+        .expect("consume completes");
+    assert!(
+        completed.value_json.contains(r#""period":"2025-12-31""#),
+        "outcome records the tz-anchored period it resolved against: {}",
+        completed.value_json
+    );
+
+    // The other standing hole: a runtime ledger.append e2e -- the handler
+    // appends and the completed fact carries the minted seq.
+    let append_input = r#"{"ledger":"audit","partition":"p1","entry":{"n":1},"schema":"E","retain_seconds":86400}"#;
+    kernel
+        .commit_rule(whipplescript_store::RuleCommit {
+            instance_id: &instance_id,
+            rule: "log",
+            trigger_event_id: None,
+            facts: &[],
+            consumed_fact_ids: &[],
+            effects: &[whipplescript_store::NewEffect {
+                timeout_seconds: None,
+                effect_id: "append-1",
+                kind: "ledger.append",
+                target: None,
+                input_json: append_input,
+                status: "queued",
+                idempotency_key: "append-1",
+                required_capabilities_json: "[]",
+                profile: None,
+                correlation_id: None,
+                source_span_json: None,
+            }],
+            dependencies: &[],
+            terminal: None,
+            idempotency_key: Some("append-1"),
+            marks: &[],
+        })
+        .expect("append commits");
+    let claimable = ClaimableEffect {
+        effect_id: "append-1".to_owned(),
+        kind: "ledger.append".to_owned(),
+        target: None,
+        profile: None,
+        input_json: append_input.to_owned(),
+        required_capabilities_json: "[]".to_owned(),
+        declared_profiles_json: "[]".to_owned(),
+    };
+    run_coordination_effect_generic(
+        &mut kernel,
+        &instance_id,
+        &claimable,
+        "2026-01-01T05:00:00Z",
+    )
+    .expect("append settles");
+    let facts = kernel.store().list_facts(&instance_id).expect("facts list");
+    let appended = facts
+        .iter()
+        .find(|fact| fact.name == "ledger.append.completed")
+        .expect("append completes");
+    assert!(
+        appended.value_json.contains(r#""variant":"Appended""#)
+            && appended.value_json.contains(r#""seq":1"#),
+        "append completes with the minted seq: {}",
+        appended.value_json
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
