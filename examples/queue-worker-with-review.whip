@@ -1,3 +1,5 @@
+use std.coercion
+
 @service
 description "Claim ready work items, implement them, review each turn, and escalate failed reviews to a human"
 workflow QueueWorkerWithReview

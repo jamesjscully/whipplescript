@@ -23,7 +23,7 @@ use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_model::MessagesApiClient;
 use whipplescript_kernel::sansio::{HttpResponse, TransportError};
 
-use crate::do_instance::{CoerceProviderConfig, ExecutorSidecarConfig, TurnContainerConfig};
+use crate::do_instance::{ExecutorSidecarConfig, ResolvedCoercionConfig, TurnContainerConfig};
 use crate::do_store::DoSql;
 use crate::do_worker::{
     DurableEffectPorts, DurableInstance, DurableStepOutcome, ScriptCapabilityInput,
@@ -828,10 +828,16 @@ fn outcome_to_json(outcome: &DurableStepOutcome) -> String {
     value.to_string()
 }
 
-/// Parse the DO-secret coerce config JSON into a `CoerceProviderConfig`.
-fn parse_coerce_config(json: &str) -> Result<CoerceProviderConfig, String> {
+/// Parse the DO-secret coerce config JSON into the ONE canonical
+/// [`ResolvedCoercionConfig`] record (spec/std-coercion.md "Config-plane
+/// reconciliation") — the same record the native door resolves from env +
+/// `whip auth` + the registry default. Defaults are owned once by std.coercion
+/// (`max_tokens` 4096, `timeout_secs` 120); the old DO-only 1024 drift is gone.
+/// The codex OAuth routing is a native-door affordance: this door carries
+/// explicit API keys only, so `codex_account_id` is always `None`.
+fn parse_coerce_config(json: &str) -> Result<ResolvedCoercionConfig, String> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
-    let provider = match value.get("provider").and_then(serde_json::Value::as_str) {
+    let backend = match value.get("provider").and_then(serde_json::Value::as_str) {
         Some("anthropic") => CoerceProvider::Anthropic,
         Some("openai") => CoerceProvider::OpenAi,
         Some("openai-generic") => CoerceProvider::OpenAiCompat,
@@ -843,16 +849,23 @@ fn parse_coerce_config(json: &str) -> Result<CoerceProviderConfig, String> {
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
     };
-    Ok(CoerceProviderConfig {
-        provider,
-        provider_name: field("provider").unwrap_or_else(|| "coerce".to_owned()),
+    Ok(ResolvedCoercionConfig {
+        backend,
+        provider_id: field("provider").unwrap_or_else(|| "coerce".to_owned()),
         base_url: field("base_url").ok_or("coerce config needs base_url")?,
         api_key: field("api_key").ok_or("coerce config needs api_key")?,
         model: field("model").ok_or("coerce config needs model")?,
         max_tokens: value
             .get("max_tokens")
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or(1024) as u32,
+            .unwrap_or(u64::from(
+                whipplescript_kernel::coerce_native::DEFAULT_COERCE_MAX_TOKENS,
+            )) as u32,
+        timeout_secs: value
+            .get("timeout_secs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(whipplescript_kernel::coerce_native::DEFAULT_COERCE_TIMEOUT_SECS),
+        codex_account_id: None,
     })
 }
 

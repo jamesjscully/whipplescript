@@ -42,6 +42,64 @@ impl CoerceProvider {
     }
 }
 
+/// Default `max_tokens` for a coerce call — owned ONCE by std.coercion
+/// (spec/std-coercion.md "Config-plane reconciliation"); both operator doors
+/// (native env + `whip auth`, DO `coerce_config_json`) inherit it.
+pub const DEFAULT_COERCE_MAX_TOKENS: u32 = 4096;
+/// Default coerce timeout in seconds, owned once alongside
+/// [`DEFAULT_COERCE_MAX_TOKENS`].
+pub const DEFAULT_COERCE_TIMEOUT_SECS: u64 = 120;
+
+/// The ONE canonical resolved coerce configuration record
+/// (spec/std-coercion.md "Config-plane reconciliation"). Both operator doors
+/// build exactly this: the native CLI resolver (env + `whip auth` + registry
+/// default — `coerce_runtime`) and the DO secrets door (`coerce_config_json`,
+/// `do_wasm::parse_coerce_config`). The kernel and both hosts see only the
+/// record, never a plane.
+pub struct ResolvedCoercionConfig {
+    /// The selected `schema_coercer` provider id as recorded on runs/terminals
+    /// and folded into the coercion-config fingerprint (e.g. `native`, or the
+    /// backend name when the operator override selects one directly).
+    pub provider_id: String,
+    /// Which provider API the call targets (config, not a separate provider —
+    /// spec/std-coercion.md "Providers").
+    pub backend: CoerceProvider,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub max_tokens: u32,
+    pub timeout_secs: u64,
+    /// `Some(account_id)` when the OpenAI credential is the Codex OAuth token,
+    /// so the call targets the codex backend (SSE) instead of `api.openai.com`.
+    /// A native-door affordance: the DO secrets door carries explicit API keys
+    /// only and always leaves this `None`.
+    pub codex_account_id: Option<String>,
+}
+
+// Credentials are operator-plane secrets and never enter logs/facts/evidence:
+// Debug redacts the key (only its presence is reported).
+impl std::fmt::Debug for ResolvedCoercionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedCoercionConfig")
+            .field("provider_id", &self.provider_id)
+            .field("backend", &self.backend)
+            .field("base_url", &self.base_url)
+            .field(
+                "api_key",
+                &if self.api_key.is_empty() {
+                    "<none>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("model", &self.model)
+            .field("max_tokens", &self.max_tokens)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("codex_account_id", &self.codex_account_id)
+            .finish()
+    }
+}
+
 // The transport-agnostic HTTP types now live in the neutral `sansio` module
 // (shared with agent turns and, later, file effects); re-exported here so the
 // many `coerce_native::{HttpRequest, HttpResponse, CoerceTransportError}` paths

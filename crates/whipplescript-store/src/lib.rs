@@ -3012,6 +3012,26 @@ impl SqliteStore {
         capability_bound_provider(&self.connection, &program_id, capability)
     }
 
+    /// The `effect_providers.config_json` for `(effect_kind, provider)` — the
+    /// registry-default configuration half of the coerce selection ladder's
+    /// rung 3 (spec/std-coercion.md "Backend selection and config precedence"):
+    /// `capability_bound_provider` names the provider, this row carries its
+    /// config. `None` when no such provider row exists.
+    pub fn effect_provider_config(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+    ) -> StoreResult<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT config_json FROM effect_providers WHERE effect_kind = ?1 AND provider = ?2",
+                params![effect_kind, provider],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn bind_capability(&self, binding: CapabilityBinding<'_>) -> StoreResult<()> {
         serde_json::from_str::<Value>(binding.config_json)?;
         self.connection.execute(

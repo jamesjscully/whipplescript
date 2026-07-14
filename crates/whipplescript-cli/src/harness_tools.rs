@@ -37,7 +37,8 @@ use whipplescript_store::{
     RegisteredProfilePolicy, SqliteStore, StoreError, StoreResult, StoredEvent,
 };
 
-use crate::coerce_runtime::{resolve_credential_with_source, UreqCoerceTransport};
+use crate::coerce_runtime::UreqCoerceTransport;
+use crate::model_auth::resolve_credential_with_source;
 
 pub const TOOL_READ: &str = "read";
 pub const TOOL_WRITE: &str = "write";

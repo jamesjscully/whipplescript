@@ -18,6 +18,8 @@ source_descriptions
 "All language reviews complete" assertion 6d151ee02288805e
 "Static provider x language task rows" table language_tasks
 "Route one queued language task to its selected provider" rule run_language_task
+uses
+  package std.coercion
 schemas
   class LanguageTask
     provider agentref<codex | claude>
@@ -68,10 +70,10 @@ rules
     writes
       schema:LanguageTask
     record_sources
-      schema:LanguageTask construct=table_row span=1993..2224
-      schema:LanguageTask construct=table_row span=2228..2451
-      schema:LanguageTask construct=table_row span=2455..2681
-      schema:LanguageTask construct=table_row span=2685..2910
+      schema:LanguageTask construct=table_row span=2011..2242
+      schema:LanguageTask construct=table_row span=2246..2469
+      schema:LanguageTask construct=table_row span=2473..2699
+      schema:LanguageTask construct=table_row span=2703..2928
     body_hash 762318eb56dea822
   rule run_language_task
     when LanguageTask as task where task.status == "queued"

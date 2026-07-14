@@ -9762,6 +9762,137 @@ rule run
 }
 
 #[test]
+fn lint_advises_std_coercion_import_for_coerce_programs() {
+    // spec/std-coercion.md "Manifest": import bite is an ADVISORY
+    // missing-import lint only — `coerce` without `use std.coercion` warns
+    // (exit 0), and the same program with the import is clean.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("lint-coercion-import");
+    let program = |import: &str| {
+        format!(
+            r#"{import}workflow CoercionImport
+
+output result R
+
+class R {{
+  ok bool
+}}
+
+class Ticket {{
+  title string
+}}
+
+coerce assess(title string) -> R {{
+  client "X"
+}}
+
+rule run
+  when Ticket as t
+=> {{
+  coerce assess(t.title) as a
+  after a succeeds as outcome {{
+    complete result {{
+      ok outcome.ok
+    }}
+  }}
+}}
+"#
+        )
+    };
+    let without = dir.join("without-import.whip");
+    let with = dir.join("with-import.whip");
+    fs::write(&without, program("")).expect("write workflow");
+    fs::write(&with, program("use std.coercion\n\n")).expect("write workflow");
+    let codes = |path: &Path| -> Vec<String> {
+        let output = Command::new(bin)
+            .args(["--json", "lint", path.to_str().expect("present")])
+            .output()
+            .expect("whip lint runs");
+        assert!(output.status.success(), "advisory lint must exit 0");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint report JSON");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f.get("code").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert!(
+        codes(&without).contains(&"lint.missing_coercion_import".to_owned()),
+        "coerce without `use std.coercion` fires the advisory"
+    );
+    assert!(
+        !codes(&with).contains(&"lint.missing_coercion_import".to_owned()),
+        "the import silences the advisory"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn coercion_status_reports_fixture_rung_and_fingerprint() {
+    // `whip coercion status` golden (spec/std-coercion.md slice 4): the
+    // fixture path reports provider `fixture`, selecting rung 4, and the
+    // literal `fixture` fingerprint — and never a credential.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("coercion-status");
+    let store = dir.join("store.sqlite3");
+    let status = |store_path: &Path| -> Value {
+        let mut command = Command::new(bin);
+        command.args([
+            "--store",
+            store_path.to_str().expect("utf-8"),
+            "--json",
+            "coercion",
+            "status",
+        ]);
+        // Hermetic: the operator-override rung must not fire from the
+        // developer's own environment.
+        for var in [
+            "WHIPPLESCRIPT_COERCE_PROVIDER",
+            "WHIPPLESCRIPT_COERCE_MODEL",
+            "WHIPPLESCRIPT_COERCE_BASE_URL",
+            "WHIPPLESCRIPT_COERCE_MAX_TOKENS",
+            "WHIPPLESCRIPT_COERCE_TIMEOUT_SECS",
+        ] {
+            command.env_remove(var);
+        }
+        let output = command.output().expect("whip coercion status runs");
+        assert!(
+            output.status.success(),
+            "status failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("status JSON")
+    };
+    // No store yet: rung 4 fixture, and the status must not create one.
+    let report = status(&store);
+    assert_eq!(report["provider_id"], "fixture", "{report}");
+    assert_eq!(report["rung"], 4, "{report}");
+    assert_eq!(report["rung_label"], "fixture", "{report}");
+    assert_eq!(report["fingerprint"], "fixture", "{report}");
+    assert!(
+        report.get("api_key").is_none() && report.get("credential").is_none(),
+        "a credential value never enters the status surface: {report}"
+    );
+    assert!(
+        !store.exists(),
+        "a status command must not create a store as a side effect"
+    );
+    // With a real (migration-seeded) store the binding row names
+    // `builtin-coerce` — still the fixture path, still rung 4.
+    drop(SqliteStore::open(&store).expect("open seeds the store"));
+    let seeded = status(&store);
+    assert_eq!(seeded["provider_id"], "fixture", "{seeded}");
+    assert_eq!(seeded["rung"], 4, "{seeded}");
+    assert_eq!(seeded["fingerprint"], "fixture", "{seeded}");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn lint_flags_unused_coerce_result() {
     // A coerce that IS called but whose result binding is never used is flagged
     // (`lint.coerce_result_unused`); the same coerce with its result handled by an

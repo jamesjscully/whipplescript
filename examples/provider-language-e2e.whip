@@ -1,3 +1,5 @@
+use std.coercion
+
 @fixture
 @acceptance
 description "Fixture-backed provider x language acceptance workflow"

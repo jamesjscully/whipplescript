@@ -18,8 +18,10 @@
 //! clearly rather than silently skipping.
 
 use whipplescript_kernel::coerce::{CoerceRequest, CoerceResult, CoerceStatus};
+#[cfg(test)]
+use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::coerce_native::{
-    build_coerce_call_parts, build_request, parse_response, CoerceCall, CoerceProvider,
+    build_coerce_call_parts, build_request, parse_response, CoerceCall,
 };
 use whipplescript_kernel::context_assembly::{
     render_project_context, BundleKind, BundleProvenance, ProjectInstruction,
@@ -53,32 +55,27 @@ use whipplescript_store::files::FileStore;
 use whipplescript_store::{ClaimableEffect, EvidenceRecord, RunStart, RuntimeStore, StoreError};
 
 /// Projected coerce provider credentials (the DO secrets plane supplies these; a
-/// live worker reads them from its bindings). Everything else the coerce HTTP
-/// effect needs is host-neutral in the kernel — `build_coerce_call_parts` +
-/// `build_request` + `parse_response` + `settle_coerce_result` — so this config is
-/// the whole of what the DO adds.
-pub struct CoerceProviderConfig {
-    pub provider: CoerceProvider,
-    /// The provider name recorded on runs/terminals.
-    pub provider_name: String,
-    pub base_url: String,
-    pub api_key: String,
-    pub model: String,
-    pub max_tokens: u32,
-}
+/// live worker reads them from its bindings). This is the ONE canonical resolved
+/// coerce config record (spec/std-coercion.md "Config-plane reconciliation"),
+/// shared with the native door — the DO builds it from `coerce_config_json`
+/// (`do_wasm::parse_coerce_config`). Everything else the coerce HTTP effect
+/// needs is host-neutral in the kernel — `build_coerce_call_parts` +
+/// `build_request` + `parse_response` + `settle_coerce_result` — so this config
+/// is the whole of what the DO adds.
+pub use whipplescript_kernel::coerce_native::ResolvedCoercionConfig;
 
 /// The coercion-config fingerprint this DO's kernel folds into `schema.coerce`
 /// effect admission keys (DR-0014 amendment) — derived from `coerce_config_json`
 /// exactly as the native host derives it from its resolved config (same
 /// combinator, same "fixture" literal when coerce is unconfigured), so an
 /// identical config yields the identical fingerprint on either host.
-pub fn do_coercion_config_fingerprint(coerce: Option<&CoerceProviderConfig>) -> String {
+pub fn do_coercion_config_fingerprint(coerce: Option<&ResolvedCoercionConfig>) -> String {
     coerce
         .map(|cfg| {
             whipplescript_kernel::coerce::coercion_config_fingerprint(
                 "schema_coercer",
-                &cfg.provider_name,
-                &cfg.provider_name,
+                &cfg.provider_id,
+                &cfg.provider_id,
                 &cfg.model,
             )
         })
@@ -218,7 +215,7 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     pub files: &'a dyn FileStore,
     /// Projected coerce provider credentials, or `None` if coerce is not configured
     /// on this DO (a `coerce.call` then errors rather than degrading silently).
-    pub coerce: Option<&'a CoerceProviderConfig>,
+    pub coerce: Option<&'a ResolvedCoercionConfig>,
     /// The DO agent model client (builds the messages request + parses the reply);
     /// `None` if agent turns are not configured. A live worker's impl reads creds
     /// from its bindings; tests inject a fake.
@@ -734,14 +731,14 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             instance_id: self.instance_id,
                             effect_id: &effect.effect_id,
                             run_id: &run_id,
-                            provider: &cfg.provider_name,
+                            provider: &cfg.provider_id,
                             worker_id: "whip-worker",
                             lease_id: &lease_id,
                             lease_expires_at: "2030-01-01T00:00:00Z",
                             metadata_json: "{}",
                         })?;
                         let call = CoerceCall {
-                            provider: cfg.provider,
+                            provider: cfg.backend,
                             base_url: &cfg.base_url,
                             api_key: &cfg.api_key,
                             model: &cfg.model,
@@ -758,7 +755,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     // and settle it through the shared kernel seam.
                     resumed => {
                         let result = match resumed {
-                            Some(Ok(response)) => parse_response(cfg.provider, &response, wrapped),
+                            Some(Ok(response)) => parse_response(cfg.backend, &response, wrapped),
                             other => CoerceResult {
                                 status: CoerceStatus::Failed,
                                 value_json: None,
@@ -777,7 +774,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             instance_id: self.instance_id,
                             effect_id: &effect.effect_id,
                             run_id: &run_id,
-                            provider: &cfg.provider_name,
+                            provider: &cfg.provider_id,
                             worker_id: "whip-worker",
                             lease_id: &lease_id,
                             lease_expires_at: "2030-01-01T00:00:00Z",
@@ -1509,13 +1506,15 @@ mod tests {
             .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
             .expect("start event");
 
-        let cfg = CoerceProviderConfig {
-            provider: CoerceProvider::Anthropic,
-            provider_name: "anthropic".to_owned(),
+        let cfg = ResolvedCoercionConfig {
+            provider_id: "anthropic".to_owned(),
+            backend: CoerceProvider::Anthropic,
             base_url: "https://api.anthropic.com".to_owned(),
             api_key: "test-key".to_owned(),
             model: "claude-test".to_owned(),
-            max_tokens: 1024,
+            max_tokens: whipplescript_kernel::coerce_native::DEFAULT_COERCE_MAX_TOKENS,
+            timeout_secs: whipplescript_kernel::coerce_native::DEFAULT_COERCE_TIMEOUT_SECS,
+            codex_account_id: None,
         };
         let driver = DoInstanceDriver {
             kernel,

@@ -315,13 +315,22 @@ Current implementation:
   prompt's `{{ ctx.output_format }}` token embeds that schema so endpoints
   without native structured output can still return schema-shaped JSON.
 
-The native path is **opt-in and credential-gated** via environment variables, so
-the fixture path remains the default for `dev`/`worker`/CI:
+Backend selection is **registry-honest with an explicit override ladder**
+([std-coercion.md](std-coercion.md) "Backend selection and config
+precedence"): per-effect `provider` in source, then the operator override,
+then the registry default (the `schema.coerce` capability binding row's
+provider plus its `effect_providers` row `config_json` — one indexed SELECT at
+claim time), then fixture. The environment variables below are thereby the
+**operator override over the registry default**, not the selection mechanism
+— though with the seeded default binding (fixture) they remain the usual way
+to opt in, and the fixture path stays the default for `dev`/`worker`/CI.
+`whip coercion status [--json]` reports the resolved provider, backend, model,
+credential source, and which rung selected it.
 
 | Variable | Meaning |
 | --- | --- |
-| `WHIPPLESCRIPT_COERCE_PROVIDER` | `openai` or `anthropic`; unset → fixture path |
-| `WHIPPLESCRIPT_COERCE_MODEL` | the model id (codex path falls back to `~/.codex/config.toml`; required otherwise) |
+| `WHIPPLESCRIPT_COERCE_PROVIDER` | `openai` or `anthropic`; unset → registry default, else fixture |
+| `WHIPPLESCRIPT_COERCE_MODEL` | the model id (beats the registry row's `model`; codex path falls back to `~/.codex/config.toml`; required otherwise) |
 | `WHIPPLESCRIPT_COERCE_BASE_URL` | override the API base URL (e.g. a mock or the Codex backend) |
 | `WHIPPLESCRIPT_COERCE_MAX_TOKENS` | Anthropic output-token bound (default 4096) |
 | `WHIPPLESCRIPT_COERCE_TIMEOUT_SECS` | per-request timeout (default 120) |
@@ -344,8 +353,27 @@ Credentials resolve as:
   (`sk-ant-oat*`) is rejected at resolution — reusing it for the API is a terms
   gray area.
 
-When the provider is set but no credential resolves, the coerce effect fails with
-a clear message rather than silently falling back to a fixture.
+When a provider is selected (by any rung) but no credential resolves, the
+coerce effect fails with a clear message rather than silently falling back to
+a fixture.
+
+Both operator doors resolve to the ONE canonical config record
+([std-coercion.md](std-coercion.md) "Config-plane reconciliation"):
+
+```text
+ResolvedCoercionConfig { provider_id, backend, base_url, api_key,
+                         model, max_tokens, timeout_secs, codex_account_id? }
+```
+
+The native door is the ladder above (env + `whip auth` + registry default);
+the durable-object door is the `coerce_config_json` secret supplied on
+`create` — same fields, fully explicit (no env on the DO plane), and it beats
+the registry default exactly as the operator-override rung does. Defaults are
+owned once by std.coercion: `max_tokens 4096`, `timeout_secs 120` on both
+doors (the DO's earlier divergent `max_tokens 1024` default is removed). The
+codex OAuth routing (`codex_account_id`) is a native-door affordance — the DO
+door carries explicit API keys only. The kernel sees only the record, never a
+plane.
 
 ## Completion Fact
 

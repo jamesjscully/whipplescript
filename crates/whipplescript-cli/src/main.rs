@@ -101,6 +101,7 @@ mod coerce_runtime;
 mod exec_server;
 mod harness_tools;
 mod improve;
+mod model_auth;
 mod project_context;
 mod skills_loader;
 mod turn_server;
@@ -204,6 +205,7 @@ fn main() -> ExitCode {
         Some("message") => message_command(&options),
         Some("otel-export") => otel_export(&options),
         Some("telemetry") => telemetry(&options),
+        Some("coercion") => coercion(&options),
         Some("leases") => coordination_list(&options, "leases"),
         Some("ledger") => coordination_list(&options, "ledger"),
         Some("counters") => coordination_list(&options, "counters"),
@@ -671,6 +673,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "signal" => "usage: whip signal <instance> --name <name> --data <json> --program <workflow.whip> [--root <workflow>]",
         "otel-export" => "usage: whip otel-export <instance> [--dry-run] [--telemetry-allowlist <Schema.field,...>] (reads OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME, WHIPPLESCRIPT_TELEMETRY_ALLOWLIST)",
         "telemetry" => "usage: whip telemetry <status|reset-cursor> [<instance>] (export-cursor management for otel-export)",
+        "coercion" => "usage: whip [--store path] [--json] coercion status (the resolved schema.coerce provider config: provider, backend, model, credential source, selecting rung, fingerprint)",
         "leases" => "usage: whip leases [<resource>]",
         "ledger" => "usage: whip ledger [<ledger>] [--partition <value>]",
         "counters" => "usage: whip counters [<counter>]",
@@ -1458,6 +1461,43 @@ fn lint_unused_coerces(ir: &IrProgram) -> Vec<LintFinding> {
         .collect()
 }
 
+/// ADVISORY import lint (spec/std-coercion.md "Manifest": import bite is a
+/// missing-import advisory only — the graduated ladder, never an error):
+/// `coerce`/`decide`/`prompt` lower to the `schema.coerce` effect owned by
+/// std.coercion; a program using them without `use std.coercion` still runs,
+/// but the import is what names the operator-config package behind the
+/// effect. Detection is conservative: `coerce`/`prompt` declarations land in
+/// `ir.coerces`, and inline `decide` is matched only at a body-line start —
+/// under-reporting is possible, wrongly flagging is not.
+fn lint_missing_coercion_import(ir: &IrProgram) -> Vec<LintFinding> {
+    if ir
+        .uses
+        .iter()
+        .any(|use_decl| use_decl.name == "std.coercion")
+    {
+        return Vec::new();
+    }
+    let uses_decide = ir.rules.iter().any(|rule| {
+        rule.body
+            .lines()
+            .any(|line| line.trim().starts_with("decide "))
+    });
+    let first_coerce = ir.coerces.first().map(|coerce| coerce.name.clone());
+    if first_coerce.is_none() && !uses_decide {
+        return Vec::new();
+    }
+    vec![LintFinding {
+        code: "lint.missing_coercion_import",
+        severity: Severity::Warning,
+        message: "program uses `coerce`/`decide`/`prompt` without `use std.coercion`; add the \
+                  import to name the package that configures the schema.coerce backend \
+                  (advisory)"
+            .to_owned(),
+        name: first_coerce,
+        span: None,
+    }]
+}
+
 /// Whole-token occurrence count of `name` in `text` (an identifier run is a maximal
 /// `[A-Za-z0-9_]+`), so `r` does not match inside `recall` or `r.field`'s neighbours.
 fn whole_token_count(text: &str, name: &str) -> usize {
@@ -1871,6 +1911,7 @@ fn lint_mark_consumption_boundaries(ir: &IrProgram) -> Vec<LintFinding> {
 
 fn lint_program(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
     let mut findings = lint_unused_coerces(ir);
+    findings.extend(lint_missing_coercion_import(ir));
     findings.extend(lint_unused_coerce_results(ir));
     findings.extend(lint_unused_resources(ir));
     findings.extend(lint_noop_rules(ir));
@@ -16401,6 +16442,17 @@ impl LoadedPackageLock {
 /// always wins. Add more std packages by appending `(name, include_str!(..))`
 /// pairs here.
 const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
+    // Operator-config package for the core `schema.coerce` effect
+    // (spec/std-coercion.md "Manifest"): capability/provider/profile/binding
+    // rows plus the `schema.coerce` effect contract. The contract mirrors the
+    // parser-compiled one (parser owns the grammar — zero constructs here) and
+    // merge-folds against it; a shape drift between the two would surface as
+    // an `effect_contract_duplicate` diagnostic. Declaring a core effect kind
+    // rides the embedded-copy privilege door (`manifest_is_embedded_copy`).
+    (
+        "std.coercion",
+        include_str!("../../../std/manifests/coercion.json"),
+    ),
     (
         "std.memory",
         include_str!("../../../std/manifests/memory.json"),
@@ -18978,6 +19030,25 @@ impl AssertionStatus {
     }
 }
 
+/// The rung-3 registry default for `schema.coerce` (spec/std-coercion.md
+/// "Backend selection and config precedence"): the capability binding row's
+/// provider plus that provider's `effect_providers` row `config_json` — one
+/// indexed SELECT at claim time, mirroring the `capability_bound` promotion.
+/// `Ok(None)` when no binding row exists (the ladder then falls to fixture).
+fn coerce_registry_default(
+    store: &SqliteStore,
+    instance_id: &str,
+) -> Result<Option<coerce_runtime::CoerceRegistryDefault>, StoreError> {
+    let Some(provider) = store.capability_bound_provider(instance_id, "schema.coerce")? else {
+        return Ok(None);
+    };
+    let config_json = store.effect_provider_config("schema.coerce", &provider)?;
+    Ok(Some(coerce_runtime::CoerceRegistryDefault {
+        provider,
+        config_json,
+    }))
+}
+
 /// Native entry: build the unified `NativeStores` handle (runtime + coordination +
 /// work-items) and drive the generic rule pass over one held `RuntimeKernel`.
 fn step_instance(
@@ -18993,8 +19064,15 @@ fn step_instance(
         resolved_coordination_store(side_stores),
         resolved_items_store(side_stores),
     )?;
-    let mut kernel = RuntimeKernel::new(stores)
-        .with_coercion_config_fingerprint(coerce_runtime::native_coercion_config_fingerprint());
+    // The coercion-config fingerprint resolves provider/model through the same
+    // ladder rungs 2-4 the dispatch path uses (rung 3 needs the registry
+    // default, so the open runtime store is consulted before the kernel takes
+    // it; rung 1 is per-effect and stays out of the kernel-construction
+    // fingerprint; credentials are never consulted).
+    let registry_default = coerce_registry_default(&stores.runtime, instance_id)?;
+    let mut kernel = RuntimeKernel::new(stores).with_coercion_config_fingerprint(
+        coerce_runtime::coercion_config_fingerprint_with_registry(registry_default.as_ref()),
+    );
     step_instance_generic(
         &mut kernel,
         instance_id,
@@ -19082,7 +19160,9 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
                 run_queue_effect_generic(kernel, id, effect, &config)?
             }
             "lease.acquire" | "lease.release" | "lease.renew" | "ledger.append"
-            | "counter.consume" => run_coordination_effect_generic(kernel, id, effect, "now")?,
+            | "counter.consume" => {
+                run_coordination_effect_generic(kernel, id, effect, &wall_clock_instant())?
+            }
             "signal.emit" => run_notify_effect_generic(kernel, id, effect, &IfcDeliveryGovernance)?,
             "file.read" => {
                 let files = file_store_for_instance(id, &effect.effect_id);
@@ -19632,7 +19712,10 @@ fn run_claimable_effect(
                 store_path,
                 instance_id,
                 effect,
-                options.virtual_now.as_deref().unwrap_or("now"),
+                options
+                    .virtual_now
+                    .as_deref()
+                    .unwrap_or(&wall_clock_instant()),
                 options.side_stores.as_ref(),
             )
         }
@@ -21496,7 +21579,7 @@ fn codex_app_server_model(config: Option<&ProviderBindingConfig>) -> Result<Stri
     config
         .and_then(|config| config.default_model.clone())
         .or_else(|| env::var("WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL").ok())
-        .or_else(coerce_runtime::codex_config_model)
+        .or_else(model_auth::codex_config_model)
         .ok_or_else(|| {
             StoreError::Conflict(
                 "no Codex agent model: set WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL, a provider-config `default_model`, or `model` in ~/.codex/config.toml"
@@ -21810,16 +21893,21 @@ fn run_coerce_effect(
     if options.outcome == FixtureOutcome::Cancelled {
         return cancel_coerce_effect(store_path, instance_id, effect, &input, options);
     }
-    // Opt-in real path: when a coerce provider is configured, issue a
-    // provider-native structured-output call instead of the fixture. A
-    // misconfiguration (unknown provider, missing credential) surfaces as a
-    // clear error rather than silently degrading to a fixture.
+    // Registry-honest selection (spec/std-coercion.md "Backend selection and
+    // config precedence"): per-effect `provider` in source, then the operator
+    // override (env + whip auth), then the registry `schema.coerce` binding
+    // row, then fixture. A misconfiguration (unknown provider, missing
+    // credential) surfaces as a clear error rather than silently degrading to
+    // a fixture.
     let provider_override = input.get("provider").and_then(Value::as_str);
-    let native_config = match provider_override {
-        Some(provider) => coerce_runtime::resolve_native_coerce_config_for(Some(provider)),
-        None => coerce_runtime::resolve_native_coerce_config(),
-    }
-    .map_err(StoreError::Conflict)?;
+    let registry_default = {
+        let store = SqliteStore::open(store_path)?;
+        coerce_registry_default(&store, instance_id)?
+    };
+    let native_config =
+        coerce_runtime::resolve_coercion_selection(provider_override, registry_default.as_ref())
+            .map_err(StoreError::Conflict)?
+            .config;
     if let Some(config) = native_config {
         return run_native_coerce_effect(
             store_path,
@@ -21857,6 +21945,118 @@ fn run_coerce_effect(
     )
 }
 
+/// `whip coercion status [--json]`: the RESOLVED `schema.coerce` provider
+/// configuration and which selection-ladder rung chose it
+/// (spec/std-coercion.md "Backend selection and config precedence"; "Static
+/// checks" tier 2 — config validation promoted to operator-visible posture).
+/// Reports the credential SOURCE label only, never the credential itself.
+fn coercion(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip [--store path] [--json] coercion status";
+    let mut positional = options.args.iter();
+    match (positional.next().map(String::as_str), positional.next()) {
+        (Some("status"), None) => {}
+        _ => {
+            eprintln!("{usage}");
+            return ExitCode::from(2);
+        }
+    }
+    // The rung-3 registry default: the GLOBAL `schema.coerce` binding row (no
+    // instance in hand, so program-scoped rows are out of scope here). A store
+    // that does not exist yet contributes none — a status command must not
+    // create one as a side effect.
+    let registry_default = if options.store_path.exists() {
+        match SqliteStore::open(&options.store_path)
+            .and_then(|store| coerce_registry_default(&store, ""))
+        {
+            Ok(default) => default,
+            Err(error) => {
+                eprintln!("coercion status: could not read the registry: {error:?}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let fingerprint =
+        coerce_runtime::coercion_config_fingerprint_with_registry(registry_default.as_ref());
+    let selection =
+        match coerce_runtime::resolve_coercion_selection(None, registry_default.as_ref()) {
+            Ok(selection) => selection,
+            Err(error) => {
+                // Misconfiguration (unknown provider, provider-set-but-no-
+                // credential, OAuth-token-for-anthropic) is exactly what this
+                // surface exists to expose.
+                if options.json {
+                    let _ = emit_json(json!({ "error": error, "fingerprint": fingerprint }));
+                } else {
+                    eprintln!("coercion: misconfigured: {error}");
+                }
+                return ExitCode::FAILURE;
+            }
+        };
+    let rung = selection.rung;
+    let credential_source = selection
+        .credential_source
+        .map(model_auth::CredentialSource::label);
+    match &selection.config {
+        Some(config) => {
+            let backend = match config.backend {
+                whipplescript_kernel::coerce_native::CoerceProvider::OpenAi => "openai",
+                whipplescript_kernel::coerce_native::CoerceProvider::OpenAiCompat => {
+                    "openai-generic"
+                }
+                whipplescript_kernel::coerce_native::CoerceProvider::Anthropic => "anthropic",
+            };
+            if options.json {
+                return emit_json(json!({
+                    "provider_id": config.provider_id,
+                    "backend": backend,
+                    "model": config.model,
+                    "credential_source": credential_source,
+                    "max_tokens": config.max_tokens,
+                    "timeout_secs": config.timeout_secs,
+                    "rung": rung.number(),
+                    "rung_label": rung.label(),
+                    "fingerprint": fingerprint,
+                }));
+            }
+            println!(
+                "coercion provider: {} (backend {backend}, model {})",
+                config.provider_id, config.model
+            );
+            println!(
+                "  credential: {}",
+                credential_source.unwrap_or_else(|| "none".to_owned())
+            );
+            println!(
+                "  max_tokens {} / timeout {}s",
+                config.max_tokens, config.timeout_secs
+            );
+            println!("  selected by rung {}: {}", rung.number(), rung.label());
+            println!("  fingerprint: {fingerprint}");
+        }
+        None => {
+            if options.json {
+                return emit_json(json!({
+                    "provider_id": "fixture",
+                    "backend": Value::Null,
+                    "model": Value::Null,
+                    "credential_source": Value::Null,
+                    "max_tokens": Value::Null,
+                    "timeout_secs": Value::Null,
+                    "rung": rung.number(),
+                    "rung_label": rung.label(),
+                    "fingerprint": fingerprint,
+                }));
+            }
+            println!("coercion provider: fixture (deterministic; no model call)");
+            println!("  selected by rung {}: {}", rung.number(), rung.label());
+            println!("  fingerprint: {fingerprint}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 /// `whip auth`: manage coerce credentials and delegate harness OAuth.
 fn auth_command(options: &CliOptions) -> ExitCode {
     let usage = "usage: whip auth <status | set <openai|anthropic> <key>>";
@@ -21892,11 +22092,10 @@ fn auth_status(options: &CliOptions) -> ExitCode {
     let mut rows = Vec::new();
     for provider in auth::KNOWN_PROVIDERS {
         let coerce_provider = coerce_provider_by_name(provider).expect("known provider");
-        let (source, redacted) =
-            match coerce_runtime::resolve_credential_with_source(coerce_provider) {
-                Some((key, source)) => (source.label(), Some(auth::redact(&key))),
-                None => ("none".to_owned(), None),
-            };
+        let (source, redacted) = match model_auth::resolve_credential_with_source(coerce_provider) {
+            Some((key, source)) => (source.label(), Some(auth::redact(&key))),
+            None => ("none".to_owned(), None),
+        };
         rows.push((provider.to_owned(), source, redacted));
     }
     // Phase 4 auth relocation: when the policy channel hands whip resolved
@@ -21981,7 +22180,7 @@ fn run_native_coerce_effect(
     options: &WorkerOptions,
     request: &CoerceRequest,
     input: &Value,
-    config: coerce_runtime::NativeCoerceConfig,
+    config: whipplescript_kernel::coerce_native::ResolvedCoercionConfig,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let program_path = options.program_path.as_ref().ok_or_else(|| {
         StoreError::Conflict("native coerce requires the program path (--program)".to_owned())
@@ -22014,7 +22213,9 @@ fn run_native_coerce_effect(
         )
         .map_err(StoreError::Conflict)?
     };
-    let transport = coerce_runtime::UreqCoerceTransport::new(config.timeout);
+    let transport = coerce_runtime::UreqCoerceTransport::new(std::time::Duration::from_secs(
+        config.timeout_secs,
+    ));
     // Codex backend needs a (account_id, session_id) pair; the session id is a
     // stable per-effect identifier.
     let codex = config.codex_account_id.map(|account_id| {
@@ -22024,7 +22225,7 @@ fn run_native_coerce_effect(
         )
     });
     let client = whipplescript_kernel::coerce_native::NativeCoerceClient {
-        provider: config.provider,
+        provider: config.backend,
         base_url: config.base_url,
         api_key: config.api_key,
         model: config.model,
@@ -23032,6 +23233,21 @@ fn run_file_export_effect_generic<S: RuntimeStore>(
             Ok(terminal)
         }
     }
+}
+
+/// The wall-clock UTC instant as ISO-8601 — the coordination pass instant
+/// when no virtual clock is injected. The kernel never reads wall time
+/// itself (std.coord slice 3: the counter period derives from THIS injected
+/// instant and is recorded on the outcome), so the host resolves it once
+/// here; a `--virtual-now` still wins at every call site.
+fn wall_clock_instant() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .map(|instant| instant.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
 }
 
 /// Executes one coordination verb (spec/coordination.md): one atomic store
@@ -40990,6 +41206,156 @@ coerce review() -> Review {
         assert_eq!(operator.len(), 1);
         assert_eq!(operator[0].id, "otlp");
         assert_eq!(operator[0].provider_kind, "otlp-exporter");
+    }
+
+    /// spec/std-coercion.md slice 4 gate: the std.coercion manifest's
+    /// capability/provider/binding rows must AGREE with migration 0001's
+    /// seeded `schema.coerce` rows — the manifest supersedes the seeds, so a
+    /// drift between them is a lie one side tells operators. Agreement is
+    /// semantic where the names differ historically: the seeded binding
+    /// provider `builtin-coerce` and the manifest default `fixture` must both
+    /// select the FIXTURE path through the same resolver predicate.
+    #[test]
+    fn coercion_manifest_agrees_with_migration_seeded_rows() {
+        let migration = include_str!("../../whipplescript-store/migrations/0001_runtime_store.sql");
+        let manifest: Value = serde_json::from_str(
+            EMBEDDED_STD_MANIFESTS
+                .iter()
+                .find(|(name, _)| *name == "std.coercion")
+                .expect("std.coercion is embedded")
+                .1,
+        )
+        .expect("valid json");
+        // Capability row: both sides declare `schema.coerce`.
+        assert!(
+            migration.contains("('schema.coerce', 'Coerce unstructured data"),
+            "migration 0001 seeds the schema.coerce capability"
+        );
+        let capability_ids: Vec<&str> = manifest["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .filter_map(|capability| capability["id"].as_str())
+            .collect();
+        assert_eq!(capability_ids, ["schema.coerce"]);
+        // Provider row: the seed registers ONE schema.coerce effect provider;
+        // extract its provider name and require it to be the fixture path —
+        // the same path the manifest's default binding selects.
+        let seeded_provider_line = migration
+            .lines()
+            .find(|line| line.contains("'provider_coerce_builtin'"))
+            .expect("migration 0001 seeds the schema.coerce effect provider");
+        let seeded_provider = seeded_provider_line
+            .split(',')
+            .nth(2)
+            .expect("provider column")
+            .trim()
+            .trim_matches(|c| c == '\'' || c == ' ');
+        assert!(
+            coerce_runtime::is_fixture_provider_name(seeded_provider),
+            "the seeded default provider `{seeded_provider}` must select the fixture path"
+        );
+        let provider_ids: Vec<&str> = manifest["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .filter_map(|provider| provider["id"].as_str())
+            .collect();
+        assert_eq!(provider_ids, ["fixture", "native"]);
+        for provider in manifest["providers"].as_array().expect("providers") {
+            assert_eq!(provider["provider_kind"], "schema_coercer");
+            assert_eq!(provider["capability"], "schema.coerce");
+        }
+        // Binding row: the seed binds schema.coerce globally to the fixture
+        // path; the manifest's default binding selects provider `fixture`.
+        let seeded_binding_line = migration
+            .lines()
+            .find(|line| line.contains("'binding_coerce_builtin'"))
+            .expect("migration 0001 seeds the schema.coerce binding");
+        let seeded_binding_provider = seeded_binding_line
+            .split(',')
+            .nth(3)
+            .expect("binding provider column")
+            .trim()
+            .trim_matches(|c| c == '\'' || c == ')' || c == ' ');
+        assert!(
+            coerce_runtime::is_fixture_provider_name(seeded_binding_provider),
+            "the seeded binding provider `{seeded_binding_provider}` must select the fixture path"
+        );
+        let bindings = manifest["bindings"].as_array().expect("bindings");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0]["capability"], "schema.coerce");
+        assert!(
+            coerce_runtime::is_fixture_provider_name(
+                bindings[0]["config"]["provider_id"]
+                    .as_str()
+                    .expect("default provider id")
+            ),
+            "the manifest default binding must select the fixture path"
+        );
+        // Profile row: both sides allow schema.coerce in a default profile.
+        assert!(
+            migration.contains(r#""schema.coerce""#),
+            "migration 0001 profiles allow schema.coerce"
+        );
+        let profiles = manifest["profiles"].as_array().expect("profiles");
+        assert!(profiles.iter().any(|profile| {
+            profile["allowed_capabilities"]
+                .as_array()
+                .is_some_and(|caps| caps.iter().any(|cap| cap == "schema.coerce"))
+        }));
+    }
+
+    /// The std.coercion manifest's `schema.coerce` contract mirrors the
+    /// parser-compiled one, so merging both (a coerce-using program that
+    /// imports std.coercion) FOLDS into one contract — a shape drift between
+    /// manifest and parser would instead surface as `effect_contract_duplicate`.
+    #[test]
+    fn coercion_manifest_contract_folds_against_the_parser_compiled_one() {
+        let source = r#"use std.coercion
+
+@service
+workflow CoercionImport
+
+enum Verdict { Yes No }
+coerce judge(summary string) -> Verdict {
+  prompt """markdown
+  Decide: {{ summary }}
+  {{ ctx.output_format }}
+  """
+}
+
+output result R
+class R { v string }
+signal go.now { x string }
+rule j
+  when go.now as g
+=> { complete result { v "ok" } }
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compiles");
+        let registry = contract_registry_for_ir(None, &ir).expect("registry resolves");
+        assert_eq!(registry.validate(), Vec::new());
+        let coerce_contracts: Vec<_> = registry
+            .effect_contracts
+            .iter()
+            .filter(|contract| contract.id == "schema.coerce")
+            .collect();
+        assert_eq!(
+            coerce_contracts.len(),
+            1,
+            "manifest and parser contracts must fold into one: {coerce_contracts:?}"
+        );
+        let contract = coerce_contracts[0];
+        assert_eq!(contract.effect_kind, "schema.coerce");
+        assert_eq!(contract.required_capabilities, ["schema.coerce"]);
+        assert_eq!(contract.provider_kinds, ["schema_coercer"]);
+        assert_eq!(
+            contract.source_forms,
+            ["coerce", "decide", "prompt"],
+            "source forms merge-unique across the two copies"
+        );
     }
 
     #[test]

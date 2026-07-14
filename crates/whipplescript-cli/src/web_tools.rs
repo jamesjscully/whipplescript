@@ -673,7 +673,7 @@ pub fn resolve_search_provider() -> Result<Box<dyn SearchProvider>, WebToolError
             }
         }
     }
-    if let Some((key, _source)) = crate::coerce_runtime::resolve_credential_with_source(
+    if let Some((key, _source)) = crate::model_auth::resolve_credential_with_source(
         whipplescript_kernel::coerce_native::CoerceProvider::Anthropic,
     ) {
         return Ok(Box::new(AnthropicNativeSearchProvider::new(key)));

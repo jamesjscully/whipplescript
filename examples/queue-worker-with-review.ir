@@ -3,6 +3,8 @@ source_tags
 @service workflow QueueWorkerWithReview
 source_descriptions
 "Claim ready work items, implement them, review each turn, and escalate failed reviews to a human" workflow QueueWorkerWithReview
+uses
+  package std.coercion
 schemas
   enum ReviewStatus { Accept, Revise, Blocked }
   class WorkReview

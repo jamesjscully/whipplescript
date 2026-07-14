@@ -30,8 +30,8 @@ use whipplescript_store::{
 };
 
 use crate::do_instance::{
-    do_coercion_config_fingerprint, CoerceProviderConfig, DoInstanceDriver, ExecutorSidecarConfig,
-    TurnContainerConfig,
+    do_coercion_config_fingerprint, DoInstanceDriver, ExecutorSidecarConfig,
+    ResolvedCoercionConfig, TurnContainerConfig,
 };
 use crate::do_store::{DoSql, DoSqlStorage, DoSqliteStore};
 use crate::DoFileStore;
@@ -86,7 +86,7 @@ pub fn unix_ms_to_iso8601(unix_ms: i64) -> String {
 #[derive(Default)]
 pub struct DurableEffectPorts {
     pub files: Option<Box<dyn FileStore>>,
-    pub coerce: Option<CoerceProviderConfig>,
+    pub coerce: Option<ResolvedCoercionConfig>,
     pub agent_model: Option<Box<dyn HttpModelClient>>,
     pub agent_tools: Option<Box<dyn ToolExecutor>>,
     /// Executor-sidecar wiring for Class-A exec effects (compute plane P8).
@@ -117,7 +117,7 @@ pub struct DurableInstance<Sql: DoSql> {
     instance_id: String,
     in_flight: Option<ClaimableEffect>,
     files: Box<dyn FileStore>,
-    coerce: Option<CoerceProviderConfig>,
+    coerce: Option<ResolvedCoercionConfig>,
     agent_model: Option<Box<dyn HttpModelClient>>,
     agent_tools: Box<dyn ToolExecutor>,
     exec: Option<ExecutorSidecarConfig>,
@@ -493,7 +493,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
 
     /// Whether coerce is configured (mirrors a live worker's binding check).
     pub fn coerce_provider(&self) -> Option<CoerceProvider> {
-        self.coerce.as_ref().map(|config| config.provider)
+        self.coerce.as_ref().map(|config| config.backend)
     }
 
     /// Capture a restorable consistent-cut checkpoint (DO parity P3 — the
@@ -879,13 +879,15 @@ mod tests {
         }
 
         let ports = DurableEffectPorts {
-            coerce: Some(CoerceProviderConfig {
-                provider: CoerceProvider::Anthropic,
-                provider_name: "anthropic".to_owned(),
+            coerce: Some(ResolvedCoercionConfig {
+                provider_id: "anthropic".to_owned(),
+                backend: CoerceProvider::Anthropic,
                 base_url: "https://api.anthropic.com".to_owned(),
                 api_key: "test-key".to_owned(),
                 model: "claude-test".to_owned(),
-                max_tokens: 1024,
+                max_tokens: whipplescript_kernel::coerce_native::DEFAULT_COERCE_MAX_TOKENS,
+                timeout_secs: whipplescript_kernel::coerce_native::DEFAULT_COERCE_TIMEOUT_SECS,
+                codex_account_id: None,
             }),
             ..DurableEffectPorts::default()
         };

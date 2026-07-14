@@ -1,6 +1,8 @@
 workflow CoerceBranch
 source_tags
 @service workflow CoerceBranch
+uses
+  package std.coercion
 schemas
   enum Priority { Low, Normal, Urgent }
   class MessageClassification

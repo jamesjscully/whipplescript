@@ -532,8 +532,15 @@ pub fn package_manifest_from_json_with_embedded(
     validate_package_manifest_identity_uniqueness(path, &value)?;
     let capabilities = package_capability_contracts(path, &value)?;
     let providers = package_provider_contracts(path, &value)?;
-    let registry =
-        package_manifest_registry(path, &value, &name, &version, &capabilities, &providers)?;
+    let registry = package_manifest_registry_with_privilege(
+        path,
+        &value,
+        &name,
+        &version,
+        &capabilities,
+        &providers,
+        privileged,
+    )?;
     validate_package_manifest_consistency(
         path,
         &value,
@@ -636,7 +643,11 @@ pub fn validate_package_manifest_consistency(
     }
 
     for contract in &registry.effect_contracts {
-        if contract.effect_kind != "capability.call" {
+        // Core effect kinds are declarable only by the platform's own embedded
+        // std copies (the same privilege door as platform-internal lowerings):
+        // e.g. std.coercion's `schema.coerce` contract, which mirrors the
+        // parser-compiled one and merge-folds against it.
+        if contract.effect_kind != "capability.call" && !privileged {
             problems.push(format!(
                 "effect contract `{}` uses unsupported effect_kind `{}`; packages currently support only `capability.call`",
                 contract.id, contract.effect_kind
@@ -1981,6 +1992,33 @@ pub fn package_manifest_registry(
     capabilities: &BTreeMap<String, PackageCapabilityContract>,
     providers: &[PackageProviderContract],
 ) -> Result<ContractRegistry, String> {
+    package_manifest_registry_with_privilege(
+        path,
+        value,
+        name,
+        version,
+        capabilities,
+        providers,
+        false,
+    )
+}
+
+/// [`package_manifest_registry`] with the embedded-copy privilege flag: a
+/// platform-embedded std manifest may declare an effect contract whose
+/// input/output schemas are the parser's contract LABELS (e.g. std.coercion's
+/// `schema.coerce.input` / `typed-provider-output`) rather than package schema
+/// fragments — the parser is the authority for those contracts, and the
+/// registry merge (`upsert_effect_contract`) refuses a manifest copy whose
+/// shape drifts from the compiled-in one.
+pub fn package_manifest_registry_with_privilege(
+    path: &Path,
+    value: &Value,
+    name: &str,
+    version: &str,
+    capabilities: &BTreeMap<String, PackageCapabilityContract>,
+    providers: &[PackageProviderContract],
+    privileged: bool,
+) -> Result<ContractRegistry, String> {
     let mut registry = ContractRegistry::default();
     let libraries = value.get("libraries").and_then(Value::as_array);
 
@@ -2004,13 +2042,14 @@ pub fn package_manifest_registry(
                 .into_iter()
                 .flatten()
             {
-                registry.upsert_effect_contract(package_effect_contract(
+                registry.upsert_effect_contract(package_effect_contract_with_privilege(
                     path,
                     contract,
                     &library_id,
                     &library_version,
                     capabilities,
                     providers,
+                    privileged,
                 )?);
             }
             for construct in library
@@ -2427,6 +2466,30 @@ pub fn package_effect_contract(
     capabilities: &BTreeMap<String, PackageCapabilityContract>,
     providers: &[PackageProviderContract],
 ) -> Result<EffectContract, String> {
+    package_effect_contract_with_privilege(
+        path,
+        value,
+        library_id,
+        version,
+        capabilities,
+        providers,
+        false,
+    )
+}
+
+/// [`package_effect_contract`] with the embedded-copy privilege flag: only a
+/// platform-embedded std manifest may carry the parser's contract schema
+/// LABELS (`schema.coerce.input`, `typed-provider-output`, …) in place of
+/// package schema fragments — third-party fragments stay strictly validated.
+pub fn package_effect_contract_with_privilege(
+    path: &Path,
+    value: &Value,
+    library_id: &str,
+    version: &str,
+    capabilities: &BTreeMap<String, PackageCapabilityContract>,
+    providers: &[PackageProviderContract],
+    privileged: bool,
+) -> Result<EffectContract, String> {
     let id = required_json_string(value, "id", "effect contract")
         .map_err(|message| format!("{} in `{}`", message, path.display()))?;
     let capability_contract = capabilities.get(&id);
@@ -2434,18 +2497,20 @@ pub fn package_effect_contract(
         .or_else(|| capability_contract.and_then(|contract| contract.output_schema.clone()));
     let input_schema = json_schema_fragment(value.get("input_schema"))
         .or_else(|| capability_contract.and_then(|contract| contract.input_schema.clone()));
-    validate_package_schema_fragment_contract(
-        path,
-        &format!("effect contract `{id}`"),
-        "input_schema",
-        input_schema.as_deref(),
-    )?;
-    validate_package_schema_fragment_contract(
-        path,
-        &format!("effect contract `{id}`"),
-        "output_schema",
-        output_schema.as_deref(),
-    )?;
+    if !privileged {
+        validate_package_schema_fragment_contract(
+            path,
+            &format!("effect contract `{id}`"),
+            "input_schema",
+            input_schema.as_deref(),
+        )?;
+        validate_package_schema_fragment_contract(
+            path,
+            &format!("effect contract `{id}`"),
+            "output_schema",
+            output_schema.as_deref(),
+        )?;
+    }
     let source_forms = optional_json_string_array(value, "source_forms")
         .filter(|forms| !forms.is_empty())
         .unwrap_or_else(|| vec![format!("call {id}")]);
