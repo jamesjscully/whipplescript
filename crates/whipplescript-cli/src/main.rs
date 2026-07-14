@@ -16329,6 +16329,15 @@ const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
         "std.script",
         include_str!("../../../std/manifests/script.json"),
     ),
+    // Operator-plane only (std-telemetry.md T3): library identity plus the
+    // `otlp` exporter's registry defaults. Zero constructs, zero effect
+    // contracts, zero capabilities — the package deliberately contributes
+    // nothing to the admission plane; `whip otel-export` reads the provider
+    // row's config as its defaults (env/flags override).
+    (
+        "std.telemetry",
+        include_str!("../../../std/manifests/telemetry.json"),
+    ),
 ];
 
 /// Whether `name` claims the reserved `std.*` package namespace. Std packages
@@ -16359,6 +16368,27 @@ fn embedded_std_manifests() -> Vec<PackageManifest> {
             })
         })
         .collect()
+}
+
+/// One registry default from an embedded std manifest's OPERATOR-PLANE
+/// provider row (std-telemetry.md T3): the row's `config.<key>` string, e.g.
+/// std.telemetry's `otlp` endpoint. Reads the raw embedded JSON — operator
+/// rows are deliberately invisible to the effect-provider surface
+/// (`package_operator_providers` is their only structured reader), and this
+/// consults defaults without registering anything on the admission plane.
+fn embedded_operator_provider_default(package: &str, provider_id: &str, key: &str) -> Option<String> {
+    let (_, json) = EMBEDDED_STD_MANIFESTS
+        .iter()
+        .find(|(name, _)| *name == package)?;
+    let value: Value = serde_json::from_str(json).ok()?;
+    let label = PathBuf::from(format!("<embedded:{package}>"));
+    package_operator_providers(&label, &value)
+        .ok()?
+        .into_iter()
+        .find(|row| row.id == provider_id)?
+        .config_json
+        .and_then(|config| serde_json::from_str::<Value>(&config).ok())
+        .and_then(|config| config.get(key).and_then(Value::as_str).map(str::to_owned))
 }
 
 /// Merge embedded std manifests into `registry` for every imported name that is
@@ -29989,8 +30019,13 @@ fn telemetry(options: &CliOptions) -> ExitCode {
         }
     }
     let cursor_path = options.store_path.with_extension("otel-cursor.json");
+    // Endpoint resolution ladder (std-telemetry.md T3): environment wins,
+    // then the std.telemetry manifest's `otlp` registry default, then the
+    // OTLP local-collector convention.
     let endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .unwrap_or_else(|_| "http://localhost:4318".to_owned());
+        .ok()
+        .or_else(|| embedded_operator_provider_default("std.telemetry", "otlp", "endpoint"))
+        .unwrap_or_else(|| "http://localhost:4318".to_owned());
     let service_name = env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "whipplescript".to_owned());
     match subcommand {
         Some("status") => {
@@ -30379,8 +30414,13 @@ struct OtelExportConfig {
 /// on an unsupported protocol, a malformed header/resource list, or auth headers
 /// over an unsafe plaintext endpoint.
 fn resolve_otel_config() -> Result<OtelExportConfig, String> {
+    // Endpoint resolution ladder (std-telemetry.md T3): environment wins,
+    // then the std.telemetry manifest's `otlp` registry default, then the
+    // OTLP local-collector convention.
     let endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .unwrap_or_else(|_| "http://localhost:4318".to_owned());
+        .ok()
+        .or_else(|| embedded_operator_provider_default("std.telemetry", "otlp", "endpoint"))
+        .unwrap_or_else(|| "http://localhost:4318".to_owned());
     let service_name = env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "whipplescript".to_owned());
 
     // Protocol validates before export: only the shipped wire shape is
@@ -40396,6 +40436,69 @@ coerce review() -> Review {
         for ((name, _), manifest) in EMBEDDED_STD_MANIFESTS.iter().zip(&manifests) {
             assert_eq!(&manifest.name, name);
         }
+    }
+
+    #[test]
+    fn telemetry_operator_provider_is_admission_inert_and_readable() {
+        // std-telemetry.md T3, machine-checkable Non-Goals: the package's
+        // `otlp` row is operator-plane — readable as a registry default,
+        // invisible to every admission-plane surface.
+        assert_eq!(
+            embedded_operator_provider_default("std.telemetry", "otlp", "endpoint").as_deref(),
+            Some("http://127.0.0.1:4318/v1/traces"),
+        );
+        assert_eq!(
+            embedded_operator_provider_default("std.telemetry", "otlp", "protocol").as_deref(),
+            Some("http/json"),
+        );
+        let (_, json) = EMBEDDED_STD_MANIFESTS
+            .iter()
+            .find(|(name, _)| *name == "std.telemetry")
+            .expect("std.telemetry is embedded");
+        let value: Value = serde_json::from_str(json).expect("valid json");
+        let label = Path::new("<embedded:std.telemetry>");
+        // Registration writes no admission-plane row: zero effect providers,
+        // zero effect contracts, zero capabilities.
+        let providers =
+            package_provider_contracts(label, &value).expect("effect-provider parse");
+        assert!(
+            providers.is_empty(),
+            "operator-plane rows must never become effect providers: {providers:?}"
+        );
+        let manifest = package_manifest_from_json(
+            &PathBuf::from("<embedded:std.telemetry>"),
+            (*json).to_owned(),
+        )
+        .expect("telemetry manifest validates");
+        assert!(manifest.registry.effect_contracts.is_empty());
+        // …while the operator surface sees exactly the one row.
+        let operator = package_operator_providers(label, &value).expect("operator parse");
+        assert_eq!(operator.len(), 1);
+        assert_eq!(operator[0].id, "otlp");
+        assert_eq!(operator[0].provider_kind, "otlp-exporter");
+    }
+
+    #[test]
+    fn operator_plane_provider_rows_are_shape_checked() {
+        // The two dishonest shapes the T3 validator amendment refuses: an
+        // operator row that ALSO claims a capability, and an unknown plane.
+        let with_capability = r#"{
+            "schema": "whipplescript.package_manifest.v0",
+            "package_id": "p", "name": "p", "version": "0.1.0",
+            "providers": [{"id": "x", "provider_kind": "k", "plane": "operator", "capability": "a.b"}]
+        }"#;
+        let error =
+            package_manifest_from_json(Path::new("p.json"), with_capability.to_owned())
+                .expect_err("operator rows are capability-free by definition");
+        assert!(error.contains("capability-free"), "{error}");
+        let unknown_plane = r#"{
+            "schema": "whipplescript.package_manifest.v0",
+            "package_id": "p", "name": "p", "version": "0.1.0",
+            "providers": [{"id": "x", "provider_kind": "k", "plane": "orbital", "capability": "a.b"}]
+        }"#;
+        let error = package_manifest_from_json(Path::new("p.json"), unknown_plane.to_owned())
+            .expect_err("unknown plane values are refused");
+        assert!(error.contains("unknown plane"), "{error}");
     }
 
     #[test]

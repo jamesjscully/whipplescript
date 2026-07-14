@@ -414,6 +414,48 @@ pub struct PackageProviderContract {
     pub provider_kind: String,
 }
 
+/// A capability-free operator-plane provider row (`"plane": "operator"`,
+/// std-telemetry.md T3): configuration an operator CLI surface reads (e.g.
+/// std.telemetry's `otlp` exporter defaults), never consulted by the effect
+/// admission gate. A distinct type — not an `Option<String>` capability on
+/// [`PackageProviderContract`] — so no admission-plane code path can reach
+/// one by construction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperatorProviderContract {
+    pub id: String,
+    pub provider_kind: String,
+    /// The row's `config` object as raw JSON text (defaults the consuming
+    /// CLI reads; env/flags override).
+    pub config_json: Option<String>,
+}
+
+/// The manifest's operator-plane provider rows (the ones
+/// `package_provider_contracts` deliberately skips).
+pub fn package_operator_providers(
+    path: &Path,
+    value: &Value,
+) -> Result<Vec<OperatorProviderContract>, String> {
+    let mut rows = Vec::new();
+    for provider in value
+        .get("providers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if provider.get("plane").and_then(Value::as_str) != Some("operator") {
+            continue;
+        }
+        rows.push(OperatorProviderContract {
+            id: required_json_string(provider, "id", "provider")
+                .map_err(|message| format!("{} in `{}`", message, path.display()))?,
+            provider_kind: required_json_string(provider, "provider_kind", "provider")
+                .map_err(|message| format!("{} in `{}`", message, path.display()))?,
+            config_json: provider.get("config").map(|config| config.to_string()),
+        });
+    }
+    Ok(rows)
+}
+
 /// Whether `raw_json` is byte-identical to a manifest in `embedded` (in
 /// production, `EMBEDDED_STD_MANIFESTS`; parameterized so the authorability-
 /// door privilege key is unit-testable with a synthetic manifest set). The key
@@ -1096,15 +1138,46 @@ pub fn validate_package_manifest_closed_shape(path: &Path, value: &Value) -> Res
                     "effect_kind",
                     "core_effect_kind",
                     "config",
+                    "plane",
                 ],
                 problems,
             );
-            validate_manifest_required_fields(
-                provider,
-                &label,
-                &["id", "provider_kind", "capability"],
-                problems,
-            );
+            // `"plane": "operator"` marks a capability-FREE provider row
+            // (std-telemetry.md T3): configuration for an operator CLI
+            // surface, never consulted by the effect admission gate. Such a
+            // row declaring a capability would be the decorative admission
+            // row M8's honesty audit forbids, so the shapes are mutually
+            // exclusive; every non-operator row still requires a capability.
+            match provider.get("plane").and_then(Value::as_str) {
+                Some("operator") => {
+                    validate_manifest_required_fields(
+                        provider,
+                        &label,
+                        &["id", "provider_kind"],
+                        problems,
+                    );
+                    if provider.get("capability").is_some() {
+                        problems.push(format!(
+                            "{label} declares `plane: operator` and a `capability`; \
+                             operator-plane provider rows are capability-free by definition"
+                        ));
+                    }
+                }
+                Some(other) => {
+                    problems.push(format!(
+                        "{label} declares unknown plane `{other}`; the only \
+                         recognized value is `operator`"
+                    ));
+                }
+                None => {
+                    validate_manifest_required_fields(
+                        provider,
+                        &label,
+                        &["id", "provider_kind", "capability"],
+                        problems,
+                    );
+                }
+            }
             validate_manifest_string_fields(
                 provider,
                 &label,
@@ -1114,6 +1187,7 @@ pub fn validate_package_manifest_closed_shape(path: &Path, value: &Value) -> Res
                     "capability",
                     "effect_kind",
                     "core_effect_kind",
+                    "plane",
                 ],
                 problems,
             );
@@ -1880,6 +1954,15 @@ pub fn package_provider_contracts(
         .into_iter()
         .flatten()
     {
+        // Operator-plane rows (`"plane": "operator"`, std-telemetry.md T3)
+        // are capability-free by definition and must never become effect
+        // providers: skipping them HERE is what keeps them admission-inert —
+        // no downstream registry, binding, or `effect_providers` path can
+        // ever see one. They surface only through
+        // `package_operator_providers`.
+        if provider.get("plane").and_then(Value::as_str) == Some("operator") {
+            continue;
+        }
         providers.push(PackageProviderContract {
             capability: required_json_string(provider, "capability", "provider")
                 .map_err(|message| format!("{} in `{}`", message, path.display()))?,
