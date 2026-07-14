@@ -26,7 +26,18 @@ pub struct HostedTurnProjection {
     pub runtime_evidence_pointers: Vec<RuntimeEvidencePointer>,
     pub pending_human: Option<LabeledHumanAsk>,
     pub receipt: Option<TurnReceipt>,
+    /// Typed, host-published token counts for product metering. The opaque
+    /// `usage_ref` remains the authoritative runtime evidence pointer; this is
+    /// only its deliberately narrow billing projection.
+    pub usage_observation: Option<HostedUsageObservation>,
     pub output_flow_signature: Vec<HostedOutputFieldFlow>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct HostedUsageObservation {
+    pub usage_ref: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -214,6 +225,7 @@ pub fn project_host_turn<S: RuntimeStore>(
             runtime_evidence_pointers: pointers,
             pending_human: Some(ask),
             receipt: None,
+            usage_observation: None,
             output_flow_signature: output_flows(&command),
         });
     }
@@ -229,6 +241,7 @@ pub fn project_host_turn<S: RuntimeStore>(
             runtime_evidence_pointers: pointers,
             pending_human: None,
             receipt: None,
+            usage_observation: None,
             output_flow_signature: output_flows(&command),
         });
     };
@@ -237,6 +250,7 @@ pub fn project_host_turn<S: RuntimeStore>(
             runtime_evidence_pointers: pointers,
             pending_human: None,
             receipt: None,
+            usage_observation: None,
             output_flow_signature: output_flows(&command),
         });
     };
@@ -248,6 +262,7 @@ pub fn project_host_turn<S: RuntimeStore>(
         "host.turn.usage",
         &run.metadata_json,
     )?;
+    let usage_observation = project_usage(&run.metadata_json, &usage_ref)?;
     let guarantee = json!({
         "protocol": HOST_PROTOCOL,
         "policy": command.policy,
@@ -355,8 +370,31 @@ pub fn project_host_turn<S: RuntimeStore>(
         runtime_evidence_pointers: pointers,
         pending_human: None,
         receipt: Some(receipt),
+        usage_observation,
         output_flow_signature: output_flows(&command),
     })
+}
+
+fn project_usage(
+    metadata_json: &str,
+    usage_ref: &str,
+) -> Result<Option<HostedUsageObservation>, String> {
+    let metadata: Value = serde_json::from_str(metadata_json).map_err(|error| error.to_string())?;
+    let Some(usage) = metadata.get("usage").filter(|usage| usage.is_object()) else {
+        return Ok(None);
+    };
+    let tokens = |primary: &str, alias: &str| {
+        usage
+            .get(primary)
+            .or_else(|| usage.get(alias))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    Ok(Some(HostedUsageObservation {
+        usage_ref: usage_ref.to_owned(),
+        input_tokens: tokens("input_tokens", "prompt_tokens"),
+        output_tokens: tokens("output_tokens", "completion_tokens"),
+    }))
 }
 
 fn output_flows(command: &StartTurnCommand) -> Vec<HostedOutputFieldFlow> {

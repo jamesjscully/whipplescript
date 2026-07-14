@@ -72,8 +72,12 @@ attributable human answers against and resumes the exact suspended command;
 exports/imports same-placement forks at an exact durable event coordinate while
 re-reading transcript authority from the source DO store; and projects
 runtime-owned evidence pointers, terminal receipts, guarantee evidence, and
-field-flow signatures. Caught-up SSE plus hibernatable WebSockets expose durable
-progress. Evidence: `governed_host_images_resolve_only_from_the_admitted_broker_cache`,
+field-flow signatures. The terminal projection also publishes a deliberately
+narrow token-count observation keyed by the opaque runtime `usage_ref`, allowing
+an embedding product to meter managed inference without reading runtime SQL or
+claiming ownership of the usage evidence body. Caught-up SSE plus hibernatable
+WebSockets expose durable progress. Evidence:
+`governed_host_images_resolve_only_from_the_admitted_broker_cache`,
 `gaugedesk_host_protocol_admits_the_same_package_on_the_do_store`, 72 host-DO
 tests, the wasm32 no-default-features build, and Worker `tsc --noEmit`. A live
 GaugeDesk-to-deployed-Worker pass remains deployment/secret infrastructure, not

@@ -241,6 +241,14 @@ workflow Method {
         let receipt = projection.receipt.expect("terminal receipt");
         assert_eq!(receipt.command_id, turn.command_id);
         assert!(receipt.guarantee_report_ref.starts_with("whip:evidence:"));
+        assert_eq!(
+            projection.usage_observation,
+            Some(crate::host_projection::HostedUsageObservation {
+                usage_ref: receipt.usage_ref.clone(),
+                input_tokens: 3,
+                output_tokens: 0,
+            })
+        );
         assert!(projection.runtime_evidence_pointers.iter().any(|pointer| {
             matches!(
                 pointer,
