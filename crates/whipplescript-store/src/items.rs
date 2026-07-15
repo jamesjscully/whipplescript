@@ -484,6 +484,8 @@ PRAGMA busy_timeout = 5000;
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS tracker_events (
     event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT,
+    parents_json TEXT NOT NULL DEFAULT '[]',
     issue_id TEXT,
     kind TEXT NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',
@@ -541,7 +543,65 @@ fn tx_now(tx: &Transaction<'_>) -> StoreResult<String> {
         .map_err(Into::into)
 }
 
-/// Append one immutable event (INSERT only — never updated or deleted).
+/// The SHA-256 content id of an event (ADR-0002 phase B1: the tracker event
+/// Merkle-DAG). The id commits to the event's whole content INCLUDING its
+/// sorted parent ids, so the log is a hash-chain: altering any past event
+/// changes its id and breaks every downstream `parents` link — a tampered
+/// issue is DETECTABLE, the adversarial-integrity property FNV content-addressing
+/// cannot give. SHA-256 (not FNV) precisely because the threat is a deliberate
+/// forger, who could otherwise compute a colliding event. Two byte-identical
+/// events (same kind/issue/payload/actor/parents/clock) share an id and dedup on
+/// merge; the distinguishing `created_at` keeps genuine re-submissions distinct.
+#[cfg(feature = "native")]
+fn event_content_id(
+    kind: &str,
+    issue_id: Option<&str>,
+    payload_json: &str,
+    actor: Option<&str>,
+    parents: &[String],
+    created_at: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut sorted = parents.to_vec();
+    sorted.sort();
+    // A field-separated canonical form; the fields cannot themselves contain the
+    // record separator (0x1e), so the encoding is injective.
+    let material = [
+        kind,
+        issue_id.unwrap_or(""),
+        payload_json,
+        actor.unwrap_or(""),
+        &sorted.join(","),
+        created_at,
+    ]
+    .join("\u{1e}");
+    format!("{:x}", Sha256::digest(material.as_bytes()))
+}
+
+/// The current head event id(s) of an issue — events with no child (nothing
+/// lists them as a parent). A new event's parents. Under single-writer appends
+/// (this store) there is exactly one head, the latest event; the DAG can only
+/// FORK when a merge imports a divergent log (phase B1 slice iii), which is when
+/// multiple heads arise. `None` (no prior event) roots the issue's history.
+#[cfg(feature = "native")]
+fn tx_issue_heads(tx: &Transaction<'_>, issue_id: &str) -> StoreResult<Vec<String>> {
+    let heads: Vec<String> = tx
+        .prepare(
+            "SELECT e.event_id FROM tracker_events e \
+             WHERE e.issue_id = ?1 AND e.event_id IS NOT NULL \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM tracker_events c \
+                 WHERE c.issue_id = ?1 \
+                   AND instr(c.parents_json, '\"' || e.event_id || '\"') > 0)",
+        )?
+        .query_map(params![issue_id], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(heads)
+}
+
+/// Append one immutable event (INSERT only — never updated or deleted). Its
+/// parents are the issue's current heads and its `event_id` is the content hash
+/// over the whole event, so the log is a Merkle-DAG (ADR-0002 phase B1).
 #[cfg(feature = "native")]
 fn tx_append_event(
     tx: &Transaction<'_>,
@@ -551,10 +611,17 @@ fn tx_append_event(
     actor: Option<&str>,
     now: &str,
 ) -> StoreResult<()> {
+    let parents = match issue_id {
+        Some(id) => tx_issue_heads(tx, id)?,
+        None => Vec::new(),
+    };
+    let payload_json = payload.to_string();
+    let event_id = event_content_id(kind, issue_id, &payload_json, actor, &parents, now);
+    let parents_json = serde_json::to_string(&parents)?;
     tx.execute(
-        "INSERT INTO tracker_events (issue_id, kind, payload_json, actor, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![issue_id, kind, payload.to_string(), actor, now],
+        "INSERT INTO tracker_events (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![event_id, parents_json, issue_id, kind, payload_json, actor, now],
     )?;
     Ok(())
 }
@@ -965,6 +1032,61 @@ mod tests {
         assert_eq!(first.id, "WS-1");
         assert_eq!(second.id, "WS-2");
         assert_eq!(second.filed_by.as_deref(), Some("turn-1"));
+    }
+
+    /// Reads the raw event log for one issue in append order.
+    fn events_for(store: &WorkItemStore, issue_id: &str) -> Vec<(String, Vec<String>, String)> {
+        store
+            .connection
+            .prepare(
+                "SELECT event_id, parents_json, kind FROM tracker_events \
+                 WHERE issue_id = ?1 ORDER BY event_seq",
+            )
+            .unwrap()
+            .query_map([issue_id], |row| {
+                let id: String = row.get(0)?;
+                let parents_json: String = row.get(1)?;
+                let kind: String = row.get(2)?;
+                Ok((id, serde_json::from_str(&parents_json).unwrap(), kind))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// ADR-0002 phase B1 slice i: every tracker event carries a SHA-256
+    /// content-hash id, and each new event's parents are the issue's prior
+    /// heads — so the log is a hash-chained Merkle-DAG, not a flat list.
+    #[test]
+    fn events_form_a_content_hash_chain() {
+        let mut store = open_memory();
+        let filed = store
+            .file_item("backlog", "Fix login", "repro", &[], &json!({}), None)
+            .expect("files");
+        // A second event on the same issue (claim), so we have a chain to check.
+        assert_eq!(
+            store
+                .claim_item(&filed.id, "worker-1", None)
+                .expect("claim"),
+            ClaimOutcome::Claimed
+        );
+
+        let events = events_for(&store, &filed.id);
+        assert_eq!(events.len(), 2, "created + claim");
+
+        let (created_id, created_parents, created_kind) = &events[0];
+        assert_eq!(created_kind, "issue.created");
+        // Content-hash id: 64 lowercase hex chars (SHA-256), not "WS-N".
+        assert_eq!(created_id.len(), 64);
+        assert!(created_id.chars().all(|c| c.is_ascii_hexdigit()));
+        // The issue's root event has no parents.
+        assert!(created_parents.is_empty());
+
+        let (claim_id, claim_parents, _) = &events[1];
+        assert_eq!(claim_id.len(), 64);
+        // The claim event chains onto the created event: it is a child.
+        assert_eq!(claim_parents, &[created_id.clone()]);
+        assert_ne!(claim_id, created_id);
     }
 
     /// Drive the store through the `WorkItems` trait as a `dyn` object: proves
