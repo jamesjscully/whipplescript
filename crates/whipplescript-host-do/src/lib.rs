@@ -33,6 +33,7 @@ use whipplescript_store::files::FileStore;
 
 pub mod do_branches;
 pub mod do_instance;
+pub mod do_memory;
 pub mod do_packages;
 /// `RuntimeStore` over the DO's synchronous SQLite (`DoSql`).
 pub mod do_store;

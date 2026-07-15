@@ -931,12 +931,22 @@ fixed-size `getRandom` pools). Open build work:
       Residuals (join the container tier when it lands): image build/push,
       pool provisioning, object-tier bucket (P7 by design).
 
-- [ ] DO-plane memory: port `MemoryStore` (whipplescript-store/src/memory.rs,
-      the std.memory `local` provider's seam) over `DoSql` so memory pools
-      work on the DO — same table shape, FTS5 replaced by the DO's LIKE-based
-      lexical match if the platform sqlite lacks FTS5. Registered here per
-      spec/std-memory.md MEM-3 (M7: the DO package layer lives in this
-      tracker); rides the same cadence as the other `Do*` store ports.
+- [x] DO-plane memory (2026-07-15, post-campaign Wave 1b): `DoMemoryStore`
+      (host-do/do_memory.rs) ports the std.memory `MemoryStore` seam over
+      `DoSql` — same `memory_entries` table shape, FTS5 replaced by
+      case-insensitive per-token `LIKE` match (the DO's platform SQLite is not
+      guaranteed to bundle FTS5). The recall/learn/curate LOGIC is a shared
+      kernel helper `run_memory_capability(&mut dyn MemoryStore, effect)` that
+      native's file-backed provider and the DO's `DoMemoryCapabilityProvider`
+      both call (no duplication); the DO capability dispatch selects it by the
+      seeded std.memory binding (`memory-provider`), so DO recall/learn/curate
+      are real, not fixture. Evidence: 4 `do_memory` unit tests (write/query
+      round-trip + pool scoping + LIKE match, recency + context_limit,
+      dedupe/prune idempotence, pools/entries) and
+      `durable_instance_learns_and_recalls_real_memory_on_the_do` (a `learn`
+      workflow drives create→step→terminal on the DO and the entry is readable
+      back from the DO memory table). host-do 80, kernel 348, wasm32 build
+      green.
 
 - [x] DO-plane package bootstrap (2026-07-15, post-campaign Wave 1):
       `do_packages::register_embedded_std_packages` seeds the always-embedded

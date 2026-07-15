@@ -166,6 +166,39 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         Self { sql }
     }
 
+    /// The `capability_bindings.provider` name bound for `capability` visible to
+    /// the program running `instance_id` — a program-scoped row wins over a
+    /// global `NULL` one; `None` when unbound (mirrors the native
+    /// `SqliteStore::capability_bound_provider`). The DO capability dispatch
+    /// reads this to route a `memory-provider`-bound effect to the real
+    /// `DoMemoryStore` instead of the fixture.
+    pub fn capability_bound_provider(
+        &self,
+        instance_id: &str,
+        capability: &str,
+    ) -> StoreResult<Option<String>> {
+        let program_id = self
+            .sql
+            .query(
+                "SELECT program_id FROM instances WHERE instance_id = ?1",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?
+            .first()
+            .map(|row| as_text(&row[0]))
+            .unwrap_or_default();
+        let rows = self
+            .sql
+            .query(
+                "SELECT provider FROM capability_bindings \
+                 WHERE capability = ?1 AND (program_id = ?2 OR program_id IS NULL) \
+                 ORDER BY (program_id IS NULL) ASC LIMIT 1",
+                &[text(capability), text(&program_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().and_then(|row| as_opt_text(&row[0])))
+    }
+
     /// The earliest future due instant (unix milliseconds) across this
     /// instance's pending timed effects — creation-anchored `timeout_seconds`
     /// deadlines and explicit `$.deadline_at` instants (DR-0033 Phase 6). The
@@ -7772,8 +7805,13 @@ pub(crate) mod test_support {
     use rusqlite::types::{Value, ValueRef};
     use rusqlite::Connection;
 
+    // `Rc<Connection>` so the handle is `Clone` (the production `DoSql` handles
+    // are shared via `Rc`; a clone is the SAME in-memory DB, as the DO's single
+    // SQLite requires). This lets `DoInstanceDriver` require `Sql: Clone` for
+    // binding-driven provider selection (e.g. the memory provider).
+    #[derive(Clone)]
     pub(crate) struct RusqliteDoSql {
-        conn: Connection,
+        conn: std::rc::Rc<Connection>,
     }
 
     fn to_value(v: &SqlValue) -> Value {
@@ -8067,7 +8105,9 @@ pub(crate) mod test_support {
             "#,
         )
         .expect("schema");
-        DoSqliteStore::new(RusqliteDoSql { conn })
+        DoSqliteStore::new(RusqliteDoSql {
+            conn: std::rc::Rc::new(conn),
+        })
     }
 }
 

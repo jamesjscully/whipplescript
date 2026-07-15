@@ -259,7 +259,7 @@ impl CapabilityContract for DoCapabilityContract {
     }
 }
 
-impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
+impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
     fn advance_rules(&mut self) -> Result<bool, StoreError> {
         step_instance_generic(&mut self.kernel, self.instance_id, self.ir, None, None)?;
         let terminal = self
@@ -346,14 +346,45 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 effect,
                 &DoDeliveryGovernance,
             )?,
-            "capability.call" => run_capability_effect_generic(
-                &mut self.kernel,
-                self.instance_id,
-                effect,
-                &config,
-                &DoCapabilityContract,
-                &FixtureCapabilityProvider,
-            )?,
+            "capability.call" => {
+                // Binding-driven provider selection (spec/std-memory.md; the DO
+                // package bootstrap seeds the std.memory binding): a
+                // `memory-provider`-bound capability routes to the real
+                // DoMemoryStore-backed provider, everything else to the fixture.
+                let bound = effect
+                    .target
+                    .as_deref()
+                    .filter(|target| !target.is_empty())
+                    .map(|target| {
+                        self.kernel
+                            .store()
+                            .capability_bound_provider(self.instance_id, target)
+                    })
+                    .transpose()?
+                    .flatten();
+                if bound.as_deref() == Some("memory-provider") {
+                    let provider = crate::do_memory::DoMemoryCapabilityProvider {
+                        sql: self.kernel.store().sql.clone(),
+                    };
+                    run_capability_effect_generic(
+                        &mut self.kernel,
+                        self.instance_id,
+                        effect,
+                        &config,
+                        &DoCapabilityContract,
+                        &provider,
+                    )?
+                } else {
+                    run_capability_effect_generic(
+                        &mut self.kernel,
+                        self.instance_id,
+                        effect,
+                        &config,
+                        &DoCapabilityContract,
+                        &FixtureCapabilityProvider,
+                    )?
+                }
+            }
             // The agent turn: multi-round sans-IO. Each round drives the
             // BrokeredTurnMachine one provider call, persisting its snapshot so an
             // eviction between fetches loses nothing (snapshot/restore); on the final

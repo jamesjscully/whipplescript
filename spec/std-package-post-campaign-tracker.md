@@ -43,8 +43,11 @@ or a design note before any code).
       wasm-bindgen-CJS glue mismatch introduced by commit 302e2c6's
       `"type":"module"` (DR-0042 worker session, off-limits dir) — the
       substantive admission logic is proven by the Rust suite instead.
-- [ ] DO-plane memory (MEM-3 port, MemoryStore over DoSql) rides the same
-      wave/area — canonical row also in durable-object-runtime-tracker.md.
+- [x] (2026-07-15; host-do/do_memory.rs DoMemoryStore + shared kernel
+      run_memory_capability + DO dispatch wiring; 4 unit tests + DO learn e2e;
+      host-do 80 + kernel 348 + wasm32 green) DO-plane memory (MEM-3 port,
+      MemoryStore over DoSql). Canonical row flipped in
+      durable-object-runtime-tracker.md "DO-plane memory".
 
 ## Wave 2 — tracker T3: renew + claim TTL end-to-end
 

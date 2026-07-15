@@ -811,6 +811,68 @@ mod tests {
         );
     }
 
+    /// DO-plane memory end-to-end (spec/std-memory.md MEM-3): a `learn` then
+    /// `recall` workflow drives to terminal on the DO, and the DO's own SQLite
+    /// memory table holds the REAL learned entry — proving the DoMemoryStore is
+    /// wired through the capability dispatch (the std.memory binding routes
+    /// `memory-provider` to it), not the fixture. Before this, DO memory
+    /// capabilities returned the fixture context.
+    #[test]
+    fn durable_instance_learns_and_recalls_real_memory_on_the_do() {
+        use crate::do_memory::DoMemoryStore;
+        use whipplescript_store::memory::MemoryStore;
+
+        let base = store().sql;
+        // A second handle onto the SAME in-memory DB (Rc<Connection>), so the
+        // test can read back what the run wrote.
+        let inspect = base.clone();
+
+        let source = "use std.memory\n\nworkflow DoMemory\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             memory pool notes {\n  context limit 8\n}\n\n\
+             class Seed {\n  topic string\n}\n\n\
+             table seeds as Seed [\n  { topic \"alpha\" }\n]\n\n\
+             rule go\n  when Seed as seed\n=> {\n\
+             \x20 learn from seed.topic into notes { note \"remember alpha detail\" } as saved\n\n\
+             \x20 after saved succeeds {\n\
+             \x20   complete result { ok 1 }\n  }\n}\n";
+        let mut instance = DurableInstance::create(
+            base,
+            source,
+            "{}",
+            "local/DoMemory",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        )
+        .expect("create");
+        for _ in 0..12 {
+            match instance.step(None, TEST_NOW_MS) {
+                DurableStepOutcome::Terminal => break,
+                DurableStepOutcome::Parked { .. } => {}
+                other => panic!("memory workflow drove to an unexpected outcome: {other:?}"),
+            }
+        }
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed"),
+            "the learn chain settled"
+        );
+
+        // The learn effect wrote REAL data into the DO's memory table (routed
+        // through the DoMemoryStore-backed provider, not the fixture), and a
+        // recall over the same DO store reads it back matched by subject — the
+        // DoMemoryStore query path the capability's memory.query arm also uses.
+        let store = DoMemoryStore::open(inspect).expect("memory store");
+        let hits = store.query("notes", "alpha", None).expect("query");
+        assert_eq!(hits.len(), 1, "the DO learned one entry into the pool");
+        assert!(
+            hits[0].text.contains("alpha") && hits[0].text.contains("remember alpha detail"),
+            "the entry carries the learned source + note: {}",
+            hits[0].text
+        );
+    }
+
     /// The alarm cycle (DR-0033 Phase 6): a timer workflow PARKS with the
     /// timer's due instant surfaced as `next_due_unix_ms` (the shell sets the
     /// DO alarm from it), and the alarm's re-entry `step` — a later injected

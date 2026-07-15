@@ -2310,6 +2310,151 @@ impl CapabilityProvider for FixtureCapabilityProvider {
     }
 }
 
+/// One recall item's JSON (spec/std-memory.md): the pre-seam record shape
+/// (`message_id`/`pool`/`source`/`note`, the message id recomputed
+/// deterministically from the write-effect id) plus the MemoryContext
+/// enrichment (memory_id, text, created_at, provenance). Shared so native and
+/// the DO render an identical item.
+pub fn memory_item_json(row: &whipplescript_store::memory::MemoryEntryRow) -> Value {
+    let mut item = serde_json::Map::new();
+    if let Some(effect_id) = &row.source_effect_id {
+        item.insert(
+            "message_id".to_owned(),
+            Value::String(idempotency_key(&[effect_id, "memory-message"])),
+        );
+    }
+    item.insert("memory_id".to_owned(), json!(row.memory_id));
+    item.insert("pool".to_owned(), Value::String(row.pool.clone()));
+    item.insert("text".to_owned(), Value::String(row.text.clone()));
+    item.insert(
+        "source".to_owned(),
+        row.source.clone().map(Value::String).unwrap_or(Value::Null),
+    );
+    if let Some(note) = &row.note {
+        item.insert("note".to_owned(), Value::String(note.clone()));
+    }
+    item.insert(
+        "created_at".to_owned(),
+        Value::String(row.created_at.clone()),
+    );
+    item.insert(
+        "provenance".to_owned(),
+        json!({
+            "source_instance_id": row.source_instance_id,
+            "source_effect_id": row.source_effect_id,
+            "source_run_id": row.source_run_id,
+            "author_actor": row.author_actor,
+        }),
+    );
+    Value::Object(item)
+}
+
+/// The `std.memory` capability provider's outcome, host-agnostic over any
+/// [`MemoryStore`](whipplescript_store::memory::MemoryStore) backend: native's
+/// file-backed `SqliteMemoryStore` and the DO's `DoMemoryStore` both call this,
+/// so recall/learn/curate behave identically on either host (the only
+/// difference is FTS5 vs LIKE lexical match inside the store). `memory.write`
+/// stores one entry (effect-plane determinism: empty `created_at`, provenance
+/// from the effect id); `memory.query` returns a MemoryContext; `memory.curate`
+/// dedupes the pool by content identity.
+pub fn run_memory_capability(
+    store: &mut dyn whipplescript_store::memory::MemoryStore,
+    effect: &ClaimableEffect,
+) -> CapabilityOutcome {
+    use whipplescript_store::memory::{CurateStrategy, NewMemoryEntry};
+    let input = json_from_str(&effect.input_json);
+    let pool = input
+        .get("pool")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    // Deterministic message id: derived from the effect id, never wall-clock.
+    let message_id = idempotency_key(&[&effect.effect_id, "memory-message"]);
+    match effect.target.as_deref() {
+        Some("memory.write") => {
+            // `source` is the resolved `from <source>` value; `note` the
+            // optional `{ note <expr> }` field; the matchable body carries
+            // BOTH (a recall may name the source or words from the note).
+            let source = input.get("source").and_then(Value::as_str);
+            let note = input.get("note").and_then(Value::as_str);
+            let text = match (source, note) {
+                (Some(source), Some(note)) => format!("{source}\n{note}"),
+                (Some(source), None) => source.to_owned(),
+                (None, Some(note)) => note.to_owned(),
+                (None, None) => input
+                    .get("source")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_string(),
+            };
+            let entry = NewMemoryEntry {
+                pool: &pool,
+                text: &text,
+                created_at: "",
+                source_instance_id: None,
+                source_effect_id: Some(&effect.effect_id),
+                source_run_id: None,
+                author_actor: None,
+                source,
+                note,
+            };
+            if let Err(error) = store.write(&entry) {
+                return CapabilityOutcome::Failed {
+                    error_kind: "memory".to_owned(),
+                    message: format!("memory write failed: {error:?}"),
+                };
+            }
+            CapabilityOutcome::Produced(json!({
+                "pool": pool,
+                "message_id": message_id,
+                "stored": true,
+            }))
+        }
+        Some("memory.query") => {
+            let query_text = input
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let limit = input
+                .get("context_limit")
+                .and_then(Value::as_u64)
+                .map(|limit| limit as usize);
+            match store.query(&pool, query_text, limit) {
+                Ok(rows) => {
+                    let items: Vec<Value> = rows.iter().map(memory_item_json).collect();
+                    CapabilityOutcome::Produced(json!({
+                        "pool": pool,
+                        "count": items.len(),
+                        "items": items,
+                    }))
+                }
+                Err(error) => CapabilityOutcome::Failed {
+                    error_kind: "memory".to_owned(),
+                    message: format!("memory query failed: {error:?}"),
+                },
+            }
+        }
+        Some("memory.curate") => match store.curate(&pool, CurateStrategy::DedupeBySourceNote) {
+            Ok(report) => CapabilityOutcome::Produced(json!({
+                "pool": pool,
+                "removed": report.removed,
+                "kept": report.kept,
+            })),
+            Err(error) => CapabilityOutcome::Failed {
+                error_kind: "memory".to_owned(),
+                message: format!("memory curate failed: {error:?}"),
+            },
+        },
+        other => CapabilityOutcome::Failed {
+            error_kind: "memory".to_owned(),
+            message: format!(
+                "memory-provider does not handle capability `{}`",
+                other.unwrap_or_default()
+            ),
+        },
+    }
+}
+
 /// Host-agnostic core (DR-0033 chunk 3): run the capability call + its terminal
 /// over a held `RuntimeKernel<S>` (only kernel methods, so `S: RuntimeStore`).
 pub fn run_capability_effect_generic<S: RuntimeStore>(
