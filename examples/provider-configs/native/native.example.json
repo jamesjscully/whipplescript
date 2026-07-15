@@ -22,7 +22,7 @@
       "default_model": "sonnet",
       "workspace_policy": "read_only",
       "timeout_ms": 60000,
-      "cancellation_depth": "cooperative_request",
+      "cancellation_depth": "none",
       "artifact_policy": "required",
       "health_checks": ["claude_sdk", "api_key", "tool_policy"]
     }
