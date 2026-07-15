@@ -221,6 +221,7 @@ fn main() -> ExitCode {
         Some("counters") => coordination_list(&options, "counters"),
         Some("issue") => issue(&options),
         Some("memory") => memory_command(&options),
+        Some("script") => script_command(&options),
         Some("evidence") => evidence_router(&options),
         Some("improve") => improve::improve_command(&options),
         Some("campaigns") => improve::campaigns_command(&options),
@@ -690,6 +691,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "counters" => "usage: whip counters [<counter>]",
         "issue" => ISSUE_USAGE,
         "memory" => "usage: whip memory <pools|entries <pool> [--limit <n>]> (the workspace memory store; WHIPPLESCRIPT_MEMORY_STORE overrides the path)",
+        "script" => "usage: whip script <list|verify> [--script-manifest <path>] (read-only views over the pinned script-capability manifest; verify re-hashes each pin, exit 1 on any mismatch)",
         "evidence" => "usage: whip [--json] evidence [<gauge>] | whip evidence instance <instance-id>\n  bare/gauge form = the gauge evidence view (estimates + standing-contradiction flags; same as `whip gauges`); `instance` = a run's provider evidence chain",
         "diagnostics" => "usage: whip diagnostics [--grouped] <instance>",
         "trace" => "usage: whip trace <instance> [--check]",
@@ -23651,6 +23653,11 @@ fn run_script_capability_exec(
     capability: &str,
     input: &Value,
     parse_contract: &Option<Value>,
+    // SC6: structured failure evidence (spec/std-script.md "operator surface
+    // polish") — a hash mismatch sets {expected_sha256, actual_sha256, path}
+    // here so the failed terminal and fact carry machine-readable fields, not
+    // message text alone.
+    failure_evidence: &mut Option<Value>,
 ) -> ExecOutcome {
     let Some(manifest) = script_manifest else {
         return Err((
@@ -23691,6 +23698,13 @@ fn run_script_capability_exec(
     };
     let actual_sha256 = sha256_hex(&bytes);
     if actual_sha256 != script.sha256 {
+        *failure_evidence = Some(json!({
+            "kind": "script.hash_mismatch",
+            "capability": capability,
+            "path": script_path.display().to_string(),
+            "expected_sha256": script.sha256,
+            "actual_sha256": actual_sha256,
+        }));
         return Err((
             None,
             format!(
@@ -23996,11 +24010,19 @@ fn run_exec_effect(
     // Set by the branch-bound raw-exec path: the import-back summary that
     // rides the effect's terminal metadata.
     let mut branch_import_meta: Option<Value> = None;
+    // SC6: structured failure evidence (hash mismatch fields).
+    let mut failure_evidence: Option<Value> = None;
 
     let outcome = if let Some(result) = cached_result {
         Ok(result)
     } else if mode == "capability" {
-        run_script_capability_exec(script_manifest, &capability, &input, &parse_contract)
+        run_script_capability_exec(
+            script_manifest,
+            &capability,
+            &input,
+            &parse_contract,
+            &mut failure_evidence,
+        )
     } else if exec_profile.is_hosted() {
         Err((
             None,
@@ -24176,7 +24198,7 @@ fn run_exec_effect(
             Ok(terminal)
         }
         Err((detail, reason)) => {
-            let metadata = match &detail {
+            let mut metadata = match &detail {
                 Some((exit_code, stdout, stderr)) => json!({
                     "failure": {"message": reason},
                     "exit_code": exit_code,
@@ -24185,6 +24207,14 @@ fn run_exec_effect(
                 }),
                 None => json!({"failure": {"message": reason}}),
             };
+            // SC6: structured evidence (e.g. hash-mismatch
+            // expected_sha256/actual_sha256) rides the failure object as
+            // machine-readable fields, not message text alone.
+            if let Some(evidence) = &failure_evidence {
+                if let Some(failure) = metadata.get_mut("failure").and_then(Value::as_object_mut) {
+                    failure.insert("evidence".to_owned(), evidence.clone());
+                }
+            }
             let terminal = kernel.fail_run(EffectCompletion {
                 instance_id,
                 effect_id: &effect.effect_id,
@@ -24201,7 +24231,7 @@ fn run_exec_effect(
                     "terminal",
                 ])),
             })?;
-            let fact = json!({
+            let mut fact = json!({
                 "effect_id": effect.effect_id,
                 "run_id": run_id,
                 "status": "failed",
@@ -24209,8 +24239,13 @@ fn run_exec_effect(
                 "capability": capability,
                 "value": effect_failure_base("exec", &reason, &reason, &effect.effect_id, &run_id),
                 "error": {"message": reason},
-            })
-            .to_string();
+            });
+            if let Some(evidence) = failure_evidence.take() {
+                if let Some(error) = fact.get_mut("error").and_then(Value::as_object_mut) {
+                    error.insert("evidence".to_owned(), evidence);
+                }
+            }
+            let fact = fact.to_string();
             kernel.derive_fact(
                 instance_id,
                 "exec.command.failed",
@@ -30780,6 +30815,161 @@ fn message_command(options: &CliOptions) -> ExitCode {
 /// read surface over the workspace memory store — the same
 /// `<store>.memory.sqlite` the std.memory `local` provider writes
 /// (`WHIPPLESCRIPT_MEMORY_STORE` overrides).
+/// SC6 operator surface (spec/std-script.md "operator surface polish"):
+/// read-only views over the pinned script-capability manifest. `list` shows
+/// the pins; `verify` re-hashes each entry's on-disk script against its
+/// pinned sha256 and reports verified/mismatch/missing with structured
+/// expected_sha256/actual_sha256 fields — exit 1 when any pin fails.
+fn script_command(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip script <list|verify> [--script-manifest <path>]";
+    let mut manifest_path = script_manifest_path_from_env();
+    let mut verb: Option<&str> = None;
+    let mut args = options.args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        match arg {
+            "--script-manifest" => match args.next() {
+                Some(value) => manifest_path = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("{usage}");
+                    return ExitCode::from(2);
+                }
+            },
+            "list" | "verify" if verb.is_none() => verb = Some(arg),
+            _ => {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(verb) = verb else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let Some(path) = manifest_path else {
+        eprintln!(
+            "no script manifest: pass --script-manifest <path> or set WHIPPLESCRIPT_SCRIPT_MANIFEST"
+        );
+        return ExitCode::from(2);
+    };
+    let manifest = match ScriptManifest::load(&path) {
+        Ok(manifest) => manifest,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
+    match verb {
+        "list" => {
+            if options.json {
+                return emit_json(Value::Array(
+                    manifest
+                        .capabilities
+                        .values()
+                        .map(|script| {
+                            json!({
+                                "name": script.name,
+                                "argv": script.argv,
+                                "sha256": script.sha256,
+                                "hermetic": script.hermetic,
+                                "env": script.env.keys().collect::<Vec<_>>(),
+                            })
+                        })
+                        .collect(),
+                ));
+            }
+            if manifest.capabilities.is_empty() {
+                println!("no script capabilities pinned in {}", path.display());
+            }
+            for script in manifest.capabilities.values() {
+                println!(
+                    "{}\tsha256={}\thermetic={}\t{}",
+                    script.name,
+                    script.sha256,
+                    script.hermetic,
+                    script.argv.join(" ")
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        "verify" => {
+            let mut rows = Vec::new();
+            let mut all_verified = true;
+            for script in manifest.capabilities.values() {
+                // Same file-location rule as the runtime pre-spawn check: the
+                // first argv element naming a readable file is the script body.
+                let row = match script.argv.iter().find(|arg| Path::new(arg).is_file()) {
+                    Some(script_path) => match fs::read(Path::new(script_path)) {
+                        Ok(bytes) => {
+                            let actual_sha256 = sha256_hex(&bytes);
+                            let verified = actual_sha256 == script.sha256;
+                            all_verified &= verified;
+                            json!({
+                                "name": script.name,
+                                "status": if verified { "verified" } else { "mismatch" },
+                                "path": script_path,
+                                "expected_sha256": script.sha256,
+                                "actual_sha256": actual_sha256,
+                            })
+                        }
+                        Err(error) => {
+                            all_verified = false;
+                            json!({
+                                "name": script.name,
+                                "status": "unreadable",
+                                "path": script_path,
+                                "expected_sha256": script.sha256,
+                                "error": error.to_string(),
+                            })
+                        }
+                    },
+                    None => {
+                        all_verified = false;
+                        json!({
+                            "name": script.name,
+                            "status": "missing",
+                            "argv": script.argv,
+                            "expected_sha256": script.sha256,
+                        })
+                    }
+                };
+                rows.push(row);
+            }
+            if options.json {
+                let code = if all_verified {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                };
+                let _ = emit_json(json!({
+                    "manifest": path.display().to_string(),
+                    "verified": all_verified,
+                    "scripts": rows,
+                }));
+                return code;
+            }
+            for row in &rows {
+                println!(
+                    "{}\t{}\texpected={}\tactual={}",
+                    row.get("name").and_then(Value::as_str).unwrap_or("?"),
+                    row.get("status").and_then(Value::as_str).unwrap_or("?"),
+                    row.get("expected_sha256")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-"),
+                    row.get("actual_sha256")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-"),
+                );
+            }
+            if all_verified {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        _ => unreachable!("verb is validated above"),
+    }
+}
+
 fn memory_command(options: &CliOptions) -> ExitCode {
     use whipplescript_store::memory::{MemoryStore, SqliteMemoryStore};
     let usage = "usage: whip memory <pools|entries <pool> [--limit <n>]>";

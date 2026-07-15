@@ -390,10 +390,19 @@ Each independently gateable under the per-piece review discipline.
 - **SC5 — static-check hardening.** `with` typed-record enforcement +
   check-time deny-list + `raw` key reservation. Gate: negative fixtures per
   check.
-- **SC6 — operator surface polish.** Structured mismatch evidence fields
-  (expected_sha256/actual_sha256, replacing message-text-only) +
-  `whip script list|verify` (read-only hash recheck against pins). Gate:
-  evidence snapshot test; CLI integration test.
+- **SC6 — operator surface polish. BUILT 2026-07-15.** The runtime
+  hash-mismatch refusal records structured evidence — `{kind:
+  "script.hash_mismatch", capability, path, expected_sha256, actual_sha256}`
+  under the failed terminal's `failure.evidence` and the
+  `exec.command.failed` fact's `error.evidence` (message text alone no
+  longer carries the hashes). `whip script list|verify
+  [--script-manifest <path>]` (env `WHIPPLESCRIPT_SCRIPT_MANIFEST`
+  honored): list shows the pins, verify re-hashes each entry's on-disk body
+  with the same file-location rule as the runtime pre-spawn check and
+  reports verified/mismatch/missing/unreadable with the structured fields,
+  exit 1 on any failure. Gates:
+  `tampered_script_capability_fails_with_structured_hash_evidence` +
+  `whip_script_list_and_verify_recheck_manifest_pins` (soft_middle).
 
 Ordering: S6 (external substrate, constitution build order) → SC1 → SC2 →
 {SC3, SC4} → SC5 → SC6. SC1 is code-free and may land before or in parallel

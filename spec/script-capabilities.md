@@ -54,9 +54,11 @@ to require scripts, so this package should stay small.
 - **Labor plane — worker agents.** May write any bytes anywhere in their
   workspaces, including over whitelisted script files — and it doesn't
   matter: they can edit the *file* but not the *capability*. Edited bytes
-  stop matching the pin and the capability fails closed, loudly (a failed
-  effect with the hash mismatch in evidence — itself a routable signal).
-  A compromised worker's best move is self-defeating.
+  stop matching the pin and the capability fails closed, loudly — a failed
+  effect whose evidence carries the structured
+  `{expected_sha256, actual_sha256, path}` fields (SC6; on the terminal's
+  `failure.evidence` and the failed fact's `error.evidence`), itself a
+  routable signal. A compromised worker's best move is self-defeating.
 
 The escalation chains this kills: author writes a command string (no such
 surface exists in hosted mode); author directs a worker to rewrite a script

@@ -5783,3 +5783,219 @@ fn whip_agent_errors_with_infoflow_pointer() {
         "`whip agent` must point at `whip infoflow`: {stderr}"
     );
 }
+
+#[test]
+fn whip_script_list_and_verify_recheck_manifest_pins() {
+    // SC6 (spec/std-script.md "operator surface polish"): read-only views
+    // over the pinned script manifest. `verify` re-hashes each entry with
+    // structured expected/actual fields and exits 1 on any mismatch; `list`
+    // shows the pins. Bootstrap trick: pin a wrong hash first and re-pin
+    // from the reported actual_sha256 so the test hardcodes no digest.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let script = temp_path("sc6-script", "py");
+    let manifest = temp_path("sc6-manifest", "json");
+    fs::write(&script, "#!/usr/bin/env python3\nprint(\"{}\")\n").expect("write script");
+    let manifest_with = |sha: &str| {
+        serde_json::json!({
+            "sc6_probe": {
+                "argv": ["python3", script.to_str().expect("utf-8")],
+                "sha256": sha
+            }
+        })
+        .to_string()
+    };
+    fs::write(&manifest, manifest_with(&"0".repeat(64))).expect("write manifest");
+
+    let mismatch = Command::new(bin)
+        .args([
+            "--json",
+            "script",
+            "verify",
+            "--script-manifest",
+            manifest.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs");
+    assert!(
+        !mismatch.status.success(),
+        "a wrong pin must fail verify: {}",
+        String::from_utf8_lossy(&mismatch.stdout)
+    );
+    let report: Value = serde_json::from_slice(&mismatch.stdout).expect("verify emits json");
+    let row = &report
+        .get("scripts")
+        .and_then(Value::as_array)
+        .expect("rows")[0];
+    assert_eq!(row.get("status").and_then(Value::as_str), Some("mismatch"));
+    assert_eq!(
+        row.get("expected_sha256").and_then(Value::as_str),
+        Some("0".repeat(64).as_str()),
+        "structured expected field"
+    );
+    let actual = row
+        .get("actual_sha256")
+        .and_then(Value::as_str)
+        .expect("structured actual field")
+        .to_owned();
+    assert_eq!(actual.len(), 64);
+
+    fs::write(&manifest, manifest_with(&actual)).expect("re-pin manifest");
+    let verified = Command::new(bin)
+        .args([
+            "--json",
+            "script",
+            "verify",
+            "--script-manifest",
+            manifest.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs");
+    assert!(
+        verified.status.success(),
+        "a correct pin must verify: {}",
+        String::from_utf8_lossy(&verified.stdout)
+    );
+
+    let listed = Command::new(bin)
+        .args([
+            "--json",
+            "script",
+            "list",
+            "--script-manifest",
+            manifest.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs");
+    assert!(listed.status.success());
+    let rows: Value = serde_json::from_slice(&listed.stdout).expect("list emits json");
+    assert_eq!(
+        rows.as_array().expect("rows")[0]
+            .get("sha256")
+            .and_then(Value::as_str),
+        Some(actual.as_str())
+    );
+
+    let _ = fs::remove_file(&script);
+    let _ = fs::remove_file(&manifest);
+}
+
+#[test]
+fn tampered_script_capability_fails_with_structured_hash_evidence() {
+    // SC6's evidence half: the runtime hash-mismatch refusal records
+    // machine-readable expected_sha256/actual_sha256 on the failed fact and
+    // terminal, replacing message-text-only evidence.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("sc6-evidence", "sqlite");
+    let source = temp_path("sc6-evidence", "whip");
+    let script = temp_path("sc6-evidence-script", "py");
+    let manifest = temp_path("sc6-evidence-manifest", "json");
+    fs::write(&script, "#!/usr/bin/env python3\nprint(\"{}\")\n").expect("write script");
+    fs::write(
+        &manifest,
+        serde_json::json!({
+            "sc6_judge": {
+                "argv": ["python3", script.to_str().expect("utf-8")],
+                "sha256": "1".repeat(64)
+            }
+        })
+        .to_string(),
+    )
+    .expect("write manifest");
+    fs::write(
+        &source,
+        r#"
+use std.script
+workflow Sc6Evidence
+
+output result Report
+failure trouble Report
+
+class Request {
+  text string
+}
+
+class Report {
+  message string
+}
+
+table requests as Request [
+  {
+    text "tampered"
+  }
+]
+
+rule go
+  when Request as request
+=> {
+  exec sc6_judge with request -> Report as report
+
+  after report succeeds as out {
+    complete result {
+      message out.message
+    }
+  }
+  after report fails as f {
+    fail trouble {
+      message f.reason
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let dev = dev_until_idle(
+        bin,
+        store.to_str().expect("utf-8"),
+        source.to_str().expect("utf-8"),
+        &[
+            "--exec-profile",
+            "hosted",
+            "--script-manifest",
+            manifest.to_str().expect("utf-8"),
+        ],
+    );
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store.to_str().expect("utf-8"),
+            "--json",
+            "facts",
+            instance,
+        ],
+    );
+    let failed = facts
+        .as_array()
+        .expect("facts array")
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("exec.command.failed"))
+        .expect("hash mismatch fails the exec effect");
+    let evidence = failed
+        .pointer("/value/error/evidence")
+        .expect("structured evidence on the failed fact");
+    assert_eq!(
+        evidence.get("kind").and_then(Value::as_str),
+        Some("script.hash_mismatch")
+    );
+    assert_eq!(
+        evidence.get("expected_sha256").and_then(Value::as_str),
+        Some("1".repeat(64).as_str())
+    );
+    assert_eq!(
+        evidence
+            .get("actual_sha256")
+            .and_then(Value::as_str)
+            .map(str::len),
+        Some(64)
+    );
+
+    let _ = fs::remove_file(&store);
+    let _ = fs::remove_file(&source);
+    let _ = fs::remove_file(&script);
+    let _ = fs::remove_file(&manifest);
+}
