@@ -1,12 +1,19 @@
 # std.tracker phase B — the DAG / conflict campaign
 
-Status: active. Registered 2026-07-15. Scope is ADR-0002's deferred phase B
+Status: active — **B1 hard core COMPLETE 2026-07-15** (commits eac8baf→6463fe3);
+only B2 additive items remain. Scope is ADR-0002's deferred phase B
 (spec/decision-records/0002-work-tracker-package.md "Phase B1"), taken on
 hard-core-first per Jack: the merge-friendly / distributed tracker that
 multi-user / multi-agent workflows (gaugedesk's multi-writer workbench) need.
 Design settled + decisions recorded in ADR-0002 "Phase B1"; model-first
 artifact `models/maude/tracker-merge.maude` (verdicts SSSSSNNNS) landed before
-any Rust.
+any Rust. The gaugedesk scenario — two clones diverge on a field, merge surfaces
+the conflict, a set resolves it — works end-to-end through the CLI.
+
+B1 residual (tiny, non-blocking): `list`/`ready` JSON conflict enrichment
+(`show` + `conflicts` cover it); a dedicated `resolve` verb (sugar over `set`);
+provenance-based `duplicate_submission` suppression so incremental re-sync is
+quiet (needs per-event origin — naturally a B2 rider).
 
 Reframe that governs the build: **heads come from MERGE, not internal
 branching** — a single SQLite serializes, so forks only arise when two clones'
@@ -28,15 +35,15 @@ transport is B2.
       append's parents are the issue's prior heads; SHA-256 (not FNV) for the
       adversarial-integrity property. `event_id`/`heads`/`state_token` are
       content-hashes, hence already merge-stable.
-- [ ] Slice i unit 2 — issue-identity flip: issue id = the content-hash of its
-      `issue.created` event; `WS-N` demoted to a stored-at-creation alias
-      (re-aliased on merge); event `issue_id` + relation payloads reference the
-      opaque id. **SEQUENCING (2026-07-15):** moved to land WITH slice iii
-      (merge), because the clone-local→merge-stable key only becomes
-      load-bearing (and testable — re-aliasing needs a second clone) once
-      import exists. Building it earlier would be a large correctness-critical
-      rewire tested only indirectly. Slice ii below is key-agnostic (folds "the
-      issue's events"), so it does not block on this.
+- [x] Slice i unit 2 — issue-identity flip (2026-07-15, commit d12629f; store
+      tests `events_are_keyed_by_opaque_content_id_not_alias` +
+      `rebuild_reproduces_projection_through_the_alias_bridge`): issue id = the
+      content-hash of its `issue.created` event (identity = the creation event);
+      `WS-N` demoted to a durable clone-local alias in `tracker_aliases`
+      (re-aliased on merge); every event `issue_id` + relation payload
+      references the opaque id. Projections stay alias-keyed; the CLI/WorkItem
+      surface is unchanged (append/query sites resolve alias→content_id at the
+      boundary). Co-built with slice iii per the sequencing note below.
 - [x] Slice ii — DAG-aware per-field conflict engine (2026-07-15, commit
       d7e8819; store tests `linear_field_history_never_conflicts` /
       `disagreeing_fork_conflicts_and_is_not_ready` / `agreeing_fork_converges`
@@ -49,17 +56,23 @@ transport is B2.
       `--tracker`, and `issue show` (text+JSON) carry the conflict view.
       Residual: `list`/`ready` JSON enrichment (cheap follow-up; `show` +
       dedicated `conflicts` cover the surface now).
-- [ ] Slice i unit 2 + Slice iii — merge / import-events (co-built): set-union
-      deduped by content-hash + the WS-N→opaque-id flip / re-aliasing; on a
-      byte-identical `issue.created` re-submission, a `duplicate_submission`
-      WARNING (never a silent collapse). **DECISION CHECKPOINT for Jack** — the
-      merge/import semantics + the identity flip are the design-loaded remainder;
-      pause here for direction before building.
-- [~] Slice iv — resolution: the conflict-clearing SEMANTICS ship (a `set` on a
-      conflicted issue parents on all heads → supersedes both → clears; store
-      test `merge_resolution_clears_conflict`, and `issue conflicts` reads).
-      A dedicated `resolve` verb is sugar deferred to the merge slice (a
-      conflict is only creatable via merge, so the verb is exercised there).
+- [x] Slice iii — merge / import-events (2026-07-15, commits 0d66185 store +
+      6463fe3 CLI/self-heal; store tests
+      `two_clones_editing_one_issue_merge_to_a_conflict` /
+      `two_clones_agreeing_merge_cleanly` /
+      `reimport_dedups_and_warns_on_duplicate_submission`):
+      `export_events`/`import_events` = set-union of the content-addressed log
+      deduped by `event_id` (UNIQUE index added — it was missing, so dedup never
+      bit), re-aliasing each newly seen issue, `duplicate_submission` warnings,
+      never a silent collapse. `whip issue export` / `import <path|->`. Verified
+      two-clone divergence → conflict end-to-end through the CLI. Schema
+      self-heals a pre-phase-B `tracker_events`.
+- [x] Slice iv — resolution SEMANTICS (2026-07-15): a `set` on a conflicted
+      issue parents on all heads → supersedes both forks → clears (store test
+      `merge_resolution_clears_conflict`; verified via CLI on two merged
+      clones). `whip issue conflicts` reads shipped in slice ii. A dedicated
+      `resolve` verb is pure sugar over `set` (same operation) — DEFERRED, no
+      new capability; documented as resolution-via-set.
 - [x] Slice v — optimistic concurrency (2026-07-15, commit 2961f9b; store test
       `optimistic_set_guards_on_state_token`): `whip issue set <id> <field> <v>
       --expect-state-token <t>` applies only if the token still matches, else
