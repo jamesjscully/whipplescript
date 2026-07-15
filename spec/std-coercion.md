@@ -219,10 +219,17 @@ fixture: literal `"fixture"`) and the kernel folds it into `schema.coerce`
 keys only. Deliberate consequences: switching model/provider re-runs future
 coercions (correct per spec); the fixture fingerprint is constant, so tests
 stay deterministic; replay still re-reads recorded terminals without
-re-invoking. The placeholder hash fields (`generated_coerce_source_hash=
-'fixture'|'do'|'coerce'`, main.rs:22523) are replaced by the real hashes.
-Model artifact: extend models/maude/effect-key.maude with a negative fixture
-proving a changed fingerprint yields a different key (bite).
+re-invoking. The placeholder hash fields
+(`generated_coerce_source_hash`/`input_schema_hash`/`output_schema_hash`,
+formerly the literal `"fixture"`/`"do"`/`"coerce"`) are now REAL,
+content-derived digests: `CoerceRequest::with_evidence_hashes` (kernel
+coerce.rs) hashes the coercion name, the normalized named-args JSON, and the
+output-type identity, and the native fixture and DO dispatch sites both build
+requests through it (Wave 3, 2026-07-15). These are EVIDENCE digests surfaced
+on the coerce fact; the load-bearing admission-key commitment to the
+IR-synthesized output JSON Schema stays in `effect_admission_key` (above).
+Model artifact: models/maude/effect-key.maude carries the S2-rider negative
+fixture proving a changed fingerprint yields a different key (bite).
 
 ## Static checks
 

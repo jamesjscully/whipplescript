@@ -42,6 +42,37 @@ pub struct CoerceRequest {
     pub output_schema_hash: String,
 }
 
+impl CoerceRequest {
+    /// Build a request whose three evidence hashes are REAL, content-derived
+    /// digests of the coercion identity and input shape — replacing the former
+    /// placeholder strings (`"fixture"`/`"do"`/`"coerce"`) that surfaced on the
+    /// coerce fact (spec/std-coercion.md: "the placeholder hash fields … are
+    /// replaced by the real hashes"). `generated_coerce_source_hash` = H(coercion
+    /// name), `input_schema_hash` = H(normalized named-args JSON), and
+    /// `output_schema_hash` = H(output-type identity). These are EVIDENCE
+    /// digests; the load-bearing admission-key commitments (declared prompt
+    /// template + IR-synthesized output JSON Schema + config fingerprint) are
+    /// computed IR-faithfully at lowering (`effect_admission_key`, DR-0014).
+    pub fn with_evidence_hashes(
+        function_name: String,
+        arguments_json: String,
+        output_type: String,
+    ) -> Self {
+        use crate::rule_lowering::stable_hash_hex;
+        let generated_coerce_source_hash = stable_hash_hex(&function_name);
+        let input_schema_hash = stable_hash_hex(&arguments_json);
+        let output_schema_hash = stable_hash_hex(&output_type);
+        Self {
+            function_name,
+            arguments_json,
+            output_type,
+            generated_coerce_source_hash,
+            input_schema_hash,
+            output_schema_hash,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoerceStatus {
     Succeeded,
@@ -159,5 +190,38 @@ mod tests {
         assert_eq!(result.status, CoerceStatus::Succeeded);
         assert_eq!(result.value_json.as_deref(), Some(r#"{"status":"Accept"}"#));
         assert!(result.transcript.contains("reviewWork"));
+    }
+
+    #[test]
+    fn evidence_hashes_are_content_derived_not_placeholders() {
+        let request = CoerceRequest::with_evidence_hashes(
+            "classifyMessage".to_owned(),
+            r#"{"title":"pager"}"#.to_owned(),
+            "MessageClassification".to_owned(),
+        );
+        // No more literal "fixture"/"do"/"coerce" placeholders — each field is a
+        // real digest of its input.
+        for hash in [
+            &request.generated_coerce_source_hash,
+            &request.input_schema_hash,
+            &request.output_schema_hash,
+        ] {
+            assert!(!["fixture", "do", "coerce", ""].contains(&hash.as_str()));
+        }
+        // Deterministic, and each commits to a DISTINCT input (identity / args /
+        // output), so a changed field changes its digest.
+        let same = CoerceRequest::with_evidence_hashes(
+            "classifyMessage".to_owned(),
+            r#"{"title":"pager"}"#.to_owned(),
+            "MessageClassification".to_owned(),
+        );
+        assert_eq!(request, same);
+        let changed_args = CoerceRequest::with_evidence_hashes(
+            "classifyMessage".to_owned(),
+            r#"{"title":"outage"}"#.to_owned(),
+            "MessageClassification".to_owned(),
+        );
+        assert_ne!(request.input_schema_hash, changed_args.input_schema_hash);
+        assert_eq!(request.output_schema_hash, changed_args.output_schema_hash);
     }
 }

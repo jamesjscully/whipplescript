@@ -22104,14 +22104,8 @@ fn run_coerce_effect(
     // fixture coerce should return; it takes precedence over the variant knob and
     // the generated placeholder.
     let injected_output = options.coerce_outputs.get(&function_name).cloned();
-    let request = CoerceRequest {
-        function_name,
-        arguments_json,
-        output_type: output_type.clone(),
-        generated_coerce_source_hash: "fixture".to_owned(),
-        input_schema_hash: "fixture".to_owned(),
-        output_schema_hash: "fixture".to_owned(),
-    };
+    let request =
+        CoerceRequest::with_evidence_hashes(function_name, arguments_json, output_type.clone());
     // Sum-type outputs carry embedded per-variant fixtures: return the
     // selected (or first declared) tagged variant (spec/sum-types.md).
     let value = injected_output

@@ -747,14 +747,11 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 // provider call after a worker eviction. Derived here where the
                 // effect identity (instance_id + effect_id) is in scope.
                 let idem_key = idempotency_key(&[self.instance_id, &effect.effect_id, "coerce"]);
-                let request = CoerceRequest {
+                let request = CoerceRequest::with_evidence_hashes(
                     function_name,
-                    arguments_json: arguments.to_string(),
+                    arguments.to_string(),
                     output_type,
-                    generated_coerce_source_hash: "do".to_owned(),
-                    input_schema_hash: "do".to_owned(),
-                    output_schema_hash: "do".to_owned(),
-                };
+                );
                 match incoming {
                     // Prepare: build the provider request and suspend on `fetch`.
                     None => {

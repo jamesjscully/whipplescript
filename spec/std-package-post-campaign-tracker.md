@@ -65,12 +65,15 @@ or a design note before any code).
 
 ## Wave 3 — coercion evidence hashers
 
-- [ ] Replace the placeholder `input_schema_hash` / `output_schema_hash` /
-      `generated_coerce_source_hash` ("fixture"/"do"/"coerce-source") on
-      CoerceRequest evidence with real hashes (spec/std-coercion.md notes the
-      real hashers would be the first). Evidence-plane honesty only — the
-      ADMISSION-key commitments are already real (22547ab) — hence ranked
-      below the structural waves.
+- [x] (2026-07-15; CoerceRequest::with_evidence_hashes in kernel coerce.rs,
+      used at the native fixture + DO dispatch sites; test
+      evidence_hashes_are_content_derived_not_placeholders; kernel 349 + full
+      battery green) Replace the placeholder `input_schema_hash` /
+      `output_schema_hash` / `generated_coerce_source_hash`
+      ("fixture"/"do"/"coerce") on CoerceRequest evidence with real
+      content-derived hashes (H(coercion name) / H(named-args JSON) /
+      H(output-type identity)). Evidence-plane honesty only — the ADMISSION-key
+      commitment to the IR-synthesized schema stays effect_admission_key's.
 
 ## Demand-gated (build when the trigger fires; never speculatively)
 
