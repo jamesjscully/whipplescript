@@ -93,26 +93,49 @@ or a design note before any code).
       Triggers documented in spec/std-coord.md's deferred table (BoundedWait
       model-first when the queue is demanded).
 
-## Design-heavy (a ruling or design note precedes any code)
+## Design-heavy (deferred-with-cause: a ruling or design note precedes any code)
 
-- [ ] messaging stdio bidirectional child: the spec names the contract but
-      not the child lifecycle surface (command config, restart policy,
-      `local_daemon` hosting). Deliverable: a short design note, then the
-      build. Owner: spec/std-messaging.md slice 5.
-- [ ] probed agent feature reports (DR-0015 "Next Validation Work"): needs
-      the live-probe harness shape + an evidence-schema decision (Jack).
-      Additive once decided (`source: probed`); the report plumbing shipped
-      in 155d436.
-- [ ] ⚑ capability-registry.md grant-plane reconciliation — naming-boundary
-      question flagged for Jack during the tracker build.
-- [ ] ⚑ messaging manifest `providers[]` rows — the design said "no provider
-      rows"; the validator requires them for bindings; shipped follows the
-      memory.json precedent (rows are the never-consulted class). Flagged for
-      Jack: bless the shipped shape or amend the validator.
-- [ ] ADR-0002 phase B (conflicts/heads/state-tokens, full relation kinds,
+These are NOT buildable-now: each is blocked on a design decision that a
+hasty unilateral answer would get wrong. Dispositioned 2026-07-15 with the
+concrete deliverable and decision-owner so any session (or Jack) can pick one
+up; each carries a proposed direction where one exists.
+
+- [~] messaging stdio bidirectional child (spec/std-messaging.md slice 5).
+      Blocked on: the child LIFECYCLE surface (the outbound marker-line seam
+      ships; a bidirectional child needs a spawn/restart/teardown contract the
+      spec never fixed). Deliverable = a design note settling: (a) child
+      command config — reuse the script-manifest argv+sha256 pin, or a new
+      `channel { command … }` clause?; (b) restart policy on child exit
+      (fail-the-effect vs respawn-with-backoff); (c) hosting — a per-workflow
+      `local_daemon` vs per-effect spawn. Proposed direction: pin the child
+      via the std.script manifest (argv+sha256, same TOCTOU discipline),
+      per-effect spawn (no daemon in v1), child-exit = typed effect failure
+      (no auto-respawn). Owner: Jack ratifies the clause shape.
+- [~] probed agent feature reports (DR-0015 "Next Validation Work"). Blocked
+      on: the live-probe harness shape + an evidence-schema decision (Jack).
+      The compiled reports + `source` rendering shipped (155d436); this is
+      purely additive (`source: "probed"`). Deliverable = decide what a probe
+      RUNS (a canned turn per feature class? a capability handshake?) and the
+      probe-evidence schema (per-class support + a probe timestamp + the
+      provider version probed). Then a `whip doctor --probe` that fills the
+      report's `source` from live results. Owner: Jack (needs live provider
+      credentials + an evidence-schema ruling).
+- [~] ⚑ capability-registry.md grant-plane reconciliation. A naming-boundary
+      question (how the grant plane's vocabulary lines up with the capability
+      registry) flagged for Jack during the tracker build — spec-only, no
+      code. Owner: Jack.
+- [~] ⚑ messaging manifest `providers[]` rows. The design said "no provider
+      rows"; the manifest validator requires them for bindings, so the shipped
+      manifest follows the memory.json precedent (the rows are the
+      never-consulted `effect_providers` class, admission-inert for
+      capability.call). Decision for Jack: bless the shipped shape (amend the
+      design's "no rows" line) OR amend the validator to allow bindings
+      without a same-manifest provider row. Owner: Jack.
+- [~] ADR-0002 phase B (conflicts/heads/state-tokens, full relation kinds,
       comments/evidence, claim-strength/external sync, DO
       rebuild_projection parity) — the largest unforced item; coord's event
-      vocabulary explicitly joins it. Its own future campaign, sequenced last.
+      vocabulary explicitly joins it (one event-sourcing campaign, not two).
+      Its own future campaign, sequenced last. Owner: a dedicated campaign.
 
 ## Adjacent (other campaigns' rows, slotted here only for sequencing)
 
