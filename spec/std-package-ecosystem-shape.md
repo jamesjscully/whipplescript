@@ -577,15 +577,33 @@ contract — no forcing demand; the ADR is status:proposed.
 
 ## What "finished" means for this campaign
 
-- [ ] All 14 inventory rows have concrete per-package designs (design
+- [x] All 14 inventory rows have concrete per-package designs (design
       tracker Process step 6), each recording its deferred set.
-- [ ] Substrate slices S0-S7 landed, each gates-green under the per-piece
-      review discipline, plus quick wins Q1-Q3.
-- [ ] Per-package v1 slices from those concrete designs landed gates-green.
-- [ ] Every deferred item carries a cause and a re-entry path (the M1
-      meta-grammar sketch, the capability_bound second-provider extension,
-      the ADR-0002 rebuild, the DO package bootstrap row, lint→error import
-      escalation, version semantics).
-- [ ] The standard-package design tracker updated: inventory rows moved to
+      *(2026-07-04: 11 design docs at spec/std-*.md; time/telemetry updated
+      in place; codex/claude inside std-agent.md.)*
+- [x] Substrate slices S0-S7 landed, each gates-green under the per-piece
+      review discipline, plus quick wins Q1-Q3. *(S0-S6d + decl migration by
+      2026-07-08; S7 kernel lift 2026-07-08; S2 rider key commitments
+      2026-07-14 (22547ab); Q1 2026-07-04, Q2 2026-07-04, Q3 2026-07-08.)*
+- [x] Per-package v1 slices from those concrete designs landed gates-green.
+      *(2026-07-13→15: memory MEM-1..7 + grants; telemetry T1-T4 + cursor
+      model; time T1-T3; coercion slices 1-4 (22547ab, 484a2b7); coord
+      slices 1-6 (a82e179, f6fda2e, 69612a0, 21bb4e4); messaging v1 tail
+      (21bb4e4); files F1-F5 + tracker tail (f1876ca); agent slices 1-7
+      (b24527a, 155d436); ingress I2-I5 (155d436); script SC1-SC6
+      (9a6b9c5, 7d55485). Each commit lists its suites.)*
+- [x] Every deferred item carries a cause and a re-entry path. *(Audited
+      2026-07-15: the M1 meta-grammar was BUILT, not deferred (Jack's
+      2026-07-04 ruling; S6a-d); capability_bound second-provider →
+      std-coord.md deferred table "External coordination backend"; ADR-0002
+      rebuild → its dated interim-status note (A+blockers shipped, B
+      deferred); the DO package bootstrap row REGISTERED in
+      durable-object-runtime-tracker.md 2026-07-15 (it had been an
+      unregistered pointer); lint→error import escalation registered here
+      (M5 ladder); version semantics = M6 below. Per-design deferred tables
+      carry the rest.)*
+- [x] The standard-package design tracker updated: inventory rows moved to
       designed/built status, "Current Rule" satisfied in order, and the two
-      ⚑ forks either ratified or reversed by Jack.
+      ⚑ forks either ratified or reversed by Jack. *(Forks ruled 2026-07-04:
+      M5 embedded manifests RATIFIED, M1 meta-grammar BUILD ordered —
+      reversing the defer recommendation; tracker flipped 2026-07-15.)*

@@ -938,6 +938,19 @@ fixed-size `getRandom` pools). Open build work:
       spec/std-memory.md MEM-3 (M7: the DO package layer lives in this
       tracker); rides the same cadence as the other `Do*` store ports.
 
+- [ ] DO-plane package bootstrap: seed the embedded std manifests at DO
+      instance creation (the native `register_locked_packages` counterpart)
+      and then remove the DO admission-gate exemptions that native already
+      vacated — `do_policy_block_on` still exempts the coordination
+      (`lease.`/`ledger.`/`counter.`), `tracker.`, `file.`, and
+      `signal.emit` kinds (host-do/do_store.rs ~3520, each site carries an
+      INTENTIONAL-DIVERGENCE comment pointing here). Registered 2026-07-15
+      per the std-package campaign close-out (constitution M7:
+      one-concern-one-tracker; std-coord/std-files/std-tracker/std-ingress
+      slice 4-style un-exemptions were native-only by design). Until this
+      lands, the native/DO policy gates intentionally diverge on those
+      kinds.
+
 ---
 
 ## Open questions / risks

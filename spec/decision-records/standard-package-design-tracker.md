@@ -52,19 +52,19 @@ constitution ([std-package-ecosystem-shape.md](../std-package-ecosystem-shape.md
 
 | Package | Design review status | Concrete design |
 | --- | --- | --- |
-| `std.tracker` | Concrete design written | [std-tracker.md](../std-tracker.md) — rename+identity now; ADR-0002 event-sourced rebuild deferred behind WorkItems seam |
-| `std.agent` | Concrete design written | [std-agent.md](../std-agent.md) — boundary/taxonomy pkg; codex/claude thin sub-pkgs in-doc; `agent.turn` is the grandfathered id≠kind |
-| `std.agent.codex` | Designed in std-agent.md | provider-catalog sub-package (open provider registry from manifests) |
-| `std.agent.claude` | Designed in std-agent.md | provider-catalog sub-package (SDK sidecar; centralized 7-preset profile table) |
-| `std.messaging` | Concrete design written | [std-messaging.md](../std-messaging.md) — 3 local providers; owns human-review migration question |
-| `std.memory` | Concrete design written | [std-memory.md](../std-memory.md) — forcing case for the CapabilityProvider seam (M2/S5) |
-| `std.time` | Concrete design written | [std-time.md](../std-time.md) — updated in place; recurrence shipped; package identity + clock_source authorability |
-| `std.ingress` | Concrete design written | [std-ingress.md](../std-ingress.md) — owns source-family authorability obligations; Q1 emit-names-signal check |
-| `std.files` | Concrete design written | [std-files.md](../std-files.md) — typed_effect_call keeping file.* kinds; grant∩store-policy fix (Q3) |
-| `std.script` | Concrete design written | [std-script.md](../std-script.md) — hard-off + runtime backstop; exec via authorable typed_effect_call |
-| `std.coord` | Concrete design written | [std-coord.md](../std-coord.md) — owns resource_effect authorability + coordination.md lease-primitive resolution |
-| `std.telemetry` | Concrete design written | [std-telemetry.md](../std-telemetry.md) — updated in place; operator-config pkg; Q2 auth headers + cursor scoping |
-| `std.coercion` | Concrete design written | [std-coercion.md](../std-coercion.md) — post-S2 rename; owns DR-0014 amendment + shared codex credential layer |
+| `std.tracker` | v1 BUILT 2026-07-15 | [std-tracker.md](../std-tracker.md) — rename+identity now; ADR-0002 event-sourced rebuild deferred behind WorkItems seam |
+| `std.agent` | v1 BUILT 2026-07-15 | [std-agent.md](../std-agent.md) — boundary/taxonomy pkg; codex/claude thin sub-pkgs in-doc; `agent.turn` is the grandfathered id≠kind |
+| `std.agent.codex` | v1 BUILT 2026-07-15 | provider-catalog sub-package (open provider registry from manifests) |
+| `std.agent.claude` | v1 BUILT 2026-07-15 | provider-catalog sub-package (SDK sidecar; centralized 7-preset profile table) |
+| `std.messaging` | v1 BUILT 2026-07-14 | [std-messaging.md](../std-messaging.md) — 3 local providers; owns human-review migration question |
+| `std.memory` | v1 BUILT 2026-07-14 | [std-memory.md](../std-memory.md) — forcing case for the CapabilityProvider seam (M2/S5) |
+| `std.time` | v1 BUILT 2026-07-14 | [std-time.md](../std-time.md) — updated in place; recurrence shipped; package identity + clock_source authorability |
+| `std.ingress` | v1 BUILT 2026-07-15 | [std-ingress.md](../std-ingress.md) — owns source-family authorability obligations; Q1 emit-names-signal check |
+| `std.files` | v1 BUILT 2026-07-15 | [std-files.md](../std-files.md) — typed_effect_call keeping file.* kinds; grant∩store-policy fix (Q3) |
+| `std.script` | v1 BUILT 2026-07-15 | [std-script.md](../std-script.md) — hard-off + runtime backstop; exec via authorable typed_effect_call |
+| `std.coord` | v1 BUILT 2026-07-14 | [std-coord.md](../std-coord.md) — owns resource_effect authorability + coordination.md lease-primitive resolution |
+| `std.telemetry` | v1 BUILT 2026-07-14 | [std-telemetry.md](../std-telemetry.md) — updated in place; operator-config pkg; Q2 auth headers + cursor scoping |
+| `std.coercion` | v1 BUILT 2026-07-14 | [std-coercion.md](../std-coercion.md) — post-S2 rename; owns DR-0014 amendment + shared codex credential layer |
 
 ## Meta Questions
 
@@ -86,8 +86,11 @@ No new implementation commitments from this pass until:
 package-by-package review complete        [x] (inventory rows + Current Notes)
 overall ecosystem shape settled           [x] 2026-07-04 → std-package-ecosystem-shape.md
 concrete package designs written          [x] 2026-07-04 → spec/std-*.md (11 designs, reviewed+coherence-checked)
-implementation slices chosen from those designs   [ ] ← current gate (slices enumerated per-design + constitution build order)
+implementation slices chosen from those designs   [x] 2026-07-13→15: chosen AND built — every design's v1 slices landed gates-green (constitution "What finished means" checklist flipped with per-slice commit evidence); deferrals live in each design's deferred-with-cause table
 ```
+
+The rule is SATISFIED in order as of 2026-07-15; the campaign's close-out
+audit lives in std-package-ecosystem-shape.md "What finished means".
 
 ## Current Notes
 
