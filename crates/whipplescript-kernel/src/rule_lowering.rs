@@ -1139,6 +1139,8 @@ pub fn lower_rule(
     let mut parsed_effects = parse_effect_statements(&pre_terminal_body, &context);
     let acquire_bindings = lease_acquire_bindings(&parsed_effects);
     rewrite_lease_releases(&mut parsed_effects, &acquire_bindings);
+    let claim_bindings = claim_item_bindings(&parsed_effects);
+    rewrite_claim_renews(&mut parsed_effects, &claim_bindings);
     let parsed_effects = parsed_effects;
     let mut node_to_effect_id = std::collections::BTreeMap::new();
     let mut binding_to_effect_id = std::collections::BTreeMap::new();
@@ -1354,6 +1356,11 @@ pub fn lower_rule(
         let mut after_acquire_bindings = acquire_bindings.clone();
         after_acquire_bindings.extend(lease_acquire_bindings(&selected_effects));
         rewrite_lease_releases(&mut selected_effects, &after_acquire_bindings);
+        // Claim bindings from the main body plus any claim in this after-block,
+        // so an after-block `renew <claim>` resolves to `tracker.renew`.
+        let mut after_claim_bindings = claim_bindings.clone();
+        after_claim_bindings.extend(claim_item_bindings(&selected_effects));
+        rewrite_claim_renews(&mut selected_effects, &after_claim_bindings);
         for effect in &mut selected_effects {
             effect.after.get_or_insert_with(|| AfterScope {
                 binding: after.binding.clone(),
@@ -2220,6 +2227,39 @@ pub fn lease_acquire_bindings(effects: &[ParsedEffect]) -> std::collections::BTr
         .collect()
 }
 
+/// `renew <x>` is claim-or-lease by referent, mirroring `rewrite_lease_releases`
+/// (T3): the parser lowers every `renew` to the coord `lease.renew`; a renew
+/// whose binding names a `claim ... as <x>` CLAIM binding is a tracker
+/// claim-renew and flips to `tracker.renew`, resolving the claimed issue id from
+/// the claim's output fact. A renew naming an acquire stays `lease.renew`.
+/// Binding-typed over the PARSED effects, never a raw body scan.
+pub fn rewrite_claim_renews(
+    effects: &mut [ParsedEffect],
+    claim_bindings: &std::collections::BTreeSet<String>,
+) {
+    for effect in effects {
+        if effect.kind == "lease.renew"
+            && effect
+                .args
+                .first()
+                .is_some_and(|binding| claim_bindings.contains(binding))
+        {
+            effect.kind = "tracker.renew".to_owned();
+        }
+    }
+}
+
+/// The claim result bindings among `effects` — the referent set
+/// `rewrite_claim_renews` resolves against (the `as` binding of a `claim`,
+/// whose output fact carries the issue id). Threaded like `lease_acquire_bindings`.
+pub fn claim_item_bindings(effects: &[ParsedEffect]) -> std::collections::BTreeSet<String> {
+    effects
+        .iter()
+        .filter(|effect| effect.kind == "tracker.claim")
+        .filter_map(|effect| effect.binding.clone())
+        .collect()
+}
+
 pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffect> {
     let mut effects = Vec::new();
     let lines = body.lines().collect::<Vec<_>>();
@@ -2586,20 +2626,29 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
             });
             index = next_index;
         } else if trimmed.starts_with("claim ") && !trimmed.contains(" with ") {
-            let item = trimmed
-                .strip_prefix("claim ")
-                .unwrap_or_default()
+            let rest = trimmed.strip_prefix("claim ").unwrap_or_default();
+            let item = rest
                 .split_whitespace()
                 .next()
                 .unwrap_or_default()
                 .to_owned();
+            // `ttl <duration>` clause (T3): the claim-TTL in seconds, carried on
+            // args[1] so the input builder can emit `ttl_seconds`.
+            let ttl_seconds = rest
+                .split(" as ")
+                .next()
+                .unwrap_or_default()
+                .split_once(" ttl ")
+                .and_then(|(_, tail)| tail.split_whitespace().next())
+                .and_then(whipplescript_parser::body::parse_short_duration_seconds)
+                .map(|seconds| seconds.to_string());
             effects.push(ParsedEffect {
                 timeout_seconds: parse_timeout_clause_seconds(trimmed),
                 kind: "tracker.claim".to_owned(),
                 target: None,
                 name: None,
                 binding: binding_after_as(trimmed),
-                args: vec![item],
+                args: vec![item, ttl_seconds.unwrap_or_default()],
                 prompt: None,
                 prompt_content_type: None,
                 prompt_template: None,
@@ -3608,7 +3657,7 @@ pub fn parsed_effect_input_json(
                 "rule": rule.name,
             })
         }
-        "tracker.claim" | "tracker.release" | "tracker.finish" => {
+        "tracker.claim" | "tracker.renew" | "tracker.release" | "tracker.finish" => {
             let binding = effect.args.first().map(String::as_str).unwrap_or_default();
             let item = parse_field_value(binding, context);
             let mut input = json!({
@@ -3616,6 +3665,18 @@ pub fn parsed_effect_input_json(
                 "id": item.get("id").cloned().unwrap_or(Value::Null),
                 "rule": rule.name,
             });
+            if effect.kind == "tracker.claim" {
+                // The `ttl <duration>` clause (T3), carried on args[1] as
+                // seconds; the handler computes `expires_at = now + ttl`.
+                if let Some(ttl_seconds) = effect
+                    .args
+                    .get(1)
+                    .filter(|arg| !arg.is_empty())
+                    .and_then(|arg| arg.parse::<i64>().ok())
+                {
+                    insert_json_field(&mut input, "ttl_seconds", json!(ttl_seconds));
+                }
+            }
             if effect.kind == "tracker.finish" {
                 let fields = parse_record_fields(
                     effect.args.get(1).map(String::as_str).unwrap_or_default(),
@@ -5452,6 +5513,55 @@ release slot
         let own_only = lease_acquire_bindings(&unthreaded);
         rewrite_lease_releases(&mut unthreaded, &own_only);
         assert_eq!(unthreaded[0].kind, "tracker.release", "{unthreaded:?}");
+    }
+
+    /// T3 renew disambiguation (mirroring `release`): a `renew <binding>`
+    /// naming a same-parse `claim ... as <binding>` CLAIM binding flips from the
+    /// parser's default `lease.renew` to `tracker.renew`.
+    #[test]
+    fn renew_of_parsed_claim_binding_becomes_tracker_renew() {
+        let body = r#"
+claim issue ttl 60s as active_claim
+renew active_claim as renewed
+"#;
+        let mut effects = parse_effect_statements(body, &RuleContext::default());
+        let claim_bindings = claim_item_bindings(&effects);
+        assert!(
+            claim_bindings.contains("active_claim"),
+            "{claim_bindings:?}"
+        );
+        rewrite_claim_renews(&mut effects, &claim_bindings);
+        let renew = effects
+            .iter()
+            .find(|effect| effect.args.first().map(String::as_str) == Some("active_claim"))
+            .expect("renew parses");
+        assert_eq!(
+            renew.kind, "tracker.renew",
+            "a renew of a claim binding must become tracker.renew: {effects:?}"
+        );
+    }
+
+    /// A renew naming an `acquire ... as <binding>` LEASE binding stays
+    /// `lease.renew` — the claim-renew rewrite only flips claim bindings.
+    #[test]
+    fn renew_of_acquire_binding_stays_lease_renew() {
+        let body = r#"
+acquire deploy_slot for t.id until ttl as slot
+renew slot until 300s as r
+"#;
+        let mut effects = parse_effect_statements(body, &RuleContext::default());
+        // No claim in this parse, so the claim-renew rewrite is a no-op.
+        let claim_bindings = claim_item_bindings(&effects);
+        assert!(claim_bindings.is_empty(), "{claim_bindings:?}");
+        rewrite_claim_renews(&mut effects, &claim_bindings);
+        let renew = effects
+            .iter()
+            .find(|effect| effect.args.first().map(String::as_str) == Some("slot"))
+            .expect("renew parses");
+        assert_eq!(
+            renew.kind, "lease.renew",
+            "a renew of an acquire binding must stay lease.renew: {effects:?}"
+        );
     }
 
     /// Spec "Count And Empty" runtime semantics for `empty`: structural

@@ -51,17 +51,18 @@ or a design note before any code).
 
 ## Wave 2 — tracker T3: renew + claim TTL end-to-end
 
-- [ ] The one tail whose absence is a documented contradiction (`renew` still
-      lowers to LeaseRenew). Store plane shipped (WorkItems::renew_claim,
-      expiry-aware readiness, tracker-lease.maude); remaining = the surface as
-      ONE slice per spec/std-tracker.md "Renew disposition" (2026-07-15 note):
-      claim `ttl` clause, `renew <claim>` binding-typed disambiguation
-      (mirroring the shipped release split, kernel/rule_lowering.rs),
-      `tracker.renew` effect kind (touches every exhaustive IrEffectKind
-      match incl. flow_expand re-serialization), `whip issue … --ttl`, and the
-      manifest contract row — which also supplies the SHARED renewal contract
-      std-coord.md's manifest deliberately awaits (its capability trio ships
-      sans contract; drift test pins the absence and flips with this slice).
+- [x] (2026-07-15; TrackerRenew IrEffectKind + claim-ttl clause + binding-typed
+      renew disambiguation + store claim_item(item,actor,expires) across 3 impls
+      + kernel/native/DO dispatch + whip issue --ttl + manifest contract fold;
+      store 227, parser 307, kernel 351+18, host-do 80, bin 460, control_plane
+      208, wasm32 green) Tracker T3 renew + claim TTL — the contradiction is
+      resolved: `renew <claim>` lowers to `tracker.renew`, `renew <acquire>`
+      stays `lease.renew`. Built per spec/std-tracker.md "T3 BUILT" note.
+      Deferrals (with cause): source `renew` is heartbeat-only (finite extension
+      via CLI `--ttl`; the source grammar has no duration), `renew` keeps its
+      required `as` binding, DO claim-`ttl` is inert (the DO `"now"` clock stub —
+      same as its coordination wait-deadline; renew heartbeat + untimed claims
+      work).
 
 ## Wave 3 — coercion evidence hashers
 

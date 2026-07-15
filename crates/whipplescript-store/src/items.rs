@@ -213,7 +213,18 @@ impl WorkItemStore {
     /// the lease insert are serialized against every concurrent claim — exactly
     /// one wins, the rest see `AlreadyClaimed`. "Already claimed" is a normal,
     /// branchable outcome, not an error.
-    pub fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome> {
+    /// `expires` is an ABSOLUTE deadline (`None` = no TTL, the historical
+    /// backstop behavior — the lease never auto-expires and terminal
+    /// auto-release is the only recovery). A finite `expires` records a
+    /// claim-TTL lease that `ready`/`claim` lazily reclaim once past-due
+    /// (`tracker-lease.maude`: expired leases do not block). The T3 claim-TTL
+    /// half of the renew mechanism.
+    pub fn claim_item(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+    ) -> StoreResult<ClaimOutcome> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -244,7 +255,7 @@ impl WorkItemStore {
             |row| row.get(0),
         )?;
         let lease_id = format!("L-{item_id}-{n}");
-        let payload = json!({"lease_id": lease_id, "actor": claimed_by, "expires_at": Value::Null});
+        let payload = json!({"lease_id": lease_id, "actor": claimed_by, "expires_at": expires});
         tx_append_event(
             &tx,
             Some(item_id),
@@ -255,8 +266,8 @@ impl WorkItemStore {
         )?;
         tx.execute(
             "INSERT INTO tracker_leases (lease_id, issue_id, actor, acquired_at, expires_at, released_at) \
-             VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
-            params![lease_id, item_id, claimed_by, now],
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+            params![lease_id, item_id, claimed_by, now, expires],
         )?;
         tx.commit()?;
         Ok(ClaimOutcome::Claimed)
@@ -789,7 +800,14 @@ pub trait WorkItems {
 
     fn ready_items(&self, queue: &str) -> StoreResult<Vec<WorkItem>>;
 
-    fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome>;
+    /// Atomic claim with an optional absolute expiry (`None` = no TTL). The
+    /// T3 claim-TTL half: the caller computes `now + ttl` and passes it here.
+    fn claim_item(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+    ) -> StoreResult<ClaimOutcome>;
 
     /// Holder-only lease extension/heartbeat (the T3 sanctioned extension).
     fn renew_claim(
@@ -847,8 +865,13 @@ impl WorkItems for WorkItemStore {
         self.ready_items(queue)
     }
 
-    fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome> {
-        self.claim_item(item_id, claimed_by)
+    fn claim_item(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+    ) -> StoreResult<ClaimOutcome> {
+        self.claim_item(item_id, claimed_by, expires)
     }
 
     fn renew_claim(
@@ -965,7 +988,9 @@ mod tests {
         assert_eq!(filed.id, "WS-1");
         assert_eq!(items.ready_items("backlog").expect("ready").len(), 1);
         assert_eq!(
-            items.claim_item(&filed.id, "worker-1").expect("claim"),
+            items
+                .claim_item(&filed.id, "worker-1", None)
+                .expect("claim"),
             ClaimOutcome::Claimed
         );
         assert!(items.ready_items("backlog").expect("ready").is_empty());
@@ -997,7 +1022,9 @@ mod tests {
             .expect("files");
         assert_eq!(store.ready_items("backlog").expect("ready").len(), 1);
         assert_eq!(
-            store.claim_item(&item.id, "worker-1").expect("claims"),
+            store
+                .claim_item(&item.id, "worker-1", None)
+                .expect("claims"),
             ClaimOutcome::Claimed
         );
         assert!(store.ready_items("backlog").expect("ready").is_empty());
@@ -1010,11 +1037,15 @@ mod tests {
             .file_item("backlog", "a", "", &[], &json!({}), None)
             .expect("files");
         assert_eq!(
-            store.claim_item(&item.id, "worker-1").expect("claims"),
+            store
+                .claim_item(&item.id, "worker-1", None)
+                .expect("claims"),
             ClaimOutcome::Claimed
         );
         assert_eq!(
-            store.claim_item(&item.id, "worker-2").expect("claims"),
+            store
+                .claim_item(&item.id, "worker-2", None)
+                .expect("claims"),
             ClaimOutcome::AlreadyClaimed {
                 holder: "worker-1".to_owned()
             }
@@ -1027,7 +1058,7 @@ mod tests {
         let item = store
             .file_item("backlog", "a", "", &[], &json!({}), None)
             .expect("files");
-        store.claim_item(&item.id, "w").expect("claims");
+        store.claim_item(&item.id, "w", None).expect("claims");
         assert!(store.release_item(&item.id).expect("releases"));
         assert_eq!(store.ready_items("backlog").expect("ready").len(), 1);
     }
@@ -1057,7 +1088,7 @@ mod tests {
             let mut already = 0;
             for worker in 0..5 {
                 match store
-                    .claim_item(id, &format!("worker-{worker}"))
+                    .claim_item(id, &format!("worker-{worker}"), None)
                     .expect("claims")
                 {
                     ClaimOutcome::Claimed => claimed += 1,
@@ -1081,14 +1112,14 @@ mod tests {
             .file_item("backlog", "a", "", &[], &json!({}), None)
             .expect("files");
         assert_eq!(
-            store.claim_item(&item.id, "w1").expect("claims"),
+            store.claim_item(&item.id, "w1", None).expect("claims"),
             ClaimOutcome::Claimed
         );
         assert!(store.release_item(&item.id).expect("releases"));
         let mut claimed = 0;
         for worker in 0..3 {
             if let ClaimOutcome::Claimed = store
-                .claim_item(&item.id, &format!("w{worker}"))
+                .claim_item(&item.id, &format!("w{worker}"), None)
                 .expect("claims")
             {
                 claimed += 1;
@@ -1109,8 +1140,10 @@ mod tests {
         let theirs = store
             .file_item("backlog", "theirs", "", &[], &json!({}), None)
             .expect("files");
-        store.claim_item(&mine.id, "w1").expect("claims mine");
-        store.claim_item(&theirs.id, "w2").expect("claims theirs");
+        store.claim_item(&mine.id, "w1", None).expect("claims mine");
+        store
+            .claim_item(&theirs.id, "w2", None)
+            .expect("claims theirs");
 
         assert_eq!(
             store.release_claims_for_holder("w1").expect("releases"),
@@ -1128,7 +1161,7 @@ mod tests {
         // The released item is claimable again; a holder with nothing held is a
         // no-op (e.g. an instance that already `finish`ed everything).
         assert_eq!(
-            store.claim_item(&mine.id, "w3").expect("reclaims"),
+            store.claim_item(&mine.id, "w3", None).expect("reclaims"),
             ClaimOutcome::Claimed
         );
         assert_eq!(store.release_claims_for_holder("w1").expect("noop"), 0);
@@ -1140,7 +1173,7 @@ mod tests {
         let item = store
             .file_item("backlog", "a", "", &[], &json!({}), None)
             .expect("files");
-        store.claim_item(&item.id, "w").expect("claims");
+        store.claim_item(&item.id, "w", None).expect("claims");
         assert!(store
             .finish_item(&item.id, Some("done by agent"))
             .expect("finishes"));
@@ -1157,7 +1190,7 @@ mod tests {
         let item = store
             .file_item("backlog", "a", "", &[], &json!({}), None)
             .expect("files");
-        store.claim_item(&item.id, "w1").expect("claims");
+        store.claim_item(&item.id, "w1", None).expect("claims");
 
         // Non-holder cannot renew.
         assert_eq!(
@@ -1187,6 +1220,60 @@ mod tests {
         );
     }
 
+    /// Claim TTL (T3): a finite absolute `expires` records a timed lease that
+    /// blocks readiness while in the future and stops blocking once past-due —
+    /// so a claim in the past is expired-on-arrival and never blocks.
+    #[test]
+    fn claim_with_ttl_records_a_finite_expiry() {
+        let mut store = open_memory();
+        let item = store
+            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .expect("files");
+        // A far-future TTL: the claim is held, so the issue is not ready.
+        assert_eq!(
+            store
+                .claim_item(&item.id, "w1", Some("2099-01-01 00:00:00"))
+                .expect("claims"),
+            ClaimOutcome::Claimed
+        );
+        assert!(store.ready_items("backlog").expect("ready").is_empty());
+        let held = store.get_item(&item.id).expect("gets").expect("exists");
+        assert_eq!(held.status, "in_progress");
+        assert_eq!(held.claimed_by.as_deref(), Some("w1"));
+        // A different worker cannot claim the still-live timed lease.
+        assert!(matches!(
+            store
+                .claim_item(&item.id, "w2", None)
+                .expect("contended claim"),
+            ClaimOutcome::AlreadyClaimed { .. }
+        ));
+        // A past TTL is expired-on-arrival: it never blocks readiness, and the
+        // lazy expiry sweep lets a fresh claim win.
+        let stale = store
+            .file_item("backlog", "b", "", &[], &json!({}), None)
+            .expect("files");
+        assert_eq!(
+            store
+                .claim_item(&stale.id, "w1", Some("2000-01-01 00:00:00"))
+                .expect("claims"),
+            ClaimOutcome::Claimed
+        );
+        let ready: Vec<String> = store
+            .ready_items("backlog")
+            .expect("ready")
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        assert!(
+            ready.contains(&stale.id),
+            "expired claim does not block: {ready:?}"
+        );
+        assert_eq!(
+            store.claim_item(&stale.id, "w2", None).expect("reclaims"),
+            ClaimOutcome::Claimed
+        );
+    }
+
     /// An expired lease frees the issue for a fresh claim and lets it be ready
     /// again (`tracker-lease.maude`: expired leases do not block).
     #[test]
@@ -1195,7 +1282,7 @@ mod tests {
         let item = store
             .file_item("backlog", "a", "", &[], &json!({}), None)
             .expect("files");
-        store.claim_item(&item.id, "w1").expect("claims");
+        store.claim_item(&item.id, "w1", None).expect("claims");
         // Set the holder's own lease to a past deadline (NULL -> finite is
         // allowed for the holder), so it is now expired.
         assert!(matches!(
@@ -1208,7 +1295,7 @@ mod tests {
         assert_eq!(store.ready_items("backlog").expect("ready").len(), 1);
         // And a different worker can claim it (the lazy expiry sweep frees it).
         assert_eq!(
-            store.claim_item(&item.id, "w2").expect("claims"),
+            store.claim_item(&item.id, "w2", None).expect("claims"),
             ClaimOutcome::Claimed
         );
     }
@@ -1268,11 +1355,11 @@ mod tests {
             .file_item("backlog", "c", "", &[], &json!({}), None)
             .expect("files c");
         store.add_blocks(&a.id, &b.id).expect("blocks");
-        store.claim_item(&c.id, "w1").expect("claims c");
+        store.claim_item(&c.id, "w1", None).expect("claims c");
         store
             .renew_claim(&c.id, "w1", Some("2099-01-01 00:00:00"))
             .expect("renew");
-        store.claim_item(&a.id, "w2").expect("claims a");
+        store.claim_item(&a.id, "w2", None).expect("claims a");
         store.release_item(&a.id).expect("release a");
         store.finish_item(&b.id, Some("done")).expect("finish b");
 

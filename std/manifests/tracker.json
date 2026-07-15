@@ -30,6 +30,15 @@
           "validation": "none"
         },
         {
+          "id": "tracker.renew",
+          "effect_kind": "tracker.renew",
+          "source_forms": ["renew"],
+          "input_schema": "tracker.renew.input",
+          "required_capabilities": ["tracker.renew"],
+          "provider_kinds": ["builtin-tracker"],
+          "validation": "none"
+        },
+        {
           "id": "tracker.release",
           "effect_kind": "tracker.release",
           "source_forms": ["release"],

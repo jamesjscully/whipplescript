@@ -1715,6 +1715,7 @@ pub enum IrEffectKind {
     ExecCommand,
     TrackerFile,
     TrackerClaim,
+    TrackerRenew,
     TrackerRelease,
     TrackerFinish,
     LeaseAcquire,
@@ -3934,6 +3935,20 @@ fn effect_contract_for_kind(
             strings(&["effect.output"]),
             TypedOutputValidation::None,
         ),
+        // T3: holder-only renew of a claimed issue. No typed output schema (the
+        // renewed/not_held outcome is a completed/failed terminal, mirroring
+        // tracker.release), so the manifest contract row folds cleanly against
+        // this compiled one.
+        IrEffectKind::TrackerRenew => (
+            "std.tracker",
+            strings(&["renew"]),
+            Some("tracker.renew.input"),
+            None,
+            strings(&["tracker.renew"]),
+            Vec::new(),
+            Vec::new(),
+            TypedOutputValidation::None,
+        ),
         IrEffectKind::TrackerRelease => (
             "std.tracker",
             strings(&["release"]),
@@ -4082,6 +4097,7 @@ impl IrEffectKind {
             Self::ExecCommand => "exec.command",
             Self::TrackerFile => "tracker.file",
             Self::TrackerClaim => "tracker.claim",
+            Self::TrackerRenew => "tracker.renew",
             Self::TrackerRelease => "tracker.release",
             Self::TrackerFinish => "tracker.finish",
             Self::LeaseAcquire => "lease.acquire",
@@ -10260,6 +10276,7 @@ fn terminal_completed_payload_type(
         | IrEffectKind::ExecCommand
         | IrEffectKind::TrackerFile
         | IrEffectKind::TrackerClaim
+        | IrEffectKind::TrackerRenew
         | IrEffectKind::TrackerRelease
         | IrEffectKind::TrackerFinish
         | IrEffectKind::LeaseAcquire
@@ -11030,9 +11047,16 @@ fn collect_effects_from_ast(
     let mut counter = 0usize;
     let mut after_stack: Vec<(String, DependencyPredicate)> = Vec::new();
     let mut case_stack: Vec<(String, String)> = Vec::new();
+    // Renew disambiguation (T3, mirroring the shipped `release` split): a
+    // `renew <binding>` whose binding names a same-rule `claim <issue> as
+    // <binding>` is a tracker claim-renew (`tracker.renew`); one naming an
+    // `acquire ... as <binding>` stays a lease renew (`lease.renew`). Collect
+    // the claim `as` bindings up front so the walk can re-classify.
+    let claim_bindings = collect_claim_bindings(statements);
     walk_effects(
         statements,
         rule_name,
+        &claim_bindings,
         &mut counter,
         &mut after_stack,
         &mut case_stack,
@@ -11042,9 +11066,27 @@ fn collect_effects_from_ast(
     (effects, dependencies)
 }
 
+/// The `as` bindings of every `claim <issue> as <binding>` in a rule body — the
+/// referent set the renew disambiguation flips `lease.renew` to `tracker.renew`
+/// against (the claim result binding, whose output fact carries the issue id).
+fn collect_claim_bindings(statements: &[body::BodyStmt]) -> BTreeSet<String> {
+    let mut bindings = BTreeSet::new();
+    for_each_body(statements, &mut |stmt| {
+        if let body::BodyStmt::Effect(effect) = stmt {
+            if matches!(effect.kind, body::BodyEffectKind::TrackerClaim { .. }) {
+                if let Some(binding) = &effect.binding {
+                    bindings.insert(binding.clone());
+                }
+            }
+        }
+    });
+    bindings
+}
+
 fn walk_effects(
     statements: &[body::BodyStmt],
     rule_name: &str,
+    claim_bindings: &BTreeSet<String>,
     counter: &mut usize,
     after_stack: &mut Vec<(String, DependencyPredicate)>,
     case_stack: &mut Vec<(String, String)>,
@@ -11059,7 +11101,14 @@ fn walk_effects(
                     .binding
                     .clone()
                     .unwrap_or_else(|| format!("effect{counter}"));
-                let kind = ir_effect_kind_for_body(&effect.kind);
+                // A `renew` naming a claim binding lowers to `tracker.renew`;
+                // otherwise it stays the coord `lease.renew` its parser produced.
+                let kind = match &effect.kind {
+                    body::BodyEffectKind::LeaseRenew {
+                        acquire_binding, ..
+                    } if claim_bindings.contains(acquire_binding) => IrEffectKind::TrackerRenew,
+                    other => ir_effect_kind_for_body(other),
+                };
                 for (upstream, predicate) in after_stack.iter() {
                     dependencies.push(IrEffectDependency {
                         upstream: upstream.clone(),
@@ -11142,6 +11191,7 @@ fn walk_effects(
                 walk_effects(
                     &after.body,
                     rule_name,
+                    claim_bindings,
                     counter,
                     after_stack,
                     case_stack,
@@ -11158,6 +11208,7 @@ fn walk_effects(
                     walk_effects(
                         &branch.body,
                         rule_name,
+                        claim_bindings,
                         counter,
                         after_stack,
                         case_stack,
@@ -11171,6 +11222,7 @@ fn walk_effects(
                 walk_effects(
                     &branch.then_body,
                     rule_name,
+                    claim_bindings,
                     counter,
                     after_stack,
                     case_stack,
@@ -11181,6 +11233,7 @@ fn walk_effects(
                     walk_effects(
                         else_body,
                         rule_name,
+                        claim_bindings,
                         counter,
                         after_stack,
                         case_stack,
@@ -11193,6 +11246,7 @@ fn walk_effects(
                 walk_effects(
                     &handler.body,
                     rule_name,
+                    claim_bindings,
                     counter,
                     after_stack,
                     case_stack,
@@ -13868,6 +13922,7 @@ fn effect_binding_schema(
         | IrEffectKind::ExecCommand
         | IrEffectKind::TrackerFile
         | IrEffectKind::TrackerClaim
+        | IrEffectKind::TrackerRenew
         | IrEffectKind::TrackerRelease
         | IrEffectKind::TrackerFinish
         | IrEffectKind::LeaseAcquire
@@ -14585,11 +14640,22 @@ fn validate_coordination_discipline(
     let mut claims = Vec::new();
     collect_coordination_effects(statements, &mut acquires, &mut consumes, &mut claims);
 
-    // A `renew <binding>` renews a lease acquired in the same rule: its binding
-    // must name an `acquire ... as <binding>` here. Renew resolves the acquire's
-    // recorded resource/key at runtime, so an unknown binding renews nothing —
-    // catch the typo at `whip check`. (Scoped to `renew`, which is new.)
-    let renewable: BTreeSet<&str> = acquires.iter().map(|(b, _, _)| b.as_str()).collect();
+    // A `renew <binding>` names ONE OF TWO legitimate referents (T3, mirroring
+    // the `release` disambiguation below):
+    //   (1) an `acquire ... as <binding>` LEASE binding acquired in this rule —
+    //       lowers to `lease.renew` (std.coord); resolves the acquire's recorded
+    //       resource/key at runtime;
+    //   (2) a `claim <issue> as <binding>` CLAIM binding claimed in this rule —
+    //       lowers to `tracker.renew` (std.tracker); resolves the claimed issue
+    //       id from the claim's output fact.
+    // A `renew <binding>` naming NEITHER renews nothing, so catch the typo at
+    // `whip check`. (Scoped to `renew`, which is new.)
+    let claim_bindings = collect_claim_bindings(statements);
+    let renewable: BTreeSet<&str> = acquires
+        .iter()
+        .map(|(b, _, _)| b.as_str())
+        .chain(claim_bindings.iter().map(String::as_str))
+        .collect();
     for_each_body(statements, &mut |stmt| {
         if let body::BodyStmt::Effect(effect) = stmt {
             if let body::BodyEffectKind::LeaseRenew {
@@ -14601,11 +14667,11 @@ fn validate_coordination_discipline(
                         related: Vec::new(),
                         span: effect.span,
                         message: format!(
-                            "rule `{}` renews unknown lease `{}`",
+                            "rule `{}` renews unbound coordination binding `{}`",
                             rule.name.name, acquire_binding
                         ),
                         suggestion: Some(format!(
-                            "`renew {acquire_binding}` must name a lease acquired in this rule with `acquire ... as {acquire_binding}`"
+                            "`renew {acquire_binding}` must name a lease acquired here (`acquire ... as {acquire_binding}`) or an issue claimed here (`claim ... as {acquire_binding}`)"
                         )),
                     });
                 }
@@ -14744,7 +14810,7 @@ fn collect_coordination_effects(
                 // A `claim <item> as <lease>` makes `<item>` releasable: the
                 // releasable referent is the *item* being claimed (the
                 // `TrackerClaim.item`), not the claim's `as` binding.
-                body::BodyEffectKind::TrackerClaim { item } => {
+                body::BodyEffectKind::TrackerClaim { item, .. } => {
                     claims.push((item.clone(), effect.span));
                 }
                 _ => {}
@@ -26993,8 +27059,8 @@ rule grab
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("renews unknown lease `nonexistent`")),
-            "expected the unknown-lease-renew diagnostic, got {messages:?}"
+                .any(|m| m.contains("renews unbound coordination binding `nonexistent`")),
+            "expected the unbound-renew diagnostic, got {messages:?}"
         );
         // Renewing the actually-acquired lease (`held`) must not be flagged.
         let ok = source.replace("renew nonexistent", "renew held");
@@ -27002,8 +27068,67 @@ rule grab
             !compile_program(&ok)
                 .diagnostics
                 .iter()
-                .any(|d| d.message.contains("renews unknown lease")),
+                .any(|d| d.message.contains("renews unbound coordination binding")),
             "renewing an acquired lease must not be flagged"
+        );
+    }
+
+    /// T3: a `renew <binding>` naming a same-rule `claim ... as <binding>` CLAIM
+    /// binding is accepted at `whip check` (it lowers to `tracker.renew`), and
+    /// the parser emits the `tracker.renew` effect kind for it.
+    #[test]
+    fn renew_of_a_claim_binding_is_accepted_and_lowers_to_tracker_renew() {
+        let source = "\
+workflow RenewClaim
+class Done { ok string }
+tracker backlog { provider builtin }
+output result Done
+rule work
+  when backlog has ready issue as issue
+=> {
+  claim issue ttl 1h as active
+
+  after active succeeds {
+    renew active as renewed
+  }
+
+  after renewed succeeds {
+    complete result { ok \"ok\" }
+  }
+}
+";
+        let compiled = compile_program(source);
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("renews unbound coordination binding")),
+            "renewing a claim binding must not be flagged: {:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("compiles");
+        let work = ir
+            .rules
+            .iter()
+            .find(|rule| rule.name == "work")
+            .expect("work rule");
+        assert!(
+            work.metadata
+                .effects
+                .iter()
+                .any(|effect| effect.kind == IrEffectKind::TrackerRenew),
+            "a renew of a claim binding lowers to TrackerRenew: {:?}",
+            work.metadata.effects
+        );
+        // And the coord `LeaseRenew` kind was NOT emitted for it.
+        assert!(
+            !work
+                .metadata
+                .effects
+                .iter()
+                .any(|effect| effect.kind == IrEffectKind::LeaseRenew),
+            "no lease.renew for a claim-binding renew: {:?}",
+            work.metadata.effects
         );
     }
 

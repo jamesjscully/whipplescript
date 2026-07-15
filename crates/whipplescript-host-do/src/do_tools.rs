@@ -701,7 +701,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         match status {
             "in_progress" => {
                 store
-                    .claim_item(id, &holder)
+                    .claim_item(id, &holder, None)
                     .map_err(|error| format!("claim: {error:?}"))?;
             }
             "completed" => {

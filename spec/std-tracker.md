@@ -141,7 +141,27 @@ expired-and-reclaimed, and other-holder — normal typed failures per DR-0002
 "Source Operations". The `WorkItems` trait gains `renew_claim` plus
 expiry-aware `ready`/`claim`; all three implementations port.
 
-**Renew disposition as of 2026-07-14 (T4 landed, T3 still open).** The store
+**T3 BUILT 2026-07-15 (post-campaign Wave 2).** The full renew + claim-TTL
+surface shipped as one slice: the `TrackerRenew` IrEffectKind (every
+exhaustive match + the claim-`ttl` clause round-trip through flow_expand),
+`claim <issue> [ttl <duration>] as c` threading an `expires` into `claim_item`
+(now `(item, actor, expires)` across all three `WorkItems` impls), and
+`renew <claim>` binding-typed disambiguation — a renew naming a `claim … as
+<b>` binding lowers to `tracker.renew` (heartbeat: re-affirms the holder's
+lease), a renew naming an `acquire … as <b>` binding stays `lease.renew`,
+mirroring the shipped `release` split; a renew naming neither is a check
+error. `whip issue claim --ttl` / `renew --ttl` set/extend a finite deadline
+(holder-checked, monotonic). The manifest's `tracker.renew` contract row
+folds against the parser-compiled one. Deferred with cause: source `renew`
+is heartbeat-only (finite extension via the CLI `--ttl`; the source grammar
+has no duration), `renew` keeps its required `as` binding (inherited from the
+shared lease-renew parser), and DO claim-`ttl` is inert (the DO clock stub
+`"now"` doesn't parse, so a ttl falls back to an untimed claim — the same
+stub the DO's coordination wait-deadline uses; renew heartbeat + untimed
+claims work). The historical disposition below records the pre-T3 state.
+
+**Renew disposition as of 2026-07-14 (T4 landed, T3 still open — SUPERSEDED
+by the T3 BUILT note above).** The store
 plane of T3 already shipped with the A+blockers rebuild: `WorkItems::renew_claim`
 (holder-checked, monotonic, heartbeat-on-untimed) and expiry-aware
 `ready`/`claim` exist across all three implementations, model-verified by

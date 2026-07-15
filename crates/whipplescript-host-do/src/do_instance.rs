@@ -1009,8 +1009,19 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     }
                 }
             }
-            "tracker.file" | "tracker.claim" | "tracker.release" | "tracker.finish" => {
-                run_queue_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
+            "tracker.file" | "tracker.claim" | "tracker.renew" | "tracker.release"
+            | "tracker.finish" => {
+                // The DO worker uses "now" as its clock stub (like coordination
+                // below); deterministic/real-clock injection — hence a live claim
+                // `ttl` deadline — is a native/scenario concern for now. The renew
+                // heartbeat and untimed claims are unaffected.
+                run_queue_effect_generic(
+                    &mut self.kernel,
+                    self.instance_id,
+                    effect,
+                    "now",
+                    &config,
+                )?
             }
             "lease.acquire" | "lease.release" | "lease.renew" | "ledger.append"
             | "counter.consume" => {

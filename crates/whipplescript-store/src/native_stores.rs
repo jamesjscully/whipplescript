@@ -721,8 +721,13 @@ impl WorkItems for NativeStores {
         self.items.ready_items(queue)
     }
 
-    fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome> {
-        self.items.claim_item(item_id, claimed_by)
+    fn claim_item(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+    ) -> StoreResult<ClaimOutcome> {
+        self.items.claim_item(item_id, claimed_by, expires)
     }
 
     fn renew_claim(

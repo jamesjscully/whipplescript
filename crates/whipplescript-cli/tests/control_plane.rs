@@ -7054,6 +7054,130 @@ rule start_item
     let _ = fs::remove_file(workflow_path);
 }
 
+/// T3 end-to-end (spec/std-tracker.md "Renew/TTL semantics"): a workflow claims
+/// a ready issue WITH a `ttl` clause, then `renew`s the claim inside the
+/// succeeds branch. The `renew active` names the CLAIM binding, so it lowers to
+/// `tracker.renew` (not the coord `lease.renew`); the claim records a finite
+/// `expires_at` (claim TTL), and the renew heartbeat runs to a `renewed`
+/// outcome. Proves the whole surface: claim `ttl`, the binding-typed renew
+/// disambiguation, and the `tracker.renew` effect kind.
+#[test]
+fn tracker_claim_ttl_then_renew_runs_end_to_end() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let items_path = temp_store_path();
+    let workflow_path = temp_workflow_path("tracker-claim-ttl-renew");
+    fs::write(
+        &workflow_path,
+        r#"
+@service
+workflow TrackerRenewTtl
+
+tracker backlog {
+  provider builtin
+}
+
+rule seed
+  when started
+=> {
+  file issue into backlog {
+    title "Fix it"
+    body "Please"
+  }
+}
+
+rule work
+  when backlog has ready issue as item
+=> {
+  claim item ttl 1h as active
+
+  after active succeeds {
+    renew active as renewed
+  }
+
+  after renewed succeeds {
+    finish item {
+      summary "done"
+    }
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let output = Command::new(bin)
+        .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(
+        output.status.success(),
+        "dev failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("dev json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+    let fact = |name: &str| {
+        facts
+            .iter()
+            .find(|fact| fact.get("name").and_then(Value::as_str) == Some(name))
+    };
+    // The claim ran with a finite TTL: its completed fact carries a non-null
+    // `expires_at` (claim TTL wired through input -> handler -> store).
+    let claim = fact("tracker.claim.completed").expect("claim completed");
+    assert!(
+        claim
+            .pointer("/value/value/expires_at")
+            .and_then(Value::as_str)
+            .is_some(),
+        "claim TTL records a finite expiry: {claim}"
+    );
+    // The renew lowered to `tracker.renew` (the disambiguation) and completed as
+    // a heartbeat renewal.
+    let renew = fact("tracker.renew.completed").expect("renew completed");
+    assert_eq!(
+        renew
+            .pointer("/value/value/renewed")
+            .and_then(Value::as_bool),
+        Some(true),
+        "the tracker.renew heartbeat renewed the claim: {renew}"
+    );
+    assert!(
+        fact("tracker.finish.completed").is_some(),
+        "the issue finished: {facts:?}"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(items_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
 /// Holder-lifetime release on cancel (spec/coordination.md principle 3): a
 /// `lease ... until ttl` is held for the instance's lifetime, and an operator
 /// `cancel` reaches a terminal — so the lease must be dropped immediately, not

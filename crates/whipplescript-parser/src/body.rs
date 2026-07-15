@@ -274,6 +274,10 @@ pub enum BodyEffectKind {
     },
     TrackerClaim {
         item: String,
+        /// `ttl <duration>`: the claim-TTL, in seconds. `Some(n)` records a
+        /// timed lease (`expires_at = now + n`) that `ready`/`claim` reclaim
+        /// once past-due; `None` is the untimed backstop lease (T3).
+        ttl_seconds: Option<u64>,
     },
     TrackerRelease {
         item: String,
@@ -3274,10 +3278,37 @@ impl<'a> BodyParser<'a> {
             self.error(
                 span,
                 "`claim <issue> with ...` is not supported".to_owned(),
-                Some("declare a `tracker` and write `claim <issue> [as x]`".to_owned()),
+                Some("declare a `tracker` and write `claim <issue> [ttl <dur>] [as x]`".to_owned()),
             );
             self.pos += 1;
             let _ = self.advance();
+        }
+        // `ttl <duration>`: the claim-TTL clause (spec/std-tracker.md, T3). It
+        // takes a duration value, e.g. `claim issue ttl 30m as c`.
+        let mut ttl_seconds = None;
+        if self.at_ident("ttl") {
+            self.pos += 1; // ttl
+            let span = self.span_here();
+            let Some(Tok::Number(value)) = self.peek().map(|t| t.tok.clone()) else {
+                self.error(
+                    span,
+                    "expected a duration after `ttl`".to_owned(),
+                    Some("use `<n><unit>` with unit s, m, h, or d, e.g. `ttl 30m`".to_owned()),
+                );
+                return None;
+            };
+            self.pos += 1;
+            match parse_short_duration_seconds(&value) {
+                Some(seconds) if seconds > 0 => ttl_seconds = Some(seconds),
+                _ => {
+                    self.error(
+                        span,
+                        format!("invalid ttl duration `{value}`"),
+                        Some("use `<n><unit>` with unit s, m, h, or d".to_owned()),
+                    );
+                    return None;
+                }
+            }
         }
         let mut binding = None;
         let mut requires = Vec::new();
@@ -3286,7 +3317,7 @@ impl<'a> BodyParser<'a> {
             return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::TrackerClaim { item },
+            kind: BodyEffectKind::TrackerClaim { item, ttl_seconds },
             binding,
             requires,
             timeout_seconds,

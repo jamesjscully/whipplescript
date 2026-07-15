@@ -1740,13 +1740,28 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
 /// Host-agnostic core (DR-0033 chunk 3): claim/release/finish a work item + record
 /// the terminal over a held `RuntimeKernel<S>`. The queue is the DO's own store on
 /// that host, so `S: RuntimeStore + WorkItems` unifies both surfaces.
+/// Resolve an absolute claim/renew deadline from the INJECTED `now` and a TTL in
+/// seconds, formatted as SQLite's `datetime('now')` shape (`YYYY-MM-DD HH:MM:SS`)
+/// so it compares lexically against the store's own clock. `None` ttl (or an
+/// unparseable `now`) means no deadline — the untimed backstop lease.
+fn tracker_expires_from_now(now: &str, ttl_seconds: Option<i64>) -> Option<String> {
+    let ttl_seconds = ttl_seconds?;
+    let instant = crate::time_pass::parse_clock_instant(now)?;
+    Some(
+        (instant + chrono::Duration::seconds(ttl_seconds))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string(),
+    )
+}
+
 pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     effect: &ClaimableEffect,
+    now: &str,
     _config: &EffectConfig,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    use whipplescript_store::items::ClaimOutcome;
+    use whipplescript_store::items::{ClaimOutcome, RenewOutcome};
     let input = json_from_str(&effect.input_json);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "queue-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "queue-lease"]);
@@ -1797,13 +1812,40 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
         }
         "tracker.claim" => {
             let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
-            match kernel.store_mut().claim_item(id, instance_id) {
-                Ok(ClaimOutcome::Claimed) => Ok(json!({"id": id, "claimed_by": instance_id})),
+            // Claim TTL (T3): `expires_at = now + ttl` from the injected clock,
+            // or `None` (untimed backstop lease) when no `ttl` clause was given.
+            let expires =
+                tracker_expires_from_now(now, input.get("ttl_seconds").and_then(Value::as_i64));
+            match kernel
+                .store_mut()
+                .claim_item(id, instance_id, expires.as_deref())
+            {
+                Ok(ClaimOutcome::Claimed) => {
+                    Ok(json!({"id": id, "claimed_by": instance_id, "expires_at": expires}))
+                }
                 Ok(ClaimOutcome::AlreadyClaimed { holder }) => {
                     Err(format!("already claimed by `{holder}`"))
                 }
                 Ok(ClaimOutcome::NotFound) => Err(format!("item `{id}` not found")),
                 Err(error) => Err(format!("claim failed: {error:?}")),
+            }
+        }
+        "tracker.renew" => {
+            // Holder heartbeat (T3): re-affirm the holder's active claim without
+            // moving its deadline (`expires = None`). `not_held`/`not_monotonic`
+            // are typed failures; the store enforces holder-only + monotonicity.
+            let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
+            match kernel.store_mut().renew_claim(id, instance_id, None) {
+                Ok(RenewOutcome::Renewed { expires_at }) => {
+                    Ok(json!({"id": id, "renewed": true, "expires_at": expires_at}))
+                }
+                Ok(RenewOutcome::NotHeld) => Err(format!(
+                    "not held: no active claim on `{id}` by this holder"
+                )),
+                Ok(RenewOutcome::NotMonotonic) => {
+                    Err(format!("renew of `{id}` would move the deadline backward"))
+                }
+                Err(error) => Err(format!("renew failed: {error:?}")),
             }
         }
         "tracker.release" => {

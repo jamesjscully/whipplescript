@@ -7284,7 +7284,12 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         Ok(rows.iter().map(|row| do_issue_row(row)).collect())
     }
 
-    fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome> {
+    fn claim_item(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+    ) -> StoreResult<ClaimOutcome> {
         let now = do_now(&self.sql)?;
         let exists = !self
             .sql
@@ -7313,8 +7318,10 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
             .first()
             .map_or(0, |row| as_i64(&row[0]));
         let lease_id = format!("L-{item_id}-{n}");
+        // `expires` is an absolute deadline (`None` = no TTL); it records a
+        // claim-TTL lease that `ready`/`claim` lazily reclaim once past-due.
         let payload = serde_json::json!({
-            "lease_id": lease_id, "actor": claimed_by, "expires_at": serde_json::Value::Null
+            "lease_id": lease_id, "actor": claimed_by, "expires_at": expires
         });
         do_tracker_append(
             &self.sql,
@@ -7327,8 +7334,14 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         self.sql
             .execute(
                 "INSERT INTO tracker_leases (lease_id, issue_id, actor, acquired_at, expires_at, released_at) \
-                 VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
-                &[text(&lease_id), text(item_id), text(claimed_by), text(&now)],
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                &[
+                    text(&lease_id),
+                    text(item_id),
+                    text(claimed_by),
+                    text(&now),
+                    opt_text(expires),
+                ],
             )
             .map_err(sql_err)?;
         Ok(ClaimOutcome::Claimed)
@@ -8250,17 +8263,17 @@ mod tests {
 
         // Claim WS-1: the first claim wins; a second contends with the holder.
         assert_eq!(
-            WorkItems::claim_item(&mut store, "WS-1", "worker:x").expect("claim"),
+            WorkItems::claim_item(&mut store, "WS-1", "worker:x", None).expect("claim"),
             ClaimOutcome::Claimed
         );
         assert_eq!(
-            WorkItems::claim_item(&mut store, "WS-1", "worker:y").expect("reclaim"),
+            WorkItems::claim_item(&mut store, "WS-1", "worker:y", None).expect("reclaim"),
             ClaimOutcome::AlreadyClaimed {
                 holder: "worker:x".to_owned()
             }
         );
         assert_eq!(
-            WorkItems::claim_item(&mut store, "WS-9", "worker:x").expect("missing"),
+            WorkItems::claim_item(&mut store, "WS-9", "worker:x", None).expect("missing"),
             ClaimOutcome::NotFound
         );
         // Only WS-2 remains ready now.

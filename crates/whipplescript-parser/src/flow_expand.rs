@@ -1343,8 +1343,11 @@ fn print_effect(
             push_stmt_line(out, indent, &format!("}}{binding}"));
             return;
         }
-        BodyEffectKind::TrackerClaim { item, .. } => {
-            format!("claim {}{binding}{timeout}", rn(item))
+        BodyEffectKind::TrackerClaim { item, ttl_seconds } => {
+            let ttl = ttl_seconds
+                .map(|seconds| format!(" ttl {seconds}s"))
+                .unwrap_or_default();
+            format!("claim {}{ttl}{binding}{timeout}", rn(item))
         }
         BodyEffectKind::TrackerRelease { item } => format!("release {}", rn(item)),
         BodyEffectKind::LeaseAcquire {

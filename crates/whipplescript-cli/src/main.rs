@@ -16883,13 +16883,11 @@ const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
     // admission gate real for `tracker.*` kinds (the builtin exemption is
     // deleted, store/lib.rs `policy_block_on`; the DO mirror keeps its
     // exemption until the DO bootstrap registers packages). `tracker.renew`
-    // ships admission rows (capability/provider/binding) and its construct
-    // row but no contract: the tracker renew EFFECT KIND arrives with slice
-    // T3 (renew end-to-end + claim TTL, spec/std-tracker.md "Renew/TTL
-    // semantics") — the same sans-contract pattern as std.coord's
-    // `lease.renew` (spec/std-coord.md "Deferred with cause"). The DECL
-    // GRAMMAR stays in std/grammars/tracker.json (build.rs-only): the
-    // manifest authorizes, it does not parse (M1).
+    // now ships a full effect contract too (T3 landed the renew end-to-end +
+    // claim TTL, spec/std-tracker.md "Renew/TTL semantics"): its manifest
+    // contract row merge-folds against the parser-compiled `tracker.renew`
+    // contract. The DECL GRAMMAR stays in std/grammars/tracker.json
+    // (build.rs-only): the manifest authorizes, it does not parse (M1).
     (
         "std.tracker",
         include_str!("../../../std/manifests/tracker.json"),
@@ -19460,8 +19458,9 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
                 &PackageLockCapabilityContract(package_lock),
                 &FixtureCapabilityProvider,
             )?,
-            "tracker.file" | "tracker.claim" | "tracker.release" | "tracker.finish" => {
-                run_queue_effect_generic(kernel, id, effect, &config)?
+            "tracker.file" | "tracker.claim" | "tracker.renew" | "tracker.release"
+            | "tracker.finish" => {
+                run_queue_effect_generic(kernel, id, effect, &wall_clock_instant(), &config)?
             }
             "lease.acquire" | "lease.release" | "lease.renew" | "ledger.append"
             | "counter.consume" => {
@@ -20001,9 +20000,17 @@ fn run_claimable_effect(
         }
         "event.emit" => run_event_effect(store_path, instance_id, effect, options),
         "workflow.invoke" => run_workflow_invoke_effect(store_path, instance_id, effect, options),
-        "tracker.file" | "tracker.claim" | "tracker.release" | "tracker.finish" => {
-            run_queue_effect(store_path, instance_id, effect, options)
-        }
+        "tracker.file" | "tracker.claim" | "tracker.renew" | "tracker.release"
+        | "tracker.finish" => run_queue_effect(
+            store_path,
+            instance_id,
+            effect,
+            options
+                .virtual_now
+                .as_deref()
+                .unwrap_or(&wall_clock_instant()),
+            options,
+        ),
         "exec.command" => run_exec_effect(
             store_path,
             instance_id,
@@ -24110,6 +24117,7 @@ fn run_queue_effect(
     store_path: &Path,
     instance_id: &str,
     effect: &ClaimableEffect,
+    now: &str,
     options: &WorkerOptions,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(NativeStores::open(
@@ -24117,7 +24125,13 @@ fn run_queue_effect(
         resolved_coordination_store(options.side_stores.as_ref()),
         resolved_items_store(options.side_stores.as_ref()),
     )?);
-    run_queue_effect_generic(&mut kernel, instance_id, effect, &options.effect_config())
+    run_queue_effect_generic(
+        &mut kernel,
+        instance_id,
+        effect,
+        now,
+        &options.effect_config(),
+    )
 }
 
 fn run_event_effect(
@@ -29585,8 +29599,8 @@ new --tracker TR --title T [--body B] [--label L]... [--actor A]|\
 list [--tracker TR] [--status S]|\
 show <id>|\
 ready <tracker> [--limit N]|\
-claim <id> [--actor A]|\
-renew <id> [--actor A]|\
+claim <id> [--actor A] [--ttl D]|\
+renew <id> [--actor A] [--ttl D]|\
 release <id>|\
 finish <id> [--summary S]|complete <id> [--summary S]|\
 fail <id> [--actor A]|\
@@ -29618,6 +29632,21 @@ fn flag_value(args: &[String], name: &str) -> Option<String> {
         .position(|arg| arg == name)
         .and_then(|index| args.get(index + 1))
         .cloned()
+}
+
+/// Resolve a `--ttl <duration>` flag to an ABSOLUTE deadline (`now + ttl`),
+/// formatted as SQLite's `datetime('now')` shape so it compares lexically
+/// against the store's clock (the T3 claim/renew TTL). `None` = no `--ttl` (an
+/// untimed claim, or a renew that heartbeats without moving the deadline).
+fn issue_ttl_expires(args: &[String]) -> Option<String> {
+    let ttl = flag_value(args, "--ttl")?;
+    let seconds = whipplescript_parser::body::parse_short_duration_seconds(&ttl)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    chrono::DateTime::<chrono::Utc>::from_timestamp(now + seconds as i64, 0)
+        .map(|instant| instant.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
 /// Emit the full issue row after a mutation (DR-0002 "CLI Requirements": no
@@ -29828,7 +29857,10 @@ fn issue(options: &CliOptions) -> ExitCode {
                 return ExitCode::from(2);
             };
             let actor = issue_actor(flag_value(args, "--actor"));
-            match store.claim_item(id, &actor) {
+            // `--ttl <duration>` records a timed claim (`expires_at = now + ttl`);
+            // omitting it is the untimed backstop lease.
+            let expires = issue_ttl_expires(args);
+            match store.claim_item(id, &actor, expires.as_deref()) {
                 Ok(ClaimOutcome::Claimed) => emit_issue_row(&store, id, "claimed", options.json),
                 Ok(ClaimOutcome::AlreadyClaimed { holder }) => {
                     eprintln!("issue `{id}` is already claimed by {holder}");
@@ -29847,9 +29879,11 @@ fn issue(options: &CliOptions) -> ExitCode {
                 return ExitCode::from(2);
             };
             let actor = issue_actor(flag_value(args, "--actor"));
-            // v1 renew is a holder heartbeat (no `--ttl`; the TTL mechanism is
-            // T3-gated). `expires = None` re-affirms the lease unchanged.
-            match store.renew_claim(id, &actor, None) {
+            // `--ttl <duration>` extends the claim to `now + ttl` (holder-checked,
+            // monotonic); omitting it is a heartbeat that re-affirms the lease
+            // without moving its deadline.
+            let expires = issue_ttl_expires(args);
+            match store.renew_claim(id, &actor, expires.as_deref()) {
                 Ok(RenewOutcome::Renewed { .. }) => {
                     emit_issue_row(&store, id, "renewed", options.json)
                 }
@@ -42581,15 +42615,14 @@ rule go
         );
     }
 
-    /// std.tracker slice T4 drift test, contracts leg: the manifest's four
+    /// std.tracker slice T4 drift test, contracts leg: the manifest's five
     /// tracker effect contracts must FOLD against the parser-compiled ones
     /// (same id/version/library/kind/schemas/validation), so a shape drift
     /// between manifest and compiler surfaces as `effect_contract_duplicate`
-    /// and fails here. `tracker.renew` is pinned CONTRACT-LESS: the effect
-    /// kind arrives with slice T3 (spec/std-tracker.md "Renew/TTL
-    /// semantics"), and until then the manifest seeds only its
-    /// capability/provider/binding trio (the std.coord `lease.renew`
-    /// precedent).
+    /// and fails here. `tracker.renew` now has a full contract too (T3 landed
+    /// the effect kind, spec/std-tracker.md "Renew/TTL semantics"): the rule
+    /// below renews its claim, so the parser emits the `tracker.renew`
+    /// contract and the manifest row folds against it.
     #[test]
     fn tracker_manifest_contracts_fold_against_the_parser_compiled_ones() {
         let source = r#"use std.tracker
@@ -42621,6 +42654,7 @@ rule work_ready_item
   claim issue as active_claim
 
   after active_claim succeeds {
+    renew active_claim as renewed
     finish issue {
       summary "done"
     }
@@ -42641,6 +42675,7 @@ rule work_ready_item
         for (kind, source_form) in [
             ("tracker.file", "file"),
             ("tracker.claim", "claim"),
+            ("tracker.renew", "renew"),
             ("tracker.release", "release"),
             ("tracker.finish", "finish"),
         ] {
@@ -42674,18 +42709,10 @@ rule work_ready_item
                 "the manifest contributes the admission-honesty provider kind: {contract:?}"
             );
         }
-        // The tracker.renew contract does NOT exist until T3 lands the effect
-        // kind — a contract row appearing here without its parser partner
-        // would be manifest-only pretense.
-        assert_eq!(
-            registry
-                .effect_contracts
-                .iter()
-                .filter(|contract| contract.id == "tracker.renew")
-                .count(),
-            0,
-            "tracker.renew stays contract-less until slice T3 (spec/std-tracker.md)"
-        );
+        // T3 landed the `tracker.renew` effect kind: the manifest contract row
+        // now merge-folds against the parser-compiled contract (the loop above
+        // already asserted the single folded row), so a contract WITHOUT its
+        // parser partner is no longer the pretense — the fold is honest.
         // The six construct rows arrive from the embedded manifest merge; the
         // claim/renew/release rows are the reserved-keyword privilege tuples'
         // first real exercisers (typed_effect_call, corrected by T4).
