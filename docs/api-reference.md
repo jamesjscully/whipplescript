@@ -26,7 +26,7 @@ The current command set is:
 ```text
 package, check, compile, verify-report, gov, agent, agents, providers, skills,
 skill, lint, lsp, fmt, test, run, revise, step, worker, dev, accept, instances,
-status, log, facts, effects, runs, artifacts, inbox, signal, message, issue,
+status, log, facts, effects, runs, artifacts, inbox, signal, ingress, message, issue,
 leases, ledger, counters, evidence, diagnostics, trace, otel-export, telemetry,
 pause, resume, cancel, checkpoint, restore, fork, retry, recover, auth, deploy,
 executor, doctor
@@ -299,13 +299,16 @@ Other analyses:
   harness of kind `owned`); the grant is dead because sub-workflow tools are only
   resolved and offered in the owned brokered loop.
 - **`lint.missing_coercion_import`** / **`lint.missing_coord_import`** /
-  **`lint.missing_files_import`** / **`lint.missing_tracker_import`** — the
+  **`lint.missing_files_import`** / **`lint.missing_tracker_import`** /
+  **`lint.missing_ingress_import`** — the
   program uses `coerce`/`decide`/`prompt` without `use std.coercion`,
   coordination resources (`lease`/`ledger`/`counter` and their verbs) without
   `use std.coord`, file stores (`file store` and the
-  `read`/`write`/`import`/`export` verbs) without `use std.files`, or the work
+  `read`/`write`/`import`/`export` verbs) without `use std.files`, the work
   tracker (`tracker` and the `file`/`claim`/`release`/`finish` verbs) without
-  `use std.tracker`. Advisory only (the graduated import ladder): the program
+  `use std.tracker`, or typed signal admission (`signal` declarations,
+  external `source` blocks, `emit signal … to`) without `use std.ingress`.
+  Advisory only (the graduated import ladder): the program
   still runs, but the import names the std package that owns and configures
   the effects.
 
@@ -827,7 +830,8 @@ whip [--store path] [--json] signal <instance> \
   --name <signal.name> \
   --data <json> \
   --program <workflow.whip> \
-  [--root Workflow]
+  [--root Workflow] \
+  [--delivery-id <id>]
 ```
 
 Validates an external signal payload against the source bundle's declared
@@ -836,14 +840,20 @@ derives the typed fact that rules match with `when <signal.name> as x` or the
 general `when fact <signal.name> as x` form. A malformed or undeclared signal is
 rejected before an ill-typed fact can land.
 
+`--delivery-id` supplies the provider/operator delivery identity: it wins over
+the derived payload hash as the admission key, so re-running the same id
+admits once across process runs — the duplicate is absorbed with a diagnostic
+(`"duplicate": true` under `--json`, naming the original event) instead of a
+second fact.
+
 Human output prints the signal sequence. JSON output includes:
 
 ```json
 {
   "instance_id": "inst_...",
   "signal": "deploy.finished",
-  "signal_id": "sig_...",
-  "fact_id": "fact_..."
+  "event_id": "evt_...",
+  "fact_event_id": "evt_..."
 }
 ```
 
@@ -851,9 +861,25 @@ Exit behavior:
 
 | Exit | Meaning |
 | --- | --- |
-| `0` | Signal accepted and typed fact derived. |
+| `0` | Signal accepted and typed fact derived (or a duplicate delivery absorbed). |
 | `1` | Store, source, or payload validation failed. |
 | `2` | CLI usage error. |
+
+### `ingress serve`
+
+```sh
+whip [--store path] ingress serve --stdio --program <workflow.whip> [--root Workflow]
+```
+
+The resident stdio admission driver (`std.ingress.stdio`, a dev/test reference
+path): reads JSONL envelopes `{"instance", "signal", "payload",
+"delivery_id"?}` from stdin and admits each through the same admission core as
+`whip signal` — declared-signal check, payload validation, internal-channel
+gate, idempotent delivery key. One JSON result line per envelope on stdout
+(`"status"`: `admitted` / `duplicate` / `rejected` with a `reason`); a
+malformed line is rejected before any fact; the process exits `0` at EOF. The
+HTTP listener driver is deferred (`spec/std-ingress.md`, "Deferred with
+cause").
 
 ### Issue commands
 
@@ -1346,16 +1372,18 @@ governance envelopes, `escalate <request>` files a low-integrity request to the
 them, and `gov agent` starts the privileged governance agent loop (it refuses to
 start without governance privilege).
 
-### `agent`
+### `infoflow`
 
 ```sh
-whip agent
+whip infoflow
 ```
 
 Starts the unprivileged interactive whip-agent loop (DR-0026/0028). It reads
 commands from stdin — `check <file>` runs the information-flow check on a whip
 source, `escalate <request>` files a governance escalation, and `quit` exits. It
-has no path to signing governance; a `sign` is refused.
+has no path to signing governance; a `sign` is refused. Renamed one-way from
+`whip agent` (no alias; spec/std-agent.md "Operator CLI") — the old spelling
+errors with a pointer here.
 
 ### `verify-report`
 
@@ -1401,7 +1429,7 @@ This section is a compact index of source constructs.
 | Coerce | `coerce fn(args...) -> Type { prompt """markdown ... """ }` | Declared coerce-backed effect. |
 | Flow | `flow name when ... { step; step; ... }` | A rule whose body is a multi-step sequence; lowers to `flow.<name>.seg<N>` rules. |
 | Channel | `channel name { provider local destination "#ops" }` | Named messaging endpoint for inbound `when message from` and outbound `send via`; the provider must be one of `local`, `desktop`, `stdio`, `fixture`. |
-| Source | `source clock\|file\|http as name { ... observe as obs emit <signal> { ... } }` | Ingress source (clock schedule, file, or GET-only http fetch) whose `emit` clause admits observed input as a typed signal (the `event.emit` effect kind). |
+| Source | `source clock\|file\|http as name { ... observe as obs emit <signal> { ... } }` | Ingress source (clock schedule, file `path` lines or `watch` content occurrences, or GET-only http fetch, optionally `dedup <obs>.<field>`) whose `emit` clause admits observed input as a typed signal through the admission core. The provider kind must be contributed by an embedded/locked package manifest. |
 | File store | `file store name { root "..." allow read [...] allow write [...] }` | Policy boundary over a provider-backed document root for `read text`/`write text`/`import`/`export`. |
 | Tracker | `tracker name { provider builtin }` | Declared vendor-neutral work-item backlog. |
 | Lease | `lease name { key Type slots N ttl 10m }` | Workspace-scoped bounded mutex/semaphore resource. |

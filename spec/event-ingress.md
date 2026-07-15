@@ -132,8 +132,11 @@ peer/CLI rule in [`admission-and-idempotency.md`](admission-and-idempotency.md):
 an operator-supplied delivery id (e.g. `--delivery-id`) is used when present;
 otherwise the kernel derives one from the canonical payload hash and the target.
 The admission records the operator/CLI origin as provenance. The store's unique
-index on `(instance, fact_identity_key)` is what makes a re-run of the same CLI
-admission append at most once; the CLI does not implement its own dedup.
+index on `events(instance_id, idempotency_key)` (migrations/0001) is what makes
+a re-run of the same CLI admission append at most once; the CLI does not
+implement its own dedup. (Amended 2026-07-15 per spec/std-ingress.md "Spec
+amendments" 2: the index name here previously read "(instance,
+fact_identity_key)" — same mechanism, wrong name.)
 
 ### In-Workflow Signal Injection
 
@@ -307,8 +310,12 @@ signal's validation and correlation requirements.
   payload type.
 - A rule that reads a declared signal is live without `@external`; the signal
   declaration is the external producer contract.
-- `source <provider> as <name>` requires an imported package that contributes
-  the provider kind.
+- `source <provider> as <name>` splits across the M5 graduated ladder (amended
+  2026-07-15 per spec/std-ingress.md "Spec amendments" 1): the provider KIND
+  must be contributed by an embedded/locked manifest — a HARD check now that
+  embedded manifests are live — while the `use <package>` import line itself
+  is an ADVISORY lint (`lint.missing_ingress_import`), with lint→error
+  escalation registered, not built.
 - `observe as <binding>` binds the provider's declared observation schema.
 - `emit <signal> { ... }` must materialize the declared signal payload type
   from the observation binding and other recorded values in scope.
@@ -336,7 +343,7 @@ signal's validation and correlation requirements.
   (external delivery, CLI, peer injection) is defined in
   [`admission-and-idempotency.md`](admission-and-idempotency.md): a provider
   delivery id when present, else the derived per-source key. The store's unique
-  index on `(instance, fact_identity_key)` enforces append-at-most-once; a
+  index on `events(instance_id, idempotency_key)` enforces append-at-most-once; a
   duplicate is absorbed and recorded as an observable duplicate diagnostic. This
   spec does not define its own dedup mechanism.
 - **Correlation soundness:** an observation can target only the instance

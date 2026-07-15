@@ -495,6 +495,11 @@ pub enum AgentField {
     Capacity(u32, SourceSpan),
     Skills(Vec<StringLiteral>, SourceSpan),
     Capabilities(Vec<StringLiteral>, SourceSpan),
+    /// `requires [session.resume, turn.cancel]`: portable feature-class
+    /// requirements (DR-0015 taxonomy; spec/std-agent.md slice 6). Entries are
+    /// dotted feature-class names, validated for taxonomy membership at
+    /// lowering and against the provider's feature report by the CLI.
+    Requires(Vec<Ident>, SourceSpan),
     /// `tools [Foo, Bar]`: the workflows this agent may invoke as typed tools
     /// (DR-0025). Entries are workflow names resolved against the program/packages.
     Tools(Vec<Ident>, SourceSpan),
@@ -616,14 +621,27 @@ pub struct SourceDecl {
     pub provider: Ident,
     /// Recurrence/timezone/missed policy; `Some` only for the `clock` provider.
     pub clock: Option<ClockPolicy>,
-    /// `path "<file>"` — required for the `file` provider, rejected elsewhere.
-    /// The file is read line-by-line; each non-empty line is admitted once as a
-    /// durable signal fact (spec/std-time.md admission semantics, append-only).
+    /// `path "<file>"` — `file` provider, line mode (exactly one of
+    /// `path`/`watch`); rejected elsewhere. The file is read line-by-line; each
+    /// non-empty line is admitted once as a durable signal fact
+    /// (spec/std-time.md admission semantics, append-only).
     pub path: Option<StringLiteral>,
+    /// `watch "<glob>"` — `file` provider, occurrence mode (exactly one of
+    /// `path`/`watch`); rejected elsewhere (spec/std-ingress.md I2a). Each
+    /// matched file is admitted once per new (path, content-hash) occurrence:
+    /// a dropped file admits once, an unchanged file never re-admits, a
+    /// content change re-admits. Content READING stays std.files.
+    pub watch: Option<StringLiteral>,
     /// `url "<url>"` — required for the `http` provider, rejected elsewhere. The
     /// URL is GET'd and its JSON-array body admitted one element per signal,
     /// keyed by (source, element index) so re-polls are idempotent (append-only).
     pub url: Option<StringLiteral>,
+    /// `dedup <observe>.<field>` — optional provider delivery-id source for
+    /// `file` (line mode) and `http` sources (spec/std-ingress.md I2a): the
+    /// named observation field becomes the admission key instead of the
+    /// positional ordinal, so a re-ordered or head-inserted feed still admits
+    /// each delivery exactly once.
+    pub dedup: Option<SourceValue>,
     /// `observe as <binding>` — binds the provider observation schema.
     pub observe_binding: Ident,
     /// `emit <signal> { <field> <value> ... }` — maps the observation into the
@@ -1297,10 +1315,18 @@ pub struct IrSource {
     pub recurrence: Option<Recurrence>,
     pub timezone: Option<String>,
     pub missed: Option<MissedPolicy>,
-    /// `path "<file>"` — the file read by a `file` source (`None` otherwise).
+    /// `path "<file>"` — the file read line-by-line by a `file` source in line
+    /// mode (`None` otherwise; exactly one of `path`/`watch`).
     pub path: Option<String>,
+    /// `watch "<glob>"` — the glob a `file` source polls in occurrence mode
+    /// (`None` otherwise): one signal per new (path, content-hash) occurrence.
+    pub watch: Option<String>,
     /// `url "<url>"` — the endpoint GET'd by an `http` source (`None` otherwise).
     pub url: Option<String>,
+    /// `dedup <observe>.<field>` — the observation field carrying the provider
+    /// delivery id for `file` (line mode) / `http` sources; replaces the
+    /// positional-ordinal admission key when declared.
+    pub dedup_field: Option<String>,
     pub observe_binding: String,
     pub emit_signal: String,
     pub emit_fields: Vec<IrSourceEmitField>,
@@ -1408,6 +1434,10 @@ pub struct IrAgent {
     pub capacity: Option<u32>,
     pub skills: Vec<String>,
     pub capabilities: Vec<String>,
+    /// Portable feature requirements (`requires [<feature.class>]`, DR-0015 /
+    /// spec/std-agent.md slice 6): taxonomy classes the selected provider's
+    /// accepted feature report must state as supported.
+    pub requires: Vec<String>,
     /// Workflows this agent may invoke as typed tools (DR-0025 `tools [...]`).
     pub tools: Vec<String>,
     /// Owned-harness conversation-compaction strategy (context-assembly Phase 5):
@@ -2697,6 +2727,7 @@ fn agent_field_span(field: &AgentField) -> SourceSpan {
         AgentField::Capacity(_, span)
         | AgentField::Skills(_, span)
         | AgentField::Capabilities(_, span)
+        | AgentField::Requires(_, span)
         | AgentField::Tools(_, span) => *span,
         AgentField::Compaction(strategy) => strategy.span,
         AgentField::Thread(mode) => mode.span,
@@ -2725,6 +2756,14 @@ fn agent_field_line(field: &AgentField) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("  capabilities [{capabilities}]")
+        }
+        AgentField::Requires(classes, _) => {
+            let classes = classes
+                .iter()
+                .map(|class| class.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("  requires [{classes}]")
         }
         AgentField::Tools(tools, _) => {
             let tools = tools
@@ -3430,6 +3469,13 @@ impl IrProgram {
                 } else {
                     format!("[{}]", agent.tools.join(", "))
                 };
+                // Feature requirements append only when declared, so agents
+                // without `requires` keep an unchanged .ir snapshot (no ripple).
+                let requires = if agent.requires.is_empty() {
+                    String::new()
+                } else {
+                    format!(" requires=[{}]", agent.requires.join(", "))
+                };
                 // Compaction strategy appends only when set, so agents that take the
                 // harness default keep an unchanged .ir snapshot (no ripple).
                 let compaction = agent
@@ -3458,8 +3504,8 @@ impl IrProgram {
                 push_line(
                     &mut snapshot,
                     format!(
-                        "  agent {} harness={} provider={} profile={} capacity={} skills={} capabilities={} tools={}{}{}{}{}",
-                        agent.name, harness, provider, profile, capacity, skills, capabilities, tools, compaction, settings, thread, class
+                        "  agent {} harness={} provider={} profile={} capacity={} skills={} capabilities={} tools={}{}{}{}{}{}",
+                        agent.name, harness, provider, profile, capacity, skills, capabilities, tools, requires, compaction, settings, thread, class
                     ),
                 );
             }
@@ -7091,34 +7137,18 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
     }
 }
 
-fn lower_harness(harness: HarnessDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
-    if !is_supported_harness_kind(&harness.kind.name) {
-        diagnostics.push(Diagnostic {
-            related: Vec::new(),
-            span: harness.kind.span,
-            message: format!(
-                "harness `{}` uses unsupported kind `{}`",
-                harness.name.name, harness.kind.name
-            ),
-            suggestion: Some(
-                "supported harness kinds are `codex`, `claude`, `fixture`, and `command`"
-                    .to_owned(),
-            ),
-        });
-    }
-
+fn lower_harness(harness: HarnessDecl, ir: &mut IrProgram, _diagnostics: &mut [Diagnostic]) {
+    // Provider/harness kind validity is registry-derived (spec/std-agent.md
+    // "Open provider registry", DR-0009): the known kind set is contributed by
+    // package manifests (embedded std + locked third-party), which the parser
+    // cannot see. The CLI check validates kinds against that registry with the
+    // M5 missing-package/missing-import diagnostic split; the parser accepts
+    // the kind structurally.
     ir.harnesses.push(IrHarness {
         name: harness.name.name,
         kind: harness.kind.name,
         span: harness.span,
     });
-}
-
-fn is_supported_harness_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "codex" | "claude" | "fixture" | "native-fixture" | "command" | "owned"
-    )
 }
 
 /// The harness class (DR-0034). `Managed` = WhippleScript is the agent runtime
@@ -7143,9 +7173,9 @@ impl HarnessClass {
 /// Classify a harness kind (DR-0034 Decision 6). Total over the supported kinds:
 /// `owned` and the credential-free `fixture` model client are Managed; every other
 /// kind (codex/claude sidecars, the `native-fixture` delegated adapter, `command`)
-/// is Delegated. An unrecognized kind — already rejected by
-/// `is_supported_harness_kind` — defaults to Delegated, never granting the Managed
-/// guarantee to something unknown.
+/// is Delegated. An unrecognized kind — validated registry-side by the CLI
+/// (spec/std-agent.md "Open provider registry") — defaults to Delegated, never
+/// granting the Managed guarantee to something unknown.
 pub fn harness_class(kind: &str) -> HarnessClass {
     match kind {
         "owned" | "fixture" => HarnessClass::Managed,
@@ -7167,6 +7197,7 @@ fn lower_agent(
         capacity: None,
         skills: Vec::new(),
         capabilities: Vec::new(),
+        requires: Vec::new(),
         tools: Vec::new(),
         compaction: None,
         thread: None,
@@ -7195,21 +7226,10 @@ fn lower_agent(
     // `delegated to <provider>` (DR-0034 Decision 2): the surface spelling of a
     // Delegated agent. It names the provider kind directly, so it must be a kind
     // that actually classifies Delegated — `delegated to owned` is a contradiction.
+    // Kind existence is registry-validated by the CLI (spec/std-agent.md "Open
+    // provider registry"); only the class contradiction is structural.
     if let Some(delegate) = &agent.delegated_to {
-        if !is_supported_harness_kind(&delegate.name) {
-            diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span: delegate.span,
-                message: format!(
-                    "agent `{}` delegates to unsupported provider `{}`",
-                    agent.name.name, delegate.name
-                ),
-                suggestion: Some(
-                    "supported delegate providers are `codex`, `claude`, `native-fixture`, and `command`"
-                        .to_owned(),
-                ),
-            });
-        } else if harness_class(&delegate.name) != HarnessClass::Delegated {
+        if harness_class(&delegate.name) != HarnessClass::Delegated {
             diagnostics.push(Diagnostic {
                 related: Vec::new(),
                 span: delegate.span,
@@ -7273,19 +7293,9 @@ fn lower_agent(
                         ),
                     });
                 }
-                if !is_supported_harness_kind(&provider.name) {
-                    diagnostics.push(Diagnostic { related: Vec::new(),
-                        span: provider.span,
-                        message: format!(
-                            "agent `{}` uses unsupported provider `{}`",
-                            agent.name.name, provider.name
-                        ),
-                        suggestion: Some(
-                            "supported providers are `owned`, `codex`, `claude`, `fixture`, `native-fixture`, and `command`"
-                                .to_owned(),
-                        ),
-                    });
-                }
+                // Provider-kind existence is registry-validated by the CLI
+                // (spec/std-agent.md "Open provider registry"): the known kind
+                // set is contributed by package manifests, not compiled in here.
                 lowered.provider = Some(provider.name);
             }
             AgentField::Profile(profile) => lowered.profile = Some(profile.value),
@@ -7335,6 +7345,44 @@ fn lower_agent(
                         });
                     }
                     lowered.capabilities.push(capability.value);
+                }
+            }
+            AgentField::Requires(classes, _) => {
+                let mut seen = BTreeSet::new();
+                for class in classes {
+                    // Taxonomy membership (DR-0015; spec/std-agent.md slice 6):
+                    // a required class must be a member of the shared
+                    // feature-class taxonomy. Validation against the selected
+                    // provider's feature REPORT is the CLI's registry-side
+                    // check — this is the vocabulary gate.
+                    if !whipplescript_core::AGENT_FEATURE_CLASS_TAXONOMY
+                        .contains(&class.name.as_str())
+                    {
+                        diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: class.span,
+                            message: format!(
+                                "agent `{}` requires unknown feature class `{}`",
+                                agent.name.name, class.name
+                            ),
+                            suggestion: Some(format!(
+                                "feature classes come from the DR-0015 taxonomy: {}",
+                                whipplescript_core::AGENT_FEATURE_CLASS_TAXONOMY.join(", ")
+                            )),
+                        });
+                    }
+                    if !seen.insert(class.name.clone()) {
+                        diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: class.span,
+                            message: format!(
+                                "agent `{}` requires feature class `{}` more than once",
+                                agent.name.name, class.name
+                            ),
+                            suggestion: Some("remove the duplicate requires entry".to_owned()),
+                        });
+                    }
+                    lowered.requires.push(class.name);
                 }
             }
             AgentField::Tools(tools, _) => {
@@ -7769,19 +7817,44 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
             });
         }
     }
-    // File-source static checks: a `file` source reads a declared path, and the
-    // `path` clause is meaningful only for `file` (rejecting it elsewhere keeps
-    // provider intent unambiguous, mirroring the clock-only-clause rejection).
+    // File-source static checks (spec/std-ingress.md "Static checks" #3,
+    // closed clause set): a `file` source reads exactly one of a declared
+    // `path` (line mode) or `watch` glob (occurrence mode); both clauses are
+    // meaningful only for `file` (rejecting them elsewhere keeps provider
+    // intent unambiguous, mirroring the clock-only-clause rejection).
     let is_file = source.provider.name == "file";
-    if is_file && source.path.is_none() {
+    if is_file && source.path.is_none() && source.watch.is_none() {
         diagnostics.push(Diagnostic {
             related: Vec::new(),
             span: source.span,
             message: format!(
-                "`file` source `{}` requires a `path` clause",
+                "`file` source `{}` requires a `path` or `watch` clause",
                 source.name.name
             ),
-            suggestion: Some("add `path \"./inbox.txt\"`".to_owned()),
+            suggestion: Some(
+                "add `path \"./inbox.txt\"` (one signal per line) or `watch \"./drops/*.json\"` \
+                 (one signal per new file-content occurrence)"
+                    .to_owned(),
+            ),
+        });
+    }
+    if is_file && source.path.is_some() && source.watch.is_some() {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: source
+                .watch
+                .as_ref()
+                .map(|watch| watch.span)
+                .unwrap_or(source.span),
+            message: format!(
+                "`file` source `{}` declares both `path` and `watch`; the modes are exclusive",
+                source.name.name
+            ),
+            suggestion: Some(
+                "keep `path` for line-by-line admission or `watch` for per-file-content \
+                 occurrences, not both"
+                    .to_owned(),
+            ),
         });
     }
     if !is_file {
@@ -7795,6 +7868,19 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
                 ),
                 suggestion: Some(
                     "use `source file as ...` for a `path`, or remove the clause".to_owned(),
+                ),
+            });
+        }
+        if let Some(watch) = &source.watch {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: watch.span,
+                message: format!(
+                    "source `{}` declares a `watch` clause but its provider is `{}`, not `file`",
+                    source.name.name, source.provider.name
+                ),
+                suggestion: Some(
+                    "use `source file as ...` for a `watch` glob, or remove the clause".to_owned(),
                 ),
             });
         }
@@ -7854,7 +7940,63 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
     let is_clock = source.clock.is_some();
     let is_file = source.provider.name == "file";
     let is_http = source.provider.name == "http";
+    // `dedup <observe>.<field>` static checks (spec/std-ingress.md I2a):
+    // meaningful only where a provider delivery identity can replace the
+    // positional ordinal — `file` line mode and `http`. A `watch` source is
+    // already content-keyed, and clock/cli sources carry their own identity.
+    // The value must be a one-segment path off the observation binding naming
+    // a known observation field (the same rule the emit mapping resolves by,
+    // `clock_emit_payload`), else the runtime key would be silently null.
+    let mut dedup_field = None;
+    if let Some(dedup) = &source.dedup {
+        let span = match dedup {
+            SourceValue::Path { span, .. } => *span,
+            SourceValue::String(literal) => literal.span,
+            SourceValue::Number(_, span) => *span,
+        };
+        if !(is_file && source.watch.is_none()) && !is_http {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span,
+                message: format!(
+                    "source `{}` declares a `dedup` clause but its provider is `{}`{}",
+                    source.name.name,
+                    source.provider.name,
+                    if is_file {
+                        " in `watch` mode, which is already content-keyed"
+                    } else {
+                        "; `dedup` applies to `file` (line mode) and `http` sources"
+                    }
+                ),
+                suggestion: Some("remove the `dedup` clause".to_owned()),
+            });
+        } else {
+            match dedup {
+                SourceValue::Path {
+                    binding, segments, ..
+                } if binding.name == source.observe_binding.name && segments.len() == 1 => {
+                    dedup_field = Some(segments[0].name.clone());
+                }
+                _ => {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span,
+                        message: format!(
+                            "source `{}` `dedup` must name one observation field off the \
+                             `observe` binding (e.g. `dedup {}.line`)",
+                            source.name.name, source.observe_binding.name
+                        ),
+                        suggestion: Some(format!(
+                            "the observation binding is `{}` (declared by `observe as {}`)",
+                            source.observe_binding.name, source.observe_binding.name
+                        )),
+                    });
+                }
+            }
+        }
+    }
     let path = source.path.as_ref().map(|literal| literal.value.clone());
+    let watch = source.watch.as_ref().map(|literal| literal.value.clone());
     let url = source.url.as_ref().map(|literal| literal.value.clone());
     let recurrence = source.clock.as_ref().map(|clock| clock.recurrence.clone());
     let timezone = source
@@ -7872,7 +8014,9 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
         timezone,
         missed,
         path,
+        watch,
         url,
+        dedup_field,
         observe_binding: source.observe_binding.name,
         emit_signal: source.emit.signal,
         emit_fields: source
@@ -15647,10 +15791,40 @@ fn validate_source_emit_signal_declared(
             "missed_count",
             "schedule_name",
         ]),
+        // `file` observes lines in `path` mode and (path, content-hash)
+        // occurrences in `watch` mode (spec/std-ingress.md I2a; content
+        // READING stays std.files).
+        "file" if source.watch.is_some() => Some(&["path", "content_hash", "watch"]),
         "file" => Some(&["line", "line_index", "path"]),
         "http" => Some(&["item", "item_index", "url"]),
         _ => None,
     };
+    // `dedup` reads the same observation record the emit mapping reads: an
+    // unknown field would make the admission key silently null at runtime.
+    if let (Some(fields), Some(SourceValue::Path { segments, .. })) =
+        (observation_fields, &source.dedup)
+    {
+        if let [field] = segments.as_slice() {
+            if !fields.contains(&field.name.as_str()) {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: field.span,
+                    message: format!(
+                        "source `{}` `dedup` reads `{}.{}`, but a `{}` source's observation has no field `{}`",
+                        source.name.name,
+                        source.observe_binding.name,
+                        field.name,
+                        source.provider.name,
+                        field.name
+                    ),
+                    suggestion: Some(format!(
+                        "available observation fields: {}",
+                        fields.join(", ")
+                    )),
+                });
+            }
+        }
+    }
     if let Some(fields) = observation_fields {
         let observe = &source.observe_binding.name;
         for emit_field in &source.emit.fields {
@@ -18172,6 +18346,14 @@ fn format_agent(agent: AgentDecl, formatted: &mut String) {
                     .join(", ");
                 push_line(formatted, format!("  capabilities [{capabilities}]"));
             }
+            AgentField::Requires(classes, _) => {
+                let classes = classes
+                    .into_iter()
+                    .map(|class| class.name)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                push_line(formatted, format!("  requires [{classes}]"));
+            }
             AgentField::Tools(tools, _) => {
                 let tools = tools
                     .into_iter()
@@ -18422,8 +18604,14 @@ fn format_source(source: SourceDecl, formatted: &mut String) {
     if let Some(path) = &source.path {
         push_line(formatted, format!("  path {:?}", path.value));
     }
+    if let Some(watch) = &source.watch {
+        push_line(formatted, format!("  watch {:?}", watch.value));
+    }
     if let Some(url) = &source.url {
         push_line(formatted, format!("  url {:?}", url.value));
+    }
+    if let Some(dedup) = &source.dedup {
+        push_line(formatted, format!("  dedup {}", format_source_value(dedup)));
     }
     push_line(
         formatted,
@@ -20243,6 +20431,13 @@ impl Parser<'_> {
                         self.synchronize_to_block_item();
                     }
                 }
+                "requires" => {
+                    if let Some((classes, span)) = self.parse_feature_class_list() {
+                        fields.push(AgentField::Requires(classes, span));
+                    } else {
+                        self.synchronize_to_block_item();
+                    }
+                }
                 "tools" => {
                     if let Some((tools, span)) = self.parse_ident_list() {
                         fields.push(AgentField::Tools(tools, span));
@@ -21286,7 +21481,9 @@ impl Parser<'_> {
         let mut timezone: Option<StringLiteral> = None;
         let mut missed: Option<MissedPolicy> = None;
         let mut path: Option<StringLiteral> = None;
+        let mut watch: Option<StringLiteral> = None;
         let mut url: Option<StringLiteral> = None;
+        let mut dedup: Option<SourceValue> = None;
         let mut observe_binding: Option<Ident> = None;
         let mut emit: Option<SourceEmit> = None;
 
@@ -21303,9 +21500,15 @@ impl Parser<'_> {
             } else if self.at_ident("path") {
                 self.advance();
                 path = self.expect_string("path string");
+            } else if self.at_ident("watch") {
+                self.advance();
+                watch = self.expect_string("watch glob string");
             } else if self.at_ident("url") {
                 self.advance();
                 url = self.expect_string("url string");
+            } else if self.at_ident("dedup") {
+                self.advance();
+                dedup = self.parse_source_value();
             } else if self.at_ident("missed") {
                 missed = self.parse_missed_policy();
             } else if self.at_ident("observe") {
@@ -21318,7 +21521,7 @@ impl Parser<'_> {
                 emit = self.parse_source_emit();
             } else {
                 self.unexpected(
-                    "a source clause (`every`/`at`, `timezone`, `path`, `url`, `missed`, `observe`, `emit`)",
+                    "a source clause (`every`/`at`, `timezone`, `path`, `watch`, `url`, `dedup`, `missed`, `observe`, `emit`)",
                 );
                 self.synchronize_to_block_item();
             }
@@ -21401,7 +21604,9 @@ impl Parser<'_> {
             provider,
             clock,
             path,
+            watch,
             url,
+            dedup,
             observe_binding,
             emit,
             span,
@@ -22310,6 +22515,39 @@ impl Parser<'_> {
 
         while !self.is_at_end() && !self.at_symbol(']') {
             values.push(self.expect_ident("tool workflow name")?);
+            if self.at_symbol(',') {
+                self.advance();
+            } else if !self.at_symbol(']') {
+                self.unexpected("`,` or `]`");
+                self.synchronize_to_block_item();
+                break;
+            }
+        }
+
+        let close = self.expect_symbol(']')?;
+        Some((values, open.span.join(close.span)))
+    }
+
+    /// Parse a bracketed list of dotted feature-class names, e.g.
+    /// `[session.resume, turn.cancel]` (agent `requires`, DR-0015 taxonomy).
+    /// Each entry is one or more identifiers joined by `.`; taxonomy
+    /// membership is validated at lowering.
+    fn parse_feature_class_list(&mut self) -> Option<(Vec<Ident>, SourceSpan)> {
+        let open = self.expect_symbol('[')?;
+        let mut values = Vec::new();
+
+        while !self.is_at_end() && !self.at_symbol(']') {
+            let head = self.expect_ident("feature class")?;
+            let mut name = head.name.clone();
+            let mut span = head.span;
+            while self.at_symbol('.') {
+                self.advance();
+                let part = self.expect_ident("feature class segment")?;
+                name.push('.');
+                name.push_str(&part.name);
+                span = span.join(part.span);
+            }
+            values.push(Ident { name, span });
             if self.at_symbol(',') {
                 self.advance();
             } else if !self.at_symbol(']') {
@@ -24743,7 +24981,7 @@ agent worker using missing {
     }
 
     #[test]
-    fn rejects_duplicate_and_unsupported_harness_declarations() {
+    fn rejects_duplicate_harness_declarations_and_accepts_kinds_structurally() {
         let source = r#"
 workflow BadHarnesses
 
@@ -24769,10 +25007,14 @@ agent worker using coder {
                 .any(|message| message.contains("harness `coder` is declared more than once")),
             "{messages:#?}"
         );
+        // Kind validity is registry-derived and validated by the CLI
+        // (spec/std-agent.md "Open provider registry"): the parser no longer
+        // holds a compiled-in kind set, so `spaceship` draws no parser
+        // diagnostic here.
         assert!(
-            messages.iter().any(|message| {
-                message.contains("harness `coder` uses unsupported kind `spaceship`")
-            }),
+            !messages
+                .iter()
+                .any(|message| message.contains("unsupported kind")),
             "{messages:#?}"
         );
     }
@@ -25356,6 +25598,67 @@ agent worker {
         );
     }
 
+    /// `requires [<feature.class>]` (spec/std-agent.md slice 6): dotted
+    /// taxonomy classes parse into `IrAgent::requires`, render in the .ir
+    /// snapshot only when declared, format canonically, and a non-taxonomy
+    /// class or duplicate is a lowering diagnostic.
+    #[test]
+    fn agent_requires_parses_taxonomy_classes() {
+        let program = "workflow R\n\nagent a {\n  provider owned\n  profile \"repo-reader\"\n  capacity 1\n  requires [session.resume, turn.cancel]\n}\n";
+        let compiled = compile_program(program);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("ir");
+        let agent = ir.agents.first().expect("agent");
+        assert_eq!(
+            agent.requires,
+            vec!["session.resume".to_owned(), "turn.cancel".to_owned()]
+        );
+        assert!(ir
+            .to_snapshot()
+            .contains("requires=[session.resume, turn.cancel]"));
+
+        // The formatter preserves the field.
+        let formatted = format_program(program).formatted.expect("formats");
+        assert!(
+            formatted.contains("  requires [session.resume, turn.cancel]"),
+            "{formatted}"
+        );
+
+        // Agents without `requires` keep an unchanged snapshot (no ripple).
+        let plain = compile_program(
+            "workflow R\n\nagent a {\n  provider owned\n  profile \"p\"\n  capacity 1\n}\n",
+        );
+        assert!(!plain.ir.expect("ir").to_snapshot().contains("requires="));
+
+        // Taxonomy membership bites (DR-0015): a made-up class is rejected.
+        let unknown = compile_program(
+            "workflow R\n\nagent a {\n  provider owned\n  profile \"p\"\n  capacity 1\n  requires [warp.drive]\n}\n",
+        );
+        assert!(
+            unknown.diagnostics.iter().any(|d| d
+                .message
+                .contains("requires unknown feature class `warp.drive`")),
+            "{:?}",
+            unknown.diagnostics
+        );
+
+        // Duplicates are rejected.
+        let duplicate = compile_program(
+            "workflow R\n\nagent a {\n  provider owned\n  profile \"p\"\n  capacity 1\n  requires [turn.cancel, turn.cancel]\n}\n",
+        );
+        assert!(
+            duplicate.diagnostics.iter().any(|d| d
+                .message
+                .contains("requires feature class `turn.cancel` more than once")),
+            "{:?}",
+            duplicate.diagnostics
+        );
+    }
+
     #[test]
     fn agent_delegated_to_sugar_and_managed_default() {
         // `agent d delegated to <provider>` is the Delegated surface spelling
@@ -25388,14 +25691,18 @@ agent worker {
             bad.diagnostics
         );
 
-        // An unsupported delegate kind is a diagnostic.
+        // An unknown delegate kind parses structurally: kind existence is
+        // registry-validated by the CLI (spec/std-agent.md "Open provider
+        // registry"), and an unrecognized kind classifies Delegated (never
+        // Managed), so `delegated to mystery` draws no parser diagnostic.
         let unknown = compile_program(
             "workflow C\nagent d delegated to mystery {\n  profile \"p\"\n  capacity 1\n}\n",
         );
         assert!(
-            unknown.diagnostics.iter().any(|d| d
-                .message
-                .contains("delegates to unsupported provider `mystery`")),
+            !unknown
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unsupported provider")),
             "diagnostics: {:?}",
             unknown.diagnostics
         );
@@ -26829,6 +27136,239 @@ rule react
                 .iter()
                 .any(|d| d.message.contains("absolute http(s) URL")),
             "a well-formed url must not be flagged"
+        );
+    }
+
+    /// I2a `watch` clause (spec/std-ingress.md): a `file` source in occurrence
+    /// mode parses, lowers `watch` into the IR, formats idempotently, and the
+    /// watch-mode observation schema (`path`/`content_hash`/`watch`) governs
+    /// the emit-field check.
+    #[test]
+    fn file_watch_source_parses_lowers_and_formats() {
+        let source = "\
+workflow WatchSource
+signal drop.arrived { path string digest string }
+source file as drops {
+  watch \"./drops/*.json\"
+  observe as obs
+  emit drop.arrived {
+    path obs.path
+    digest obs.content_hash
+  }
+}
+output result Done
+class Done { ok string }
+rule react
+  when drop.arrived as f
+=> { complete result { ok \"ok\" } }
+";
+        let compiled = compile_program(source);
+        let ir = compiled.ir.expect("watch source compiles");
+        let decl = ir.sources.first().expect("source lowered");
+        assert!(decl.is_file);
+        assert_eq!(decl.watch.as_deref(), Some("./drops/*.json"));
+        assert_eq!(decl.path, None);
+        let formatted = format_program(source).formatted.expect("formats");
+        assert!(
+            formatted.contains("watch \"./drops/*.json\""),
+            "{formatted}"
+        );
+        assert_eq!(
+            format_program(&formatted).formatted.expect("reformats"),
+            formatted,
+            "fmt must be idempotent over the watch clause"
+        );
+        // The watch-mode observation record has no `line`: reading it is the
+        // unknown-observation-field diagnostic.
+        let bad = source.replace("digest obs.content_hash", "digest obs.line");
+        let messages: Vec<String> = compile_program(&bad)
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("observation has no field `line`")),
+            "watch-mode emit must validate against the occurrence schema, got {messages:?}"
+        );
+    }
+
+    /// I2a closed clause sets (spec/std-ingress.md "Static checks" #3): `watch`
+    /// is file-only; `path`/`watch` are exclusive; a file source must declare
+    /// one of them.
+    #[test]
+    fn file_source_clause_set_is_closed() {
+        let watch_on_clock = "\
+workflow BadWatch
+signal tick.fired { at time }
+source clock as ticker {
+  every 5m
+  missed skip
+  watch \"./drops/*.json\"
+  observe as tick
+  emit tick.fired { at tick.scheduled_at }
+}
+output result Done
+class Done { ok string }
+rule react
+  when tick.fired as f
+=> { complete result { ok \"ok\" } }
+";
+        let messages: Vec<String> = compile_program(watch_on_clock)
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("`watch` clause but its provider is `clock`")),
+            "watch outside `file` must be rejected, got {messages:?}"
+        );
+
+        let both_modes = "\
+workflow BothModes
+signal ingress.fed { text string }
+source file as feed {
+  path \"./inbox.txt\"
+  watch \"./drops/*.txt\"
+  observe as obs
+  emit ingress.fed { text obs.path }
+}
+output result Done
+class Done { ok string }
+rule react
+  when ingress.fed as f
+=> { complete result { ok \"ok\" } }
+";
+        let messages: Vec<String> = compile_program(both_modes)
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("declares both `path` and `watch`")),
+            "path+watch must be rejected as exclusive modes, got {messages:?}"
+        );
+
+        let neither = "\
+workflow Neither
+signal ingress.fed { text string }
+source file as feed {
+  observe as obs
+  emit ingress.fed { text obs.line }
+}
+output result Done
+class Done { ok string }
+rule react
+  when ingress.fed as f
+=> { complete result { ok \"ok\" } }
+";
+        let messages: Vec<String> = compile_program(neither)
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("requires a `path` or `watch` clause")),
+            "a file source with neither mode must be rejected, got {messages:?}"
+        );
+    }
+
+    /// I2a `dedup` clause (spec/std-ingress.md): parses and lowers to
+    /// `dedup_field` for http/file(line) sources; rejected where no provider
+    /// delivery identity applies (clock, watch mode) and when the path does
+    /// not name a known observation field off the observe binding.
+    #[test]
+    fn dedup_clause_parses_lowers_and_validates() {
+        let source = "\
+workflow DedupSource
+signal ingress.ingested { text string }
+source http as feed {
+  url \"https://example.com/feed.json\"
+  dedup obs.item
+  observe as obs
+  emit ingress.ingested { text obs.item }
+}
+output result Done
+class Done { ok string }
+rule react
+  when ingress.ingested as f
+=> { complete result { ok \"ok\" } }
+";
+        let compiled = compile_program(source);
+        let ir = compiled.ir.expect("dedup source compiles");
+        let decl = ir.sources.first().expect("source lowered");
+        assert!(decl.is_http);
+        assert_eq!(decl.dedup_field.as_deref(), Some("item"));
+        let formatted = format_program(source).formatted.expect("formats");
+        assert!(formatted.contains("dedup obs.item"), "{formatted}");
+        assert_eq!(
+            format_program(&formatted).formatted.expect("reformats"),
+            formatted,
+            "fmt must be idempotent over the dedup clause"
+        );
+
+        // Unknown observation field: the admission key would be silently null.
+        let bad_field = source.replace("dedup obs.item", "dedup obs.delivery_id");
+        let messages: Vec<String> = compile_program(&bad_field)
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("observation has no field `delivery_id`")),
+            "an unknown dedup field must be rejected, got {messages:?}"
+        );
+
+        // Wrong binding root: dedup reads the observation, nothing else.
+        let bad_root = source.replace("dedup obs.item", "dedup other.item");
+        let messages: Vec<String> = compile_program(&bad_root)
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("`dedup` must name one observation field")),
+            "a dedup path off a foreign binding must be rejected, got {messages:?}"
+        );
+
+        // No provider delivery identity on a clock source.
+        let on_clock = "\
+workflow DedupClock
+signal tick.fired { at time }
+source clock as ticker {
+  every 5m
+  missed skip
+  dedup tick.occurrence_id
+  observe as tick
+  emit tick.fired { at tick.scheduled_at }
+}
+output result Done
+class Done { ok string }
+rule react
+  when tick.fired as f
+=> { complete result { ok \"ok\" } }
+";
+        let messages: Vec<String> = compile_program(on_clock)
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("declares a `dedup` clause but its provider is `clock`")),
+            "dedup on a clock source must be rejected, got {messages:?}"
         );
     }
 

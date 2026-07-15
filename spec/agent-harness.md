@@ -396,6 +396,15 @@ input, run output, and related facts; they must not depend on prompt text.
 
 ## Provider Configuration
 
+Provider-kind validity is registry-derived from package manifests, not a
+compiled-in set (spec/std-agent.md "Open provider registry", executed
+2026-07-15): the known kinds are contributed by the embedded `std.agent`
+manifest (`owned`, `fixture`, `native-fixture`, `command`), by
+`std.agent.codex`/`std.agent.claude` when their adapter cargo features are
+compiled in, and by locked third-party manifests. A kind contributed by no
+known manifest is a check error naming a missing package; contributed-but-not-
+imported is an advisory missing-import lint (the M5 graduated ladder).
+
 Provider bindings are runtime configuration, not workflow source. A binding
 should specify at least:
 
@@ -453,6 +462,16 @@ no-repo
 
 Provider names are not profile names. The capability registry binds profiles to
 providers and enforcement options.
+
+Preset tool policy is defined by the `std.agent` profile table
+(kernel/agent_profile.rs, mirrored in the embedded manifest's `profiles`
+section; spec/std-agent.md slice 4, executed 2026-07-15): each row carries the
+explicit owned-harness tool-policy vector, the per-provider-class translation
+hints (Claude base tool set, Codex mapping), and the capability list the
+preset grants. The owned harness, both adapters, and the sidecar consume
+computed policy from that table; an unknown NAMED preset is fail-closed (a
+recoverable block at owned-turn setup, never the permissive fallback), and
+`issue-triager` is mapped (repo read + tracker work, no writes).
 
 Turn-scoped authority narrowing on top of the profile is expressed in source as
 `with access to <resource> { … }`. Per Proposal A it is authority-narrowing

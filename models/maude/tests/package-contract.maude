@@ -373,3 +373,28 @@ search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
   requiredEffectCapability(fileReadEff, fileReadCap)
   =>*
   acceptedPackageContract(unboundFileReadDecl) .
+
+--- std.agent slice 3 (spec/std-agent.md "Open provider registry") positive:
+--- a provider kind contributed by a known manifest authorizes an agent
+--- binding for that kind, and the contribution row survives (registry data,
+--- not consumed).
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  agentProviderRequest(fixtureKind)
+  providerKindContributed(fixtureKind, stdAgentPkg)
+  providerKindContributed(ownedKind, stdAgentPkg)
+  =>*
+  authorizedProviderKind(fixtureKind, stdAgentPkg)
+  providerKindContributed(fixtureKind, stdAgentPkg)
+  providerKindContributed(ownedKind, stdAgentPkg) .
+
+--- std.agent slice 3 negative (bite): a provider kind contributed by NO known
+--- manifest is never authorized — even with other kinds contributed by other
+--- packages in the soup, no path reaches authorizedProviderKind for the
+--- unknown kind, under any binding of the contributing package.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  agentProviderRequest(unknownRoboKind)
+  providerKindContributed(fixtureKind, stdAgentPkg)
+  providerKindContributed(ownedKind, stdAgentPkg)
+  =>*
+  authorizedProviderKind(unknownRoboKind, PP:ProviderPackageId)
+  RESIDUAL:Cfg .

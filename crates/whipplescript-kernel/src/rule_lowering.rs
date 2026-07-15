@@ -4334,6 +4334,184 @@ pub fn ir_type_name(ty: &IrType) -> String {
     }
 }
 
+/// IR-typed JSON validation (lifted from the CLI for the std.ingress
+/// admission core, spec/std-ingress.md I3: every driver validates payloads
+/// against the DECLARATION, so the validator lives kernel-side; the CLI
+/// re-exports these). Unlike the embedded-shape mirror
+/// (`effect_handlers::validate_ingest_value`), this reads the program IR
+/// directly and carries Family B conditional required-presence.
+pub fn validate_json_for_ir_type(
+    ir: &IrProgram,
+    value: &Value,
+    ty: &IrType,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    match ty {
+        IrType::Primitive(primitive) => validate_json_for_primitive(value, primitive, path, errors),
+        IrType::LiteralString(expected) => {
+            if value.as_str() != Some(expected.as_str()) {
+                errors.push(format!("{path} must be literal {expected:?}"));
+            }
+        }
+        IrType::Ref(name) => validate_json_for_ref(ir, value, name, path, errors),
+        IrType::AgentRef(agents) => match value.as_str() {
+            Some(agent) if agents.iter().any(|candidate| candidate == agent) => {}
+            Some(_) => errors.push(format!(
+                "{path} must name one of these agents: {}",
+                agents.join(", ")
+            )),
+            None => errors.push(format!("{path} must be an agent name string")),
+        },
+        IrType::Object(fields) => validate_json_for_object(ir, value, fields, path, errors),
+        IrType::Optional(inner) => {
+            if !value.is_null() {
+                validate_json_for_ir_type(ir, value, inner, path, errors);
+            }
+        }
+        IrType::Array(inner) => match value.as_array() {
+            Some(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    validate_json_for_ir_type(ir, item, inner, &format!("{path}[{index}]"), errors);
+                }
+            }
+            None => errors.push(format!("{path} must be an array")),
+        },
+        IrType::Map(inner) => match value.as_object() {
+            Some(map) => {
+                for (key, item) in map {
+                    validate_json_for_ir_type(ir, item, inner, &format!("{path}.{key}"), errors);
+                }
+            }
+            None => errors.push(format!("{path} must be an object map")),
+        },
+        IrType::Union(types) => {
+            if !types
+                .iter()
+                .any(|candidate| json_matches_ir_type(ir, value, candidate))
+            {
+                errors.push(format!(
+                    "{path} must match one of: {}",
+                    types
+                        .iter()
+                        .map(ir_type_name)
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                ));
+            }
+        }
+    }
+}
+
+fn validate_json_for_primitive(
+    value: &Value,
+    primitive: &IrPrimitiveType,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    let valid = match primitive {
+        IrPrimitiveType::String
+        | IrPrimitiveType::Duration
+        | IrPrimitiveType::Time
+        | IrPrimitiveType::Image
+        | IrPrimitiveType::Audio
+        | IrPrimitiveType::Pdf
+        | IrPrimitiveType::Video => value.is_string(),
+        IrPrimitiveType::Int => value.as_i64().is_some(),
+        IrPrimitiveType::Float => value.as_f64().is_some(),
+        IrPrimitiveType::Bool => value.is_boolean(),
+        IrPrimitiveType::Null => value.is_null(),
+    };
+    if !valid {
+        errors.push(format!(
+            "{path} must be {}",
+            ir_type_name(&IrType::Primitive(primitive.clone()))
+        ));
+    }
+}
+
+fn validate_json_for_ref(
+    ir: &IrProgram,
+    value: &Value,
+    name: &str,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    if let Some(class) = ir.schemas.iter().find_map(|schema| match schema {
+        IrSchema::Class(class) if class.name == name => Some(class),
+        _ => None,
+    }) {
+        validate_json_for_object(ir, value, &class.fields, path, errors);
+        return;
+    }
+    if let Some(enum_decl) = ir.schemas.iter().find_map(|schema| match schema {
+        IrSchema::Enum(enum_decl) if enum_decl.name == name => Some(enum_decl),
+        _ => None,
+    }) {
+        match value.as_str() {
+            Some(variant)
+                if enum_decl
+                    .variants
+                    .iter()
+                    .any(|candidate| candidate == variant) => {}
+            Some(_) => errors.push(format!(
+                "{path} must be one of: {}",
+                enum_decl.variants.join(", ")
+            )),
+            None => errors.push(format!("{path} must be a string enum variant")),
+        }
+        return;
+    }
+    errors.push(format!("{path} references unknown type `{name}`"));
+}
+
+pub fn validate_json_for_object(
+    ir: &IrProgram,
+    value: &Value,
+    fields: &[IrClassField],
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    let Some(object) = value.as_object() else {
+        errors.push(format!("{path} must be an object"));
+        return;
+    };
+    for key in object.keys() {
+        if !fields.iter().any(|field| field.name == *key) {
+            errors.push(format!("{path}.{key} is not declared"));
+        }
+    }
+    for field in fields {
+        let field_path = format!("{path}.{}", field.name);
+        // Family B conditional required-presence (discriminated-families-design.md
+        // §5.7): a `when <disc> is "<lit>"` field is required only when its
+        // discriminant equals the literal. An inapplicable sibling (the discriminant
+        // names a different value) is neither required nor rejected nor validated —
+        // soundness needs only positive presence, and this admits the
+        // all-keys-present webhook shape.
+        if let Some((disc, lit)) = &field.presence_condition {
+            let applicable = object
+                .get(disc)
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == lit);
+            if !applicable {
+                continue;
+            }
+        }
+        match object.get(&field.name) {
+            Some(value) => validate_json_for_ir_type(ir, value, &field.ty, &field_path, errors),
+            None if matches!(field.ty, IrType::Optional(_)) => {}
+            None => errors.push(format!("{field_path} is required")),
+        }
+    }
+}
+
+pub fn json_matches_ir_type(ir: &IrProgram, value: &Value, ty: &IrType) -> bool {
+    let mut errors = Vec::new();
+    validate_json_for_ir_type(ir, value, ty, "$", &mut errors);
+    errors.is_empty()
+}
+
 pub fn top_level_record_blocks(body: &str) -> Vec<RecordBlock> {
     let mut blocks = Vec::new();
     let lines = body.lines().collect::<Vec<_>>();

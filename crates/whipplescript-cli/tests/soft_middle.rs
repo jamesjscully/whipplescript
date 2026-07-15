@@ -4591,6 +4591,76 @@ fn signal_rejects_bad_payload_and_unknown_signal() {
     let _ = fs::remove_file(source);
 }
 
+/// I5 (spec/std-ingress.md): `whip signal --delivery-id` — the operator's
+/// delivery id WINS over the derived payload hash, and the same id twice
+/// admits once ACROSS PROCESS RUNS: the second invocation is a fresh process
+/// against the same store, and the duplicate is absorbed with an observable
+/// diagnostic instead of a second fact (or a store conflict).
+#[test]
+fn signal_delivery_id_admits_once_across_process_runs() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("signal-delivery", "sqlite");
+    let source = temp_path("signal-delivery", "whip");
+    fs::write(&source, EVENT_SOURCE).expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let source_str = source.to_str().expect("utf-8");
+    let dev = dev_until_idle(bin, store_str, source_str, &[]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    let deliver = |payload: &str| -> Value {
+        run_json(
+            bin,
+            &[
+                "--store",
+                store_str,
+                "--json",
+                "signal",
+                &instance,
+                "--name",
+                "deploy.finished",
+                "--data",
+                payload,
+                "--program",
+                source_str,
+                "--delivery-id",
+                "provider-evt-42",
+            ],
+        )
+    };
+
+    let first = deliver(r#"{"service":"api","status":"ok"}"#);
+    assert!(first.get("event_id").and_then(Value::as_str).is_some());
+    assert_eq!(first.get("duplicate"), None, "{first}");
+
+    // Same delivery id, DIFFERENT payload bytes: the delivery id wins over the
+    // derived payload hash, so this is the same delivery — absorbed once.
+    let second = deliver(r#"{"service":"api","status":"retried"}"#);
+    assert_eq!(second.get("duplicate").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        second.get("event_id").and_then(Value::as_str),
+        first.get("event_id").and_then(Value::as_str),
+        "the duplicate names the original admission: {second}"
+    );
+
+    // Exactly one durable signal fact landed.
+    let facts = run_json(bin, &["--store", store_str, "--json", "facts", &instance]);
+    let admitted = facts
+        .as_array()
+        .expect("facts array")
+        .iter()
+        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("deploy.finished"))
+        .count();
+    assert_eq!(admitted, 1, "same delivery id twice admits once: {facts}");
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
 const FAMILY_B_SIGNAL_SOURCE: &str = r#"
 workflow FamilyBSignal
 
@@ -5656,10 +5726,11 @@ fn ifc_governance_agent_loop_drafts_and_signs() {
     let _ = fs::remove_file(&out);
 }
 
-/// End-to-end whip agent loop (DR-0026/0028): the unprivileged whip agent can
+/// End-to-end whip infoflow loop (DR-0026/0028; renamed from `whip agent`,
+/// spec/std-agent.md "Operator CLI"): the unprivileged whip agent can
 /// `check` a whip but is refused if it tries to `sign` governance.
 #[test]
-fn ifc_whip_agent_loop_checks_and_refuses_to_sign() {
+fn ifc_whip_infoflow_loop_checks_and_refuses_to_sign() {
     use std::io::Write;
     let bin = env!("CARGO_BIN_EXE_whip");
     let whip = temp_path("whip-agent-whip", "whip");
@@ -5668,7 +5739,7 @@ fn ifc_whip_agent_loop_checks_and_refuses_to_sign() {
     let script = format!("check {whip_arg}\nsign anything\nquit\n");
 
     let mut child = Command::new(bin)
-        .args(["agent"])
+        .args(["infoflow"])
         .env_remove("WHIPPLESCRIPT_IFC_ENVELOPE")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -5681,7 +5752,7 @@ fn ifc_whip_agent_loop_checks_and_refuses_to_sign() {
         .write_all(script.as_bytes())
         .expect("write script");
     let output = child.wait_with_output().expect("wait");
-    assert!(output.status.success(), "whip agent loop should succeed");
+    assert!(output.status.success(), "whip infoflow loop should succeed");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("no information-flow violations"),
@@ -5689,8 +5760,26 @@ fn ifc_whip_agent_loop_checks_and_refuses_to_sign() {
     );
     assert!(
         stdout.contains("cannot sign governance"),
-        "whip agent must refuse to sign: {stdout}"
+        "whip infoflow must refuse to sign: {stdout}"
     );
 
     let _ = fs::remove_file(&whip);
+}
+
+/// `whip agent` is a one-way rename to `whip infoflow` (spec/std-agent.md
+/// "Operator CLI"): no alias — the old name errors with a pointer, freeing the
+/// `whip agent` namespace for std.agent.
+#[test]
+fn whip_agent_errors_with_infoflow_pointer() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let output = Command::new(bin).args(["agent"]).output().expect("run");
+    assert!(
+        !output.status.success(),
+        "`whip agent` must fail after the infoflow rename"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("whip infoflow"),
+        "`whip agent` must point at `whip infoflow`: {stderr}"
+    );
 }

@@ -284,6 +284,13 @@ concurrent turns and backs `is available` readiness. `capabilities` limits
 what the agent may be asked to do; `skills` attaches context bundles to its
 turns.
 
+`requires [<feature.class>, …]` declares portable feature requirements from
+the DR-0015 taxonomy (e.g. `requires [turn.cancel]`). A class outside the
+taxonomy is a compile error; at check time each required class is validated
+against the selected provider's published feature report — a class the report
+cannot truthfully state as supported (`native`/`emulated`) fails the check
+(spec/std-agent.md).
+
 `settings` (delegated harnesses, DR-0034) selects which of the delegate's own
 ambient-config sources it may read when assembling its context: `project`,
 `user`, or `none`. Unset means the provider's own default. Ambient config
@@ -579,6 +586,25 @@ source file as feed {
 }
 ```
 
+A `file` source can instead declare `watch "<glob>"` (exactly one of
+`path`/`watch`): occurrence mode admits one signal per new
+(path, content-hash) occurrence of a matched file — a dropped file admits
+once, an unchanged file never re-admits, a content change re-admits. Its
+observation record binds `{ path, content_hash, watch }` (content *reading*
+stays with the `std.files` effects). The v1 glob is a literal directory plus
+one `*`-wildcarded file name (no `**`).
+
+```whip
+source file as drops {
+  watch "./drops/*.json"
+  observe as obs
+  emit drop.arrived {
+    path obs.path
+    digest obs.content_hash
+  }
+}
+```
+
 An `http` source GETs a URL that returns a JSON array; its observation record
 binds `{ item, item_index, url }` (where `item` is the JSON element
 re-stringified):
@@ -592,6 +618,15 @@ source http as feed {
   }
 }
 ```
+
+`file` (line mode) and `http` sources accept an optional
+`dedup <observe>.<field>` clause naming the observation field that carries the
+provider's delivery identity: the admission key derives from that field
+instead of the positional ordinal, so a re-ordered or head-inserted feed still
+admits each delivery exactly once (e.g. `dedup obs.item` dedups an `http` feed
+by element content). The named field must exist on the provider's observation
+record — `whip check` rejects an unknown one. A `watch` source is already
+content-keyed and takes no `dedup`.
 
 `http` fetches are GET-only and pass through an SSRF/egress policy: only
 `http`/`https` URLs are accepted, and private and loopback addresses are always
@@ -1733,8 +1768,13 @@ harness reviewer: claude
 agent worker using coder { ... }
 ```
 
-Supported harness kinds: `codex`, `claude`, `fixture`,
-`native-fixture`, `command`. Reach for this only when a plain `provider`
+Provider/harness kinds are registry-derived (spec/std-agent.md "Open provider
+registry"): the known set is contributed by package manifests — the embedded
+`std.agent` package contributes `owned`, `fixture`, `native-fixture`, and
+`command`; `std.agent.codex` and `std.agent.claude` contribute `codex` and
+`claude` when their adapter features are compiled in; locked third-party
+packages may contribute more. An unknown kind is a check error naming the
+missing package. Reach for named harnesses only when a plain `provider`
 binding genuinely cannot express the endpoint topology you need.
 
 ## Typed data and coordination
@@ -1820,7 +1860,14 @@ There is no `now` in guards — the clock is read only at the worker boundary.
 external ingress. React with the bare form `when deploy.finished as d`
 (typed, no `@external` needed). Inject from outside with `whip signal
 <instance> --name deploy.finished --data '{"service":"api","status":"ok"}'
---program <workflow.whip>` — the payload is validated at the boundary. Inject
+--program <workflow.whip>` — the payload is validated at the boundary. An
+optional `--delivery-id <id>` makes the delivery idempotent by the
+provider/operator id (it wins over the derived payload hash): the same id
+twice admits once, across process runs, with the duplicate absorbed and
+reported. For piped/scripted ingestion, `whip ingress serve --stdio --program
+<workflow.whip>` reads JSONL envelopes `{"instance", "signal", "payload",
+"delivery_id"?}` from stdin through the same admission door, one JSON result
+line per envelope. Inject
 from inside another workflow with the signal injection effect:
 
 ```whip

@@ -326,8 +326,11 @@ boundary:
   drives.
 - **std.ingress owns:** the admission drivers — the `whip signal` operator
   door, signal declarations, source-provider capability reports, and every
-  non-clock provider kind (http/stdio/file/…) — none of which run today
-  (cli/main.rs:20831 skips every non-clock source).
+  non-clock provider kind (http/stdio/file/…). (Status 2026-07-15: the
+  file/http worker-pass pollers and the `whip ingress serve --stdio` driver
+  all run through the shared admission core,
+  kernel/src/ingress_pass.rs; the earlier "cli/main.rs:20831 skips every
+  non-clock source" state is gone.)
 - **Core owns:** the source-resolving worker pass and the admission core
   (schema validation, the at-most-once dedup index, the H8 signal-integrity
   gate, fact derivation) — lifecycle invariants per the ecosystem shape's
@@ -358,7 +361,12 @@ by the same pipeline as third-party manifests, catalog-privileged:
   (the shared source-family owner) registers as an S6 obligation; std.time
   contributes only the `clock_source` data, not that mechanism.
 - **capabilities:** none (no effect operations — see "Surface").
-- **providers:** `std.time.clock` (source provider kind `clock`).
+- **providers:** `std.time.clock` (source provider kind `clock`). (Status
+  2026-07-15: the shipped `std/manifests/time.json` carries this as an
+  operator-plane provider row `{"id": "clock", "provider_kind": "clock",
+  "plane": "operator"}` — added with std.ingress slice I2b so the
+  provider-kind-known hard check derives its ENTIRE known-kind set from
+  manifest data; the construct row above remains unshipped.)
 - **profiles:** none.
 
 Import bite: advisory missing-import lint in v1 (a program declaring a clock

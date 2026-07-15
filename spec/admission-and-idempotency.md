@@ -40,9 +40,11 @@ value. (`validation: "runtime"` in a package manifest is an input alias for
 ## Admission Identity (Idempotency Key)
 
 Every admitted fact carries an idempotency key derived deterministically from its
-source. The store enforces a unique index on `(instance_id, fact_identity_key)`
-inside the admission transaction, so a re-delivered or retried admission appends
-at most once.
+source. The store enforces a unique index on `events(instance_id,
+idempotency_key)` (migrations/0001) inside the admission transaction, so a
+re-delivered or retried admission appends at most once. (Amended 2026-07-15
+per spec/std-ingress.md "Spec amendments" 2: this previously read
+"(instance_id, fact_identity_key)" — same mechanism, wrong name.)
 
 ```text
 source                         idempotency key

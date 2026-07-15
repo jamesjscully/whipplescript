@@ -38,7 +38,12 @@ claude = ["whipplescript-kernel/claude"]
 [dev-dependencies]
 # Enables the private legacy-envelope fixture constructor only while compiling
 # this crate's tests; normal library/binary builds do not expose it.
-whipplescript-kernel = { version = "0.4.0", path = "../whipplescript-kernel", features = ["test-support"] }
+# `default-features = false` keeps the kernel's codex/claude adapter features
+# under THIS crate's feature forwarding in test builds too (std.agent slice 7
+# build matrix: a `--no-default-features` whip test target must agree with the
+# binary about which provider kinds exist); `native` is re-enabled explicitly
+# to match the regular dependency.
+whipplescript-kernel = { version = "0.4.0", path = "../whipplescript-kernel", default-features = false, features = ["test-support", "native"] }
 
 [[bin]]
 name = "whip"

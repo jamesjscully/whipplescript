@@ -92,24 +92,27 @@ pub fn build_claude_agent_tool_policy(
             "Claude Agent SDK runs require a WhippleScript profile",
         ));
     };
-    let mut allowed_tools = match profile {
-        "repo-reader" => strings(&["Read", "Glob", "Grep"]),
-        "repo-writer" => strings(&["Read", "Glob", "Grep", "Edit", "Write"]),
-        "human-review" => strings(&["AskUserQuestion"]),
-        other => {
-            return Err(policy_error(
-                "unsupported_profile",
-                format!("profile `{other}` is not mapped to a Claude tool policy"),
-            ));
-        }
+    // The translation is COMPUTED from the std.agent profile table
+    // (kernel/agent_profile.rs; spec/std-agent.md slice 4): the preset row
+    // carries the base Claude tool set and the capability grants the preset
+    // can truthfully expand to. A preset without a Claude translation — or a
+    // name that is no preset at all — fails closed.
+    let preset = crate::agent_profile::agent_profile_preset(profile);
+    let base_tools = preset.and_then(|preset| preset.claude_allowed_tools);
+    let (Some(preset), Some(base_tools)) = (preset, base_tools) else {
+        return Err(policy_error(
+            "unsupported_profile",
+            format!("profile `{profile}` is not mapped to a Claude tool policy"),
+        ));
     };
+    let mut allowed_tools = strings(base_tools);
     let mut needs_approval = false;
     for capability in required_capabilities {
         match capability.as_str() {
             "repo.read" | "agent.tell" => {}
             "human.ask" => insert_unique(&mut allowed_tools, "AskUserQuestion"),
             "repo.write" => {
-                if profile != "repo-writer" {
+                if !preset.grants_capability("repo.write") {
                     return Err(policy_error(
                         "profile_denied",
                         format!("profile `{profile}` cannot grant capability `repo.write`"),
@@ -121,7 +124,7 @@ pub fn build_claude_agent_tool_policy(
                 insert_unique(&mut allowed_tools, "Write");
             }
             "command.run" => {
-                if profile != "repo-writer" {
+                if !preset.grants_capability("command.run") {
                     return Err(policy_error(
                         "profile_denied",
                         format!("profile `{profile}` cannot grant capability `command.run`"),

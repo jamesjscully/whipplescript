@@ -465,6 +465,15 @@ impl RuntimeStore for NativeStores {
         self.runtime.list_events(instance_id)
     }
 
+    fn event_by_idempotency_key(
+        &self,
+        instance_id: &str,
+        idempotency_key: &str,
+    ) -> StoreResult<Option<StoredEvent>> {
+        self.runtime
+            .event_by_idempotency_key(instance_id, idempotency_key)
+    }
+
     fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
         self.runtime.list_facts(instance_id)
     }

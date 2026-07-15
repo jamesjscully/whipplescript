@@ -333,6 +333,49 @@ report schema — no premature shared framework.
    on/off; kind resolution flips accordingly; Claude report states
    `turn.cancel: unknown` per DR-0017 (report half of slice 2).
 
+## Shipped shape notes (2026-07-15, slices 1 and 3-7 built; slice 2 shipped earlier)
+
+Deviations the build recorded against the closed manifest schema and shipped
+mechanisms — the design's intent holds, the carrier shapes differ:
+
+1. **No `agent.tell` contract mirror in the manifest.** The closed manifest
+   shape requires every effect contract's `id` to be a declared capability
+   (the M3 id==kind pattern is structural in
+   `validate_package_manifest_consistency`), which the grandfathered
+   `agent.turn` capability id cannot satisfy without minting a decorative
+   `agent.tell` capability row. The parser-compiled contract remains the
+   single authority (the std.time precedent); the manifest carries library
+   identity, the `agent.turn` capability row, providers, and profiles.
+2. **Provider kinds ride OPERATOR-PLANE rows.** Agent provider kinds are
+   contributed by `"plane": "operator"` provider rows carrying
+   `"agent_provider": true` in their config (with the compiled feature report
+   under `config.feature_report`). Operator rows are skipped by both the
+   admission-plane reader and store seeding, so a kind contribution is
+   visibility data by construction (X3) — and third-party manifests can
+   contribute kinds with zero capability declarations. Registry reader:
+   cli `known_agent_provider_kinds`.
+3. **Profile rows are audit-mode.** The manifest `profiles` section mirrors
+   the compiled preset table (kernel/agent_profile.rs) row for row, but ships
+   `enforcement_mode: "audit"` with empty `allowed_capabilities`: profile
+   rows DO seed the store's registered-profile-policy leg, and an
+   enforce-mode row would intersect (and with `[]`, kill) the preset
+   expansion. Enforcement flows through the compiled preset leg; the manifest
+   rows are the package-data home, drift-tested
+   (`agent_manifest_reports_and_profiles_match_compiled_data`).
+4. **The package-to-package dependency edge is behavioral, not declared.**
+   The manifest v0 closed shape has no dependency field, so
+   `std.agent.codex`/`.claude` cannot literally state "depends on std.agent";
+   the edge ships as prose in the provider-row description plus the
+   feature-conditional embedding discipline. A declared `depends` field is a
+   manifest-schema question for the ecosystem shape, not this package.
+5. **`permissive` shipped as the non-canonical row** (Open naming-boundary
+   question 1's recommendation, adopted provisionally): operator/dev-only,
+   `canonical: false`, never part of the pinned 7 — Jack can strike or keep
+   the row with a one-line table edit.
+6. **`requires` snapshot posture:** the `.ir` agent line carries
+   `requires=[...]` only when declared, so no existing golden moved
+   (`scripts/regen-ir-goldens.sh --check` green with zero churn).
+
 ## Deferred with cause
 
 - **Skills wiring.** Declared skills parse and persist but dispatch sends

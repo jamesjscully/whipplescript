@@ -142,6 +142,36 @@ pub const CONSTRUCT_GRAMMAR_CLAUSE_KINDS: &[&str] = &[
 pub const CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES: &[&str] =
     &["from", "for", "into", "to", "via", "by"];
 
+/// The DR-0015 agent feature-class taxonomy, verbatim (spec/std-agent.md
+/// "Capability reports"). Shared vocabulary: the parser checks
+/// `requires [<feature.class>]` membership against it (slice 6), and the
+/// kernel's compiled provider feature reports may only state these classes
+/// (slice 5) — one list, no drift.
+pub const AGENT_FEATURE_CLASS_TAXONOMY: &[&str] = &[
+    "context.compact",
+    "context.auto_compact",
+    "session.resume",
+    "session.fork",
+    "session.clone",
+    "session.export",
+    "turn.cancel",
+    "turn.steer",
+    "turn.follow_up",
+    "subagent.spawn",
+    "subagent.observe",
+    "subagent.steer",
+    "skill.attach",
+    "plugin.load",
+    "hook.lifecycle",
+    "native.command.dispatch",
+    "permission.policy",
+    "model.select",
+    "reasoning.select",
+    "goal.track",
+    "command.list",
+    "feature.report",
+];
+
 impl ConstructGrammar {
     /// Derive the flat `fields[]` view downstream consumers read.
     ///
@@ -821,6 +851,32 @@ pub const PLATFORM_CONSTRUCT_CATALOG: PlatformConstructCatalog = PlatformConstru
             construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION,
             scope: CONSTRUCT_SCOPE_RULE_BODY,
             lowering_target: CONSTRUCT_LOWERING_RESOURCE_EFFECT,
+        },
+        // std.ingress rows (spec/std-ingress.md "Catalog privilege additions"):
+        // `signal` and `emit` are reserved keywords, so the embedded std.ingress
+        // manifest's construct rows need exact privilege tuples to clear
+        // `reserved_keyword_privilege_error`. The `emit` tuple's lowering target
+        // (`signal_emit`) is a non-authorable class, so — like the std.coord
+        // `resource_effect` tuples above — it also opens the authorability door
+        // for exactly this tuple. `source` is not reserved and needs no tuple;
+        // its non-authorable `signal_source` lowering is admitted through the
+        // embedded-copy leg (`manifest_is_embedded_copy`). NOTE: the design
+        // sketch named lowering `metadata` for `signal`, but `metadata` is not
+        // compatible with `declaration_block` — the shipped decl-block lowering
+        // is `metadata_only` (the std.tracker/std.coord precedent).
+        PlatformReservedKeywordPrivilege {
+            keyword: "signal",
+            library_id: "std.ingress",
+            construct_family: CONSTRUCT_FAMILY_DECLARATION_BLOCK,
+            scope: "top_level",
+            lowering_target: CONSTRUCT_LOWERING_METADATA_ONLY,
+        },
+        PlatformReservedKeywordPrivilege {
+            keyword: "emit",
+            library_id: "std.ingress",
+            construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION,
+            scope: CONSTRUCT_SCOPE_RULE_BODY,
+            lowering_target: CONSTRUCT_LOWERING_SIGNAL_EMIT,
         },
     ],
 };

@@ -39,6 +39,15 @@ deployment environment concept.
 
 ## What Is Standardized
 
+Amendment 2026-07-15 (spec/std-agent.md, slice 5 shipped): v1 ships the
+MINIMAL report — schema `whipplescript.agent_feature_report.v0`, the
+feature-class taxonomy below verbatim, each entry carrying
+`class`/`support`/`source` plus `native_name` + `dispatch` when support is
+stated. The full per-entry field list below (versions, headless flags, event
+mappings, …) moves to the probed-report re-entry and is NOT required of v1
+manifests. The taxonomy's single compiled source is
+`whipplescript_core::AGENT_FEATURE_CLASS_TAXONOMY`.
+
 `std.agent` should standardize these contract fields:
 
 ```text

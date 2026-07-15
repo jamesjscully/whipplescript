@@ -10,5 +10,18 @@
       "standard": true
     }
   ],
-  "capabilities": []
+  "capabilities": [],
+  "providers": [
+    {
+      "id": "clock",
+      "provider_kind": "clock",
+      "plane": "operator",
+      "config": {
+        "transport": "worker-pass clock (kernel time_pass); admits one signal per due recurrence occurrence, missed-policy applied",
+        "dedup_source": "occurrence id H(source, scheduled_instant)",
+        "correlation": "running instances of the declaring program",
+        "can_start_instances": false
+      }
+    }
+  ]
 }

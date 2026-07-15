@@ -367,13 +367,15 @@ pub fn build_codex_app_server_policy(
         }
     }
 
-    match profile {
-        "repo-reader" => {}
-        "repo-writer" => {}
-        other => {
+    // Table-driven (kernel/agent_profile.rs; spec/std-agent.md slice 4): a
+    // preset maps to Codex only when its row says so; unknown names and
+    // unmapped presets fail closed.
+    match crate::agent_profile::agent_profile_preset(profile) {
+        Some(preset) if preset.codex_mapped => {}
+        _ => {
             return Err(codex_policy_error(
                 "profile_denied",
-                format!("profile `{other}` is not mapped to a Codex policy"),
+                format!("profile `{profile}` is not mapped to a Codex policy"),
             ));
         }
     }
@@ -405,7 +407,11 @@ fn require_codex_writer(
     workspace_policy: &str,
     capability: &str,
 ) -> Result<(), CodexAppServerPolicyError> {
-    if profile != "repo-writer" {
+    // A destructive capability is granted only when the preset's table row
+    // carries it (spec/std-agent.md slice 4) — not by a hard-matched name.
+    let grants = crate::agent_profile::agent_profile_preset(profile)
+        .is_some_and(|preset| preset.codex_mapped && preset.grants_capability(capability));
+    if !grants {
         return Err(codex_policy_error(
             "profile_denied",
             format!("profile `{profile}` cannot use Codex capability `{capability}`"),

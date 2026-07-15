@@ -3522,16 +3522,18 @@ fn do_policy_block<Sql: DoSql>(
     //
     // INTENTIONAL DIVERGENCE from the native mirror (store/lib.rs
     // `policy_block_on`, std.coord slice 4 + std.files slice F2 + std.tracker
-    // slice T4): the native gate dropped its coordination, file, and tracker
-    // exemptions because the embedded std.coord / std.files / std.tracker
-    // manifests seed capability/provider/binding rows at store init. The DO
-    // bootstrap seeds only coerce rows (do_instance.rs / do_worker.rs) and M7
-    // defers DO manifest registration to the DO tracker, so removing the
-    // `lease.`/`ledger.`/`counter.`/`file.`/`tracker.` lines HERE would turn
-    // every in-DO coordination, file, or tracker effect into
-    // blocked_by_capability. These exemptions stay until the DO tracker's
-    // package-registration row lands (spec/std-coord.md / spec/std-files.md /
-    // spec/std-tracker.md "Deferred with cause").
+    // slice T4; std.ingress slice I2b): the native gate dropped its
+    // coordination, file, tracker, and signal.emit exemptions because the
+    // embedded std.coord / std.files / std.tracker / std.ingress manifests
+    // seed capability/provider/binding rows at store init. The DO bootstrap
+    // seeds only coerce rows (do_instance.rs / do_worker.rs) and M7 defers DO
+    // manifest registration to the DO tracker, so removing the
+    // `lease.`/`ledger.`/`counter.`/`file.`/`tracker.`/`signal.emit` lines
+    // HERE would turn every in-DO coordination, file, tracker, or peer-signal
+    // effect into blocked_by_capability. These exemptions stay until the DO
+    // tracker's package-registration row lands (spec/std-coord.md /
+    // spec/std-files.md / spec/std-tracker.md / spec/std-ingress.md
+    // "Deferred with cause").
     if effect.kind == "timer.wait"
         || effect.kind.starts_with("tracker.")
         || effect.kind.starts_with("lease.")
@@ -6083,6 +6085,25 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             )
             .map_err(sql_err)?;
         Ok(rows.iter().map(|r| event_view_from_row(r)).collect())
+    }
+
+    fn event_by_idempotency_key(
+        &self,
+        instance_id: &str,
+        idempotency_key: &str,
+    ) -> StoreResult<Option<StoredEvent>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT event_id, sequence FROM events \
+                 WHERE instance_id = ?1 AND idempotency_key = ?2",
+                &[text(instance_id), text(idempotency_key)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| StoredEvent {
+            event_id: as_text(&row[0]),
+            sequence: as_i64(&row[1]),
+        }))
     }
 
     fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {

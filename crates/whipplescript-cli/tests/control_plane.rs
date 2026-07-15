@@ -953,6 +953,316 @@ rule record_item
     let _ = fs::remove_file(dead_source);
 }
 
+/// A `file` ingress source in `watch` mode (spec/std-ingress.md I2a/I3):
+/// `watch "<glob>"` admits one durable signal fact per new (path,
+/// content-hash) occurrence through the shared admission core — a dropped
+/// file admits once, an unchanged file never re-admits on a later worker
+/// pass, and a content change re-admits (a new occurrence of the same path).
+#[test]
+fn dev_file_watch_source_admits_per_content_occurrence() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let root = unique_temp_dir("file-watch-root");
+    fs::write(root.join("a.json"), r#"{"n":1}"#).expect("seed drop");
+    let source_path = temp_workflow_path("file-watch-source");
+    fs::write(
+        &source_path,
+        format!(
+            r#"
+@service
+workflow IngressWatchSource
+
+signal drop.arrived {{
+  path string
+  digest string
+}}
+
+class DropSeen {{
+  path string
+  digest string
+}}
+
+source file as drops {{
+  watch "{}/*.json"
+
+  observe as obs
+  emit drop.arrived {{
+    path obs.path
+    digest obs.content_hash
+  }}
+}}
+
+rule record_drop
+  when drop.arrived as f
+=> {{
+  record DropSeen {{
+    path f.path
+    digest f.digest
+  }}
+}}
+"#,
+            root.display()
+        ),
+    )
+    .expect("write source");
+
+    let store = store_path.to_str().expect("utf-8 store path");
+    let program = source_path.to_str().expect("utf-8 source path");
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            program,
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    let drop_facts = |instance: &str| -> Vec<(String, String)> {
+        let facts = run_json(bin, &["--store", store, "--json", "facts", instance]);
+        facts
+            .as_array()
+            .expect("facts array")
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("drop.arrived"))
+            .map(|fact| {
+                (
+                    fact.pointer("/value/path")
+                        .and_then(Value::as_str)
+                        .expect("occurrence carries the path")
+                        .to_owned(),
+                    fact.pointer("/value/digest")
+                        .and_then(Value::as_str)
+                        .expect("occurrence carries the content hash")
+                        .to_owned(),
+                )
+            })
+            .collect()
+    };
+
+    let first = drop_facts(&instance_id);
+    assert_eq!(first.len(), 1, "the dropped file admits once: {first:?}");
+    assert!(first[0].0.ends_with("a.json"), "{first:?}");
+
+    // Unchanged content: a later worker pass re-admits nothing.
+    let worker = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "worker",
+            &instance_id,
+            "--program",
+            program,
+            "--provider",
+            "fixture",
+        ],
+    );
+    assert_eq!(
+        worker.get("file_lines_admitted").and_then(Value::as_u64),
+        Some(0),
+        "an unchanged watched file never re-admits: {worker}"
+    );
+    assert_eq!(drop_facts(&instance_id).len(), 1);
+
+    // A content change is a NEW (path, content-hash) occurrence: it re-admits.
+    fs::write(root.join("a.json"), r#"{"n":2}"#).expect("change drop");
+    let worker = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "worker",
+            &instance_id,
+            "--program",
+            program,
+            "--provider",
+            "fixture",
+        ],
+    );
+    assert_eq!(
+        worker.get("file_lines_admitted").and_then(Value::as_u64),
+        Some(1),
+        "a content change re-admits one occurrence: {worker}"
+    );
+    let after_change = drop_facts(&instance_id);
+    assert_eq!(after_change.len(), 2, "{after_change:?}");
+    assert_ne!(
+        after_change[0].1, after_change[1].1,
+        "the two occurrences carry distinct content hashes"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// `whip ingress serve --stdio` (spec/std-ingress.md I3, the std.ingress.stdio
+/// driver): JSONL envelopes from stdin go through the SAME admission core as
+/// `whip signal` — a valid envelope admits a durable signal fact the reacting
+/// rule fires on, a re-delivered `delivery_id` is absorbed exactly once (an
+/// observable `duplicate` result), and a malformed line is rejected before any
+/// fact.
+#[test]
+fn ingress_serve_stdio_admits_absorbs_duplicates_and_rejects_malformed() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("ingress-stdio");
+    fs::write(
+        &source_path,
+        r#"
+@service
+workflow IngressStdio
+
+signal deploy.finished {
+  service string
+  status string
+}
+
+class DeploySeen {
+  service string
+}
+
+rule record_deploy
+  when deploy.finished as f
+=> {
+  record DeploySeen {
+    service f.service
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store = store_path.to_str().expect("utf-8 store path");
+    let program = source_path.to_str().expect("utf-8 source path");
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "dev",
+            program,
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // Four envelopes: valid, exact duplicate delivery id, malformed JSON,
+    // undeclared signal. Exactly one admission may result.
+    let envelopes = format!(
+        "{}\n{}\nnot json at all\n{}\n",
+        json!({"instance": instance_id, "signal": "deploy.finished", "payload": {"service": "api", "status": "ok"}, "delivery_id": "dl-1"}),
+        json!({"instance": instance_id, "signal": "deploy.finished", "payload": {"service": "api", "status": "ok"}, "delivery_id": "dl-1"}),
+        json!({"instance": instance_id, "signal": "deploy.unknown", "payload": {}}),
+    );
+    let mut serve = Command::new(bin)
+        .args([
+            "--store",
+            store,
+            "ingress",
+            "serve",
+            "--stdio",
+            "--program",
+            program,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ingress serve spawns");
+    serve
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(envelopes.as_bytes())
+        .expect("write envelopes");
+    let output = serve.wait_with_output().expect("serve completes");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let results: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("result line is JSON"))
+        .collect();
+    let statuses: Vec<&str> = results
+        .iter()
+        .map(|result| {
+            result
+                .get("status")
+                .and_then(Value::as_str)
+                .expect("status")
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        vec!["admitted", "duplicate", "rejected", "rejected"],
+        "{results:?}"
+    );
+    assert!(
+        results[2]
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason.contains("invalid JSON envelope")),
+        "{results:?}"
+    );
+    assert!(
+        results[3]
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason.contains("not declared")),
+        "{results:?}"
+    );
+
+    // The one admitted signal fires the reacting rule on the next pass; the
+    // duplicate and the rejected lines left no facts behind.
+    run_text(
+        bin,
+        &["--store", store, "step", &instance_id, "--program", program],
+    );
+    let facts = run_json(bin, &["--store", store, "--json", "facts", &instance_id]);
+    let count = |name: &str| -> usize {
+        facts
+            .as_array()
+            .expect("facts array")
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some(name))
+            .count()
+    };
+    assert_eq!(
+        count("deploy.finished"),
+        1,
+        "one admission across the duplicate delivery: {facts}"
+    );
+    assert_eq!(count("DeploySeen"), 1, "the valid line fired the rule");
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
 /// std.files `write` (spec/std-library/files.md): `write text to <store> at
 /// <path> { body <expr> mode <mode> }` renders a body to disk through the real
 /// worker, settling `file.write.completed`. The mode is enforced ("no silent
@@ -10070,6 +10380,367 @@ rule work_ready_item
     );
     assert!(
         !codes(&with).contains(&"lint.missing_tracker_import".to_owned()),
+        "the import silences the advisory"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lint_advises_std_ingress_import_for_signal_programs() {
+    // spec/std-ingress.md "Static checks" #2, M5 graduated ladder: the
+    // provider-kind-known check is HARD, but the `use std.ingress` import
+    // line itself is an ADVISORY missing-import lint only — signal
+    // declarations / external sources without the import warn (exit 0), and
+    // the same program with the import is clean.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("lint-ingress-import");
+    fs::create_dir_all(&dir).expect("create dir");
+    let program = |import: &str| {
+        format!(
+            r#"{import}@service
+workflow IngressImport
+
+signal deploy.finished {{
+  service string
+}}
+
+class Seen {{
+  service string
+}}
+
+rule react
+  when deploy.finished as f
+=> {{
+  record Seen {{
+    service f.service
+  }}
+}}
+"#
+        )
+    };
+    let without = dir.join("without-import.whip");
+    let with = dir.join("with-import.whip");
+    fs::write(&without, program("")).expect("write workflow");
+    fs::write(&with, program("use std.ingress\n\n")).expect("write workflow");
+    let codes = |path: &Path| -> Vec<String> {
+        let output = Command::new(bin)
+            .args(["--json", "lint", path.to_str().expect("present")])
+            .output()
+            .expect("whip lint runs");
+        assert!(output.status.success(), "advisory lint must exit 0");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint report JSON");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f.get("code").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert!(
+        codes(&without).contains(&"lint.missing_ingress_import".to_owned()),
+        "signal declarations without `use std.ingress` fire the advisory"
+    );
+    assert!(
+        !codes(&with).contains(&"lint.missing_ingress_import".to_owned()),
+        "the import silences the advisory"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Provider-kind-known HARD check (spec/std-ingress.md "Static checks" #2):
+/// a `source <kind> as …` header whose kind no embedded/locked manifest
+/// contributes is a `whip check` error naming the known kinds; the shipped
+/// kinds (clock via std.time, cli/stdio/file/http via std.ingress) stay
+/// green. Before embedded manifests, any bare ident was silently accepted
+/// and the source never resolved.
+#[test]
+fn check_rejects_unknown_source_provider_kind() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("source-kind-known");
+    fs::create_dir_all(&dir).expect("create dir");
+    let program = |kind: &str, clause: &str| {
+        format!(
+            r#"@service
+workflow SourceKind
+
+signal ingress.fed {{
+  text string
+}}
+
+class Seen {{
+  text string
+}}
+
+source {kind} as feed {{
+{clause}
+  observe as obs
+  emit ingress.fed {{
+    text "fixed"
+  }}
+}}
+
+rule react
+  when ingress.fed as f
+=> {{
+  record Seen {{
+    text f.text
+  }}
+}}
+"#
+        )
+    };
+    let unknown = dir.join("unknown-kind.whip");
+    fs::write(&unknown, program("webhook", "")).expect("write workflow");
+    let output = Command::new(bin)
+        .args(["check", unknown.to_str().expect("utf-8")])
+        .output()
+        .expect("whip check runs");
+    assert!(
+        !output.status.success(),
+        "an unknown source provider kind must fail `whip check`"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown provider kind `webhook`") && stderr.contains("known source kinds"),
+        "stderr: {stderr}"
+    );
+
+    let known = dir.join("known-kind.whip");
+    fs::write(&known, program("file", "  path \"./inbox.txt\"\n")).expect("write workflow");
+    let output = Command::new(bin)
+        .args(["check", known.to_str().expect("utf-8")])
+        .output()
+        .expect("whip check runs");
+    assert!(
+        output.status.success(),
+        "a manifest-contributed kind checks clean: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// One agent workflow body, parameterized on the provider kind and leading
+/// imports (spec/std-agent.md "Open provider registry" tests).
+fn agent_provider_workflow(imports: &str, kind: &str) -> String {
+    format!(
+        r#"workflow ProviderRegistry
+
+{imports}output result Done
+
+class Done {{
+  agent string
+}}
+
+agent helper {{
+  provider {kind}
+  profile "repo-reader"
+  capacity 1
+}}
+
+rule start
+  when started
+=> {{
+  tell helper "hi"
+}}
+
+rule done
+  when helper completed turn as turn
+=> {{
+  complete result {{
+    agent turn.agent
+  }}
+}}
+"#
+    )
+}
+
+/// Open provider registry (spec/std-agent.md slice 3): agent provider kinds
+/// are registry-derived, not compiled in. A kind contributed by an embedded
+/// std manifest validates; a kind contributed by NO known manifest is a check
+/// error naming a missing package; a fixture third-party manifest contributing
+/// the kind via the package lock makes the same workflow validate.
+#[test]
+fn agent_provider_kinds_are_registry_derived() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("agent-provider-registry");
+    fs::create_dir_all(&dir).expect("create temp dir");
+
+    // Embedded contribution: `fixture` comes from std.agent's manifest rows.
+    let known = dir.join("known.whip");
+    fs::write(&known, agent_provider_workflow("", "fixture")).expect("write workflow");
+    let output = Command::new(bin)
+        .args(["check", known.to_str().expect("utf-8")])
+        .output()
+        .expect("check runs");
+    assert!(
+        output.status.success(),
+        "embedded std.agent must contribute `fixture`\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Unknown kind: contributed by no known manifest — error naming a missing
+    // package.
+    let unknown = dir.join("unknown.whip");
+    fs::write(&unknown, agent_provider_workflow("", "robo")).expect("write workflow");
+    let output = Command::new(bin)
+        .args(["check", unknown.to_str().expect("utf-8")])
+        .output()
+        .expect("check runs");
+    assert!(
+        !output.status.success(),
+        "an unknown provider kind must fail check"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown provider kind `robo`") && stderr.contains("missing package"),
+        "the error names the unknown kind and the missing package: {stderr}"
+    );
+
+    // Fixture third-party contribution: a locked manifest's operator-plane
+    // `"agent_provider": true` row makes the SAME workflow validate.
+    let manifest = dir.join("robo.json");
+    fs::write(
+        &manifest,
+        r#"{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "acme.robo",
+  "name": "robopkg",
+  "version": "0.1.0",
+  "libraries": [{"id": "robopkg", "version": "0.1.0"}],
+  "capabilities": [],
+  "providers": [
+    {"id": "robo", "provider_kind": "robo", "plane": "operator",
+     "config": {"agent_provider": true}}
+  ]
+}"#,
+    )
+    .expect("write manifest");
+    let lock = dir.join("whip.lock");
+    run_text(
+        bin,
+        &[
+            "package",
+            "lock",
+            "--output",
+            lock.to_str().expect("utf-8 lock"),
+            manifest.to_str().expect("utf-8 manifest"),
+        ],
+    );
+    let output = Command::new(bin)
+        .args([
+            "check",
+            "--package-lock",
+            lock.to_str().expect("utf-8 lock"),
+            unknown.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("check runs");
+    assert!(
+        output.status.success(),
+        "a locked manifest contributing `robo` must validate the workflow\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `requires [<feature.class>]` vs the provider's feature report
+/// (spec/std-agent.md slice 6): a class the selected provider's report cannot
+/// state as supported is a check ERROR; the owned harness's all-native report
+/// satisfies any taxonomy class.
+#[test]
+fn agent_requires_validates_against_provider_feature_report() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("agent-requires-report");
+    fs::create_dir_all(&dir).expect("create temp dir");
+
+    // fixture's deterministic report states session.resume unsupported.
+    let unsupported = dir.join("unsupported.whip");
+    fs::write(
+        &unsupported,
+        agent_provider_workflow("", "fixture").replace(
+            "  profile \"repo-reader\"",
+            "  profile \"repo-reader\"\n  requires [session.resume]",
+        ),
+    )
+    .expect("write workflow");
+    let output = Command::new(bin)
+        .args(["check", unsupported.to_str().expect("utf-8")])
+        .output()
+        .expect("check runs");
+    assert!(!output.status.success(), "unreportable class must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires feature class `session.resume`")
+            && stderr.contains("`unsupported`"),
+        "the error names the class and the stated support: {stderr}"
+    );
+
+    // owned states every class native, so the same requirement passes.
+    let satisfied = dir.join("satisfied.whip");
+    fs::write(
+        &satisfied,
+        agent_provider_workflow("", "owned").replace(
+            "  profile \"repo-reader\"",
+            "  profile \"repo-reader\"\n  requires [session.resume, turn.cancel]",
+        ),
+    )
+    .expect("write workflow");
+    let output = Command::new(bin)
+        .args(["check", satisfied.to_str().expect("utf-8")])
+        .output()
+        .expect("check runs");
+    assert!(
+        output.status.success(),
+        "owned's all-native report satisfies the requirement\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The M5 ladder's middle rung (spec/std-agent.md "Open provider registry"):
+/// a kind contributed by a known embedded package that is not imported is
+/// valid but draws the `lint.missing_agent_import` advisory; the import
+/// silences it.
+#[test]
+fn lint_missing_agent_import_is_advisory_only() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("agent-import-lint");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let without = dir.join("without-import.whip");
+    let with = dir.join("with-import.whip");
+    fs::write(&without, agent_provider_workflow("", "fixture")).expect("write workflow");
+    fs::write(
+        &with,
+        agent_provider_workflow("use std.agent\n\n", "fixture"),
+    )
+    .expect("write workflow");
+    let codes = |path: &Path| -> Vec<String> {
+        let output = Command::new(bin)
+            .args(["--json", "lint", path.to_str().expect("present")])
+            .output()
+            .expect("whip lint runs");
+        assert!(output.status.success(), "advisory lint must exit 0");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint report JSON");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f.get("code").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert!(
+        codes(&without).contains(&"lint.missing_agent_import".to_owned()),
+        "a provider kind without its contributing import fires the advisory"
+    );
+    assert!(
+        !codes(&with).contains(&"lint.missing_agent_import".to_owned()),
         "the import silences the advisory"
     );
 

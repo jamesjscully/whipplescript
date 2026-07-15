@@ -1249,6 +1249,16 @@ pub fn validate_package_manifest_closed_shape(path: &Path, value: &Value) -> Res
                 ],
                 problems,
             );
+            // Agent-provider rows (`"agent_provider": true` in config;
+            // spec/std-agent.md "Open provider registry") may carry a compiled
+            // feature report. Its classes must be DR-0015 taxonomy members and
+            // its vocabulary the DR-0004/DR-0017 one — an unknown class is a
+            // manifest validation error (Static checks item 4).
+            if let Some(config) = provider.get("config") {
+                if config.get("agent_provider").and_then(Value::as_bool) == Some(true) {
+                    validate_agent_provider_feature_report_shape(config, &label, problems);
+                }
+            }
         },
     );
     validate_manifest_array_objects(
@@ -1326,6 +1336,60 @@ pub fn validate_package_manifest_closed_shape(path: &Path, value: &Value) -> Res
             path.display(),
             problems.join("\n- ")
         ))
+    }
+}
+
+/// Validate an agent-provider row's `config.feature_report` (spec/std-agent.md
+/// slices 5/7, Static checks item 4): every entry's `class` must be a DR-0015
+/// taxonomy member, `support` and `source` must use the DR-0004/DR-0017
+/// vocabulary, and a stated support level carries `native_name` + `dispatch`.
+/// Absence of the report is fine (the row contributes only the kind).
+fn validate_agent_provider_feature_report_shape(
+    config: &Value,
+    label: &str,
+    problems: &mut Vec<String>,
+) {
+    let Some(report) = config.get("feature_report") else {
+        return;
+    };
+    let Some(entries) = report.as_array() else {
+        problems.push(format!("{label} config.feature_report must be an array"));
+        return;
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_label = format!("{label} config.feature_report[{index}]");
+        let Some(class) = entry.get("class").and_then(Value::as_str) else {
+            problems.push(format!("{entry_label} is missing string `class`"));
+            continue;
+        };
+        if !whipplescript_core::AGENT_FEATURE_CLASS_TAXONOMY.contains(&class) {
+            problems.push(format!(
+                "{entry_label} states unknown feature class `{class}` (not in the DR-0015 taxonomy)"
+            ));
+        }
+        let support = entry.get("support").and_then(Value::as_str);
+        match support {
+            Some("native" | "emulated" | "request_only" | "unsupported" | "unknown") => {}
+            Some(other) => problems.push(format!(
+                "{entry_label} states unknown support `{other}`; expected native, emulated, request_only, unsupported, or unknown"
+            )),
+            None => problems.push(format!("{entry_label} is missing string `support`")),
+        }
+        match entry.get("source").and_then(Value::as_str) {
+            Some("compiled" | "probed") => {}
+            Some(other) => problems.push(format!(
+                "{entry_label} states unknown source `{other}`; expected compiled or probed"
+            )),
+            None => problems.push(format!("{entry_label} is missing string `source`")),
+        }
+        let stated = matches!(support, Some("native" | "emulated" | "request_only"));
+        let has_native_name = entry.get("native_name").and_then(Value::as_str).is_some();
+        let has_dispatch = entry.get("dispatch").and_then(Value::as_str).is_some();
+        if stated && (!has_native_name || !has_dispatch) {
+            problems.push(format!(
+                "{entry_label} states support without native_name + dispatch"
+            ));
+        }
     }
 }
 

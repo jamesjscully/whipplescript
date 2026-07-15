@@ -1,5 +1,6 @@
 //! Deterministic runtime kernel scaffold.
 
+pub mod agent_profile;
 pub mod artifact_manifest;
 #[cfg(feature = "claude")]
 pub mod claude_agent_sdk;
@@ -20,6 +21,7 @@ pub mod host_package;
 pub mod host_policy;
 pub mod host_protocol;
 pub mod ifc;
+pub mod ingress_pass;
 pub mod instance_machine;
 pub mod lowering;
 pub mod native_lifecycle;

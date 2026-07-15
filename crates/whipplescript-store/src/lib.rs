@@ -4449,6 +4449,34 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// The already-recorded event carrying this `(instance_id, idempotency_key)`
+    /// pair, if any — the read side of the events unique index, so admission
+    /// drivers can absorb a re-delivered key instead of tripping the index.
+    pub fn event_by_idempotency_key(
+        &self,
+        instance_id: &str,
+        idempotency_key: &str,
+    ) -> StoreResult<Option<StoredEvent>> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT event_id, sequence
+                FROM events
+                WHERE instance_id = ?1
+                  AND idempotency_key = ?2
+                "#,
+                params![instance_id, idempotency_key],
+                |row| {
+                    Ok(StoredEvent {
+                        event_id: row.get(0)?,
+                        sequence: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
         let mut statement = self.connection.prepare(
             r#"
@@ -6226,6 +6254,16 @@ pub trait RuntimeStore {
     fn list_instances(&self) -> StoreResult<Vec<InstanceView>>;
     fn get_instance(&self, instance_id: &str) -> StoreResult<Option<InstanceView>>;
     fn list_events(&self, instance_id: &str) -> StoreResult<Vec<EventView>>;
+    /// The already-recorded event carrying this `(instance_id, idempotency_key)`
+    /// pair, if any — the read side of the events unique index
+    /// (migrations/0001), so an admission driver can absorb a re-delivered
+    /// key instead of tripping the index (spec/std-ingress.md, one shared
+    /// admission core for every driver).
+    fn event_by_idempotency_key(
+        &self,
+        instance_id: &str,
+        idempotency_key: &str,
+    ) -> StoreResult<Option<StoredEvent>>;
     fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>>;
     fn list_facts_including_consumed(&self, instance_id: &str) -> StoreResult<Vec<FactView>>;
     fn list_effects(&self, instance_id: &str) -> StoreResult<Vec<EffectView>>;
@@ -6618,6 +6656,13 @@ impl RuntimeStore for SqliteStore {
     }
     fn list_events(&self, instance_id: &str) -> StoreResult<Vec<EventView>> {
         self.list_events(instance_id)
+    }
+    fn event_by_idempotency_key(
+        &self,
+        instance_id: &str,
+        idempotency_key: &str,
+    ) -> StoreResult<Option<StoredEvent>> {
+        self.event_by_idempotency_key(instance_id, idempotency_key)
     }
     fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
         self.list_facts(instance_id)
@@ -7551,21 +7596,22 @@ fn policy_block_on(
         return Ok(Some(block));
     }
 
-    // Timers and builtin-tracker verbs are resolved by the runtime itself on
-    // worker passes: no provider, capability, or profile applies.
+    // Timers are resolved by the runtime itself on worker passes: no provider,
+    // capability, or profile applies.
     //
     // Coordination kinds (`lease.*` / `ledger.*` / `counter.*`, std.coord
-    // slice 4), file kinds (`file.*`, std.files slice F2), and tracker kinds
-    // (`tracker.*`, std.tracker slice T4) are NOT exempt here: the embedded
-    // std.coord / std.files / std.tracker manifests seed their
-    // capability/provider/binding rows at store init, so the admission gate
-    // is REAL for them — an unbound coordination, file, or tracker kind
-    // blocks as blocked_by_capability. INTENTIONAL DIVERGENCE from the DO
-    // mirror (host-do/do_store.rs `do_policy_block_on`), which keeps all
-    // three exemptions until the DO tracker's package-registration row seeds
-    // the same rows in the DO bootstrap (spec/std-coord.md /
-    // spec/std-files.md / spec/std-tracker.md "Deferred with cause").
-    if effect.kind == "timer.wait" || effect.kind == "signal.emit" {
+    // slice 4), file kinds (`file.*`, std.files slice F2), tracker kinds
+    // (`tracker.*`, std.tracker slice T4), and the ingress kind
+    // (`signal.emit`, std.ingress slice I2b) are NOT exempt here: the
+    // embedded std.coord / std.files / std.tracker / std.ingress manifests
+    // seed their capability/provider/binding rows at store init, so the
+    // admission gate is REAL for them — an unbound kind blocks as
+    // blocked_by_capability. INTENTIONAL DIVERGENCE from the DO mirror
+    // (host-do/do_store.rs `do_policy_block_on`), which keeps the exemptions
+    // until the DO tracker's package-registration row seeds the same rows in
+    // the DO bootstrap (spec/std-coord.md / spec/std-files.md /
+    // spec/std-tracker.md / spec/std-ingress.md "Deferred with cause").
+    if effect.kind == "timer.wait" {
         return Ok(None);
     }
 
@@ -16525,6 +16571,124 @@ mod tests {
             .expect("claimable effects load");
         assert_eq!(claimable.len(), 1, "{claimable:?}");
         assert_eq!(claimable[0].effect_id, "claim-1");
+    }
+
+    /// std.ingress slice I2b gate: the NATIVE admission gate is real for
+    /// `signal.emit`. With the builtin exemption deleted from
+    /// `policy_block_on`, an UNBOUND `signal.emit` effect blocks as
+    /// blocked_by_capability (no effect provider registered), and the same
+    /// kind becomes claimable once the embedded std.ingress manifest's
+    /// capability/provider/binding rows are registered — exactly what
+    /// `register_locked_packages` seeds at store init in production.
+    #[test]
+    fn signal_emit_blocks_unbound_and_claims_once_manifest_seeded() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("IngressGate", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        let effects = [NewEffect {
+            timeout_seconds: None,
+            effect_id: "emit-1",
+            kind: "signal.emit",
+            target: None,
+            input_json: r#"{"target_instance":"peer","event":"deploy.finished","payload":{}}"#,
+            status: "queued",
+            idempotency_key: "rule=notify;effect=emit-1",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "notify",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-notify"),
+                marks: &[],
+            })
+            .expect("rule commits");
+
+        // Unbound: no worker may claim it, and a forced start blocks durably.
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert!(
+            claimable.is_empty(),
+            "unbound signal.emit must not be claimable: {claimable:?}"
+        );
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "emit-1",
+                run_id: "run-emit",
+                provider: "notify",
+                worker_id: "worker-1",
+                lease_id: "lease-emit",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("unbound signal.emit blocks at admission");
+        assert!(
+            matches!(&blocked, StoreError::PolicyBlocked { reason, .. } if reason.contains("signal.emit")),
+            "{blocked:?}"
+        );
+        assert_eq!(effect_status(&store, "emit-1"), "blocked_by_capability");
+
+        // Seeded: on a store where the embedded std.ingress manifest
+        // registered first (production order — `register_locked_packages`
+        // runs at store init, before any worker pass), the same effect is
+        // claimable.
+        let mut seeded = SqliteStore::open_in_memory().expect("store opens");
+        seeded
+            .register_package_manifest(include_str!("../../../std/manifests/ingress.json"))
+            .expect("std.ingress manifest registers");
+        let version = seeded
+            .create_program_version(test_program_version(
+                "IngressGateSeeded",
+                "source-1",
+                "ir-1",
+            ))
+            .expect("program version creates");
+        let instance = seeded
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        seeded
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "notify",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-notify"),
+                marks: &[],
+            })
+            .expect("rule commits");
+        let claimable = seeded
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert_eq!(claimable.len(), 1, "{claimable:?}");
+        assert_eq!(claimable[0].effect_id, "emit-1");
     }
 
     #[test]

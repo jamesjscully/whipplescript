@@ -450,6 +450,14 @@ Harness spec reconciliation:
 
 ## CLI And Operations
 
+Status 2026-07-15 (std-agent v1, spec/std-agent.md "Operator CLI"): the freed
+`whip agent` namespace comes from the one-way `whip infoflow` rename (no
+alias; the old spelling errors with a pointer). `whip agents` / `whip
+providers` / `whip skills` exist today as compiled-IR introspection surfaces;
+the fuller operator suite sketched below is registered DEFERRED — `whip
+doctor --providers` (now rendering the compiled feature reports with their
+`source`) remains the operator door.
+
 `std.agent` should own or extend operator commands for:
 
 ```text

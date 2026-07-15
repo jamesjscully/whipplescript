@@ -4,7 +4,7 @@
 # Regenerate with: scripts/check-formal-models.sh --update-verdicts
 # filename<TAB>signature
 action-expansion.maude	SSNNN
-admission.maude	SSSSNNNNNSSNNN
+admission.maude	SSSSNNNNNSSNNNSSNNN
 branch-effect-key.maude	SSSNSN
 cache-prefix-append-only.maude	SSSN
 case-family.maude	SSSSSNNNN
@@ -68,7 +68,7 @@ owned-harness-loop.maude	SSSNNNNN
 owned-harness-resume.maude	SN
 owned-harness-sandbox.maude	SN
 owned-harness-tracker.maude	SSNN
-package-contract.maude	SSSSNNSNNNNNNSNSNNNSNNSN
+package-contract.maude	SSSSNNSNNNNNNSNSNNNSNNSNSN
 pattern-body-surface.maude	SSSSSSNN
 pattern-recursion.maude	SSSNN
 policy-capacity-retry.maude	NSNSSS

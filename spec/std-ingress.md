@@ -83,6 +83,21 @@ post-parse against the std.ingress manifest):
 
   Clause set is closed per provider kind (see Static checks). No source-level
   secret literals ("Non-Goals" in `event-ingress.md`).
+
+  **Reality reconciliation (2026-07-15, I2a as built).** Between this design
+  and the build, POLLING file/http drivers shipped with their own clauses:
+  `file` reads `path <string>` line-by-line (one signal per non-empty line)
+  and `http` GETs `url <string>` (one signal per JSON-array element) — both
+  keyed by positional ordinal. I2a landed on that shipped surface rather than
+  the table above: `watch <glob-string>` is the file OCCURRENCE mode (exactly
+  one of `path`/`watch`; one signal per new (path, content-hash) occurrence,
+  observation `{path, content_hash, watch}`) and
+  `dedup <observe>.<field>` is the provider delivery-id source for `file`
+  (line mode) and `http` (replaces the positional key; a watch source is
+  already content-keyed, so `dedup` is rejected there). The table's
+  `path`-as-endpoint, `auth`, and `correlate` clauses belong to the INBOUND
+  listener and defer WITH slice I4 ("Deferred with cause") — building
+  secret/auth grammar with no listener to consume it would be dead surface.
 - `emit signal <name> to <target> { payload } as b` — directed peer injection
   (body.rs:2818-2869).
 
@@ -259,6 +274,54 @@ risk.
 - **Neither package fires rules directly**; both emit typed signal facts
   through the same admission boundary ("Relationship To `std.time`").
 
+## Build status (2026-07-15)
+
+- **I1 — SHIPPED** (pre-dates this pass): emit-names-a-declared-signal +
+  observation-field checks, parser-side
+  (`validate_source_emit_signal_declared`, rule-side
+  `validate_emit_signal_declarations`).
+- **I2a — BUILT, reconciled to the shipped poller surface** (see "Reality
+  reconciliation" under Surface): `watch` + `dedup` clauses in the hand
+  parser (`source` is a hand-parsed structural exception; no grammar-table
+  rows), closed-set validation, fmt idempotency, IR fields
+  (`IrSource::watch`/`dedup_field`). The `auth`/`correlate`/http-`path`
+  clauses defer with I4.
+- **I2b — BUILT**: embedded `std/manifests/ingress.json` (signal.emit
+  contract mirroring the parser-compiled shape; `signal`/`source`/`emit`
+  construct rows; capability/provider/binding rows making the NATIVE
+  `signal.emit` admission gate real — builtin exemption deleted from
+  store `policy_block_on`, DO mirror keeps its exemption per M7); catalog
+  privilege tuples for (`signal`, std.ingress, declaration_block,
+  `metadata_only`) and (`emit`, std.ingress, effect_operation,
+  `signal_emit`) in core/lib.rs (NOTE: the design sketch said lowering
+  `metadata` for `signal`; `metadata` is not declaration_block-compatible —
+  the shipped decl-block lowering is `metadata_only`, the
+  std.tracker/std.coord precedent); operator-plane provider rows carry the
+  static Provider Contract descriptors (cli/stdio/file/http; the clock row
+  landed in std/manifests/time.json). Provider-kind-known hard check ON
+  (`validate_source_provider_kinds`, kinds derived from manifest operator
+  rows); import advisory `lint.missing_ingress_import` ON. The
+  authorability-door mechanism S6 was obligated to provide already existed
+  (privilege-tuple leg, modeled `[door-privileged]` in
+  std-construct-authorization.maude) — no re-model needed, tuples are data.
+- **I3 — BUILT**: shared admission core
+  `kernel/src/ingress_pass.rs::admit_external_signal` (declared-signal check,
+  H8 gate, IR-typed payload validation — `validate_json_for_object` moved
+  kernel-side, CLI re-exports — delivery-key idempotency with duplicate
+  ABSORPTION via the new `RuntimeStore::event_by_idempotency_key`, fact
+  derivation); the file/http source passes relocated kernel-side generic over
+  the store traits with native I/O seams (`IngressFileIo`, fetch closure
+  carrying the SSRF screens; positional keys byte-compatible with the
+  pre-lift cursor keys, and the cursor itself is gone — the key lookup also
+  fixes its head-insert desync); `whip ingress serve --stdio` admits JSONL
+  envelopes `{instance, signal, payload, delivery_id?}` (shell CLI-side).
+  admission.maude extended with the delivery-id + file-occurrence key forms
+  and bite fixtures.
+- **I4 — DEFERRED** (moved to "Deferred with cause").
+- **I5 — BUILT**: `whip signal --delivery-id` wins over the derived payload
+  hash; the duplicate is absorbed once ACROSS process runs with an observable
+  diagnostic (`"duplicate": true` under `--json`).
+
 ## v1 implementation slices
 
 Each independently gateable under the per-piece review discipline; all assume
@@ -324,6 +387,22 @@ depend on nothing else.
 
 ## Deferred with cause
 
+- **I4 — `whip ingress serve` HTTP listener (+ its `path`/`auth`/`correlate`
+  clauses), deferred 2026-07-15.** Cause: (a) reality overtook the design —
+  a POLLING http driver (`url`, worker-pass GET with SSRF screens) shipped
+  ahead of this design's listener and covers the current pull-shaped demand,
+  so the listener no longer gates any live user; (b) the slice is model-first
+  by house discipline (IngressDeliveryLifecycle.tla, coverage AND bite,
+  before the hand-rolled listener + hmac/bearer/shared auth), a full gate of
+  its own that should not ride a multi-slice pass; (c) its clause set
+  (`path`-as-endpoint, `auth <mode> secret <ident>`, `correlate`) is dead
+  grammar without the listener, so the clauses defer WITH it (built now:
+  `watch`/`dedup`, which the shipped pollers consume). Re-entry: the first
+  push-delivery (webhook) demand; the slice enters exactly as specified in
+  "v1 implementation slices" I4 — TLA+ model first, then the listener —
+  plus the deferred clauses; the `dedup` machinery and the shared admission
+  core it must route through are already in place. The stdio driver (also
+  I3) was NOT deferred: it shipped as the dev/test reference path.
 - **`std.ingress.grpc`.** Cause: `event-ingress.md` itself sequences it after
   cli/http harden the admission contract; HTTP/2 + protobuf pulls a heavy
   dependency tree against the threads-plus-ureq house minimalism; zero demand.

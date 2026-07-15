@@ -176,7 +176,15 @@ fn main() -> ExitCode {
         Some("package") => package(&options),
         Some("check") => check(&options),
         Some("gov") => gov(&options),
-        Some("agent") => whip_agent(&options),
+        Some("infoflow") => whip_infoflow(&options),
+        // The IFC REPL moved to `whip infoflow` (spec/std-agent.md "Operator
+        // CLI", ecosystem shape "Names"): a one-way rename with no alias, so the
+        // `whip agent`/`whip agents` namespace belongs to std.agent.
+        Some("agent") => {
+            eprintln!("`whip agent` was renamed: the information-flow REPL is now `whip infoflow`");
+            eprintln!("try `whip infoflow`");
+            ExitCode::from(2)
+        }
         Some("agents") => agents(&options),
         Some("providers") => providers(&options),
         Some("skills") => skills(&options),
@@ -202,6 +210,7 @@ fn main() -> ExitCode {
         Some("artifacts") => artifacts(&options),
         Some("inbox") => inbox(&options),
         Some("signal") => signal(&options),
+        Some("ingress") => ingress_command(&options),
         Some("message") => message_command(&options),
         Some("mailbox") => mailbox_command(&options),
         Some("otel-export") => otel_export(&options),
@@ -631,7 +640,7 @@ fn print_usage() {
     println!("usage: whip [--store path] [--json] <command> [args]");
     println!("commands: package, check, compile, verify-report, run, revise, step, worker, dev, accept, instances, status, log, facts, effects, runs");
     println!(
-        "          artifacts, inbox, signal, issue, leases, ledger, counters, evidence, diagnostics, trace"
+        "          artifacts, inbox, signal, ingress, issue, leases, ledger, counters, evidence, diagnostics, trace"
     );
     println!("          otel-export, pause, resume, cancel, checkpoint, restore, fork, retry, recover, doctor, deploy");
     println!("          improve, campaigns, campaign, adopt, answer, pin, suppose, settle, gauges");
@@ -671,7 +680,8 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "runs" => "usage: whip runs <instance>",
         "artifacts" => "usage: whip artifacts <run-id>",
         "inbox" => "usage: whip inbox [<instance>|show <item>|answer <item> (--choice X|--text X) [--by NAME]]",
-        "signal" => "usage: whip signal <instance> --name <name> --data <json> --program <workflow.whip> [--root <workflow>]",
+        "signal" => "usage: whip signal <instance> --name <name> --data <json> --program <workflow.whip> [--root <workflow>] [--delivery-id <id>]\n  --delivery-id: the provider/operator delivery id wins over the derived payload-hash key; the same id twice admits once (the duplicate is absorbed with a diagnostic)",
+        "ingress" => "usage: whip ingress serve --stdio --program <workflow.whip> [--root <workflow>]\n  reads JSONL envelopes {\"instance\", \"signal\", \"payload\", \"delivery_id\"?} from stdin and admits each\n  through the shared admission core; one JSON result line per envelope on stdout\n  (the HTTP listener driver is deferred: spec/std-ingress.md \"Deferred with cause\")",
         "otel-export" => "usage: whip otel-export <instance> [--dry-run] [--telemetry-allowlist <Schema.field,...>] (reads OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME, WHIPPLESCRIPT_TELEMETRY_ALLOWLIST)",
         "telemetry" => "usage: whip telemetry <status|reset-cursor> [<instance>] (export-cursor management for otel-export)",
         "coercion" => "usage: whip [--store path] [--json] coercion status (the resolved schema.coerce provider config: provider, backend, model, credential source, selecting rung, fingerprint)",
@@ -695,6 +705,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "retry" => "usage: whip retry <instance> <effect>",
         "recover" => "usage: whip recover <instance>",
         "doctor" => "usage: whip doctor [--providers] [--provider-config <path>] [--record-provider-evidence <instance>]",
+        "infoflow" => "usage: whip infoflow   (interactive information-flow REPL: check <file> | escalate <request> | quit; renamed from `whip agent`)",
         "agents" => "usage: whip [--json] agents [--root <workflow>] <workflow.whip>",
         "providers" => "usage: whip [--json] providers [--root <workflow>] <workflow.whip>",
         "skills" => "usage: whip [--json] skills [--root <workflow>] <workflow.whip>",
@@ -768,6 +779,36 @@ fn doctor(options: &CliOptions) -> ExitCode {
     } else {
         0
     };
+    // Compiled agent feature reports (spec/std-agent.md slice 5): rendered
+    // under `--providers`, `source` included per entry (probed-vs-compiled
+    // honesty, DR-0015).
+    let agent_feature_reports: Vec<Value> = if doctor_options.providers {
+        whipplescript_kernel::agent_profile::AGENT_FEATURE_REPORTS
+            .iter()
+            .map(|report| {
+                json!({
+                    "schema": whipplescript_kernel::agent_profile::AGENT_FEATURE_REPORT_SCHEMA,
+                    "provider_kind": report.provider_kind,
+                    "entries": report.entries.iter().map(|entry| {
+                        let mut value = json!({
+                            "class": entry.class,
+                            "support": entry.support.as_str(),
+                            "source": entry.source.as_str(),
+                        });
+                        if let Some(native_name) = entry.native_name {
+                            value["native_name"] = json!(native_name);
+                        }
+                        if let Some(dispatch) = entry.dispatch {
+                            value["dispatch"] = json!(dispatch);
+                        }
+                        value
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     if options.json {
         emit_json(json!({
             "stage": whipplescript_kernel::kernel_stage(),
@@ -785,6 +826,7 @@ fn doctor(options: &CliOptions) -> ExitCode {
                 .iter()
                 .map(provider_health_check_to_json)
                 .collect::<Vec<_>>(),
+            "agent_feature_reports": agent_feature_reports,
             "provider_validation_evidence_recorded": provider_validation_evidence_recorded,
         }))
     } else {
@@ -854,6 +896,36 @@ fn doctor(options: &CliOptions) -> ExitCode {
                     check.status.as_str(),
                     check.message
                 );
+            }
+        }
+        if doctor_options.providers {
+            println!("agent feature reports ({}):", {
+                whipplescript_kernel::agent_profile::AGENT_FEATURE_REPORT_SCHEMA
+            });
+            for report in whipplescript_kernel::agent_profile::AGENT_FEATURE_REPORTS {
+                for entry in report.entries {
+                    // The default posture is unsupported/compiled; print the
+                    // rows that state something, plus turn.cancel always (the
+                    // DR-0017 conservative-cancel surface).
+                    let stated = !matches!(
+                        entry.support,
+                        whipplescript_kernel::agent_profile::FeatureSupport::Unsupported
+                    );
+                    if !stated && entry.class != "turn.cancel" {
+                        continue;
+                    }
+                    println!(
+                        "  {:<16} {:<24} {:<12} source={}{}",
+                        report.provider_kind,
+                        entry.class,
+                        entry.support.as_str(),
+                        entry.source.as_str(),
+                        match (entry.native_name, entry.dispatch) {
+                            (Some(name), Some(dispatch)) => format!(" {name} via {dispatch}"),
+                            _ => String::new(),
+                        }
+                    );
+                }
             }
         }
         if provider_validation_evidence_recorded > 0 {
@@ -1632,6 +1704,89 @@ fn lint_missing_tracker_import(ir: &IrProgram) -> Vec<LintFinding> {
     }]
 }
 
+/// ADVISORY import lint (spec/std-ingress.md "Static checks" #2, the M5
+/// graduated ladder: provider-kind-known is the HARD check, the import line
+/// itself is advisory only): `signal` declarations, external `source` blocks
+/// (non-clock — the clock kind is std.time's), and `emit signal … to` lower
+/// to the admission surface owned by std.ingress; a program using them
+/// without `use std.ingress` still runs, but the import is what names the
+/// package whose embedded manifest seeds the `signal.emit` admission rows and
+/// carries the driver descriptors. Detection reads the compiled IR (declared
+/// signals + lowered sources/effects), so it cannot wrongly flag prose.
+fn lint_missing_ingress_import(ir: &IrProgram) -> Vec<LintFinding> {
+    if ir
+        .uses
+        .iter()
+        .any(|use_decl| use_decl.name == "std.ingress")
+    {
+        return Vec::new();
+    }
+    let first_subject = ir
+        .events
+        .first()
+        .map(|event| event.name.clone())
+        .or_else(|| {
+            ir.sources
+                .iter()
+                .find(|source| !source.is_clock)
+                .map(|source| source.name.clone())
+        });
+    let uses_signal_emit = ir.rules.iter().any(|rule| {
+        rule.metadata
+            .effects
+            .iter()
+            .any(|effect| matches!(effect.kind, whipplescript_parser::IrEffectKind::SignalEmit))
+    });
+    if first_subject.is_none() && !uses_signal_emit {
+        return Vec::new();
+    }
+    vec![LintFinding {
+        code: "lint.missing_ingress_import",
+        severity: Severity::Warning,
+        message: "program uses typed signal admission (`signal`, external `source` blocks, \
+                  `emit signal … to`) without `use std.ingress`; add the import to name the \
+                  package that owns the admission surface (advisory)"
+            .to_owned(),
+        name: first_subject,
+        span: None,
+    }]
+}
+
+/// ADVISORY import lint (spec/std-agent.md "Open provider registry": the M5
+/// graduated ladder's middle rung — a provider kind contributed by a KNOWN
+/// embedded std package that the program does not import is valid but draws a
+/// missing-import advisory, never an error). Detection reads the compiled IR's
+/// agents/harnesses against the embedded manifests' agent-provider rows, so it
+/// cannot wrongly flag prose.
+fn lint_missing_agent_import(ir: &IrProgram) -> Vec<LintFinding> {
+    let mut findings = Vec::new();
+    let mut flagged_packages = BTreeSet::new();
+    for (kind, owner, _span) in ir_agent_provider_kind_uses(ir) {
+        for (package, json) in EMBEDDED_STD_MANIFESTS {
+            if !manifest_json_agent_provider_kinds(json).contains(&kind) {
+                continue;
+            }
+            if ir.uses.iter().any(|use_decl| use_decl.name == *package) {
+                continue;
+            }
+            if flagged_packages.insert(*package) {
+                findings.push(LintFinding {
+                    code: "lint.missing_agent_import",
+                    severity: Severity::Warning,
+                    message: format!(
+                        "provider kind `{kind}` is contributed by the std package \
+                         `{package}`; add `use {package}` to name the package that \
+                         defines the provider (advisory)"
+                    ),
+                    name: Some(owner.clone()),
+                    span: None,
+                });
+            }
+        }
+    }
+    findings
+}
+
 /// Whole-token occurrence count of `name` in `text` (an identifier run is a maximal
 /// `[A-Za-z0-9_]+`), so `r` does not match inside `recall` or `r.field`'s neighbours.
 fn whole_token_count(text: &str, name: &str) -> usize {
@@ -2049,6 +2204,9 @@ fn lint_program(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
     findings.extend(lint_missing_coord_import(ir));
     findings.extend(lint_missing_files_import(ir));
     findings.extend(lint_missing_tracker_import(ir));
+    findings.extend(lint_missing_ingress_import(ir));
+    findings.extend(lint_missing_agent_import(ir));
+    findings.extend(lint_agent_requires_probed_source(ir));
     findings.extend(lint_unused_coerce_results(ir));
     findings.extend(lint_unused_resources(ir));
     findings.extend(lint_noop_rules(ir));
@@ -3519,6 +3677,31 @@ fn check(options: &CliOptions) -> ExitCode {
                         }));
                     } else {
                         for diagnostic in hosted_exec_diagnostics {
+                            eprint!("{}", render_diagnostic(&path, &source, &diagnostic));
+                        }
+                    }
+                    continue;
+                }
+                let mut provider_kind_diagnostics =
+                    agent_provider_kind_diagnostics(&ir, package_lock.as_ref());
+                provider_kind_diagnostics.extend(agent_requires_diagnostics(&ir));
+                if !provider_kind_diagnostics.is_empty() {
+                    failed = true;
+                    if options.json {
+                        reports.push(json!({
+                            "schema": "whipplescript.check_report.v0",
+                            "path": display_path(&path),
+                            "status": "error",
+                            "error": {
+                                "kind": "diagnostics",
+                                "diagnostics": provider_kind_diagnostics
+                                    .iter()
+                                    .map(parser_diagnostic_to_json)
+                                    .collect::<Vec<_>>(),
+                            },
+                        }));
+                    } else {
+                        for diagnostic in provider_kind_diagnostics {
                             eprint!("{}", render_diagnostic(&path, &source, &diagnostic));
                         }
                     }
@@ -12965,14 +13148,15 @@ fn gov_escalate(options: &CliOptions) -> ExitCode {
     }
 }
 
-/// `whip agent` — the interactive whip agent loop (DR-0026/0028). UNPRIVILEGED: the
+/// `whip infoflow` — the interactive whip agent loop (DR-0026/0028), renamed from
+/// `whip agent` (spec/std-agent.md "Operator CLI"; no alias). UNPRIVILEGED: the
 /// user-facing agent that authors and checks whips under the active envelope. It can
 /// `check <file>` (run the IFC check) and `escalate <request>` (file a low-integrity
 /// request for the admin), but it has NO path to signing governance — a `sign` is
 /// refused. An LLM driver or a human user feeds it the same stdin.
-fn whip_agent(_options: &CliOptions) -> ExitCode {
+fn whip_infoflow(_options: &CliOptions) -> ExitCode {
     use std::io::BufRead;
-    println!("whip agent (unprivileged): check <file> | escalate <request> | quit");
+    println!("whip infoflow (unprivileged): check <file> | escalate <request> | quit");
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let Ok(line) = line else {
@@ -16554,6 +16738,36 @@ impl LoadedPackageLock {
 /// always wins. Add more std packages by appending `(name, include_str!(..))`
 /// pairs here.
 const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
+    // Boundary/taxonomy package for the agent-provider seam (spec/std-agent.md
+    // "Manifest"): the `agent.tell` effect-contract mirror (parser owns the
+    // grammar; merge-folds, drift surfaces as `effect_contract_duplicate` —
+    // rides the embedded-copy privilege door), the grandfathered `agent.turn`
+    // capability row, and OPERATOR-PLANE provider rows (`"agent_provider":
+    // true`) contributing the built-in provider kinds
+    // owned/fixture/native-fixture/command to the open provider registry.
+    // Operator-plane rows are admission-inert by construction: the kind set is
+    // visibility data the provider-kind-known check reads, never a grant.
+    (
+        "std.agent",
+        include_str!("../../../std/manifests/agent.json"),
+    ),
+    // Thin provider package (spec/std-agent.md "Providers"): contributes
+    // provider kind `codex` iff the `codex` cargo feature compiles the adapter
+    // in — manifest presence and adapter presence agree by construction. A
+    // binary without the feature genuinely does not know the kind, and the
+    // registry reports it as a missing package, which is the truth.
+    #[cfg(feature = "codex")]
+    (
+        "std.agent.codex",
+        include_str!("../../../std/manifests/agent-codex.json"),
+    ),
+    // Thin provider package: provider kind `claude` iff the `claude` cargo
+    // feature compiles the sidecar adapter in (see std.agent.codex above).
+    #[cfg(feature = "claude")]
+    (
+        "std.agent.claude",
+        include_str!("../../../std/manifests/agent-claude.json"),
+    ),
     // Operator-config package for the core `schema.coerce` effect
     // (spec/std-coercion.md "Manifest"): capability/provider/profile/binding
     // rows plus the `schema.coerce` effect contract. The contract mirrors the
@@ -16599,6 +16813,30 @@ const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
     (
         "std.files",
         include_str!("../../../std/manifests/files.json"),
+    ),
+    // Runtime identity for the typed signal-admission package
+    // (spec/std-ingress.md "Manifest", slice I2b): the `signal.emit` effect
+    // contract (mirroring the parser-compiled one — merge-folds, drift
+    // surfaces as `effect_contract_duplicate`), three construct rows (the
+    // `signal` declaration_block, the `source` source_declaration exercising
+    // the `signal_source` lowering class, and the `emit signal … to`
+    // effect_operation on `signal_emit` — `signal`/`emit` are reserved
+    // keywords admitted through the authorability door's privilege-tuple leg,
+    // `source` through the embedded-copy leg), and the
+    // capability/provider/binding rows that make the NATIVE admission gate
+    // real for `signal.emit` (the builtin exemption is deleted, store/lib.rs
+    // `policy_block_on`; the DO mirror keeps its exemption until the DO
+    // bootstrap registers packages). The operator-plane provider rows carry
+    // the static "Provider Contract" descriptors for the cli/stdio/file/http
+    // admission drivers (E3 defers probed capability reports demand-side);
+    // they also feed the provider-kind-known source-header check. The clock
+    // provider row lives in std/manifests/time.json, not here (E2 boundary).
+    // Sources have NO grammar file: the `signal`/`source` decls are
+    // hand-parsed core grammar (M1), the manifest authorizes, it does not
+    // parse.
+    (
+        "std.ingress",
+        include_str!("../../../std/manifests/ingress.json"),
     ),
     (
         "std.memory",
@@ -16768,11 +17006,71 @@ fn contract_registry_for_ir(
     }
 }
 
+/// Every source-provider kind contributed by an embedded or locked manifest:
+/// the operator-plane provider rows' `provider_kind` values (std.ingress
+/// contributes cli/stdio/file/http, std.time contributes clock). Operator rows
+/// are deliberately invisible to the effect-provider surface, so this reads
+/// the raw manifest JSON like `embedded_operator_provider_default` does.
+fn known_source_provider_kinds(package_lock: Option<&LoadedPackageLock>) -> BTreeSet<String> {
+    let mut kinds = BTreeSet::new();
+    let mut collect = |label: PathBuf, value: &Value| {
+        if let Ok(rows) = package_operator_providers(&label, value) {
+            for row in rows {
+                kinds.insert(row.provider_kind);
+            }
+        }
+    };
+    for (name, json) in EMBEDDED_STD_MANIFESTS {
+        if let Ok(value) = serde_json::from_str::<Value>(json) {
+            collect(PathBuf::from(format!("<embedded:{name}>")), &value);
+        }
+    }
+    if let Some(package_lock) = package_lock {
+        for manifest in &package_lock.manifests {
+            if let Ok(value) = serde_json::from_str::<Value>(&manifest.manifest_json) {
+                collect(manifest.path.clone(), &value);
+            }
+        }
+    }
+    kinds
+}
+
+/// Provider-kind-known HARD check (spec/std-ingress.md "Static checks" #2,
+/// the M5 graduated ladder's hard rung): a `source <kind> as …` header must
+/// name a provider kind some embedded or locked manifest contributes —
+/// before embedded manifests landed, any bare ident was silently accepted
+/// and the source never resolved. The `use <package>` import itself stays an
+/// ADVISORY lint (`lint_missing_ingress_import`), never a hard error.
+fn validate_source_provider_kinds(
+    ir: &IrProgram,
+    package_lock: Option<&LoadedPackageLock>,
+) -> Result<(), String> {
+    if ir.sources.is_empty() {
+        return Ok(());
+    }
+    let known = known_source_provider_kinds(package_lock);
+    for source in &ir.sources {
+        if !known.contains(&source.provider) {
+            return Err(format!(
+                "source `{}` uses unknown provider kind `{}`; no embedded or locked package \
+                 manifest contributes it (known source kinds: {})",
+                source.name,
+                source.provider,
+                known.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_construct_uses(
     package_lock: Option<&LoadedPackageLock>,
     ir: &IrProgram,
     registry: &ContractRegistry,
 ) -> Result<(), String> {
+    // Source headers ride the same validation door as construct uses: both
+    // resolve names against manifest-contributed vocabulary.
+    validate_source_provider_kinds(ir, package_lock)?;
     let uses = ir.construct_uses();
     let Some(package_lock) = package_lock else {
         // Without a lock, both a non-`std.` import and a package-owned construct
@@ -18774,177 +19072,13 @@ fn workflow_input_fact_name(contract: &IrWorkflowContract) -> String {
     }
 }
 
-fn validate_json_for_ir_type(
-    ir: &IrProgram,
-    value: &Value,
-    ty: &IrType,
-    path: &str,
-    errors: &mut Vec<String>,
-) {
-    match ty {
-        IrType::Primitive(primitive) => validate_json_for_primitive(value, primitive, path, errors),
-        IrType::LiteralString(expected) => {
-            if value.as_str() != Some(expected.as_str()) {
-                errors.push(format!("{path} must be literal {expected:?}"));
-            }
-        }
-        IrType::Ref(name) => validate_json_for_ref(ir, value, name, path, errors),
-        IrType::AgentRef(agents) => match value.as_str() {
-            Some(agent) if agents.iter().any(|candidate| candidate == agent) => {}
-            Some(_) => errors.push(format!(
-                "{path} must name one of these agents: {}",
-                agents.join(", ")
-            )),
-            None => errors.push(format!("{path} must be an agent name string")),
-        },
-        IrType::Object(fields) => validate_json_for_object(ir, value, fields, path, errors),
-        IrType::Optional(inner) => {
-            if !value.is_null() {
-                validate_json_for_ir_type(ir, value, inner, path, errors);
-            }
-        }
-        IrType::Array(inner) => match value.as_array() {
-            Some(items) => {
-                for (index, item) in items.iter().enumerate() {
-                    validate_json_for_ir_type(ir, item, inner, &format!("{path}[{index}]"), errors);
-                }
-            }
-            None => errors.push(format!("{path} must be an array")),
-        },
-        IrType::Map(inner) => match value.as_object() {
-            Some(map) => {
-                for (key, item) in map {
-                    validate_json_for_ir_type(ir, item, inner, &format!("{path}.{key}"), errors);
-                }
-            }
-            None => errors.push(format!("{path} must be an object map")),
-        },
-        IrType::Union(types) => {
-            if !types
-                .iter()
-                .any(|candidate| json_matches_ir_type(ir, value, candidate))
-            {
-                errors.push(format!(
-                    "{path} must match one of: {}",
-                    types
-                        .iter()
-                        .map(ir_type_name)
-                        .collect::<Vec<_>>()
-                        .join(" | ")
-                ));
-            }
-        }
-    }
-}
-
-fn validate_json_for_primitive(
-    value: &Value,
-    primitive: &IrPrimitiveType,
-    path: &str,
-    errors: &mut Vec<String>,
-) {
-    let valid = match primitive {
-        IrPrimitiveType::String
-        | IrPrimitiveType::Duration
-        | IrPrimitiveType::Time
-        | IrPrimitiveType::Image
-        | IrPrimitiveType::Audio
-        | IrPrimitiveType::Pdf
-        | IrPrimitiveType::Video => value.is_string(),
-        IrPrimitiveType::Int => value.as_i64().is_some(),
-        IrPrimitiveType::Float => value.as_f64().is_some(),
-        IrPrimitiveType::Bool => value.is_boolean(),
-        IrPrimitiveType::Null => value.is_null(),
-    };
-    if !valid {
-        errors.push(format!(
-            "{path} must be {}",
-            ir_type_name(&IrType::Primitive(primitive.clone()))
-        ));
-    }
-}
-
-fn validate_json_for_ref(
-    ir: &IrProgram,
-    value: &Value,
-    name: &str,
-    path: &str,
-    errors: &mut Vec<String>,
-) {
-    if let Some(class) = ir.schemas.iter().find_map(|schema| match schema {
-        IrSchema::Class(class) if class.name == name => Some(class),
-        _ => None,
-    }) {
-        validate_json_for_object(ir, value, &class.fields, path, errors);
-        return;
-    }
-    if let Some(enum_decl) = ir.schemas.iter().find_map(|schema| match schema {
-        IrSchema::Enum(enum_decl) if enum_decl.name == name => Some(enum_decl),
-        _ => None,
-    }) {
-        match value.as_str() {
-            Some(variant)
-                if enum_decl
-                    .variants
-                    .iter()
-                    .any(|candidate| candidate == variant) => {}
-            Some(_) => errors.push(format!(
-                "{path} must be one of: {}",
-                enum_decl.variants.join(", ")
-            )),
-            None => errors.push(format!("{path} must be a string enum variant")),
-        }
-        return;
-    }
-    errors.push(format!("{path} references unknown type `{name}`"));
-}
-
-fn validate_json_for_object(
-    ir: &IrProgram,
-    value: &Value,
-    fields: &[whipplescript_parser::IrClassField],
-    path: &str,
-    errors: &mut Vec<String>,
-) {
-    let Some(object) = value.as_object() else {
-        errors.push(format!("{path} must be an object"));
-        return;
-    };
-    for key in object.keys() {
-        if !fields.iter().any(|field| field.name == *key) {
-            errors.push(format!("{path}.{key} is not declared"));
-        }
-    }
-    for field in fields {
-        let field_path = format!("{path}.{}", field.name);
-        // Family B conditional required-presence (discriminated-families-design.md
-        // §5.7): a `when <disc> is "<lit>"` field is required only when its
-        // discriminant equals the literal. An inapplicable sibling (the discriminant
-        // names a different value) is neither required nor rejected nor validated —
-        // soundness needs only positive presence, and this admits the
-        // all-keys-present webhook shape.
-        if let Some((disc, lit)) = &field.presence_condition {
-            let applicable = object
-                .get(disc)
-                .and_then(Value::as_str)
-                .is_some_and(|value| value == lit);
-            if !applicable {
-                continue;
-            }
-        }
-        match object.get(&field.name) {
-            Some(value) => validate_json_for_ir_type(ir, value, &field.ty, &field_path, errors),
-            None if matches!(field.ty, IrType::Optional(_)) => {}
-            None => errors.push(format!("{field_path} is required")),
-        }
-    }
-}
-
-fn json_matches_ir_type(ir: &IrProgram, value: &Value, ty: &IrType) -> bool {
-    let mut errors = Vec::new();
-    validate_json_for_ir_type(ir, value, ty, "$", &mut errors);
-    errors.is_empty()
-}
+// IR-typed JSON validation moved KERNEL-side with the std.ingress admission
+// core (spec/std-ingress.md I3): every ingress driver validates payloads
+// against the declaration through the same functions, so the CLI delegates
+// (S0 dedup — a shape change touches exactly one definition).
+use whipplescript_kernel::rule_lowering::{
+    json_matches_ir_type, validate_json_for_ir_type, validate_json_for_object,
+};
 
 fn step(options: &CliOptions) -> ExitCode {
     let step_options = match StepOptions::parse(&options.args) {
@@ -20068,99 +20202,110 @@ fn resolve_due_clock_sources(
     whipplescript_kernel::time_pass::resolve_due_clock_sources(&mut kernel, instance_id, now, ir)
 }
 
-/// Admits durable signal facts from `file` sources (spec/std-time.md admission
-/// semantics): read each source's `path`, and for every non-empty line at
-/// (non-empty) ordinal `i`, admit one signal keyed by `line_id = H(source, i)`
-/// — append-only log semantics, so re-reading the file re-admits nothing already
-/// seen and a growing file only adds its new tail.
-///
-/// Dedup mirrors the clock source's cursor, not a store-level upsert: the event
-/// log hard-errors on a duplicate idempotency key (no `ON CONFLICT`), so — as
-/// `resolve_due_clock_sources` does with `last_clock_occurrence` — we must never
-/// re-attempt an already-admitted line. The cursor is the count of external
-/// events already admitted for this signal (each admitted line appends exactly
-/// one such event; `derive_fact` appends a `fact.derived` event, not one of this
-/// type, so it does not inflate the count). Because non-empty ordinals are
-/// gap-free and admissions form a prefix `0..count`, skipping `i < count` is
-/// exactly the set already admitted.
-///
-/// A missing file is not an error: the source simply has nothing to admit yet.
-/// The observation record `{ line, line_index, path }` is mapped onto the
-/// declared signal by the author's `emit` clause exactly as a clock occurrence
-/// is mapped by `clock_emit_payload`.
+/// Admits durable signal facts from `file` sources. Lifted KERNEL-side with
+/// the std.ingress admission core (spec/std-ingress.md I3,
+/// `whipplescript_kernel::ingress_pass::resolve_due_file_sources`): the CLI
+/// opens the store once and supplies the native filesystem seam — line-mode
+/// `path` reads plus the `watch` glob walk (the FileStore plane has no
+/// directory listing). Line keys are byte-identical to the pre-lift
+/// `H(source, i)` cursor keys, so existing stores never double-admit.
 fn resolve_due_file_sources(
     store_path: &Path,
     instance_id: &str,
     ir: &IrProgram,
 ) -> Result<u64, StoreError> {
-    let mut admitted = 0u64;
-    for source in &ir.sources {
-        if !source.is_file {
-            continue;
+    struct NativeIngressFileIo;
+    impl whipplescript_kernel::ingress_pass::IngressFileIo for NativeIngressFileIo {
+        fn read_file(&mut self, path: &str) -> Result<Option<String>, String> {
+            match fs::read_to_string(path) {
+                Ok(contents) => Ok(Some(contents)),
+                // A missing file is not an error: nothing to admit yet.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(format!("reading `{path}` failed: {error}")),
+            }
         }
-        let Some(path) = source.path.as_ref() else {
-            continue;
-        };
-        let already_admitted = {
-            let store = SqliteStore::open(store_path)?;
-            if store.get_instance(instance_id)?.is_none() {
-                continue;
-            }
-            store
-                .list_events(instance_id)?
-                .into_iter()
-                .filter(|event| {
-                    event.source == "external" && event.event_type == source.emit_signal
-                })
-                .count()
-        };
-        // A missing file is not an error: there is simply nothing to admit yet.
-        let contents = match fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(StoreError::Conflict(error.to_string())),
-        };
-        for (index, line) in contents
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .enumerate()
-        {
-            if index < already_admitted {
-                continue;
-            }
-            let line_id = idempotency_key(&[&source.name, &index.to_string()]);
-            let mut observation = serde_json::Map::new();
-            observation.insert("line".to_owned(), Value::String(line.to_owned()));
-            observation.insert("line_index".to_owned(), json!(index));
-            observation.insert("path".to_owned(), Value::String(path.clone()));
-            let payload_json = clock_emit_payload(source, &observation).to_string();
-            let store = SqliteStore::open(store_path)?;
-            let mut kernel = RuntimeKernel::new(store);
-            // Record the line event, then derive its durable signal fact
-            // (mirroring `whip signal`), keyed by `line_id` so both steps stay
-            // idempotent under replay.
-            let received = kernel.ingest_external_event(
-                instance_id,
-                &source.emit_signal,
-                &payload_json,
-                Some(&line_id),
-            )?;
-            kernel.derive_fact(
-                instance_id,
-                &source.emit_signal,
-                &received.event_id,
-                &payload_json,
-                Some(&received.event_id),
-                Some(&idempotency_key(&[
-                    instance_id,
-                    "file-fact",
-                    &received.event_id,
-                ])),
-            )?;
-            admitted += 1;
+        fn glob_files(&mut self, pattern: &str) -> Result<Vec<String>, String> {
+            glob_watch_files(pattern)
         }
     }
-    Ok(admitted)
+    let store = SqliteStore::open(store_path)?;
+    let mut kernel = RuntimeKernel::new(store);
+    let report = whipplescript_kernel::ingress_pass::resolve_due_file_sources(
+        &mut kernel,
+        instance_id,
+        ir,
+        &mut NativeIngressFileIo,
+    )?;
+    for note in &report.notes {
+        eprintln!("{note}");
+    }
+    Ok(report.admitted)
+}
+
+/// The v1 `watch` glob walk (spec/std-ingress.md I2a): a literal directory
+/// prefix plus one filename pattern where `*` matches any run of characters —
+/// deliberately the WHIPPLESCRIPT_EXEC_ALLOW-style conservative surface, no
+/// `**` and no wildcard directories. Non-matching and non-file entries are
+/// skipped; a missing directory is an empty match (nothing dropped yet).
+fn glob_watch_files(pattern: &str) -> Result<Vec<String>, String> {
+    let (dir, name_pattern) = match pattern.rsplit_once('/') {
+        Some((dir, name)) => (dir.to_owned(), name.to_owned()),
+        None => (".".to_owned(), pattern.to_owned()),
+    };
+    if dir.contains('*') {
+        return Err(format!(
+            "watch glob `{pattern}` uses a wildcard directory; v1 supports wildcards in the file name only"
+        ));
+    }
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("listing `{dir}` failed: {error}")),
+    };
+    let mut matched = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("listing `{dir}` failed: {error}"))?;
+        if !entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if wildcard_name_matches(&name_pattern, name) {
+            matched.push(format!("{dir}/{name}"));
+        }
+    }
+    matched.sort();
+    Ok(matched)
+}
+
+/// `*`-only wildcard match over a single path segment (no `?`, no classes).
+fn wildcard_name_matches(pattern: &str, name: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let Some(first) = parts.next() else {
+        return pattern == name;
+    };
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+    let mut parts = parts.peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            // Last literal must be a suffix of what remains.
+            return part.is_empty() || rest.ends_with(part);
+        }
+        match rest.find(part) {
+            Some(found) => rest = &rest[found + part.len()..],
+            None => return false,
+        }
+    }
+    // Pattern had no `*` at all: the strip_prefix consumed it entirely.
+    rest.is_empty()
 }
 
 /// Admits durable signal facts from `http` sources: GET each source's `url`,
@@ -20348,115 +20493,43 @@ fn resolve_due_http_sources(
     instance_id: &str,
     ir: &IrProgram,
 ) -> Result<u64, StoreError> {
-    let mut admitted = 0u64;
-    for source in &ir.sources {
-        if !source.is_http {
-            continue;
-        }
-        let Some(url) = source.url.as_ref() else {
-            continue;
-        };
+    // Lifted KERNEL-side with the std.ingress admission core
+    // (spec/std-ingress.md I3): the CLI supplies the native fetch seam — the
+    // SSRF policy screen plus the in-tree `ureq` client (mirroring the coerce
+    // and otel transports) with connection-time DNS screening, so a rebinding
+    // name cannot swing to an internal address between check and connect.
+    // Element keys are byte-identical to the pre-lift `H(source, i)` cursor
+    // keys, so existing stores never double-admit. A network/HTTP error is
+    // not a hard failure: admit nothing this pass so a flaky endpoint can't
+    // crash the worker.
+    let mut fetch = |url: &str| -> Result<String, String> {
         if let Some(reason) = http_source_url_policy_error(url) {
-            eprintln!("http source `{}`: refused {url}: {reason}", source.name);
-            continue;
+            return Err(format!("refused {url}: {reason}"));
         }
-        let already_admitted = {
-            let store = SqliteStore::open(store_path)?;
-            if store.get_instance(instance_id)?.is_none() {
-                continue;
-            }
-            store
-                .list_events(instance_id)?
-                .into_iter()
-                .filter(|event| {
-                    event.source == "external" && event.event_type == source.emit_signal
-                })
-                .count()
-        };
-        // GET the endpoint over the in-tree `ureq` client (mirrors the coerce and
-        // otel transports). A network/HTTP error is not a hard failure: admit
-        // nothing this pass so a flaky endpoint can't crash the worker.
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(5))
             .user_agent("whipplescript-ingress")
-            // Screen at connection time so a rebinding DNS name cannot swing to
-            // an internal address between the policy check and the connect.
             .resolver(screen_public_addrs)
             .build();
-        let body = match agent.get(url).call() {
-            Ok(response) => match response.into_string() {
-                Ok(body) => body,
-                Err(error) => {
-                    eprintln!(
-                        "http source `{}`: reading {url} failed: {error}",
-                        source.name
-                    );
-                    continue;
-                }
-            },
-            Err(error) => {
-                eprintln!("http source `{}`: GET {url} failed: {error}", source.name);
-                continue;
-            }
-        };
-        // The body must be a JSON array; anything else admits nothing this pass.
-        let elements = match serde_json::from_str::<Value>(&body) {
-            Ok(Value::Array(elements)) => elements,
-            Ok(_) => {
-                eprintln!(
-                    "http source `{}`: {url} did not return a JSON array; skipping",
-                    source.name
-                );
-                continue;
-            }
-            Err(error) => {
-                eprintln!(
-                    "http source `{}`: {url} returned invalid JSON: {error}",
-                    source.name
-                );
-                continue;
-            }
-        };
-        for (index, element) in elements.into_iter().enumerate() {
-            if index < already_admitted {
-                continue;
-            }
-            let item_id = idempotency_key(&[&source.name, &index.to_string()]);
-            let mut observation = serde_json::Map::new();
-            // `item` carries the element re-stringified, so a source can emit the
-            // whole element as a string field (or, once field access lands, drill
-            // into it); `item_index`/`url` mirror `line_index`/`path`.
-            observation.insert("item".to_owned(), Value::String(element.to_string()));
-            observation.insert("item_index".to_owned(), json!(index));
-            observation.insert("url".to_owned(), Value::String(url.clone()));
-            let payload_json = clock_emit_payload(source, &observation).to_string();
-            let store = SqliteStore::open(store_path)?;
-            let mut kernel = RuntimeKernel::new(store);
-            // Record the item event, then derive its durable signal fact
-            // (mirroring `whip signal`), keyed by `item_id` so both steps stay
-            // idempotent under replay.
-            let received = kernel.ingest_external_event(
-                instance_id,
-                &source.emit_signal,
-                &payload_json,
-                Some(&item_id),
-            )?;
-            kernel.derive_fact(
-                instance_id,
-                &source.emit_signal,
-                &received.event_id,
-                &payload_json,
-                Some(&received.event_id),
-                Some(&idempotency_key(&[
-                    instance_id,
-                    "http-fact",
-                    &received.event_id,
-                ])),
-            )?;
-            admitted += 1;
+        match agent.get(url).call() {
+            Ok(response) => response
+                .into_string()
+                .map_err(|error| format!("reading {url} failed: {error}")),
+            Err(error) => Err(format!("GET {url} failed: {error}")),
         }
+    };
+    let store = SqliteStore::open(store_path)?;
+    let mut kernel = RuntimeKernel::new(store);
+    let report = whipplescript_kernel::ingress_pass::resolve_due_http_sources(
+        &mut kernel,
+        instance_id,
+        ir,
+        &mut fetch,
+    )?;
+    for note in &report.notes {
+        eprintln!("{note}");
     }
-    Ok(admitted)
+    Ok(report.admitted)
 }
 
 /// Autonomous inbound RECEIVE for `local` channels (spec/messaging.md): the
@@ -30185,12 +30258,13 @@ fn inbox_answer(options: &CliOptions) -> ExitCode {
 /// recorded fact is the source of truth; replay re-reads it, never the
 /// delivery.
 fn signal(options: &CliOptions) -> ExitCode {
-    let usage = "usage: whip signal <instance> --name <name> --data <json> --program <workflow.whip> [--root <workflow>]";
+    let usage = "usage: whip signal <instance> --name <name> --data <json> --program <workflow.whip> [--root <workflow>] [--delivery-id <id>]";
     let mut instance_id = None;
     let mut event_name = None;
     let mut data = None;
     let mut program_path = None;
     let mut root = None;
+    let mut delivery_id = None;
     let mut index = 0;
     while index < options.args.len() {
         match options.args[index].as_str() {
@@ -30209,6 +30283,13 @@ fn signal(options: &CliOptions) -> ExitCode {
             "--root" => {
                 index += 1;
                 root = options.args.get(index).cloned();
+            }
+            // I5 (spec/std-ingress.md): the operator-supplied delivery id WINS
+            // over the derived payload-hash key, completing "CLI Admission" —
+            // the same id twice admits once, across process runs.
+            "--delivery-id" => {
+                index += 1;
+                delivery_id = options.args.get(index).cloned();
             }
             other if other.starts_with('-') => {
                 eprintln!("unknown signal option `{other}`");
@@ -30233,39 +30314,6 @@ fn signal(options: &CliOptions) -> ExitCode {
         Ok(compiled) => compiled,
         Err(error) => return report_compile_failure(&program_path, error),
     };
-    let Some(event) = ir.events.iter().find(|event| event.name == event_name) else {
-        let declared = ir
-            .events
-            .iter()
-            .map(|event| event.name.as_str())
-            .collect::<Vec<_>>();
-        eprintln!(
-            "signal `{event_name}` is not declared in {program_path}{}",
-            if declared.is_empty() {
-                "; the program declares no signals".to_owned()
-            } else {
-                format!("; declared signals: {}", declared.join(", "))
-            }
-        );
-        return ExitCode::from(2);
-    };
-    // No laundering (H8 stage b): a signal governance marks INTERNAL is an internal
-    // channel whose integrity is carried from its emitter, so it may not be sourced
-    // by an external `whip signal` injection — otherwise an attacker could smuggle
-    // untrusted data in under a trusted signal name. Ungoverned/dev mode imposes
-    // nothing.
-    if ifc::signal_is_internal(&event_name) {
-        eprintln!(
-            "signal `{event_name}` is governed as an INTERNAL channel (DR-0027 H8); external \
-             injection is refused — an internal signal carries its emitter's integrity and may \
-             not be sourced from outside"
-        );
-        eprintln!(
-            "to allow external delivery, remove the `internal` mark on `signal:{event_name}` in \
-             the governance envelope (it then becomes an external-entry source, default low)"
-        );
-        return ExitCode::from(1);
-    }
     let payload: Value = match serde_json::from_str(&data) {
         Ok(payload) => payload,
         Err(error) => {
@@ -30273,73 +30321,266 @@ fn signal(options: &CliOptions) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut errors = Vec::new();
-    validate_json_for_object(&ir, &payload, &event.fields, "$", &mut errors);
-    if !errors.is_empty() {
-        eprintln!(
-            "payload does not conform to signal `{event_name}`: {}",
-            errors.join("; ")
-        );
-        return ExitCode::from(2);
-    }
     let store = match open_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
-    match store.get_instance(&instance_id) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            eprintln!("instance `{instance_id}` not found");
-            return ExitCode::from(2);
-        }
-        Err(error) => return report_store_error("failed to load instance", error),
-    }
+    // The ONE shared admission core (spec/std-ingress.md I3): declared-signal
+    // check, H8 internal-channel gate, payload validation, idempotent append,
+    // fact derivation — the same door every ingress driver goes through.
     let payload_json = payload.to_string();
-    let mut kernel = RuntimeKernel::new(store);
-    let received = match kernel.ingest_external_event(
+    let delivery_key = whipplescript_kernel::ingress_pass::signal_delivery_key(
         &instance_id,
         &event_name,
         &payload_json,
-        Some(&idempotency_key(&[
-            &instance_id,
-            "signal",
-            &event_name,
-            &payload_json,
-        ])),
+        delivery_id.as_deref(),
+    );
+    let mut kernel = RuntimeKernel::new(store);
+    let admission = match whipplescript_kernel::ingress_pass::admit_external_signal(
+        &mut kernel,
+        &instance_id,
+        &ir,
+        &event_name,
+        &payload,
+        &delivery_key,
     ) {
-        Ok(event) => event,
+        Ok(admission) => admission,
         Err(error) => return report_store_error("failed to record event", error),
     };
-    let fact_event = match kernel.derive_fact(
-        &instance_id,
-        &event_name,
-        &received.event_id,
-        &payload_json,
-        Some(&received.event_id),
-        Some(&idempotency_key(&[
-            &instance_id,
-            "signal-fact",
-            &received.event_id,
-        ])),
-    ) {
-        Ok(event) => event,
-        Err(error) => return report_store_error("failed to record event fact", error),
-    };
-    if options.json {
-        emit_json(json!({
-            "instance_id": instance_id,
-            "signal": event_name,
-            "event_id": received.event_id,
-            "fact_event_id": fact_event.event_id,
-            "payload": payload,
-        }))
-    } else {
-        println!(
-            "signaled {instance_id} with `{event_name}` at event #{}",
-            fact_event.sequence
-        );
-        ExitCode::SUCCESS
+    use whipplescript_kernel::ingress_pass::{SignalAdmission, SignalRefusal};
+    match admission {
+        SignalAdmission::Refused(SignalRefusal::UndeclaredSignal { declared }) => {
+            eprintln!(
+                "signal `{event_name}` is not declared in {program_path}{}",
+                if declared.is_empty() {
+                    "; the program declares no signals".to_owned()
+                } else {
+                    format!("; declared signals: {}", declared.join(", "))
+                }
+            );
+            ExitCode::from(2)
+        }
+        // No laundering (H8 stage b): a signal governance marks INTERNAL is an
+        // internal channel whose integrity is carried from its emitter, so it
+        // may not be sourced by an external `whip signal` injection —
+        // otherwise an attacker could smuggle untrusted data in under a
+        // trusted signal name. Ungoverned/dev mode imposes nothing.
+        SignalAdmission::Refused(SignalRefusal::InternalChannel) => {
+            eprintln!(
+                "signal `{event_name}` is governed as an INTERNAL channel (DR-0027 H8); external \
+                 injection is refused — an internal signal carries its emitter's integrity and may \
+                 not be sourced from outside"
+            );
+            eprintln!(
+                "to allow external delivery, remove the `internal` mark on `signal:{event_name}` in \
+                 the governance envelope (it then becomes an external-entry source, default low)"
+            );
+            ExitCode::from(1)
+        }
+        SignalAdmission::Refused(SignalRefusal::PayloadInvalid { errors }) => {
+            eprintln!(
+                "payload does not conform to signal `{event_name}`: {}",
+                errors.join("; ")
+            );
+            ExitCode::from(2)
+        }
+        SignalAdmission::Refused(SignalRefusal::InstanceNotFound) => {
+            eprintln!("instance `{instance_id}` not found");
+            ExitCode::from(2)
+        }
+        // The observable duplicate ("CLI Admission", spec/event-ingress.md):
+        // the delivery was already admitted, nothing new landed — success,
+        // because the operator's intent (this delivery is in) holds.
+        SignalAdmission::Duplicate { existing_event_id } => {
+            if options.json {
+                emit_json(json!({
+                    "instance_id": instance_id,
+                    "signal": event_name,
+                    "duplicate": true,
+                    "event_id": existing_event_id,
+                    "payload": payload,
+                }))
+            } else {
+                println!(
+                    "signal `{event_name}` was already admitted to {instance_id} (event {existing_event_id}); duplicate delivery absorbed"
+                );
+                ExitCode::SUCCESS
+            }
+        }
+        SignalAdmission::Admitted {
+            event_id,
+            fact_event_id,
+            sequence,
+        } => {
+            if options.json {
+                emit_json(json!({
+                    "instance_id": instance_id,
+                    "signal": event_name,
+                    "event_id": event_id,
+                    "fact_event_id": fact_event_id,
+                    "payload": payload,
+                }))
+            } else {
+                println!("signaled {instance_id} with `{event_name}` at event #{sequence}");
+                ExitCode::SUCCESS
+            }
+        }
     }
+}
+
+/// `whip ingress serve --stdio` (spec/std-ingress.md slice I3, the
+/// `std.ingress.stdio` resident operator driver): read JSONL envelopes
+/// `{instance, signal, payload, delivery_id?}` from stdin and admit each
+/// through the SAME admission core `whip signal` and the file/http pollers
+/// use — a malformed envelope is rejected before any fact, a re-delivered
+/// `delivery_id` is absorbed once. One JSON result line per envelope on
+/// stdout; the process exits 0 at EOF (dev/test reference path, native-only,
+/// no M2 effect seam involved). The HTTP LISTENER driver is deferred with
+/// slice I4 ("Deferred with cause").
+fn ingress_command(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip ingress serve --stdio --program <workflow.whip> [--root <workflow>]";
+    if options.args.first().map(String::as_str) != Some("serve") {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    }
+    let mut stdio = false;
+    let mut program_path = None;
+    let mut root = None;
+    let mut index = 1;
+    while index < options.args.len() {
+        match options.args[index].as_str() {
+            "--stdio" => stdio = true,
+            "--program" => {
+                index += 1;
+                program_path = options.args.get(index).cloned();
+            }
+            "--root" => {
+                index += 1;
+                root = options.args.get(index).cloned();
+            }
+            other => {
+                eprintln!("unknown ingress serve option `{other}`");
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+        index += 1;
+    }
+    if !stdio {
+        eprintln!(
+            "`whip ingress serve` currently drives --stdio only; the HTTP listener driver is \
+             deferred (spec/std-ingress.md \"Deferred with cause\", slice I4)"
+        );
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    }
+    let Some(program_path) = program_path else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let (_source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
+        Ok(compiled) => compiled,
+        Err(error) => return report_compile_failure(&program_path, error),
+    };
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let mut kernel = RuntimeKernel::new(store);
+    use whipplescript_kernel::ingress_pass::{
+        admit_external_signal, refusal_reason, signal_delivery_key, SignalAdmission,
+    };
+    let stdin = std::io::stdin();
+    let mut line_number = 0usize;
+    for line in std::io::BufRead::lines(stdin.lock()) {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                eprintln!("reading stdin failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        line_number += 1;
+        // Envelope validation happens BEFORE any store write: a malformed
+        // line rejects with a per-line result and admits nothing.
+        let reject =
+            |reason: String| json!({"line": line_number, "status": "rejected", "reason": reason});
+        let envelope: Value = match serde_json::from_str(&line) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                println!("{}", reject(format!("invalid JSON envelope: {error}")));
+                continue;
+            }
+        };
+        let (Some(instance_id), Some(signal_name)) = (
+            envelope.get("instance").and_then(Value::as_str),
+            envelope.get("signal").and_then(Value::as_str),
+        ) else {
+            println!(
+                "{}",
+                reject(
+                    "envelope must carry string `instance` and `signal` fields (and a `payload` object)"
+                        .to_owned()
+                )
+            );
+            continue;
+        };
+        let Some(payload) = envelope.get("payload") else {
+            println!("{}", reject("envelope has no `payload`".to_owned()));
+            continue;
+        };
+        let delivery_id = envelope.get("delivery_id").and_then(Value::as_str);
+        let payload_json = payload.to_string();
+        let delivery_key =
+            signal_delivery_key(instance_id, signal_name, &payload_json, delivery_id);
+        let admission = match admit_external_signal(
+            &mut kernel,
+            instance_id,
+            &ir,
+            signal_name,
+            payload,
+            &delivery_key,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                eprintln!("failed to record event: {error:?}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let result = match admission {
+            SignalAdmission::Admitted {
+                event_id,
+                fact_event_id,
+                ..
+            } => json!({
+                "line": line_number,
+                "status": "admitted",
+                "instance_id": instance_id,
+                "signal": signal_name,
+                "event_id": event_id,
+                "fact_event_id": fact_event_id,
+            }),
+            SignalAdmission::Duplicate { existing_event_id } => json!({
+                "line": line_number,
+                "status": "duplicate",
+                "instance_id": instance_id,
+                "signal": signal_name,
+                "event_id": existing_event_id,
+            }),
+            SignalAdmission::Refused(refusal) => json!({
+                "line": line_number,
+                "status": "rejected",
+                "instance_id": instance_id,
+                "signal": signal_name,
+                "reason": refusal_reason(&refusal),
+            }),
+        };
+        println!("{result}");
+    }
+    ExitCode::SUCCESS
 }
 
 /// `whip message`: inject an inbound `Message` (spec/messaging.md) on a declared
@@ -35412,6 +35653,222 @@ fn resolve_same_bundle_tool_grant(program_path: &Path, name: &str) -> Result<IrP
 /// must resolve and be a convergence-eligible `@tool`. Emits the DR's intended
 /// diagnostic, *"agent A is granted Z, which is not `@tool`"*. v1 resolves grants
 /// against the same bundle; cross-package resolution extends `resolve_tool_grant`.
+/// Every agent-provider kind the program binds, with the surface that binds it
+/// and the best available span: direct `provider <kind>` fields (which also
+/// cover the `delegated to` sugar and the managed `owned` default) and
+/// `harness <name>: <kind>` declarations.
+fn ir_agent_provider_kind_uses(ir: &IrProgram) -> Vec<(String, String, SourceSpan)> {
+    let mut uses = Vec::new();
+    for agent in &ir.agents {
+        if let Some(provider) = &agent.provider {
+            uses.push((
+                provider.clone(),
+                format!("agent `{}`", agent.name),
+                SourceSpan { start: 0, end: 0 },
+            ));
+        }
+    }
+    for harness in &ir.harnesses {
+        uses.push((
+            harness.kind.clone(),
+            format!("harness `{}`", harness.name),
+            harness.span,
+        ));
+    }
+    uses
+}
+
+/// The agent-provider kinds one manifest contributes (spec/std-agent.md "Open
+/// provider registry"): OPERATOR-PLANE provider rows carrying `"agent_provider":
+/// true` in their config. Operator rows are admission-inert by construction
+/// (`package_operator_providers` is their only structured reader), so a kind
+/// contribution is visibility data, never a runtime grant (X3).
+fn manifest_json_agent_provider_kinds(manifest_json: &str) -> BTreeSet<String> {
+    let Ok(value) = serde_json::from_str::<Value>(manifest_json) else {
+        return BTreeSet::new();
+    };
+    value
+        .get("providers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|row| {
+            row.get("plane").and_then(Value::as_str) == Some("operator")
+                && row
+                    .get("config")
+                    .and_then(|config| config.get("agent_provider"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
+        .filter_map(|row| {
+            row.get("provider_kind")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// The registry-derived agent-provider kind set (spec/std-agent.md "Open
+/// provider registry", replacing the parser's compiled-in
+/// `is_supported_harness_kind`): kind → the packages contributing it, from the
+/// embedded std manifests (feature-conditional: a binary without the `codex`
+/// feature genuinely does not know the kind) plus every locked manifest.
+fn known_agent_provider_kinds(
+    package_lock: Option<&LoadedPackageLock>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut kinds: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (package, json) in EMBEDDED_STD_MANIFESTS {
+        for kind in manifest_json_agent_provider_kinds(json) {
+            kinds.entry(kind).or_default().insert((*package).to_owned());
+        }
+    }
+    if let Some(lock) = package_lock {
+        for manifest in &lock.manifests {
+            for kind in manifest_json_agent_provider_kinds(&manifest.manifest_json) {
+                kinds.entry(kind).or_default().insert(manifest.name.clone());
+            }
+        }
+    }
+    kinds
+}
+
+/// Provider-kind-known check (spec/std-agent.md "Static checks" 1, the M5
+/// graduated ladder's bottom rung): a provider/harness kind contributed by NO
+/// known manifest — embedded std (feature-conditional) or locked third-party —
+/// is an error naming it a missing package. The middle rung (contributed but
+/// not imported) is `lint.missing_agent_import`, advisory only.
+fn agent_provider_kind_diagnostics(
+    ir: &IrProgram,
+    package_lock: Option<&LoadedPackageLock>,
+) -> Vec<Diagnostic> {
+    let known = known_agent_provider_kinds(package_lock);
+    ir_agent_provider_kind_uses(ir)
+        .into_iter()
+        .filter(|(kind, _, _)| !known.contains_key(kind))
+        .map(|(kind, owner, span)| Diagnostic {
+            related: Vec::new(),
+            span,
+            message: format!(
+                "{owner} uses unknown provider kind `{kind}`: no known package \
+                 manifest contributes it (missing package)"
+            ),
+            suggestion: Some(
+                "provider kinds are contributed by package manifests (embedded std \
+                 packages such as `std.agent`, `std.agent.codex`, `std.agent.claude`, \
+                 or a locked third-party package); add the providing package to the \
+                 package lock, or use a contributed kind"
+                    .to_owned(),
+            ),
+        })
+        .collect()
+}
+
+/// The provider kind one agent resolves to: a direct `provider`/`delegated to`
+/// binding (the parser also defaults bare managed agents to `owned`), or the
+/// kind of the bound `using <harness>` declaration.
+fn resolved_agent_provider_kind<'a>(
+    ir: &'a IrProgram,
+    agent: &'a whipplescript_parser::IrAgent,
+) -> Option<&'a str> {
+    agent.provider.as_deref().or_else(|| {
+        agent.harness.as_deref().and_then(|name| {
+            ir.harnesses
+                .iter()
+                .find(|harness| harness.name == name)
+                .map(|harness| harness.kind.as_str())
+        })
+    })
+}
+
+/// `requires [<feature.class>]` vs the selected provider's accepted feature
+/// report (spec/std-agent.md "Static checks" 2, slice 6): a required class the
+/// report cannot truthfully state as supported (`native`/`emulated`) is an
+/// error; a provider without a report cannot validate any requirement. The
+/// probed-vs-compiled source mismatch is the WARNING half, emitted as an
+/// advisory lint (`lint_agent_requires_probed_source`).
+fn agent_requires_diagnostics(ir: &IrProgram) -> Vec<Diagnostic> {
+    use whipplescript_kernel::agent_profile::agent_feature_report;
+    let mut diagnostics = Vec::new();
+    for agent in &ir.agents {
+        if agent.requires.is_empty() {
+            continue;
+        }
+        let Some(kind) = resolved_agent_provider_kind(ir, agent) else {
+            continue;
+        };
+        let report = agent_feature_report(kind);
+        for class in &agent.requires {
+            let entry = report.and_then(|report| report.entry(class));
+            let satisfied = entry.is_some_and(|entry| entry.support.satisfies_requirement());
+            if satisfied {
+                continue;
+            }
+            let stated = match (report, entry) {
+                (None, _) => format!("provider kind `{kind}` publishes no feature report"),
+                (Some(_), None) => format!("provider `{kind}`'s report does not state it"),
+                (Some(_), Some(entry)) => format!(
+                    "provider `{kind}`'s report states it `{}`",
+                    entry.support.as_str()
+                ),
+            };
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: SourceSpan { start: 0, end: 0 },
+                message: format!(
+                    "agent `{}` requires feature class `{class}`, but {stated}",
+                    agent.name
+                ),
+                suggestion: Some(
+                    "a required class must be stated `native` or `emulated` by the selected \
+                     provider's accepted feature report (DR-0015); pick a provider that \
+                     supports it or drop the requirement"
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+    diagnostics
+}
+
+/// ADVISORY probed-vs-compiled lint (DR-0015 severity rule; spec/std-agent.md
+/// slice 6): a requirement satisfied by a `probed` (not compiled) report entry
+/// is a warning — the claim depends on the local probe, not the shipped
+/// package. v1 reports are all compiled, so this cannot fire until the probed
+/// upgrade lands (deferred with cause in spec/std-agent.md); the check is
+/// wired so the severity rule has a home.
+fn lint_agent_requires_probed_source(ir: &IrProgram) -> Vec<LintFinding> {
+    use whipplescript_kernel::agent_profile::{agent_feature_report, FeatureReportSource};
+    let mut findings = Vec::new();
+    for agent in &ir.agents {
+        let Some(kind) = resolved_agent_provider_kind(ir, agent) else {
+            continue;
+        };
+        let Some(report) = agent_feature_report(kind) else {
+            continue;
+        };
+        for class in &agent.requires {
+            let Some(entry) = report.entry(class) else {
+                continue;
+            };
+            if entry.support.satisfies_requirement() && entry.source == FeatureReportSource::Probed
+            {
+                findings.push(LintFinding {
+                    code: "lint.agent_requires_probed_source",
+                    severity: Severity::Warning,
+                    message: format!(
+                        "agent `{}` requires `{class}`, satisfied only by a probed (not \
+                         compiled) claim from provider `{kind}` (advisory)",
+                        agent.name
+                    ),
+                    name: Some(agent.name.clone()),
+                    span: None,
+                });
+            }
+        }
+    }
+    findings
+}
+
 fn lint_agent_tool_grants(
     program_path: &Path,
     ir: &IrProgram,
@@ -41678,6 +42135,76 @@ coerce review() -> Review {
         );
     }
 
+    /// std.ingress I2b manifest template: the two reserved-keyword construct
+    /// rows (`signal` declaration_block + `emit` signal_emit) parameterized on
+    /// the library id, so both privilege coordinates can bite.
+    const INGRESS_KEYWORD_MANIFEST_TEMPLATE: &str = r#"
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "{LIB}",
+  "name": "{LIB}",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "{LIB}",
+      "constructs": [
+        {
+          "id": "ingress.signal",
+          "construct_family": "declaration_block",
+          "keyword": "signal",
+          "scope": "top_level",
+          "lowering_target": "metadata_only"
+        },
+        {
+          "id": "signal.emit",
+          "construct_family": "effect_operation",
+          "keyword": "emit",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Event" }],
+          "lowering_target": "signal_emit"
+        }
+      ]
+    }
+  ]
+}
+"#;
+
+    /// std.ingress I2b, privilege-tuple leg (spec/std-ingress.md "Catalog
+    /// privilege additions"): the catalog tuples (`signal`, std.ingress,
+    /// declaration_block, metadata_only) and (`emit`, std.ingress,
+    /// effect_operation, signal_emit) admit the construct rows WITHOUT the
+    /// embedded-copy key (empty embedded set), the same door std.coord's
+    /// resource_effect rows ride.
+    #[test]
+    fn package_manifest_privilege_tuples_admit_ingress_signal_and_emit() {
+        let manifest = INGRESS_KEYWORD_MANIFEST_TEMPLATE.replace("{LIB}", "std.ingress");
+        let manifest =
+            package_manifest_from_json_with_embedded(Path::new("ingress.json"), manifest, &[])
+                .expect("the catalog tuples authorize the signal/emit rows");
+        assert_eq!(manifest.registry.constructs.len(), 2);
+        assert!(manifest
+            .registry
+            .constructs
+            .iter()
+            .any(|form| form.keyword == "emit" && form.lowering_target == "signal_emit"));
+    }
+
+    /// Negative fixture (I2b gate): a NON-privileged manifest cannot author
+    /// the `signal`/`emit` keywords or the `signal_emit` lowering — the tuples
+    /// are exact, so a vendor library with the same rows is refused.
+    #[test]
+    fn package_manifest_without_ingress_tuples_cannot_author_signal_or_emit() {
+        let vendor = INGRESS_KEYWORD_MANIFEST_TEMPLATE.replace("{LIB}", "acme.ingress");
+        let error =
+            package_manifest_from_json_with_embedded(Path::new("acme-ingress.json"), vendor, &[])
+                .expect_err("a vendor library holds neither ingress tuple");
+        assert!(
+            error.contains("reserved construct keyword")
+                || error.contains("platform-internal lowering_target `signal_emit`"),
+            "{error}"
+        );
+    }
+
     /// std.coord slice 4 drift test, contracts leg: the manifest's four
     /// coordination effect contracts must FOLD against the parser-compiled
     /// ones (same id/version/library/kind/schemas/validation), so a shape
@@ -42208,6 +42735,209 @@ rule work_ready_item
         assert_eq!(manifests.len(), EMBEDDED_STD_MANIFESTS.len());
         for ((name, _), manifest) in EMBEDDED_STD_MANIFESTS.iter().zip(&manifests) {
             assert_eq!(&manifest.name, name);
+        }
+    }
+
+    /// Manifest/adapter drift (spec/std-agent.md "Static checks" 4, slice 7):
+    /// the thin provider packages' embedded manifests are present iff their
+    /// adapter cargo feature is compiled in — a binary without feature `codex`
+    /// genuinely does not know provider kind `codex`.
+    #[test]
+    fn agent_provider_manifests_track_adapter_features() {
+        assert!(is_embedded_std_manifest("std.agent"));
+        assert_eq!(
+            is_embedded_std_manifest("std.agent.codex"),
+            cfg!(feature = "codex"),
+            "std.agent.codex manifest presence must equal the codex feature"
+        );
+        assert_eq!(
+            is_embedded_std_manifest("std.agent.claude"),
+            cfg!(feature = "claude"),
+            "std.agent.claude manifest presence must equal the claude feature"
+        );
+        // Kind resolution flips with the feature set.
+        let kinds = known_agent_provider_kinds(None);
+        for kind in ["owned", "fixture", "native-fixture", "command"] {
+            assert!(
+                kinds.contains_key(kind),
+                "std.agent must contribute `{kind}`"
+            );
+        }
+        assert_eq!(kinds.contains_key("codex"), cfg!(feature = "codex"));
+        assert_eq!(kinds.contains_key("claude"), cfg!(feature = "claude"));
+        // And the compiled feature reports track the same features.
+        use whipplescript_kernel::agent_profile::agent_feature_report;
+        assert_eq!(
+            agent_feature_report("codex").is_some(),
+            cfg!(feature = "codex")
+        );
+        assert_eq!(
+            agent_feature_report("claude").is_some(),
+            cfg!(feature = "claude")
+        );
+    }
+
+    /// Manifest-vs-compiled drift (spec/std-agent.md slices 4/5/7): every
+    /// embedded agent-provider row's `config.feature_report` matches the
+    /// compiled report for that kind exactly, and the `std.agent` manifest's
+    /// `profiles` section mirrors the compiled preset table row for row.
+    #[test]
+    fn agent_manifest_reports_and_profiles_match_compiled_data() {
+        use whipplescript_kernel::agent_profile::{
+            agent_feature_report, agent_profile_preset, AGENT_PROFILE_PRESETS,
+        };
+        let mut kinds_with_manifest_reports = BTreeSet::new();
+        for (package, json) in EMBEDDED_STD_MANIFESTS {
+            if *package != "std.agent" && !package.starts_with("std.agent.") {
+                continue;
+            }
+            let value: Value = serde_json::from_str(json).expect("embedded manifest json");
+            for row in value
+                .get("providers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let config = row.get("config").expect("provider config");
+                if config.get("agent_provider").and_then(Value::as_bool) != Some(true) {
+                    continue;
+                }
+                let kind = row
+                    .get("provider_kind")
+                    .and_then(Value::as_str)
+                    .expect("provider_kind");
+                let compiled = agent_feature_report(kind)
+                    .unwrap_or_else(|| panic!("no compiled report for manifest kind `{kind}`"));
+                let entries = config
+                    .get("feature_report")
+                    .and_then(Value::as_array)
+                    .unwrap_or_else(|| panic!("kind `{kind}` manifest row carries no report"));
+                assert_eq!(
+                    entries.len(),
+                    compiled.entries.len(),
+                    "kind `{kind}` report length drifted"
+                );
+                for (entry, compiled_entry) in entries.iter().zip(compiled.entries) {
+                    assert_eq!(
+                        entry.get("class").and_then(Value::as_str),
+                        Some(compiled_entry.class),
+                        "kind `{kind}` report class order drifted"
+                    );
+                    assert_eq!(
+                        entry.get("support").and_then(Value::as_str),
+                        Some(compiled_entry.support.as_str()),
+                        "kind `{kind}` class `{}` support drifted",
+                        compiled_entry.class
+                    );
+                    assert_eq!(
+                        entry.get("source").and_then(Value::as_str),
+                        Some(compiled_entry.source.as_str()),
+                        "kind `{kind}` class `{}` source drifted",
+                        compiled_entry.class
+                    );
+                    assert_eq!(
+                        entry.get("native_name").and_then(Value::as_str),
+                        compiled_entry.native_name,
+                        "kind `{kind}` class `{}` native_name drifted",
+                        compiled_entry.class
+                    );
+                    assert_eq!(
+                        entry.get("dispatch").and_then(Value::as_str),
+                        compiled_entry.dispatch,
+                        "kind `{kind}` class `{}` dispatch drifted",
+                        compiled_entry.class
+                    );
+                }
+                kinds_with_manifest_reports.insert(kind.to_owned());
+            }
+        }
+        // Every compiled report has a manifest home (feature-conditional on
+        // both sides, so the sets agree under any feature combination).
+        for report in whipplescript_kernel::agent_profile::AGENT_FEATURE_REPORTS {
+            assert!(
+                kinds_with_manifest_reports.contains(report.provider_kind),
+                "compiled report `{}` has no embedded manifest row",
+                report.provider_kind
+            );
+        }
+
+        // Profile table fold (slice 4's manifest home): std.agent `profiles`
+        // rows mirror the compiled preset table exactly.
+        let (_, agent_json) = EMBEDDED_STD_MANIFESTS
+            .iter()
+            .find(|(name, _)| *name == "std.agent")
+            .expect("std.agent embedded");
+        let value: Value = serde_json::from_str(agent_json).expect("agent manifest json");
+        let profiles = value
+            .get("profiles")
+            .and_then(Value::as_array)
+            .expect("std.agent profiles");
+        assert_eq!(profiles.len(), AGENT_PROFILE_PRESETS.len());
+        for row in profiles {
+            let name = row.get("name").and_then(Value::as_str).expect("name");
+            let preset = agent_profile_preset(name)
+                .unwrap_or_else(|| panic!("manifest profile `{name}` is not a compiled preset"));
+            // Enforcement flows through the compiled preset leg; the manifest
+            // row is audit/visibility data so registered-policy seeding can
+            // never narrow (or widen) the preset expansion.
+            assert_eq!(
+                row.get("enforcement_mode").and_then(Value::as_str),
+                Some("audit"),
+                "profile `{name}` must be audit-mode data"
+            );
+            let config = row.get("config").expect("profile config");
+            assert_eq!(
+                config.get("canonical").and_then(Value::as_bool),
+                Some(preset.canonical)
+            );
+            assert_eq!(
+                config.get("codex_mapped").and_then(Value::as_bool),
+                Some(preset.codex_mapped)
+            );
+            let claude_tools: Option<Vec<&str>> = config
+                .get("claude_allowed_tools")
+                .and_then(Value::as_array)
+                .map(|tools| tools.iter().filter_map(Value::as_str).collect());
+            assert_eq!(
+                claude_tools,
+                preset.claude_allowed_tools.map(|tools| tools.to_vec()),
+                "profile `{name}` claude translation drifted"
+            );
+            let capabilities: Vec<&str> = config
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .map(|caps| caps.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            assert_eq!(
+                capabilities,
+                preset.capabilities.to_vec(),
+                "profile `{name}` capability list drifted"
+            );
+            let owned = config.get("owned_tools").expect("owned_tools");
+            let flag = |key: &str| owned.get(key).and_then(Value::as_bool).unwrap_or(false);
+            assert_eq!(
+                (
+                    flag("read_files"),
+                    flag("write_files"),
+                    flag("bash"),
+                    flag("tracker_file"),
+                    flag("tracker_claim"),
+                    flag("tracker_finish"),
+                    flag("tracker_release"),
+                    flag("workflow_invoke"),
+                ),
+                (
+                    preset.owned.read_files,
+                    preset.owned.write_files,
+                    preset.owned.bash,
+                    preset.owned.tracker_file,
+                    preset.owned.tracker_claim,
+                    preset.owned.tracker_finish,
+                    preset.owned.tracker_release,
+                    preset.owned.workflow_invoke,
+                ),
+                "profile `{name}` owned expansion drifted"
+            );
         }
     }
 
@@ -52200,6 +52930,13 @@ rule go
         let envelope_path = unique_test_path("e2-dyn-envelope", "json");
 
         let mut store = SqliteStore::open(&store_path).expect("store");
+        // Production order: `register_locked_packages` seeds the embedded
+        // std.ingress capability/provider/binding rows at store init, so the
+        // now-real `signal.emit` admission gate (std.ingress I2b) lets the
+        // effect start and the E2-DYN refusal under test is the run outcome.
+        store
+            .register_package_manifest(include_str!("../../../std/manifests/ingress.json"))
+            .expect("std.ingress manifest registers");
         let sender =
             create_runtime_identity_instance(&mut store, "Sender", "workflow:local/Sender");
         let target =
@@ -53243,6 +53980,10 @@ rule finish_batch
         assert_eq!(dev.stream, Some(DevStreamFormat::Ndjson));
     }
 
+    // Feature-gated: validates codex/claude provider-config rows against the
+    // registered capability catalog, which only carries those rows when the
+    // adapter features are compiled in (std.agent slice 7 build matrix).
+    #[cfg(all(feature = "codex", feature = "claude"))]
     #[test]
     fn doctor_provider_config_validation_redacts_extra_values() {
         let results = validate_doctor_provider_config_json(
@@ -53534,6 +54275,9 @@ rule finish_batch
         );
     }
 
+    // Feature-gated: binds a `codex` harness surface, which needs the codex
+    // capability row (std.agent slice 7 build matrix).
+    #[cfg(feature = "codex")]
     #[test]
     fn agent_provider_selection_uses_provider_config_for_harness_surface() {
         let config_path = std::env::temp_dir().join(format!(
@@ -53801,6 +54545,10 @@ rule finish_batch
         );
     }
 
+    // Feature-gated: the codex/claude native-turn request builders exist only
+    // when their adapter features are compiled in (spec/std-agent.md slice 7
+    // build matrix: the features-off test target must also compile).
+    #[cfg(all(feature = "codex", feature = "claude"))]
     #[test]
     fn native_turn_request_applies_provider_config_fields() {
         let config_json = json!({

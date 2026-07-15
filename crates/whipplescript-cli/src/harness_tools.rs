@@ -665,45 +665,50 @@ impl HarnessProfilePolicy {
         }
     }
 
+    /// The preset expansion from the `std.agent` profile table
+    /// (kernel/agent_profile.rs; spec/std-agent.md slice 4). `None` (no
+    /// profile at all) preserves the direct/test-executor permissive default;
+    /// a NAMED profile that is not a table preset is FAIL-CLOSED — the
+    /// permissive fallback is dead.
     fn for_profile(profile: Option<&str>) -> Self {
-        match profile {
-            Some("repo-reader") | Some("human-review") => Self {
-                profile: profile.map(str::to_owned),
-                read_files: true,
-                write_files: false,
-                bash: false,
-                tracker_file: false,
-                tracker_claim: false,
-                tracker_finish: false,
-                tracker_release: false,
-                workflow_invoke: true,
-            },
-            Some("no-repo") | Some("internet-research") => Self {
-                profile: profile.map(str::to_owned),
-                read_files: false,
-                write_files: false,
-                bash: false,
-                tracker_file: false,
-                tracker_claim: false,
-                tracker_finish: false,
-                tracker_release: false,
-                workflow_invoke: true,
-            },
-            Some("repo-writer") | Some("permissive") | Some("release-operator") => Self {
-                profile: profile.map(str::to_owned),
-                read_files: true,
-                write_files: true,
-                bash: true,
-                tracker_file: true,
-                tracker_claim: true,
-                tracker_finish: true,
-                tracker_release: true,
-                workflow_invoke: true,
-            },
-            // Package-defined/custom profiles do not have a local tool-policy
-            // vocabulary in the owned harness yet. Preserve the existing behavior
-            // until the registry-backed profile policy lands.
-            _ => Self::permissive(),
+        let Some(name) = profile else {
+            return Self::permissive();
+        };
+        match whipplescript_kernel::agent_profile::agent_profile_preset(name) {
+            Some(preset) => Self::from_preset_row(name, &preset.owned),
+            None => Self::deny_all(profile),
+        }
+    }
+
+    fn from_preset_row(
+        name: &str,
+        row: &whipplescript_kernel::agent_profile::OwnedToolPolicyRow,
+    ) -> Self {
+        Self {
+            profile: Some(name.to_owned()),
+            read_files: row.read_files,
+            write_files: row.write_files,
+            bash: row.bash,
+            tracker_file: row.tracker_file,
+            tracker_claim: row.tracker_claim,
+            tracker_finish: row.tracker_finish,
+            tracker_release: row.tracker_release,
+            workflow_invoke: row.workflow_invoke,
+        }
+    }
+
+    /// The fail-closed policy an unknown named preset resolves to.
+    fn deny_all(profile: Option<&str>) -> Self {
+        Self {
+            profile: profile.map(str::to_owned),
+            read_files: false,
+            write_files: false,
+            bash: false,
+            tracker_file: false,
+            tracker_claim: false,
+            tracker_finish: false,
+            tracker_release: false,
+            workflow_invoke: false,
         }
     }
 
@@ -711,11 +716,20 @@ impl HarnessProfilePolicy {
         profile: Option<&str>,
         registered: Option<&RegisteredProfilePolicy>,
     ) -> Self {
-        let base = Self::for_profile(profile);
         let Some(registered) = registered else {
-            return base;
+            return Self::for_profile(profile);
         };
-        base.intersect(&Self::from_registered_policy(profile, registered))
+        let registered_policy = Self::from_registered_policy(profile, registered);
+        // A registered package profile policy is its own authority for a
+        // non-preset name (a preset name additionally narrows to the preset
+        // expansion) — the fail-closed unknown-preset policy applies only when
+        // NOTHING defines the profile.
+        match profile.and_then(whipplescript_kernel::agent_profile::agent_profile_preset) {
+            Some(preset) => {
+                Self::from_preset_row(preset.name, &preset.owned).intersect(&registered_policy)
+            }
+            None => registered_policy,
+        }
     }
 
     fn from_registered_policy(profile: Option<&str>, registered: &RegisteredProfilePolicy) -> Self {
@@ -3727,6 +3741,22 @@ pub fn run_owned_agent_turn(
     let turn_tool_access = turn_tool_access_from_input(input_json).map_err(StoreError::Conflict)?;
     enforce_turn_access_governance(&turn_tool_access).map_err(StoreError::Conflict)?;
     let registered_profile_policy = registered_profile_policy_from_store(store_path, profile)?;
+    // Unknown-preset fail-closed (spec/std-agent.md slice 4): a named profile
+    // that is neither a `std.agent` table preset nor a registered profile
+    // policy blocks the turn recoverably at setup — it never falls through to
+    // the permissive policy.
+    if let Some(name) = profile {
+        if registered_profile_policy.is_none()
+            && whipplescript_kernel::agent_profile::agent_profile_preset(name).is_none()
+        {
+            return Err(StoreError::Conflict(format!(
+                "profile `{name}` names neither a std.agent preset nor a registered \
+                 profile policy; owned turns refuse the permissive fallback \
+                 (spec/std-agent.md, presets: {})",
+                whipplescript_kernel::agent_profile::canonical_preset_names().join(", ")
+            )));
+        }
+    }
     let mut profile_policy = HarnessProfilePolicy::for_profile_with_registry(
         profile,
         registered_profile_policy.as_ref(),
@@ -5142,6 +5172,64 @@ mod tests {
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
         assert_eq!(reader_names, vec![TOOL_LIST_TODOS.to_owned()]);
+    }
+
+    /// INVERTED permissive-fallback regression (spec/std-agent.md slice 4): a
+    /// named profile that is not a `std.agent` table preset resolves to the
+    /// fail-closed deny-all policy — it must never fall through to
+    /// `permissive()` as the shipped harness once did.
+    #[test]
+    fn unknown_named_preset_fails_closed_not_permissive() {
+        let policy = HarnessProfilePolicy::for_profile(Some("definitely-not-a-preset"));
+        assert!(!policy.read_files);
+        assert!(!policy.write_files);
+        assert!(!policy.bash);
+        assert!(!policy.tracker_file && !policy.tracker_claim);
+        assert!(!policy.tracker_finish && !policy.tracker_release);
+        assert!(!policy.workflow_invoke);
+        // No profile at all keeps the direct/test-executor permissive default.
+        let unset = HarnessProfilePolicy::for_profile(None);
+        assert!(unset.read_files && unset.write_files && unset.bash);
+    }
+
+    /// Table-vs-harness-policy drift test (spec/std-agent.md slice 4 gate):
+    /// every `std.agent` preset row expands to exactly the owned-harness
+    /// policy vector the table states — reintroducing hard-matched names in
+    /// `for_profile` breaks this immediately.
+    #[test]
+    fn profile_policy_matches_the_agent_profile_table() {
+        for preset in whipplescript_kernel::agent_profile::AGENT_PROFILE_PRESETS {
+            let policy = HarnessProfilePolicy::for_profile(Some(preset.name));
+            let row = &preset.owned;
+            assert_eq!(
+                (
+                    policy.read_files,
+                    policy.write_files,
+                    policy.bash,
+                    policy.tracker_file,
+                    policy.tracker_claim,
+                    policy.tracker_finish,
+                    policy.tracker_release,
+                    policy.workflow_invoke,
+                ),
+                (
+                    row.read_files,
+                    row.write_files,
+                    row.bash,
+                    row.tracker_file,
+                    row.tracker_claim,
+                    row.tracker_finish,
+                    row.tracker_release,
+                    row.workflow_invoke,
+                ),
+                "preset `{}` drifted from the std.agent table",
+                preset.name
+            );
+        }
+        // `issue-triager` is mapped (previously the silent-permissive hole).
+        let triager = HarnessProfilePolicy::for_profile(Some("issue-triager"));
+        assert!(triager.read_files && triager.tracker_claim);
+        assert!(!triager.write_files && !triager.bash);
     }
 
     #[test]

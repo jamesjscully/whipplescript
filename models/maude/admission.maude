@@ -104,4 +104,49 @@ mod WHIPPLESCRIPT-ADMISSION is
       if member(derive(E, R), KS) = true .
   rl  [import-reject] : importRow(E, R, invalid) admitted(KS)
       => rejected(derive(E, R)) admitted(KS) .
+
+  --- std.ingress driver delivery identity, spec/std-ingress.md I3/I5: every
+  --- ingress driver derives a DELIVERY KEY that flows through the same
+  --- admitted-set idempotency as any other admission. Two key forms beyond
+  --- the positional row index:
+  ---   * deliveryKey: an operator/provider-supplied delivery id -- the
+  ---     whip signal --delivery-id flag or the stdio envelope delivery_id.
+  ---     The key is derived from the id ALONE, never the payload bytes, so
+  ---     a re-delivery under the same id is absorbed even when the payload
+  ---     differs -- the id wins over the derived payload hash.
+  ---   * occKey: a path plus content-hash file occurrence, watch mode. An
+  ---     unchanged file re-observed collides on the same key and is
+  ---     absorbed; a content change is a distinct key and admits anew.
+  sorts DeliveryId FilePath ContentHash Payload .
+  ops d1 d2 : -> DeliveryId [ctor] .
+  op p1 : -> FilePath [ctor] .
+  ops h1 h2 : -> ContentHash [ctor] .
+  ops payA payB : -> Payload [ctor] .
+  op deliveryKey : DeliveryId -> Key [ctor] .
+  op occKey : FilePath ContentHash -> Key [ctor] .
+  op deliver : DeliveryId Payload Validity -> Cfg [ctor] .
+  op observeFile : FilePath ContentHash Validity -> Cfg [ctor] .
+
+  var D : DeliveryId .
+  var P : FilePath .
+  var H : ContentHash .
+  var PL : Payload .
+
+  crl [deliver-admit] : deliver(D, PL, valid) admitted(KS)
+      => fact(deliveryKey(D)) admitted(deliveryKey(D) ; KS)
+      if member(deliveryKey(D), KS) = false .
+  crl [deliver-dup] : deliver(D, PL, valid) admitted(KS)
+      => admitted(KS)
+      if member(deliveryKey(D), KS) = true .
+  rl  [deliver-reject] : deliver(D, PL, invalid) admitted(KS)
+      => rejected(deliveryKey(D)) admitted(KS) .
+
+  crl [occ-admit] : observeFile(P, H, valid) admitted(KS)
+      => fact(occKey(P, H)) admitted(occKey(P, H) ; KS)
+      if member(occKey(P, H), KS) = false .
+  crl [occ-dup] : observeFile(P, H, valid) admitted(KS)
+      => admitted(KS)
+      if member(occKey(P, H), KS) = true .
+  rl  [occ-reject] : observeFile(P, H, invalid) admitted(KS)
+      => rejected(occKey(P, H)) admitted(KS) .
 endm
