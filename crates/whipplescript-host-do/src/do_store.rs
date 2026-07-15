@@ -3515,33 +3515,19 @@ fn do_policy_block<Sql: DoSql>(
     if let Some(block) = agent_target_policy_block(&effect)? {
         return Ok(Some(block));
     }
-    // Timers, builtin-tracker verbs, coordination verbs, and file verbs are
-    // runtime-resolved: no provider/capability/profile applies. (The tracker
-    // prefix was `queue.` before the S3 noun rename; the exemption follows
-    // the shipped `tracker.*` kind strings.)
+    // Timers are resolved by the runtime itself on worker passes: no provider,
+    // capability, or profile applies. This is the ONLY runtime-resolved
+    // exemption, matching the native gate (store/lib.rs `policy_block_on`).
     //
-    // INTENTIONAL DIVERGENCE from the native mirror (store/lib.rs
-    // `policy_block_on`, std.coord slice 4 + std.files slice F2 + std.tracker
-    // slice T4; std.ingress slice I2b): the native gate dropped its
-    // coordination, file, tracker, and signal.emit exemptions because the
-    // embedded std.coord / std.files / std.tracker / std.ingress manifests
-    // seed capability/provider/binding rows at store init. The DO bootstrap
-    // seeds only coerce rows (do_instance.rs / do_worker.rs) and M7 defers DO
-    // manifest registration to the DO tracker, so removing the
-    // `lease.`/`ledger.`/`counter.`/`file.`/`tracker.`/`signal.emit` lines
-    // HERE would turn every in-DO coordination, file, tracker, or peer-signal
-    // effect into blocked_by_capability. These exemptions stay until the DO
-    // tracker's package-registration row lands (spec/std-coord.md /
-    // spec/std-files.md / spec/std-tracker.md / spec/std-ingress.md
-    // "Deferred with cause").
-    if effect.kind == "timer.wait"
-        || effect.kind.starts_with("tracker.")
-        || effect.kind.starts_with("lease.")
-        || effect.kind.starts_with("ledger.")
-        || effect.kind.starts_with("counter.")
-        || effect.kind == "signal.emit"
-        || effect.kind.starts_with("file.")
-    {
+    // Coordination (`lease.*`/`ledger.*`/`counter.*`), file (`file.*`), tracker
+    // (`tracker.*`), and ingress (`signal.emit`) kinds are NO LONGER exempt:
+    // the DO-plane package bootstrap (do_packages::register_embedded_std_packages,
+    // called at DurableInstance::create/attach) seeds the same
+    // capability/provider/binding rows the native store seeds at init, so the
+    // admission gate is REAL here too — an unbound kind blocks as
+    // blocked_by_capability, parity with native (the DO tracker's "DO-plane
+    // package bootstrap" row, spec/durable-object-runtime-tracker.md).
+    if effect.kind == "timer.wait" {
         return Ok(None);
     }
     if effect.kind == "exec.command" {
@@ -9641,6 +9627,43 @@ mod tests {
             .is_err());
     }
 
+    /// DO package bootstrap (spec/durable-object-runtime-tracker.md): a fresh DO
+    /// store has NO provider rows for the coordination/tracker/file/ingress/
+    /// coercion kinds, so the admission gate would block them — which is why the
+    /// old `do_policy_block_on` exempted them. `register_embedded_std_packages`
+    /// seeds the same rows native seeds, making the gate REAL on the DO too, so
+    /// the exemptions could be removed (only `timer.wait` stays waved through).
+    #[test]
+    fn do_package_bootstrap_seeds_admission_rows_for_std_effect_kinds() {
+        let store = store();
+        let gated_kinds = [
+            "lease.acquire",
+            "ledger.append",
+            "counter.consume",
+            "tracker.claim",
+            "file.read",
+            "signal.emit",
+            "schema.coerce",
+        ];
+        // Before the bootstrap: no provider row → these kinds would block.
+        for kind in gated_kinds {
+            assert!(
+                !do_effect_provider_exists(&store.sql, kind).expect("query"),
+                "unbootstrapped DO store must not know provider for `{kind}`"
+            );
+        }
+        crate::do_packages::register_embedded_std_packages(&store).expect("bootstrap");
+        // After: every std effect kind has an admission-plane provider row.
+        for kind in gated_kinds {
+            assert!(
+                do_effect_provider_exists(&store.sql, kind).expect("query"),
+                "bootstrap must seed a provider for `{kind}` so the gate admits it"
+            );
+        }
+        // Idempotent: a re-attach re-seeding is a no-op, not an error.
+        crate::do_packages::register_embedded_std_packages(&store).expect("re-bootstrap");
+    }
+
     /// renew_lease extends an active lease (guarded); expire_leases sweeps expired
     /// leases, recording an event and requeuing the run + effect. Real SQL.
     #[test]
@@ -9807,16 +9830,33 @@ mod tests {
                 text("{}"),
             ],
         );
+        // A registered admitted kind: provider + capability + global binding, so
+        // an effect of this kind passes the (now real) admission gate. (Since the
+        // DO package bootstrap, coordination/file/tracker/signal kinds go through
+        // the same gate as native — nothing is waved through but `timer.wait`.)
+        seed(
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[text("p_demo"), text("builtin.demo"), text("builtin"), text("builtin.demo"), text("{}")],
+        );
+        seed(
+            "INSERT INTO capability_schemas (capability, description, schema_json) VALUES (?1, ?2, ?3)",
+            &[text("builtin.demo"), text(""), text("{}")],
+        );
+        seed(
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[text("b_demo"), SqlValue::Null, text("builtin.demo"), text("builtin"), text("{}")],
+        );
 
-        // A queued coordination effect (timer-like builtin: no policy applies) is
-        // immediately claimable.
+        // A queued effect of the admitted kind is immediately claimable.
         seed(
             "INSERT INTO effects (effect_id, instance_id, kind, status, input_json, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             &[
                 text("eff_q"),
                 text("i1"),
-                text("tracker.push"),
+                text("builtin.demo"),
                 text("queued"),
                 text("{}"),
                 text("2026-01-01T00:00:00Z"),
@@ -9843,7 +9883,7 @@ mod tests {
             &[
                 text("eff_up"),
                 text("i1"),
-                text("tracker.push"),
+                text("builtin.demo"),
                 text("queued"),
                 text("{}"),
                 text("2026-01-01T00:00:02Z"),
@@ -9855,7 +9895,7 @@ mod tests {
             &[
                 text("eff_down"),
                 text("i1"),
-                text("tracker.push"),
+                text("builtin.demo"),
                 text("blocked_by_dependency"),
                 text("{}"),
                 text("2026-01-01T00:00:03Z"),
@@ -9917,14 +9957,31 @@ mod tests {
                 text("{}"),
             ],
         );
-        // A runtime-resolved coordination effect (no policy applies) — claimable.
+        // Register the admitted demo kind (provider + capability + global
+        // binding) so it passes the now-real admission gate (see the DO package
+        // bootstrap; only `timer.wait` is waved through).
+        seed(
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[text("p_demo"), text("builtin.demo"), text("builtin"), text("builtin.demo"), text("{}")],
+        );
+        seed(
+            "INSERT INTO capability_schemas (capability, description, schema_json) VALUES (?1, ?2, ?3)",
+            &[text("builtin.demo"), text(""), text("{}")],
+        );
+        seed(
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[text("b_demo"), SqlValue::Null, text("builtin.demo"), text("builtin"), text("{}")],
+        );
+        // A queued effect of the admitted kind — claimable.
         seed(
             "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             &[
                 text("eff_1"),
                 text("i1"),
-                text("tracker.push"),
+                text("builtin.demo"),
                 text("queued"),
                 text("{\"a\":1}"),
             ],
@@ -9949,7 +10006,7 @@ mod tests {
             &[
                 text("eff_up"),
                 text("i1"),
-                text("tracker.push"),
+                text("builtin.demo"),
                 text("queued"),
                 text("{}"),
             ],
@@ -9960,7 +10017,7 @@ mod tests {
             &[
                 text("eff_dn"),
                 text("i1"),
-                text("tracker.push"),
+                text("builtin.demo"),
                 text("queued"),
                 text("{}"),
             ],

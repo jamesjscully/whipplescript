@@ -938,18 +938,27 @@ fixed-size `getRandom` pools). Open build work:
       spec/std-memory.md MEM-3 (M7: the DO package layer lives in this
       tracker); rides the same cadence as the other `Do*` store ports.
 
-- [ ] DO-plane package bootstrap: seed the embedded std manifests at DO
-      instance creation (the native `register_locked_packages` counterpart)
-      and then remove the DO admission-gate exemptions that native already
-      vacated — `do_policy_block_on` still exempts the coordination
-      (`lease.`/`ledger.`/`counter.`), `tracker.`, `file.`, and
-      `signal.emit` kinds (host-do/do_store.rs ~3520, each site carries an
-      INTENTIONAL-DIVERGENCE comment pointing here). Registered 2026-07-15
-      per the std-package campaign close-out (constitution M7:
-      one-concern-one-tracker; std-coord/std-files/std-tracker/std-ingress
-      slice 4-style un-exemptions were native-only by design). Until this
-      lands, the native/DO policy gates intentionally diverge on those
-      kinds.
+- [x] DO-plane package bootstrap (2026-07-15, post-campaign Wave 1):
+      `do_packages::register_embedded_std_packages` seeds the always-embedded
+      std manifests (byte-identical to cli's set minus the feature-gated
+      codex/claude adapters) into the DO store at `DurableInstance::create`
+      AND `attach`, via the DO store's `register_package_manifest` — the
+      native `register_locked_packages` counterpart. The
+      `do_policy_block_on` exemptions for coordination
+      (`lease.`/`ledger.`/`counter.`), `tracker.`, `file.`, and `signal.emit`
+      are DELETED; only `timer.wait` stays runtime-resolved, matching native
+      exactly. Evidence: `do_package_bootstrap_seeds_admission_rows_for_std_effect_kinds`
+      (all seven gated kinds gain a provider row; idempotent re-seed),
+      `durable_instance_admits_a_coordination_effect_through_the_real_gate`
+      (lease.acquire drives create→step→terminal through the seeded gate),
+      and the existing `branch_bound_instance_dispatches_file_effects…` file
+      e2e now runs through the real gate. host-do 75 + store 226 green; wasm32
+      `--no-default-features --release` build green. **Harness note:** `npm run
+      validate` (worker/validate.cjs) is currently red on a node-ESM vs
+      wasm-bindgen-CJS glue mismatch (`exports is not defined in ES module
+      scope`) — a worker/ config/tooling drift (node 24 + `"type":"module"`),
+      independent of this Rust change and in the DR-0042-owned worker/ dir;
+      the substantive DO admission logic is proven by the Rust suite above.
 
 ---
 

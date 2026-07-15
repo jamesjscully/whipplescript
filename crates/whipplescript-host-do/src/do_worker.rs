@@ -152,6 +152,12 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         if !exists {
             return Err(format!("no governed host instance `{instance_id}`"));
         }
+        // DO-plane package bootstrap (see `create`): the governed host facade
+        // opens the instance without seeding std packages, so seed them here
+        // too. Idempotent (`ON CONFLICT DO UPDATE`), so a re-attach after an
+        // isolate eviction is a no-op.
+        crate::do_packages::register_embedded_std_packages(kernel.store())
+            .map_err(|error| format!("{error:?}"))?;
         let default_files: Box<dyn FileStore> = Box::new(DoFileStore::new(
             DoSqlStorage::for_instance(Rc::clone(&sql), instance_id),
         ));
@@ -210,6 +216,14 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                 },
                 &ir,
             )
+            .map_err(|error| format!("{error:?}"))?;
+        // DO-plane package bootstrap (spec/durable-object-runtime-tracker.md):
+        // seed the embedded std manifests so the admission gate is REAL for
+        // coordination / file / tracker / ingress / coercion kinds — the DO
+        // counterpart to native `register_locked_packages`. Must precede the
+        // first worker pass; the `do_policy_block_on` exemptions those kinds
+        // relied on are gone.
+        crate::do_packages::register_embedded_std_packages(kernel.store())
             .map_err(|error| format!("{error:?}"))?;
         // Register deploy-shipped project instructions (context-assembly
         // Phase 3 item 4) — content-addressed, idempotent by position, read by
@@ -750,6 +764,50 @@ mod tests {
         assert_eq!(
             instance.status().expect("status").as_deref(),
             Some("completed")
+        );
+    }
+
+    /// DO package bootstrap end-to-end (spec/durable-object-runtime-tracker.md):
+    /// a COORDINATION effect (`lease.acquire`) now passes the REAL admission gate
+    /// on the DO — the `create` path seeds the embedded std.coord manifest, so
+    /// the effect's provider/capability/binding rows exist and it admits, drives
+    /// to `Held`, and completes. Before the bootstrap this kind was waved through
+    /// by a `do_policy_block_on` exemption; that exemption is gone, so this
+    /// terminal is proof the seeded rows carry the admission (not an exemption).
+    #[test]
+    fn durable_instance_admits_a_coordination_effect_through_the_real_gate() {
+        let source = "use std.coord\n\nworkflow CoordAdmit\n\noutput result Done\n\n\
+             class Done {\n  ok int\n}\n\n\
+             lease slot {\n  key Env\n  slots 1\n  ttl 10m\n}\n\n\
+             class Env {\n  id string\n}\n\n\
+             table envs as Env [\n  { id \"prod\" }\n]\n\n\
+             rule grab\n  when Env as env\n=> {\n\
+             \x20 acquire slot for env.id as grabbed\n\n\
+             \x20 after grabbed held {\n    complete result { ok 1 }\n  }\n\
+             \x20 after grabbed contended {\n    complete result { ok 0 }\n  }\n}\n";
+        let mut instance = DurableInstance::create(
+            store().sql,
+            source,
+            "{}",
+            "local/CoordAdmit",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        )
+        .expect("create");
+        // Drive to quiescence: the record→acquire→complete chain settles across
+        // the machine's fixpoint (no HTTP, so no NeedsHttp suspension).
+        for _ in 0..8 {
+            match instance.step(None, TEST_NOW_MS) {
+                DurableStepOutcome::Terminal => break,
+                DurableStepOutcome::Parked { .. } => {}
+                other => panic!("coordination admit drove to an unexpected outcome: {other:?}"),
+            }
+        }
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed"),
+            "the lease.acquire effect admitted through the seeded gate and completed"
         );
     }
 

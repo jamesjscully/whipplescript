@@ -32,17 +32,17 @@ or a design note before any code).
 
 ## Wave 1 — DO package bootstrap (first real build; cross-cutting unlock)
 
-- [ ] Seed the embedded std manifests at DO instance creation (the native
-      `register_locked_packages` counterpart), then remove the DO
-      admission-gate exemptions native already vacated — `do_policy_block_on`
-      still exempts `lease.`/`ledger.`/`counter.`, `tracker.`, `file.`, and
-      `signal.emit` (host-do/do_store.rs ~3520; each site's
-      INTENTIONAL-DIVERGENCE comment points at the DO tracker's row, which
-      this item executes). Canonical row: durable-object-runtime-tracker.md
-      "DO-plane package bootstrap" — work it THERE per one-concern-one-tracker;
-      this row only sequences it. Rationale for first place: the sole
-      remaining host-security divergence; gates every package's DO parity.
-      Gate: validate.cjs (the suite the standard gates skip) + wasm32 builds.
+- [x] (2026-07-15; do_packages.rs + create/attach seeding; exemptions deleted,
+      only timer.wait waved through; host-do 75 incl. bootstrap + coordination-
+      admit + file e2e, store 226, wasm32 build green) Seed the embedded std
+      manifests at DO instance creation (the native `register_locked_packages`
+      counterpart), then remove the DO admission-gate exemptions native already
+      vacated. Canonical row: durable-object-runtime-tracker.md "DO-plane
+      package bootstrap" (flipped there with full evidence). NOTE: `npm run
+      validate` (worker/validate.cjs) is red on a pre-existing node-ESM vs
+      wasm-bindgen-CJS glue mismatch introduced by commit 302e2c6's
+      `"type":"module"` (DR-0042 worker session, off-limits dir) — the
+      substantive admission logic is proven by the Rust suite instead.
 - [ ] DO-plane memory (MEM-3 port, MemoryStore over DoSql) rides the same
       wave/area — canonical row also in durable-object-runtime-tracker.md.
 
