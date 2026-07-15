@@ -47,52 +47,7 @@ test("codex admission uses only the authenticated local broker sentinel", () => 
   assert.equal(resolved.credential_id, codex.credential_id);
 });
 
-test("static bindings remain only as exact explicit worker-secret transitions", () => {
-  const configured = {
-    [admission.provider_binding_id]: {
-      credential_id: admission.credential_id,
-      provider: admission.provider,
-      model: admission.model,
-      base_url: admission.base_url,
-      execution: "worker-secret",
-      secret: "OPENAI_API_KEY",
-    },
-  };
-  const resolved = resolveAdmittedProvider(admission, {
-    WHIP_HOST_PROVIDER_BINDINGS_JSON: JSON.stringify(configured),
-    OPENAI_API_KEY: "transitional-secret",
-  });
-  assert.equal(resolved.execution, "worker-secret");
-  assert.equal(resolved.api_key, "transitional-secret");
-
-  configured[admission.provider_binding_id].model = "tampered-model";
-  assert.throws(
-    () => resolveAdmittedProvider(admission, {
-      WHIP_HOST_PROVIDER_BINDINGS_JSON: JSON.stringify(configured),
-      OPENAI_API_KEY: "transitional-secret",
-    }),
-    /no exact hosted realization/,
-  );
-});
-
-test("legacy static broker declarations and missing broker transport fail closed", () => {
-  const legacy = {
-    [admission.provider_binding_id]: {
-      credential_id: admission.credential_id,
-      provider: admission.provider,
-      model: admission.model,
-      base_url: admission.base_url,
-      execution: "model-broker",
-    },
-  };
-  assert.throws(
-    () => resolveAdmittedProvider(admission, {
-      WHIP_HOST_PROVIDER_BINDINGS_JSON: JSON.stringify(legacy),
-      WHIP_MODEL_BROKER_URL: "https://home.example/internal/model-egress",
-      WHIP_MODEL_BROKER_TOKEN: "hop-token",
-    }),
-    /static model-broker realizations are retired/,
-  );
+test("missing broker transport fails closed with no Worker-secret fallback", () => {
   assert.throws(
     () => resolveAdmittedProvider(admission, {}),
     /has no model broker/,

@@ -175,10 +175,6 @@ export interface Env {
   // epochs. Both are deployment configuration; a request may supply neither.
   GAUGEDESK_GOVERNANCE_SIGNER?: string;
   GAUGEDESK_GOVERNANCE_KEY?: string;
-  // Transitional Worker-secret realizations keyed by policy binding handle.
-  // Brokered provider identity is realized dynamically from signed admission
-  // and requires no entry here.
-  WHIP_HOST_PROVIDER_BINDINGS_JSON?: string;
   // Secret-free provider egress (DR-0042). The URL is authenticated with this
   // broker-only token after WhippleScript admits the opaque credential ref.
   // Provider credential bytes never enter this Worker realization.
@@ -1268,7 +1264,7 @@ export class WorkflowInstance implements DurableObject {
     ] as const;
     try {
       // Phase 1 crosses no credential boundary. Only after WhippleScript has
-      // returned these exact opaque ids may this Worker read a provider secret.
+      // returned these exact opaque ids may this Worker invoke the broker.
       const admission = JSON.parse(
         hostFunctions.host_validate_turn(makeBridge(this.ctx.storage.sql), ...common),
       ) as HostTurnAdmission;
@@ -1307,7 +1303,7 @@ export class WorkflowInstance implements DurableObject {
       const driven = await this.driveInstance(
         instance,
         instanceId,
-        binding.execution === "model-broker" ? binding : undefined,
+        binding,
       );
       this.ctx.storage.sql.exec(
         "DELETE FROM host_turn_images WHERE instance_id = ?1 AND command_id = ?2",
@@ -1400,7 +1396,7 @@ export class WorkflowInstance implements DurableObject {
       const driven = await this.driveInstance(
         instance,
         instanceId,
-        binding.execution === "model-broker" ? binding : undefined,
+        binding,
       );
       return Response.json({
         admitted: true,

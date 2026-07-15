@@ -45,17 +45,9 @@ reference:
    wrangler secret put WHIP_MODEL_BROKER_TOKEN
    # Set non-secret WHIP_MODEL_BROKER_URL in wrangler configuration.
    ```
-   The transitional `worker-secret` realization resolves a named Worker secret
-   only after admission. Its `WHIP_HOST_PROVIDER_BINDINGS_JSON` entry must
-   exactly repeat the signed tuple, explicitly set
-   `"execution":"worker-secret"`, and name `OPENAI_API_KEY` or
-   `ANTHROPIC_API_KEY` in `secret`:
-   ```
-   wrangler secret put ANTHROPIC_API_KEY
-   wrangler secret put OPENAI_API_KEY
-   ```
-   A static `model-broker` entry is rejected. Broker failure is fail-closed;
-   the Worker never falls back to direct provider egress.
+   Governed host turns have no static provider map or provider-secret binding.
+   Broker failure is fail-closed; the Worker never falls back to direct provider
+   egress.
 
    For a remote-DO development turn using GaugeDesk's locally sealed Codex
    login, point the same broker variables at the authenticated outbound tunnel's
