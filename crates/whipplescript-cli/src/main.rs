@@ -29607,6 +29607,7 @@ fail <id> [--actor A]|\
 set <id> <field> <value> [--expect-state-token T]|\
 conflicts <id>|conflicts --tracker TR|\
 dep add <blocked> [depends-on] <blocker>|\
+export|import <path|->|\
 rebuild>";
 
 /// Run-identity provenance stamp: anything filed/claimed from inside a turn is
@@ -30119,6 +30120,80 @@ fn issue(options: &CliOptions) -> ExitCode {
             }
             Err(error) => report_store_error("failed to rebuild projection", error),
         },
+        "export" => {
+            // Dump the content-addressed event log as JSON — the unit another
+            // clone unions in (`issue import`). Always JSON (it is data).
+            match store.export_events() {
+                Ok(events) => match serde_json::to_string_pretty(&events) {
+                    Ok(text) => {
+                        println!("{text}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => {
+                        eprintln!("failed to serialize events: {error}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(error) => report_store_error("failed to export events", error),
+            }
+        }
+        "import" => {
+            // `import <path>` (or `-` for stdin): union another clone's event log
+            // into this one, deduped by content hash. Reports what merged and
+            // warns on any byte-identical duplicate submission.
+            let Some(path) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let raw = if path == "-" {
+                let mut buf = String::new();
+                match std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
+                    Ok(_) => buf,
+                    Err(error) => {
+                        eprintln!("failed to read stdin: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                match std::fs::read_to_string(path) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        eprintln!("failed to read `{path}`: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            };
+            let events: Vec<whipplescript_store::items::TrackerEvent> =
+                match serde_json::from_str(&raw) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        eprintln!("failed to parse events: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            match store.import_events(&events) {
+                Ok(report) => {
+                    for content_id in &report.duplicate_submissions {
+                        eprintln!("warning: duplicate submission collapsed onto existing issue ({content_id})");
+                    }
+                    if options.json {
+                        emit_json(json!({
+                            "imported": report.imported,
+                            "skipped": report.skipped,
+                            "new_issues": report.new_issues,
+                            "duplicate_submissions": report.duplicate_submissions,
+                        }))
+                    } else {
+                        println!(
+                            "imported {} event(s), {} new issue(s), {} already present",
+                            report.imported, report.new_issues, report.skipped
+                        );
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(error) => report_store_error("failed to import events", error),
+            }
+        }
         _ => {
             eprintln!("{usage}");
             ExitCode::from(2)

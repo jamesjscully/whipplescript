@@ -147,6 +147,20 @@ impl WorkItemStore {
         }
         let connection = Connection::open(path)?;
         connection.execute_batch(TRACKER_SCHEMA_SQL)?;
+        // Self-heal a pre-phase-B `tracker_events` (the ADR-0002 v1 linear log
+        // had neither column): `CREATE TABLE IF NOT EXISTS` never alters an
+        // existing table, so add the Merkle-DAG columns before the unique index
+        // over `event_id` (which would otherwise fail on the old shape).
+        tx_ensure_column(&connection, "tracker_events", "event_id", "TEXT")?;
+        tx_ensure_column(
+            &connection,
+            "tracker_events",
+            "parents_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        connection.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tracker_events_id ON tracker_events(event_id);",
+        )?;
         Ok(Self { connection })
     }
 
@@ -848,12 +862,26 @@ CREATE TABLE IF NOT EXISTS tracker_aliases (
 CREATE INDEX IF NOT EXISTS idx_tracker_issues_queue ON tracker_issues(queue, status);
 CREATE INDEX IF NOT EXISTS idx_tracker_leases_issue ON tracker_leases(issue_id, released_at);
 CREATE INDEX IF NOT EXISTS idx_tracker_events_issue ON tracker_events(issue_id, kind);
--- Content-hash identity: an event is its `event_id`. This UNIQUE index is what
--- makes `INSERT OR IGNORE` a set-union — merge dedups byte-identical events
--- across clones (ADR-0002 phase B1). NULLs are distinct in SQLite, harmless
--- since every real tracker event carries a hash.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_tracker_events_id ON tracker_events(event_id);
 "#;
+
+/// Add a column to a table if it is missing (`CREATE TABLE IF NOT EXISTS` never
+/// alters an existing table). Idempotent — the schema self-heals across phase
+/// upgrades without a migration file.
+#[cfg(feature = "native")]
+fn tx_ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> StoreResult<()> {
+    let present = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+    if !present {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
 
 /// Projection columns in `WorkItem` order (see `row_to_item`).
 #[cfg(feature = "native")]
@@ -1697,6 +1725,34 @@ mod tests {
         // Identity = the creation event: the created event's id IS the content_id.
         let (created_id, _, _) = &events_for(&store, "WS-1")[0];
         assert_eq!(created_id, &content_id);
+    }
+
+    /// A pre-phase-B `tracker_events` (the ADR-0002 v1 linear log, no `event_id`
+    /// / `parents_json`) opens without crashing: the schema self-heals the
+    /// columns before the unique index, so an old store upgrades in place.
+    #[test]
+    fn open_self_heals_a_pre_phase_b_event_table() {
+        let path =
+            std::env::temp_dir().join(format!("whip-tracker-heal-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tracker_events ( \
+                   event_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+                   issue_id TEXT, kind TEXT NOT NULL, \
+                   payload_json TEXT NOT NULL DEFAULT '{}', \
+                   actor TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);",
+            )
+            .unwrap();
+        }
+        // Opening adds the Merkle-DAG columns + index rather than erroring.
+        let mut store = WorkItemStore::open(&path).expect("open self-heals old schema");
+        let filed = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .expect("files on the healed store");
+        assert_eq!(filed.id, "WS-1");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A rebuild reconstructs the alias-keyed projection from the content_id-keyed
