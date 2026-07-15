@@ -104,6 +104,34 @@ pub enum SetFieldOutcome {
     StateChanged { actual: String },
 }
 
+/// One tracker event in transport form (ADR-0002 phase B1 slice iii): the
+/// content-addressed unit that crosses between clones. `issue_id` is the opaque
+/// content_id (never a WS-N alias), so a set-union of two clones' events is
+/// well-defined and deduped by `event_id`.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TrackerEvent {
+    pub event_id: String,
+    #[serde(default)]
+    pub parents: Vec<String>,
+    pub issue_id: Option<String>,
+    pub kind: String,
+    pub payload_json: String,
+    pub actor: Option<String>,
+    pub created_at: String,
+}
+
+/// The result of importing another clone's events (ADR-0002 phase B1 slice iii).
+/// `duplicate_submissions` names each byte-identical `issue.created` that
+/// collapsed onto an existing one — surfaced as a WARNING, never silently
+/// dropped, because a silent collapse could corrupt workflow integrity.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ImportReport {
+    pub imported: usize,
+    pub skipped: usize,
+    pub new_issues: usize,
+    pub duplicate_submissions: Vec<String>,
+}
+
 #[cfg(feature = "native")]
 pub struct WorkItemStore {
     connection: Connection,
@@ -624,6 +652,107 @@ impl WorkItemStore {
         Ok(())
     }
 
+    /// Export every event in transport form (ADR-0002 phase B1 slice iii) — the
+    /// content-addressed log another clone unions in. Ordered by append seq.
+    pub fn export_events(&self) -> StoreResult<Vec<TrackerEvent>> {
+        let mut statement = self.connection.prepare(
+            "SELECT event_id, parents_json, issue_id, kind, payload_json, actor, created_at \
+             FROM tracker_events ORDER BY event_seq",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                let event_id: Option<String> = row.get(0)?;
+                let parents_json: String = row.get(1)?;
+                Ok(TrackerEvent {
+                    event_id: event_id.unwrap_or_default(),
+                    parents: serde_json::from_str(&parents_json).unwrap_or_default(),
+                    issue_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    payload_json: row.get(4)?,
+                    actor: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Merge another clone's events into this one (ADR-0002 phase B1 slice iii):
+    /// a set-union of the content-addressed log, deduped by `event_id`. Two
+    /// clones that edited the SAME issue (same content_id) from a shared parent
+    /// FORK its DAG — the conflict engine then surfaces the disagreement. Newly
+    /// seen issues are RE-ALIASED locally (this clone's WS-N, independent of the
+    /// origin's). A byte-identical `issue.created` that collapses onto one we
+    /// already hold is reported in `duplicate_submissions` — a warning, never a
+    /// silent collapse. Projections are rebuilt from the unioned log.
+    pub fn import_events(&mut self, events: &[TrackerEvent]) -> StoreResult<ImportReport> {
+        let mut report = ImportReport::default();
+        {
+            let tx = self
+                .connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            for event in events {
+                let parents_json = serde_json::to_string(&event.parents)?;
+                let changes = tx.execute(
+                    "INSERT OR IGNORE INTO tracker_events \
+                     (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        event.event_id,
+                        parents_json,
+                        event.issue_id,
+                        event.kind,
+                        event.payload_json,
+                        event.actor,
+                        event.created_at,
+                    ],
+                )?;
+                if changes == 1 {
+                    report.imported += 1;
+                } else {
+                    // Already present (deduped). A re-submitted creation is a
+                    // duplicate submission — surface it, never collapse silently.
+                    report.skipped += 1;
+                    if event.kind == "issue.created" {
+                        report.duplicate_submissions.push(
+                            event
+                                .issue_id
+                                .clone()
+                                .unwrap_or_else(|| event.event_id.clone()),
+                        );
+                    }
+                }
+            }
+            // Re-alias every newly-seen issue (has a created event, no local
+            // alias yet) in append order, minting this clone's own WS-N.
+            let unaliased: Vec<String> = tx
+                .prepare(
+                    "SELECT issue_id FROM tracker_events \
+                     WHERE kind = 'issue.created' AND issue_id IS NOT NULL \
+                       AND issue_id NOT IN (SELECT content_id FROM tracker_aliases) \
+                     GROUP BY issue_id ORDER BY MIN(event_seq)",
+                )?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for content_id in &unaliased {
+                let next: i64 = tx.query_row(
+                    "UPDATE tracker_counter SET next_id = next_id + 1 WHERE singleton = 1 RETURNING next_id - 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
+                    params![content_id, format!("WS-{next}")],
+                )?;
+                report.new_issues += 1;
+            }
+            tx.commit()?;
+        }
+        // Materialize projections from the unioned log (folds forks in on read).
+        self.rebuild_projection()?;
+        Ok(report)
+    }
+
     fn active_holder(&self, item_id: &str) -> StoreResult<Option<String>> {
         self.connection
             .query_row(
@@ -719,6 +848,11 @@ CREATE TABLE IF NOT EXISTS tracker_aliases (
 CREATE INDEX IF NOT EXISTS idx_tracker_issues_queue ON tracker_issues(queue, status);
 CREATE INDEX IF NOT EXISTS idx_tracker_leases_issue ON tracker_leases(issue_id, released_at);
 CREATE INDEX IF NOT EXISTS idx_tracker_events_issue ON tracker_events(issue_id, kind);
+-- Content-hash identity: an event is its `event_id`. This UNIQUE index is what
+-- makes `INSERT OR IGNORE` a set-union — merge dedups byte-identical events
+-- across clones (ADR-0002 phase B1). NULLs are distinct in SQLite, harmless
+-- since every real tracker event carries a hash.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tracker_events_id ON tracker_events(event_id);
 "#;
 
 /// Projection columns in `WorkItem` order (see `row_to_item`).
@@ -1802,6 +1936,92 @@ mod tests {
         assert!(!resolved.conflicted(), "resolver supersedes both forks");
         assert_eq!(resolved.heads.len(), 1);
         assert_ne!(resolved.state_token, token_before, "the frontier changed");
+    }
+
+    /// ADR-0002 phase B1 slice iii — the real multi-writer scenario (two clones,
+    /// one shared workbench). Clone B imports clone A's issue, both edit the SAME
+    /// field independently, and a cross-import FORKS the field: the merged clone
+    /// sees a genuine conflict with both values. This is what gaugedesk needs.
+    #[test]
+    fn two_clones_editing_one_issue_merge_to_a_conflict() {
+        let mut a = open_memory();
+        let mut b = open_memory();
+
+        // A creates the issue; B imports it and re-aliases it locally.
+        let issue = a
+            .file_item("q", "Shared", "", &[], &json!({}), None)
+            .expect("files");
+        let report = b.import_events(&a.export_events().unwrap()).unwrap();
+        assert_eq!(report.new_issues, 1, "B re-aliased A's issue");
+        assert_eq!(report.imported, 1, "just the created event");
+        // Both clones happen to name it WS-1 — independent, clone-local aliases.
+        let b_alias = "WS-1";
+        assert_eq!(b.get_item(b_alias).unwrap().unwrap().title, "Shared");
+
+        // Divergent edits to the SAME field from a shared parent.
+        a.set_field(&issue.id, "title", "from-A").expect("set A");
+        b.set_field(b_alias, "title", "from-B").expect("set B");
+
+        // Cross-import A's edit into B → the title forks.
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        let conflicts = b.issue_conflicts(b_alias).unwrap().unwrap();
+        assert!(conflicts.conflicted(), "the two writers disagree on title");
+        assert_eq!(conflicts.field_conflicts.len(), 1);
+        assert_eq!(conflicts.field_conflicts[0].field, "title");
+        assert_eq!(
+            conflicts.field_conflicts[0].values,
+            vec!["from-A", "from-B"]
+        );
+        assert!(
+            b.ready_items("q").unwrap().is_empty(),
+            "a conflicted issue is not handed to a worker"
+        );
+    }
+
+    /// Agreeing writers converge: two clones set the same value, merge is clean.
+    #[test]
+    fn two_clones_agreeing_merge_cleanly() {
+        let mut a = open_memory();
+        let mut b = open_memory();
+        let issue = a
+            .file_item("q", "Shared", "", &[], &json!({}), None)
+            .expect("files");
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        a.set_field(&issue.id, "status", "closed").expect("set A");
+        b.set_field("WS-1", "status", "closed").expect("set B");
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        let conflicts = b.issue_conflicts("WS-1").unwrap().unwrap();
+        assert!(!conflicts.conflicted(), "same value → convergence");
+    }
+
+    /// Import is idempotent and content-dedups: re-importing the same log adds no
+    /// events, and each re-submitted `issue.created` is reported as a
+    /// duplicate_submission (warned, never silently collapsed).
+    #[test]
+    fn reimport_dedups_and_warns_on_duplicate_submission() {
+        let mut a = open_memory();
+        let mut b = open_memory();
+        a.file_item("q", "One", "", &[], &json!({}), None)
+            .expect("files");
+        a.file_item("q", "Two", "", &[], &json!({}), None)
+            .expect("files");
+        let events = a.export_events().unwrap();
+
+        let first = b.import_events(&events).unwrap();
+        assert_eq!(first.imported, 2);
+        assert_eq!(first.new_issues, 2);
+        assert!(first.duplicate_submissions.is_empty());
+
+        let second = b.import_events(&events).unwrap();
+        assert_eq!(second.imported, 0, "nothing new on re-import");
+        assert_eq!(second.new_issues, 0, "no re-aliasing");
+        assert_eq!(
+            second.duplicate_submissions.len(),
+            2,
+            "both re-submitted creations warned"
+        );
+        // Still exactly two issues — no silent collapse into duplicates.
+        assert_eq!(b.list_items(Some("q"), None).unwrap().len(), 2);
     }
 
     /// ADR-0002 phase B1 slice v: an optimistic set applies against the current
