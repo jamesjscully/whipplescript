@@ -5,6 +5,7 @@ uses
   package std.coercion
   package std.coord
   package std.tracker
+  package std.agent
 schemas
   class Workspace
     name string
@@ -39,7 +40,7 @@ rules
     writes
       schema:WorkspaceReady
     record_sources
-      schema:WorkspaceReady construct=table_row span=932..971
+      schema:WorkspaceReady construct=table_row span=946..985
     body_hash be140b933c7ae3a2
   rule file_ticket
     when started
@@ -80,9 +81,9 @@ rules
       log_entry --succeeds--> effect9
       log_entry --succeeds--> effect10
     case_branches
-      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"merge" guard=- body_hash=104d5324dd84bda4 span=2306..2313
-      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"revise" guard=- body_hash=fb9e3c965f9df749 span=2490..2498
-      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"blocked" guard=- body_hash=e73625310a0c4637 span=2540..2549
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"merge" guard=- body_hash=104d5324dd84bda4 span=2320..2327
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"revise" guard=- body_hash=fb9e3c965f9df749 span=2504..2512
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"blocked" guard=- body_hash=e73625310a0c4637 span=2554..2563
     body_hash 6f028d2403a11cdd
 rule_dependencies
   table_workspaces --schema:WorkspaceReady--> implement_ready_ticket

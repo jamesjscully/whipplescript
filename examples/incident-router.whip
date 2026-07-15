@@ -1,3 +1,6 @@
+use std.agent.codex
+use std.agent.claude
+
 @service
 workflow IncidentRouter
 

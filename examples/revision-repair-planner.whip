@@ -1,3 +1,5 @@
+use std.agent
+
 workflow RevisionRepairPlanner {
   input issue RepairIssue
   output proposal PatchProposal

@@ -20,6 +20,8 @@ source_descriptions
 "Route one queued language task to its selected provider" rule run_language_task
 uses
   package std.coercion
+  package std.agent.claude
+  package std.agent.codex
 schemas
   class LanguageTask
     provider agentref<codex | claude>
@@ -70,10 +72,10 @@ rules
     writes
       schema:LanguageTask
     record_sources
-      schema:LanguageTask construct=table_row span=2011..2242
-      schema:LanguageTask construct=table_row span=2246..2469
-      schema:LanguageTask construct=table_row span=2473..2699
-      schema:LanguageTask construct=table_row span=2703..2928
+      schema:LanguageTask construct=table_row span=2052..2283
+      schema:LanguageTask construct=table_row span=2287..2510
+      schema:LanguageTask construct=table_row span=2514..2740
+      schema:LanguageTask construct=table_row span=2744..2969
     body_hash 762318eb56dea822
   rule run_language_task
     when LanguageTask as task where task.status == "queued"

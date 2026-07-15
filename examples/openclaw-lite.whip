@@ -1,3 +1,6 @@
+use std.agent.claude
+use std.agent.codex
+
 @service
 workflow OpenClawLite
 

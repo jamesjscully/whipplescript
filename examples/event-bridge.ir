@@ -1,6 +1,8 @@
 workflow EventBridge
 source_tags
 @service workflow EventBridge
+uses
+  package std.ingress
 schemas
   class DeploymentNotice
     service string

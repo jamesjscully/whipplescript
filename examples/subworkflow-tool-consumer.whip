@@ -1,3 +1,5 @@
+use std.agent
+
 # A consumer of a packaged `@tool` workflow (DR-0025 cross-package tools). The
 # `toolkit` package exports the convergence-checked `@tool` workflow `EchoText`
 # (see examples/packages/toolkit.json); this program `use`s the package and an

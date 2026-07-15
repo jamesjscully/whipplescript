@@ -5,6 +5,7 @@ source_descriptions
 "The agent turn only runs after the work-item claim succeeds" workflow QueueGatedSmoke
 uses
   package std.tracker
+  package std.agent.codex
 schemas
   class QueueGatedResult
     itemId string

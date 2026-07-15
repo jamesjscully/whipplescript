@@ -6,6 +6,7 @@ source_descriptions
 uses
   package std.coercion
   package std.tracker
+  package std.agent
 schemas
   enum ReviewStatus { Accept, Revise, Blocked }
   class WorkReview

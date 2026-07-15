@@ -1,4 +1,6 @@
 use std.coercion
+use std.agent.claude
+use std.agent.codex
 
 @fixture
 @acceptance

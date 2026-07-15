@@ -2,6 +2,8 @@ workflow FileStoreDemo
 workflow_contracts
   output result ref<Saved>
   failure error ref<FileError>
+uses
+  package std.files
 schemas
   class Saved
     content string

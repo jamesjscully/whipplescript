@@ -2,6 +2,8 @@ workflow TriageFlow
 workflow_contracts
   output result ref<TriageDecision>
   failure error ref<TriageRejected>
+uses
+  package std.agent
 schemas
   class Ticket
     id string
@@ -29,7 +31,7 @@ rules
     writes
       schema:Ticket
     record_sources
-      schema:Ticket construct=table_row span=489..601
+      schema:Ticket construct=table_row span=504..616
     body_hash 10199dcd14dd6a01
   rule flow.triage_ticket.seg0
     when Ticket as ticket where ticket.status == "open"

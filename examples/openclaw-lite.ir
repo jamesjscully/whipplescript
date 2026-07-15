@@ -2,6 +2,8 @@ workflow OpenClawLite
 source_tags
 @service workflow OpenClawLite
 uses
+  package std.agent.claude
+  package std.agent.codex
   package std.memory
   package std.tracker
 schemas

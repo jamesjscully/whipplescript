@@ -4,6 +4,7 @@ source_tags
 source_descriptions
 "Recall package memory before agent work and save context after each turn" workflow PackageMemory
 uses
+  package std.agent.codex
   package std.memory
   package std.tracker
 trackers

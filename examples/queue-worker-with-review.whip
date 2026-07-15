@@ -1,5 +1,6 @@
 use std.coercion
 use std.tracker
+use std.agent
 
 @service
 description "Claim ready work items, implement them, review each turn, and escalate failed reviews to a human"
