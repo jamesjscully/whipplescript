@@ -29604,7 +29604,7 @@ renew <id> [--actor A] [--ttl D]|\
 release <id>|\
 finish <id> [--summary S]|complete <id> [--summary S]|\
 fail <id> [--actor A]|\
-set <id> <field> <value>|\
+set <id> <field> <value> [--expect-state-token T]|\
 conflicts <id>|conflicts --tracker TR|\
 dep add <blocked> [depends-on] <blocker>|\
 rebuild>";
@@ -29685,7 +29685,7 @@ fn emit_issue_row(
 }
 
 fn issue(options: &CliOptions) -> ExitCode {
-    use whipplescript_store::items::{ClaimOutcome, RenewOutcome, WorkItemStore};
+    use whipplescript_store::items::{ClaimOutcome, RenewOutcome, SetFieldOutcome, WorkItemStore};
     let usage = ISSUE_USAGE;
     let args = &options.args;
     let command = args.first().map(String::as_str).unwrap_or("list");
@@ -29989,21 +29989,61 @@ fn issue(options: &CliOptions) -> ExitCode {
             }
         }
         "set" => {
-            // `set <id> <field> <value>`: append an `issue.field_set`. Two
-            // independent sets that meet at a merge fork the field; the conflict
-            // view (`issue conflicts`) surfaces the disagreement.
-            let (Some(id), Some(field), Some(value)) = (args.get(1), args.get(2), args.get(3))
+            // `set <id> <field> <value> [--expect-state-token <t>]`: append an
+            // `issue.field_set`. Two independent sets that meet at a merge fork
+            // the field; the conflict view (`issue conflicts`) surfaces the
+            // disagreement. `--expect-state-token` makes it optimistic: apply
+            // only if the frontier still matches the token the caller observed.
+            let positional = args
+                .iter()
+                .skip(1)
+                .take_while(|arg| !arg.starts_with("--"))
+                .collect::<Vec<_>>();
+            let (Some(id), Some(field), Some(value)) =
+                (positional.first(), positional.get(1), positional.get(2))
             else {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             };
-            match store.set_field(id, field, value) {
-                Ok(true) => emit_issue_row(&store, id, &format!("{field} set"), options.json),
-                Ok(false) => {
-                    eprintln!("issue `{id}` was not found");
-                    ExitCode::FAILURE
+            if let Some(expected) = flag_value(args, "--expect-state-token") {
+                match store.set_field_checked(id, field, value, &expected) {
+                    Ok(SetFieldOutcome::Applied { state_token }) => {
+                        if options.json {
+                            emit_json(json!({
+                                "id": id, "outcome": "applied", "state_token": state_token,
+                            }))
+                        } else {
+                            println!("{id} {field} set (state-token {state_token})");
+                            ExitCode::SUCCESS
+                        }
+                    }
+                    Ok(SetFieldOutcome::StateChanged { actual }) => {
+                        if options.json {
+                            return emit_json(json!({
+                                "id": id, "outcome": "state-changed", "state_token": actual,
+                            }));
+                        }
+                        eprintln!(
+                            "issue `{id}` changed under you (state-token is now {actual}); \
+                             not applied"
+                        );
+                        ExitCode::FAILURE
+                    }
+                    Ok(SetFieldOutcome::NotFound) => {
+                        eprintln!("issue `{id}` was not found");
+                        ExitCode::FAILURE
+                    }
+                    Err(error) => report_store_error("failed to set field", error),
                 }
-                Err(error) => report_store_error("failed to set field", error),
+            } else {
+                match store.set_field(id, field, value) {
+                    Ok(true) => emit_issue_row(&store, id, &format!("{field} set"), options.json),
+                    Ok(false) => {
+                        eprintln!("issue `{id}` was not found");
+                        ExitCode::FAILURE
+                    }
+                    Err(error) => report_store_error("failed to set field", error),
+                }
             }
         }
         "conflicts" => {

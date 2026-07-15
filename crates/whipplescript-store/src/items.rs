@@ -93,6 +93,17 @@ impl IssueConflicts {
     }
 }
 
+/// The outcome of an optimistic field set (ADR-0002 phase B1 slice v): a set
+/// guarded by the `state_token` the caller last observed. `StateChanged` means
+/// the frontier moved under the caller — the set was NOT applied, and `actual`
+/// is the current token to retry against.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SetFieldOutcome {
+    Applied { state_token: String },
+    NotFound,
+    StateChanged { actual: String },
+}
+
 #[cfg(feature = "native")]
 pub struct WorkItemStore {
     connection: Connection,
@@ -478,20 +489,48 @@ impl WorkItemStore {
             tx.commit()?;
             return Ok(false);
         }
-        let payload = json!({"field": field, "value": value});
-        tx_append_event(&tx, Some(item_id), "issue.field_set", &payload, None, &now)?;
-        // Fold into the linear projection column (the conflict view is computed
-        // on read from the DAG; the column is the last-writer display value).
-        if let Some(column) = projection_column(field) {
-            tx.execute(
-                &format!(
-                    "UPDATE tracker_issues SET {column} = ?2, updated_at = ?3 WHERE issue_id = ?1"
-                ),
-                params![item_id, value, now],
-            )?;
-        }
+        tx_apply_field_set(&tx, item_id, field, value, &now)?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Optimistic field set (ADR-0002 phase B1 slice v): apply only if the
+    /// issue's current `state_token` still equals `expect_token`. The check and
+    /// the append share one `Immediate` transaction, so a concurrent writer
+    /// cannot slip a change in between — a stale token is refused with the
+    /// current `actual`, never silently overwriting the other change.
+    pub fn set_field_checked(
+        &mut self,
+        item_id: &str,
+        field: &str,
+        value: &str,
+        expect_token: &str,
+    ) -> StoreResult<SetFieldOutcome> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM tracker_issues WHERE issue_id = ?1",
+                [item_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            tx.commit()?;
+            return Ok(SetFieldOutcome::NotFound);
+        }
+        let current = analyze_issue_dag(&load_issue_events(&tx, item_id)?).state_token;
+        if current != expect_token {
+            tx.commit()?;
+            return Ok(SetFieldOutcome::StateChanged { actual: current });
+        }
+        tx_apply_field_set(&tx, item_id, field, value, &now)?;
+        let after = analyze_issue_dag(&load_issue_events(&tx, item_id)?).state_token;
+        tx.commit()?;
+        Ok(SetFieldOutcome::Applied { state_token: after })
     }
 
     /// The DAG conflict view of one issue (ADR-0002 phase B1 slice ii): its
@@ -794,6 +833,31 @@ fn tx_mark_lease_released(
         "UPDATE tracker_leases SET released_at = ?2 WHERE lease_id = ?1",
         params![lease_id, now],
     )?;
+    Ok(())
+}
+
+/// Append one `issue.field_set` (chaining onto the issue's heads) and fold it
+/// into the linear display column. Shared by the plain and token-checked sets.
+#[cfg(feature = "native")]
+fn tx_apply_field_set(
+    tx: &Transaction<'_>,
+    item_id: &str,
+    field: &str,
+    value: &str,
+    now: &str,
+) -> StoreResult<()> {
+    let payload = json!({"field": field, "value": value});
+    tx_append_event(tx, Some(item_id), "issue.field_set", &payload, None, now)?;
+    // The conflict view is computed on read from the DAG; the column is only
+    // the last-writer display value.
+    if let Some(column) = projection_column(field) {
+        tx.execute(
+            &format!(
+                "UPDATE tracker_issues SET {column} = ?2, updated_at = ?3 WHERE issue_id = ?1"
+            ),
+            params![item_id, value, now],
+        )?;
+    }
     Ok(())
 }
 
@@ -1527,6 +1591,49 @@ mod tests {
         assert!(!resolved.conflicted(), "resolver supersedes both forks");
         assert_eq!(resolved.heads.len(), 1);
         assert_ne!(resolved.state_token, token_before, "the frontier changed");
+    }
+
+    /// ADR-0002 phase B1 slice v: an optimistic set applies against the current
+    /// state token, moves the token, and refuses a stale token — reporting the
+    /// actual one to retry against, without overwriting the intervening change.
+    #[test]
+    fn optimistic_set_guards_on_state_token() {
+        let mut store = open_memory();
+        let it = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .expect("files");
+        let token0 = store.issue_conflicts(&it.id).unwrap().unwrap().state_token;
+
+        // A fresh token applies and returns the new frontier token.
+        let token1 = match store
+            .set_field_checked(&it.id, "title", "A", &token0)
+            .expect("set")
+        {
+            SetFieldOutcome::Applied { state_token } => {
+                assert_ne!(state_token, token0);
+                state_token
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        };
+
+        // Re-using the stale token0 is refused with the current actual token1.
+        match store
+            .set_field_checked(&it.id, "title", "B", &token0)
+            .expect("set")
+        {
+            SetFieldOutcome::StateChanged { actual } => assert_eq!(actual, token1),
+            other => panic!("expected StateChanged, got {other:?}"),
+        }
+        // The refused set did not apply: the linear column is still "A".
+        assert_eq!(store.get_item(&it.id).unwrap().unwrap().title, "A");
+
+        // A missing issue reports NotFound, not a false token mismatch.
+        assert_eq!(
+            store
+                .set_field_checked("WS-999", "title", "Z", &token0)
+                .unwrap(),
+            SetFieldOutcome::NotFound
+        );
     }
 
     /// Drive the store through the `WorkItems` trait as a `dyn` object: proves
