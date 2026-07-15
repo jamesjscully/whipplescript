@@ -5,6 +5,7 @@ source_descriptions
 "Claim ready work items, implement them, review each turn, and escalate failed reviews to a human" workflow QueueWorkerWithReview
 uses
   package std.coercion
+  package std.tracker
 schemas
   enum ReviewStatus { Accept, Revise, Blocked }
   class WorkReview

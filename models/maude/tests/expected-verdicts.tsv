@@ -68,7 +68,7 @@ owned-harness-loop.maude	SSSNNNNN
 owned-harness-resume.maude	SN
 owned-harness-sandbox.maude	SN
 owned-harness-tracker.maude	SSNN
-package-contract.maude	SSSSNNSNNNNNNSNSNNNSNN
+package-contract.maude	SSSSNNSNNNNNNSNSNNNSNNSN
 pattern-body-surface.maude	SSSSSSNN
 pattern-recursion.maude	SSSNN
 policy-capacity-retry.maude	NSNSSS

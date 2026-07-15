@@ -77,6 +77,7 @@ as complete:
 | Tagged terminal branch runtime | `crates/whipplescript-parser/src/lib.rs`, `crates/whipplescript-cli/src/main.rs`, `crates/whipplescript-cli/tests/control_plane.rs` | Parser validates terminal-output tags inside `after ... completes`; runtime binds completed/failed terminal payload variants for deterministic case routing. |
 | Companion skill validation | `skills/whipplescript-author/SKILL.md`, `spec/companion-skill.md`, companion-skill example fixture, `crates/whipplescript-cli/tests/control_plane.rs` | Companion-skill workflow authored with one shared task schema, typed `AgentRef` reviewers, source assertions, and fixture-provider e2e coverage. |
 | Assertion JSON detail surface | `crates/whipplescript-cli/src/main.rs`, `crates/whipplescript-cli/tests/control_plane.rs` | `whip dev --json` assertion reports now include deterministic expected predicate metadata, evaluated actual operand values, and failure reasons for failed/error assertions. |
+| Expression test-debt closure + `empty` restoration | `crates/whipplescript-parser/src/lib.rs`, `crates/whipplescript-kernel/src/rule_lowering.rs`, `examples/expression-kernel.whip`/`.ir`, `crates/whipplescript-cli/tests/control_plane.rs`, `docs/language-reference.md` | Every-form parser matrix, invalid-syntax matrix, dangling-operator truncation fix, formatter verbatim-preservation test, every-operator-class golden fixture (compile + fmt + dev e2e), `empty` restored across parse/type-check/eval (regression found by this pass), docs corrected (`empty(x)` is parenthesized-only; arithmetic + flat comparison level documented). |
 
 ## Current Implementation Summary
 
@@ -115,7 +116,7 @@ as complete:
 | `count(collection)` | [x] | [x] | [~] | [x] | [~] | [x] | Implemented over fact/effect projection queries; generated Maude now covers exact finite array/object literal cardinality plus query count thresholds through 0/1/2/3/many. |
 | `exists(collection)` | [x] | [x] | [~] | [x] | [~] | [x] | Implemented over projection queries; generated Maude covers query/array/map/object presence witnesses. |
 | `exists path` presence proof | [x] | [x] | [~] | [x] | [~] | [x] | Runtime checks non-missing/non-null; local parser proof tracking accepts `exists x` before optional field access. |
-| `empty(collection)` / `empty(expr)` | [x] | [x] | [~] | [x] | [~] | [x] | Implemented for projections, arrays, objects, strings, and null; generated Maude covers query/array/map/object emptiness witnesses. |
+| `empty(collection)` / `empty(expr)` | [x] | [x] | [~] | [x] | [~] | [x] | REGRESSION FOUND + FIXED 2026-07-14: `empty` had silently dropped out of the typed expression pipeline entirely (the call-form parser accepted only `count`/`exists`, so `empty(...)` was an "unexpected token" parse error; no type check, no eval — while this row read [x] and the committed `bad-expression-functions.diagnostics` golden documented semantic diagnostics that no longer reproduced; the invalid-fixture test only asserts non-empty diagnostics, so nothing caught it). Restored per spec "Count And Empty": parse (`count | exists | empty`), typing (`empty -> Bool`, `is_emptiable_type` incl. the optional-delegation rule), kernel eval (arrays/maps/strings/queries structural, null/missing true, scalars typed error). Live diagnostics again byte-identical to the committed golden. Covered by `eval_empty_follows_count_and_empty_spec`, `validates_empty_call_arity_and_optional_arguments`, and the expression-kernel golden fixture e2e. |
 | Equality `==` | [x] | [x] | [~] | [x] | [~] | [x] | Runtime supports JSON scalar equality; compiler rejects obvious incompatible scalar comparisons and finite-domain typos. |
 | Inequality `!=` | [x] | [x] | [~] | [x] | [~] | [x] | Implemented with same static limitations as equality. |
 | Boolean `&&` | [x] | [x] | [~] | [x] | [~] | [x] | Runtime short-circuits; parser carries presence proofs left-to-right; generated Maude models abstract conjunction truth/error paths. |
@@ -153,10 +154,26 @@ as complete:
   path/indexing, unary/calls, ordering/membership, equality, `&&`, `||`.
 - [x] Parse `exists path` separately from `exists(collection)`.
 - [x] Parse `not in` as one membership operator, not as `not` plus identifier.
-- [ ] Keep formatter output stable and parenthesize when precedence could be
-  surprising.
-- [~] Add invalid syntax diagnostics for dangling operators, unclosed
-  parentheses, malformed queries, and unsupported function names.
+- [x] Keep formatter output stable and parenthesize when precedence could be
+  surprising. (Resolved 2026-07-14: `whip fmt` never re-renders expressions —
+  guards/assertions are raw source captures, so the author's spelling is
+  preserved verbatim and formatting is idempotent over them
+  (`format_preserves_expression_source_text_verbatim` + the corpus-wide
+  `fmt_is_non_destructive_across_every_example`). Rendered parenthesization
+  belongs to the IR snapshot (`to_snapshot_with_parentheses` wraps every
+  binary subexpression), pinned per form by
+  `parses_every_expression_form_with_pinned_precedence`.)
+- [x] Add invalid syntax diagnostics for dangling operators, unclosed
+  parentheses, malformed queries, and unsupported function names. (Closed
+  2026-07-14: parse-level matrix
+  `invalid_expression_syntax_produces_deterministic_errors`; compile-time
+  surfacing with rule/assertion context
+  `guard_and_assertion_syntax_errors_surface_with_context`; and a real fix —
+  the file-level lexer steps over expression operators, so a clause ENDING in
+  a dangling operator was silently truncated (`assert a ==` parsed as
+  `assert a` and mis-diagnosed as non-boolean); raw-capture spans now extend
+  over trailing skipped-operator bytes (`extend_span_over_skipped_operators`)
+  so the dangling operator is a syntax error.)
 
 ### 2. Type Checker
 
@@ -302,11 +319,32 @@ Tagged terminal-output union branch matching implementation checklist:
 
 ### 7. Tests And Fixtures
 
-- [ ] Parser tests for every expression form.
-- [~] Golden IR snapshots for guards and assertions using every operator class.
-- [ ] Static-analysis tests for unknown bindings, unknown fields, optional
+- [x] Parser tests for every expression form.
+  (`parses_every_expression_form_with_pinned_precedence` pins parse +
+  snapshot for every spec grammar form — literals, paths, chained map
+  indexing, unary/word-form connectives, arithmetic, ordering, equality,
+  membership, `exists path` vs `exists(collection)`, `count`/`empty` over
+  arrays and fact/effect queries, array/object literals — including the flat
+  left-associative comparison level, documented where the spec sketch draws
+  ordering tighter than equality.)
+- [x] Golden IR snapshots for guards and assertions using every operator class.
+  (`examples/expression-kernel.whip` + `.ir`: every operator class across two
+  guards and 13 assertions; registered in `example_ir_snapshots_are_stable`,
+  `checks_all_example_workflows`, the fmt non-destructiveness sweep, and
+  `scripts/regen-ir-goldens.sh --check`; runs deterministically end-to-end in
+  `dev_runs_the_expression_kernel_golden_fixture`.)
+- [x] Static-analysis tests for unknown bindings, unknown fields, optional
   misuse, invalid enums, invalid literal values, bad membership, bad ordering,
-  bad array literals, and bad `AgentRef` targets.
+  bad array literals, and bad `AgentRef` targets. (Verified present
+  2026-07-14 — unknown roots/fields:
+  `validates_symmetric_finite_domain_literals_and_unknown_guard_roots`,
+  `validates_assertion_expression_types_and_paths`; optional misuse:
+  `requires_presence_proof_for_optional_field_access`; enums/literal values:
+  the finite-domain family; membership/ordering/array literals/map keys:
+  `rejects_invalid_expression_types`; AgentRef: the
+  `rejects_*_agent_ref_*`/`rejects_quoted_agent_ref_record_values` family;
+  function/query shapes: `examples/invalid/bad-expression-functions.*`; plus
+  the new `validates_empty_call_arity_and_optional_arguments`.)
 - [x] Runtime tests for guard true, false, and error paths.
 - [x] Runtime tests for assertion pass, fail, and error paths.
 - [x] Parser/type-checker tests for enum, literal, optional, and tagged-union

@@ -3,6 +3,8 @@ source_tags
 @service workflow QueueGatedSmoke
 source_descriptions
 "The agent turn only runs after the work-item claim succeeds" workflow QueueGatedSmoke
+uses
+  package std.tracker
 schemas
   class QueueGatedResult
     itemId string

@@ -7,6 +7,7 @@ workflow OpenClawLite
 # context before planning and saves the new plan after, so successive runs build
 # on what came before instead of starting cold.
 use std.memory
+use std.tracker
 
 class Heartbeat {
   job string

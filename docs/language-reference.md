@@ -174,7 +174,7 @@ event         ::= "event" dotted_name "{" field* "}"
 agent         ::= "agent" Ident ("using" Ident)? "{" agent_field* "}"
 harness       ::= "harness" Ident ":" Ident
 table         ::= "table" Ident "as" TypeName "[" row* "]"
-queue         ::= "queue" Ident "{" "tracker" Ident "}"
+tracker       ::= "tracker" Ident "{" "provider" Ident "}"
 lease         ::= "lease" Ident "{" "shared"? "key" TypeName "slots" int "ttl" duration "}"
 ledger        ::= "ledger" Ident "{" "shared"? "entry" TypeName "partition" "by" Ident "retain" duration "}"
 counter       ::= "counter" Ident "{" "shared"? "key" TypeName "cap" int "reset" period ("timezone" string)? "}"
@@ -705,25 +705,34 @@ literal values. Supported forms:
 
 ```text
 field access                    task.review.status
+arithmetic                      +  -  *  /
 comparison                      ==  !=  <  <=  >  >=
 boolean                         and  or  not      (&&, ||, ! accepted)
 membership                      x in [...]        x not in [...]
-presence                        exists x          empty x
-finite queries                  count(Class where ...)   exists(Class where ...)
+presence                        exists x          empty(x)
+finite queries                  count(Class where ...)   exists(Class where ...)   empty(Class where ...)
 literals                        strings, numbers, booleans, null, arrays, objects
 indexing                        task.metadata["phase"]
 enum / finite-domain values     Accept, codex
 ```
+
+`empty(...)` is a structural emptiness test for arrays, maps, strings,
+fact/effect queries, and null — for an optional value it is true when the
+value is missing/null and otherwise tests the present inner value (so
+`empty(job.note)` works for `note string?`, while an optional scalar such as
+`int?` is rejected; use `exists x` or `x == null` there).
 
 Expression precedence, from tightest to loosest:
 
 | Level | Operators/forms | Notes |
 | --- | --- | --- |
 | 1 | field access, indexing, function/query call | `task.owner.name`, `metadata["phase"]`, `count(Task where ...)` |
-| 2 | unary presence/boolean | `not x`, `!x`, `exists x`, `empty x` |
-| 3 | comparison and membership | `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`, `not in` |
-| 4 | conjunction | `and`, `&&` |
-| 5 | disjunction | `or`, `||` |
+| 2 | unary presence/boolean | `not x`, `!x`, `exists x`, `empty(x)` |
+| 3 | multiplication and division | `*`, `/` |
+| 4 | addition and subtraction | `+`, `-` |
+| 5 | comparison and membership | `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`, `not in` (one flat level, left-associative) |
+| 6 | conjunction | `and`, `&&` |
+| 7 | disjunction | `or`, `||` |
 
 `and` and `or` short-circuit left to right. Comparisons are type-checked:
 numbers compare with numbers, strings with strings, booleans with booleans,
@@ -1212,8 +1221,8 @@ including an operator `whip cancel` — the runtime returns the still-held item 
 Operators and agents manage items from the CLI:
 
 ```sh
-whip issue new --queue backlog --title "Fix login" [--body "..."] [--label bug]
-whip issue list [--queue backlog] [--status open]
+whip issue new --tracker backlog --title "Fix login" [--body "..."] [--label bug]
+whip issue list [--tracker backlog] [--status open]
 whip issue show WS-1
 whip issue ready backlog [--limit 5]
 whip issue claim WS-1 [--actor agent:a]
@@ -1334,11 +1343,15 @@ file store project_files {
   root "./data"
   allow read ["docs/**", "notes/*.md"]
   allow write ["out/**"]
+  provider local
 }
 ```
 
 The optional `allow read`/`allow write` globs narrow which paths (relative to
 `root`) each operation may touch; an absent list means any path inside the root.
+The optional `provider <name>` clause names the store's backing provider —
+`local` (the default when absent) is the only v1 provider, and an unknown name
+is a check error.
 
 `import <format> <Schema> from <store> at <path> as <binding>` decodes a
 structured file (`jsonl`, `json`, or `csv`) into one typed `<Schema>` fact per

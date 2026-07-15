@@ -418,12 +418,17 @@ pub struct FileStoreDecl {
     pub root: String,
     pub read_globs: Vec<String>,
     pub write_globs: Vec<String>,
+    /// Optional `provider <name>` clause (std.files v1, spec/std-files.md
+    /// "Surface"): the store's backing provider, defaulting to `local` when
+    /// absent. Unknown providers are rejected at check time.
+    pub provider: Option<Ident>,
     /// Source spans of each clause keyword (`root` / the `allow` of read / write),
     /// so `whip fmt` can interleave own-line and trailing body comments by position
     /// (the body otherwise rebuilds from the AST, dropping comments).
     pub root_span: Option<SourceSpan>,
     pub read_span: Option<SourceSpan>,
     pub write_span: Option<SourceSpan>,
+    pub provider_span: Option<SourceSpan>,
     pub span: SourceSpan,
 }
 
@@ -1221,6 +1226,10 @@ pub struct IrFileStore {
     pub read_globs: Vec<String>,
     /// Path globs a `write` may touch; empty = any path inside the root.
     pub write_globs: Vec<String>,
+    /// Declared `provider <name>` clause; `None` = the default `local`
+    /// provider (spec/std-files.md "Providers"). Serialized to the snapshot
+    /// only when declared, so provider-less stores keep their prior `.ir`.
+    pub provider: Option<String>,
 }
 
 /// A lowered `memory pool` declaration (std.memory, MEM-1): the pool identity +
@@ -2635,6 +2644,11 @@ fn try_format_filestore_with_comments(
             ));
         }
     }
+    if let Some(provider) = &file_store.provider {
+        if let Some(span) = file_store.provider_span {
+            members.push((span, vec![format!("  provider {}", provider.name)]));
+        }
+    }
     members.sort_by_key(|(span, _)| span.start);
     let Some((own_line, trailing)) =
         classify_body_comments(source, file_store.span, &members, comments)
@@ -3050,6 +3064,12 @@ impl IrProgram {
         if !self.channels.is_empty() {
             register_standard_library(&mut libraries, "std.messaging");
         }
+        // A bare `file store` declaration registers the owning library even
+        // before any rule uses a file effect (spec/std-files.md "Manifest":
+        // the declaration alone previously registered nothing).
+        if !self.file_stores.is_empty() {
+            register_standard_library(&mut libraries, "std.files");
+        }
         if self.sources.iter().any(|source| source.is_clock) {
             register_standard_library(&mut libraries, "std.time");
         }
@@ -3363,6 +3383,12 @@ impl IrProgram {
                         &mut snapshot,
                         format!("    allow write {:?}", file_store.write_globs),
                     );
+                }
+                // The provider likewise serializes only when declared (unset =
+                // the `local` default), so provider-less stores keep their
+                // prior `.ir` byte-identically (slice F5 zero-churn gate).
+                if let Some(provider) = &file_store.provider {
+                    push_line(&mut snapshot, format!("    provider {provider}"));
                 }
             }
         }
@@ -3932,12 +3958,16 @@ fn effect_contract_for_kind(
             Vec::new(),
             TypedOutputValidation::None,
         ),
+        // std.files capability ids EQUAL effect kinds (spec/std-files.md, M3
+        // id==kind): each contract requires exactly its own kind string, which
+        // the store's default-required-capability rule already derives for an
+        // empty list — declaring it here makes the registry honest about it.
         IrEffectKind::FileRead => (
             "std.files",
             strings(&["read"]),
             Some("file.read.input"),
             Some("FileReadResult"),
-            Vec::new(),
+            strings(&["file.read"]),
             Vec::new(),
             strings(&["effect.output"]),
             TypedOutputValidation::RuntimeBoundary,
@@ -3947,7 +3977,7 @@ fn effect_contract_for_kind(
             strings(&["write"]),
             Some("file.write.input"),
             Some("FileWriteResult"),
-            Vec::new(),
+            strings(&["file.write"]),
             Vec::new(),
             strings(&["effect.output"]),
             TypedOutputValidation::RuntimeBoundary,
@@ -3957,7 +3987,7 @@ fn effect_contract_for_kind(
             strings(&["import"]),
             Some("file.import.input"),
             Some("FileImportResult"),
-            Vec::new(),
+            strings(&["file.import"]),
             Vec::new(),
             strings(&["effect.output"]),
             TypedOutputValidation::RuntimeBoundary,
@@ -3967,7 +3997,7 @@ fn effect_contract_for_kind(
             strings(&["export"]),
             Some("file.export.input"),
             Some("FileExportResult"),
-            Vec::new(),
+            strings(&["file.export"]),
             Vec::new(),
             strings(&["effect.output"]),
             TypedOutputValidation::RuntimeBoundary,
@@ -4259,11 +4289,36 @@ fn lower_program(
             // lowers to its name + literal root; the runtime file provider reads
             // `<root>/<path>` for `read` effects against this store.
             Item::FileStore(file_store) => {
+                // Conditioned check (spec/std-files.md "Static checks"): the
+                // optional `provider <name>` clause must name a known file
+                // provider. v1 ships exactly one — `local`, the FileStore
+                // host-projection seam — and it is also the default when the
+                // clause is absent. Unknown providers would lower to a store
+                // no runtime seam backs, so they are rejected at check time.
+                if let Some(provider) = &file_store.provider {
+                    if !FILE_STORE_PROVIDERS.contains(&provider.name.as_str()) {
+                        diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: provider.span,
+                            message: format!(
+                                "file store `{}` names unknown provider `{}`",
+                                file_store.name.name, provider.name
+                            ),
+                            suggestion: Some(format!(
+                                "declare one of the v1 file providers: {}",
+                                FILE_STORE_PROVIDERS.join(", ")
+                            )),
+                        });
+                        // Fall through: the store still lowers so read/write
+                        // sites do not cascade an unknown-store error on top.
+                    }
+                }
                 ir.file_stores.push(IrFileStore {
                     name: file_store.name.name,
                     root: file_store.root,
                     read_globs: file_store.read_globs,
                     write_globs: file_store.write_globs,
+                    provider: file_store.provider.map(|provider| provider.name),
                 });
             }
             // The `memory pool` declaration (std.memory, MEM-1) lowers to its
@@ -6710,6 +6765,13 @@ pub fn channel_provider_report(provider: &str) -> Option<&'static ChannelProvide
 /// The built-in resource gauges: deterministic observables already in the
 /// effect ledger, present without declaration (improve design note §3).
 pub const BUILTIN_GAUGES: &[&str] = &["std.spend", "std.latency", "std.tokens"];
+
+/// The v1 std.files store providers (spec/std-files.md "Providers"): `local`
+/// is the FileStore host-projection seam (native + DO) and the default when a
+/// `file store` declares no `provider` clause. Non-filesystem providers
+/// (S3/GitHub/Drive) are deferred with cause; an unknown identifier is a
+/// check error at the declaration.
+pub const FILE_STORE_PROVIDERS: &[&str] = &["local"];
 
 fn lower_gauge(gauge: GaugeDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
     if let Some(existing) = ir.gauges.iter().find(|other| other.name == gauge.name.name) {
@@ -11839,6 +11901,45 @@ fn validate_function_call(
                 });
             }
         }
+        "empty" => {
+            if args.len() != 1 {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: context.span,
+                    message: format!(
+                        "{} calls `empty` with {} arguments, expected 1",
+                        context.subject,
+                        args.len()
+                    ),
+                    suggestion: Some(
+                        "call `empty` with exactly one array, map, string, fact query, or effect query argument"
+                            .to_owned(),
+                    ),
+                });
+                return;
+            }
+            let ty = infer_expr_type(&args[0], semantic, scope, context, diagnostics);
+            if !is_emptiable_type(&ty) {
+                // An optional gets its own message: the inner type is what
+                // makes it unsupported (spec: `empty(Optional<T>)` is defined
+                // only when `empty(T)` is).
+                let optional = matches!(ty, ExprType::Optional(_));
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: context.span,
+                    message: format!(
+                        "{} calls `empty` with unsupported {}argument type `{}`",
+                        context.subject,
+                        if optional { "optional " } else { "" },
+                        expr_type_label(&ty)
+                    ),
+                    suggestion: Some(
+                        "use `empty` only with arrays, maps, strings, fact queries, effect queries, null, or supported optional values"
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
         _ => {}
     }
 }
@@ -12104,6 +12205,7 @@ fn infer_expr_type(
         Expr::Call { name, args } => match name.as_str() {
             "count" => ExprType::Int,
             "exists" => ExprType::Bool,
+            "empty" => ExprType::Bool,
             _ => {
                 diagnostics.push(Diagnostic {
                     related: Vec::new(),
@@ -12112,7 +12214,7 @@ fn infer_expr_type(
                         "{} calls unsupported expression function `{name}`",
                         context.subject
                     ),
-                    suggestion: Some("use `count` or `exists`".to_owned()),
+                    suggestion: Some("use `count`, `exists`, or `empty`".to_owned()),
                 });
                 for arg in args {
                     infer_expr_type(arg, semantic, scope, context, diagnostics);
@@ -12453,6 +12555,23 @@ fn is_exists_type(ty: &ExprType) -> bool {
             | ExprType::Optional(_)
             | ExprType::Unknown
     )
+}
+
+/// Spec "Count And Empty": `empty` is a structural emptiness test for arrays,
+/// maps, strings, fact/effect queries, and null; `empty(Optional<T>)` is
+/// defined only when `empty(T)` is (so `empty(string?)` works, `empty(int?)`
+/// does not). It never coerces scalars, objects, enum variants, or agent refs.
+fn is_emptiable_type(ty: &ExprType) -> bool {
+    match ty {
+        ExprType::Array(_)
+        | ExprType::Map(_)
+        | ExprType::String
+        | ExprType::Collection
+        | ExprType::Null
+        | ExprType::Unknown => true,
+        ExprType::Optional(inner) => is_emptiable_type(inner),
+        _ => false,
+    }
 }
 
 fn expr_type_label(ty: &ExprType) -> String {
@@ -16857,7 +16976,8 @@ impl<'a> ExprParser<'a> {
                 })
             }
             Some(ExprTokenKind::Ident(value))
-                if matches!(value.as_str(), "count" | "exists") && self.at_symbol('(') =>
+                if matches!(value.as_str(), "count" | "exists" | "empty")
+                    && self.at_symbol('(') =>
             {
                 self.expect_symbol('(')?;
                 if let Some(query) = self.try_parse_query()? {
@@ -17822,6 +17942,9 @@ fn format_item(item: Item, formatted: &mut String) {
             };
             format_globs(formatted, "read", &file_store.read_globs);
             format_globs(formatted, "write", &file_store.write_globs);
+            if let Some(provider) = &file_store.provider {
+                push_line(formatted, format!("  provider {}", provider.name));
+            }
             push_line(formatted, "}");
         }
         Item::MemoryPool(pool) => {
@@ -19815,8 +19938,10 @@ impl Parser<'_> {
                 let root_span = bag.span("root");
                 let read_span = bag.span("allow read");
                 let write_span = bag.span("allow write");
+                let provider_span = bag.span("provider");
                 let read_globs = bag.globs("allow read");
                 let write_globs = bag.globs("allow write");
+                let provider = bag.ident("provider");
                 let Some(root) = bag.text("root") else {
                     self.diagnostics.push(Diagnostic {
                         related: Vec::new(),
@@ -19833,9 +19958,11 @@ impl Parser<'_> {
                     root,
                     read_globs,
                     write_globs,
+                    provider,
                     root_span,
                     read_span,
                     write_span,
+                    provider_span,
                     span,
                 }))
             }
@@ -21821,6 +21948,7 @@ impl Parser<'_> {
             expr_end = self.peek()?.span.end.min(line_end);
             self.advance();
         }
+        expr_end = Self::extend_span_over_skipped_operators(self.source, expr_end, line_end);
 
         let span = SourceSpan {
             start: expr_start,
@@ -21857,6 +21985,11 @@ impl Parser<'_> {
             text_end = self.peek()?.span.end;
             self.advance();
         }
+        let limit = self
+            .peek()
+            .map(|token| token.span.start)
+            .unwrap_or(self.source.len());
+        text_end = Self::extend_span_over_skipped_operators(self.source, text_end, limit);
 
         let span = SourceSpan {
             start: text_start,
@@ -21864,6 +21997,43 @@ impl Parser<'_> {
         };
         let (text, span) = trimmed_source_text(self.source_text(span), span);
         Some(WhenClause { text, span })
+    }
+
+    /// The file-level lexer steps over expression operators (`==`, `!=`,
+    /// `<=`, `>=`, `&&`, `||`, `*`, `/`, `-`) without emitting tokens —
+    /// expressions are re-parsed from raw source slices. A raw capture that
+    /// walks TOKEN spans therefore stops short when the clause ends in a
+    /// dangling operator, silently truncating `assert a ==` to `assert a`
+    /// (which then mis-diagnoses as a non-boolean expression instead of a
+    /// syntax error). Extend `end` across same-line trailing operator bytes
+    /// so the expression parser sees the dangling operator. `=>`/`->` are
+    /// real tokens and `//` starts a comment; neither is consumed here.
+    fn extend_span_over_skipped_operators(source: &str, mut end: usize, limit: usize) -> usize {
+        let bytes = source.as_bytes();
+        loop {
+            let mut cursor = end;
+            while cursor < limit && bytes[cursor].is_ascii_whitespace() && bytes[cursor] != b'\n' {
+                cursor += 1;
+            }
+            let width = match (bytes.get(cursor), bytes.get(cursor + 1)) {
+                _ if cursor >= limit => break,
+                (Some(b'='), Some(b'='))
+                | (Some(b'!'), Some(b'='))
+                | (Some(b'<'), Some(b'='))
+                | (Some(b'>'), Some(b'='))
+                | (Some(b'&'), Some(b'&'))
+                | (Some(b'|'), Some(b'|')) => 2,
+                (Some(b'/'), Some(b'/')) => break,
+                (Some(b'-'), Some(b'>')) => break,
+                (Some(b'*' | b'/' | b'-'), _) => 1,
+                _ => break,
+            };
+            if cursor + width > limit {
+                break;
+            }
+            end = cursor + width;
+        }
+        end
     }
 
     fn parse_grouped_when_clauses(&mut self, when: SourceSpan) -> Option<Vec<WhenClause>> {
@@ -23046,6 +23216,65 @@ file store notes_store {
         assert_eq!(text_at(store.root_span.expect("root span")), "root");
         assert_eq!(text_at(store.read_span.expect("read span")), "allow");
         assert_eq!(text_at(store.write_span.expect("write span")), "allow");
+        // No `provider` clause: the decl records None (the runtime default is
+        // `local`), and the `.ir` snapshot stays provider-free (F5 zero-churn).
+        assert_eq!(store.provider, None);
+        let ir = compile_program(source).ir.expect("valid IR");
+        assert_eq!(ir.file_stores[0].provider, None);
+        assert!(!ir.to_snapshot().contains("provider"));
+    }
+
+    #[test]
+    fn file_store_provider_clause_parses_and_unknown_is_rejected() {
+        // spec/std-files.md "Surface" (slice F5): the optional block-internal
+        // `provider <ident>` clause parses (aligning with the channel
+        // declaration's provider clause), serializes into the snapshot, and
+        // an identifier outside the v1 provider list is a check error.
+        let source = r#"
+workflow FileProviderProbe
+file store notes_store {
+  root "./data"
+  allow read ["notes/**"]
+  provider local
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(
+            compiled.diagnostics,
+            Vec::new(),
+            "unexpected diagnostics: {:?}",
+            compiled.diagnostics
+        );
+        let ir = compiled.ir.expect("valid IR");
+        assert_eq!(ir.file_stores[0].provider.as_deref(), Some("local"));
+        assert!(ir.to_snapshot().contains("    provider local"));
+
+        let unknown = source.replace("provider local", "provider s3");
+        let compiled = compile_program(&unknown);
+        assert!(
+            compiled.diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("file store `notes_store` names unknown provider `s3`")
+            }),
+            "unknown provider must be a check error: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn formatter_preserves_file_store_provider_clause() {
+        let source = r#"
+workflow FileProviderFmt
+file store notes_store { root "./data" provider local }
+"#;
+        let formatted = format_program(source);
+        assert_eq!(formatted.diagnostics, Vec::new());
+        let formatted = formatted.formatted.expect("formats");
+        assert!(
+            formatted.contains("file store notes_store {\n  root \"./data\"\n  provider local\n}"),
+            "{formatted}"
+        );
     }
 
     #[test]
@@ -25469,6 +25698,231 @@ rule safe_not_null
         }
     }
 
+    /// Every expression form in the spec's grammar (expression-kernel.md
+    /// "Expression Forms") parses and renders to a pinned snapshot, so parser
+    /// precedence and snapshot parenthesization are locked for each form.
+    #[test]
+    fn parses_every_expression_form_with_pinned_precedence() {
+        let cases = [
+            // Literals.
+            ("\"text\"", "\"text\""),
+            ("42", "42"),
+            ("2.5", "2.5"),
+            ("true && false", "true && false"),
+            ("task.note == null", "task.note == null"),
+            // Paths and (map) indexing, including chained indexes.
+            (
+                "task.meta[\"a\"][\"b\"] == \"c\"",
+                "task.meta[\"a\"][\"b\"] == \"c\"",
+            ),
+            // Unary and word-form connectives normalize to symbol operators.
+            ("not task.done", "!task.done"),
+            ("!!task.done", "!!task.done"),
+            (
+                "task.a and task.b or task.c",
+                "(task.a && task.b) || task.c",
+            ),
+            // Prefix `not` binds looser than comparisons.
+            ("not task.state == \"open\"", "!(task.state == \"open\")"),
+            // Boolean precedence: `&&` over `||`, unary over both.
+            (
+                "task.a || task.b && !task.c",
+                "task.a || (task.b && !task.c)",
+            ),
+            // Arithmetic precedence: `* /` over `+ -`, both over comparisons.
+            ("1 + 2 * 3 == 7", "(1 + (2 * 3)) == 7"),
+            ("10 - 4 / 2 >= 8", "(10 - (4 / 2)) >= 8"),
+            // Comparisons/membership are ONE flat left-associative level:
+            // `a == b < c` groups as `(a == b) < c` (the spec sketch draws
+            // ordering tighter than equality; the divergence is only
+            // observable in chains, which the type checker rejects anyway —
+            // this pin documents the implemented grouping).
+            ("task.a == task.b < task.c", "(task.a == task.b) < task.c"),
+            // Ordering and membership forms.
+            ("task.n <= 5 && task.n > 0", "(task.n <= 5) && (task.n > 0)"),
+            ("\"x\" in task.labels", "\"x\" in task.labels"),
+            ("\"x\" not in task.labels", "\"x\" not in task.labels"),
+            // Presence proof form vs collection form.
+            ("exists task.owner", "exists(task.owner)"),
+            (
+                "exists(Task where done == false)",
+                "exists(Task where done == false)",
+            ),
+            // count/empty over arrays, queries, and effect queries.
+            ("count([1, 2]) == 2", "count([1, 2]) == 2"),
+            (
+                "empty(Task where done == false)",
+                "empty(Task where done == false)",
+            ),
+            ("empty(task.labels)", "empty(task.labels)"),
+            ("empty([])", "empty([])"),
+            (
+                "count(effect kind agent.tell where target == \"w\") == 0",
+                "count(effect kind agent.tell where target == \"w\") == 0",
+            ),
+            (
+                "exists(effect kind human.ask)",
+                "exists(effect kind human.ask)",
+            ),
+            // Array and object literals.
+            ("[\"a\", \"b\"]", "[\"a\", \"b\"]"),
+            (
+                "{title task.title, meta {phase \"kernel\"}}",
+                "{title task.title, meta {phase \"kernel\"}}",
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let expr = parse_expression(source).expect(source);
+            assert_eq!(expr.to_snapshot(), expected, "for `{source}`");
+        }
+    }
+
+    /// Invalid expression syntax fails deterministically with an actionable
+    /// message: dangling operators, unclosed delimiters, malformed queries,
+    /// and unsupported call syntax (tracker "invalid syntax diagnostics").
+    #[test]
+    fn invalid_expression_syntax_produces_deterministic_errors() {
+        let cases = [
+            // Dangling operators.
+            ("task.a ==", "expected expression"),
+            ("1 +", "expected expression"),
+            ("task.a && || task.b", "expected expression"),
+            ("task.a == == 1", "expected expression"),
+            ("!", "expected expression"),
+            // Unclosed delimiters.
+            ("(task.a == 1", "expected `)`"),
+            ("task.labels[\"k\"", "expected `]`"),
+            ("[1, 2", "expected `,`"),
+            ("{a 1", "expected object field name"),
+            // Trailing garbage after a complete expression.
+            ("task.a == 1)", "unexpected token"),
+            ("in task.a", "unexpected token"),
+            // Malformed queries and paths.
+            ("count(Task where", "expected expression"),
+            ("count(Task where )", "expected expression"),
+            ("task..a", "expected field name after `.`"),
+            ("task.a not b", "expected `in` after `not`"),
+        ];
+
+        for (source, expected) in cases {
+            let message = parse_expression(source).expect_err(source);
+            assert!(
+                message.contains(expected),
+                "`{source}` -> `{message}` (expected `{expected}`)"
+            );
+        }
+    }
+
+    /// Syntax errors inside real guards and assertions surface as compile
+    /// diagnostics naming the rule/assertion, not as panics or silent drops.
+    #[test]
+    fn guard_and_assertion_syntax_errors_surface_with_context() {
+        let source = r#"
+workflow BadExpressionSyntax
+
+class Task {
+  title string
+}
+
+assert count(Task) ==
+
+rule dangling_guard
+  when Task as task where task.title ==
+=> {
+}
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("invalid assertion expression: expected expression")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("rule `dangling_guard` has invalid guard expression: expected expression")));
+    }
+
+    /// `empty` static checks: arity, scalar rejection, and the optional rule —
+    /// `empty(Optional<T>)` is defined only when `empty(T)` is, so an optional
+    /// string is accepted while an optional int is rejected.
+    #[test]
+    fn validates_empty_call_arity_and_optional_arguments() {
+        let source = r#"
+workflow EmptyCallChecks
+
+class Task {
+  title string
+  note string?
+  age int?
+  done bool
+}
+
+assert empty() == true
+assert empty(["a"], ["b"]) == true
+assert count(Task where empty(note) && empty(title)) == 0
+assert count(Task where empty(age)) == 0
+assert count(Task where empty(done)) == 0
+"#;
+
+        let compiled = compile_program(source);
+        assert!(compiled.ir.is_none());
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("calls `empty` with 0 arguments, expected 1")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("calls `empty` with 2 arguments, expected 1")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("calls `empty` with unsupported optional argument type `int?`")));
+        assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("calls `empty` with unsupported argument type `bool`")));
+        // The accepted forms produce no `empty` diagnostics of their own.
+        assert!(!compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("`string?`")));
+        assert!(!compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("unsupported argument type `string`")));
+    }
+
+    /// The formatter never re-renders expression text: guards and assertions
+    /// keep the author's exact spelling (word-form connectives, redundant
+    /// parentheses), and formatting is idempotent over them. Rendered
+    /// parenthesization belongs to the IR snapshot (see
+    /// `parses_every_expression_form_with_pinned_precedence`), never to `fmt`.
+    #[test]
+    fn format_preserves_expression_source_text_verbatim() {
+        let source = r#"workflow FormatExpressions
+
+class Task {
+  title string
+  done bool
+}
+
+assert count(Task where (done == false) and not done) == 0
+
+rule keep_spelling
+  when Task as task where not task.done and (task.title == "a" or task.title == "b")
+=> {
+}
+"#;
+
+        let formatted = format_program(source);
+        assert_eq!(formatted.diagnostics, Vec::new());
+        let once = formatted.formatted.expect("formats");
+        assert!(once.contains(
+            "when Task as task where not task.done and (task.title == \"a\" or task.title == \"b\")"
+        ));
+        assert!(once.contains("assert count(Task where (done == false) and not done) == 0"));
+
+        let twice = format_program(&once).formatted.expect("formats twice");
+        assert_eq!(once, twice, "formatting is idempotent over expressions");
+    }
+
     #[test]
     fn validates_expected_schema_object_and_map_record_fields() {
         let source = r#"
@@ -25959,6 +26413,10 @@ rule_dependencies
             (
                 include_str!("../../../examples/incident-router.whip"),
                 include_str!("../../../examples/incident-router.ir"),
+            ),
+            (
+                include_str!("../../../examples/expression-kernel.whip"),
+                include_str!("../../../examples/expression-kernel.ir"),
             ),
             (
                 include_str!("../../../examples/human-review.whip"),

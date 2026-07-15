@@ -24,6 +24,7 @@ fn checks_all_example_workflows() {
         "terminal-output-union.whip",
         "triage-flow.whip",
         "incident-router.whip",
+        "expression-kernel.whip",
         "scheduled-escalation.whip",
         "event-bridge.whip",
         "reusable-review-pattern.whip",
@@ -7068,7 +7069,7 @@ fn issue_cli_lifecycle() {
         "--json",
         "issue",
         "new",
-        "--queue",
+        "--tracker",
         "backlog",
         "--title",
         "fix login",
@@ -7146,10 +7147,22 @@ fn issue_cli_dep_add_gates_readiness() {
     };
 
     let blocker = issue_json(run(&[
-        "--json", "issue", "new", "--queue", "backlog", "--title", "blocker",
+        "--json",
+        "issue",
+        "new",
+        "--tracker",
+        "backlog",
+        "--title",
+        "blocker",
     ]));
     let blocked = issue_json(run(&[
-        "--json", "issue", "new", "--queue", "backlog", "--title", "blocked",
+        "--json",
+        "issue",
+        "new",
+        "--tracker",
+        "backlog",
+        "--title",
+        "blocked",
     ]));
     let blocker_id = blocker["id"].as_str().expect("blocker id").to_owned();
     let blocked_id = blocked["id"].as_str().expect("blocked id").to_owned();
@@ -9911,6 +9924,152 @@ rule go
     );
     assert!(
         !codes(&with).contains(&"lint.missing_coord_import".to_owned()),
+        "the import silences the advisory"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lint_advises_std_files_import_for_file_programs() {
+    // spec/std-files.md "Manifest": import posture is an ADVISORY
+    // missing-import lint only (the M5 graduated ladder; the hard `use
+    // std.files` requirement is explicitly deferred) — file stores and verbs
+    // without `use std.files` warn (exit 0), and the same program with the
+    // import is clean.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("lint-files-import");
+    let program = |import: &str| {
+        format!(
+            r#"{import}workflow FilesImport
+
+output result Done
+
+class Done {{
+  note string
+}}
+
+file store docs {{
+  root "fixtures"
+  allow read ["**/*.md"]
+}}
+
+rule seed
+  when started
+=> {{
+  read text from docs at "note.md" as body
+
+  after body succeeds as file {{
+    complete result {{ note file.content }}
+  }}
+}}
+"#
+        )
+    };
+    let without = dir.join("without-import.whip");
+    let with = dir.join("with-import.whip");
+    fs::write(&without, program("")).expect("write workflow");
+    fs::write(&with, program("use std.files\n\n")).expect("write workflow");
+    let codes = |path: &Path| -> Vec<String> {
+        let output = Command::new(bin)
+            .args(["--json", "lint", path.to_str().expect("present")])
+            .output()
+            .expect("whip lint runs");
+        assert!(output.status.success(), "advisory lint must exit 0");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint report JSON");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f.get("code").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert!(
+        codes(&without).contains(&"lint.missing_files_import".to_owned()),
+        "file verbs without `use std.files` fire the advisory"
+    );
+    assert!(
+        !codes(&with).contains(&"lint.missing_files_import".to_owned()),
+        "the import silences the advisory"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lint_advises_std_tracker_import_for_tracker_programs() {
+    // spec/std-tracker.md "Manifest": import bite per E5 is an ADVISORY
+    // missing-import lint only (the M5 graduated ladder; the hard `use
+    // std.tracker` requirement is explicitly deferred) — tracker declarations
+    // and verbs without `use std.tracker` warn (exit 0), and the same program
+    // with the import is clean.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("lint-tracker-import");
+    let program = |import: &str| {
+        format!(
+            r#"{import}workflow TrackerImport
+
+output result Done
+failure error Busy
+
+class Done {{
+  note string
+}}
+
+class Busy {{
+  reason string
+}}
+
+tracker backlog {{
+  provider builtin
+}}
+
+rule work_ready_item
+  when backlog has ready issue as issue
+=> {{
+  claim issue as active_claim
+
+  after active_claim succeeds {{
+    finish issue {{
+      summary "done"
+    }}
+    complete result {{ note "ok" }}
+  }}
+
+  after active_claim fails {{
+    release issue
+    fail error {{ reason "busy" }}
+  }}
+}}
+"#
+        )
+    };
+    let without = dir.join("without-import.whip");
+    let with = dir.join("with-import.whip");
+    fs::write(&without, program("")).expect("write workflow");
+    fs::write(&with, program("use std.tracker\n\n")).expect("write workflow");
+    let codes = |path: &Path| -> Vec<String> {
+        let output = Command::new(bin)
+            .args(["--json", "lint", path.to_str().expect("present")])
+            .output()
+            .expect("whip lint runs");
+        assert!(output.status.success(), "advisory lint must exit 0");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint report JSON");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f.get("code").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert!(
+        codes(&without).contains(&"lint.missing_tracker_import".to_owned()),
+        "tracker verbs without `use std.tracker` fire the advisory"
+    );
+    assert!(
+        !codes(&with).contains(&"lint.missing_tracker_import".to_owned()),
         "the import silences the advisory"
     );
 
@@ -15591,6 +15750,60 @@ fn dev_incident_router_routes_with_agentref_metadata() {
             .into_iter()
             .map(str::to_owned)
             .collect::<std::collections::BTreeSet<_>>()
+    );
+
+    let _ = fs::remove_file(store_path);
+}
+
+/// The expression-kernel golden fixture runs end-to-end: every operator
+/// class (arithmetic, ordering, equality, membership, boolean word/symbol
+/// forms, presence, indexing, `count`/`exists`/`empty` over literals and
+/// fact/effect queries) evaluates in guards and assertions, all assertions
+/// pass, and the workflow completes deterministically with no providers.
+#[test]
+fn dev_runs_the_expression_kernel_golden_fixture() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let example = example_path("expression-kernel.whip");
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "dev",
+            example.to_str().expect("utf-8 example path"),
+        ],
+    );
+    let assertions = dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("assertions");
+    assert_eq!(assertions.len(), 13, "{assertions:#?}");
+    assert!(
+        assertions
+            .iter()
+            .all(|assertion| assertion.get("status").and_then(Value::as_str) == Some("passed")),
+        "{assertions:#?}"
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let status = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "status",
+            instance_id,
+        ],
+    );
+    assert_eq!(
+        status.pointer("/instance/status").and_then(Value::as_str),
+        Some("completed"),
+        "{status}"
     );
 
     let _ = fs::remove_file(store_path);

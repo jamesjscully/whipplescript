@@ -1,3 +1,5 @@
+use std.tracker
+
 @service
 description "The agent turn only runs after the work-item claim succeeds"
 workflow QueueGatedSmoke

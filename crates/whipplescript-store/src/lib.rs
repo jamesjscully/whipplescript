@@ -7554,19 +7554,18 @@ fn policy_block_on(
     // Timers and builtin-tracker verbs are resolved by the runtime itself on
     // worker passes: no provider, capability, or profile applies.
     //
-    // Coordination kinds (`lease.*` / `ledger.*` / `counter.*`) are NOT
-    // exempt here (std.coord slice 4): the embedded std.coord manifest seeds
-    // their capability/provider/binding rows at store init, so the admission
-    // gate is REAL for them — an unbound coordination kind blocks as
-    // blocked_by_capability. INTENTIONAL DIVERGENCE from the DO mirror
-    // (host-do/do_store.rs `do_policy_block_on`), which keeps its coordination
-    // exemption until the DO tracker's package-registration row seeds the same
-    // rows in the DO bootstrap (spec/std-coord.md "Deferred with cause").
-    if effect.kind == "timer.wait"
-        || effect.kind.starts_with("tracker.")
-        || effect.kind == "signal.emit"
-        || effect.kind.starts_with("file.")
-    {
+    // Coordination kinds (`lease.*` / `ledger.*` / `counter.*`, std.coord
+    // slice 4), file kinds (`file.*`, std.files slice F2), and tracker kinds
+    // (`tracker.*`, std.tracker slice T4) are NOT exempt here: the embedded
+    // std.coord / std.files / std.tracker manifests seed their
+    // capability/provider/binding rows at store init, so the admission gate
+    // is REAL for them — an unbound coordination, file, or tracker kind
+    // blocks as blocked_by_capability. INTENTIONAL DIVERGENCE from the DO
+    // mirror (host-do/do_store.rs `do_policy_block_on`), which keeps all
+    // three exemptions until the DO tracker's package-registration row seeds
+    // the same rows in the DO bootstrap (spec/std-coord.md /
+    // spec/std-files.md / spec/std-tracker.md "Deferred with cause").
+    if effect.kind == "timer.wait" || effect.kind == "signal.emit" {
         return Ok(None);
     }
 
@@ -16293,6 +16292,239 @@ mod tests {
             .expect("claimable effects load");
         assert_eq!(claimable.len(), 1, "{claimable:?}");
         assert_eq!(claimable[0].effect_id, "acquire-1");
+    }
+
+    /// std.files slice F2 gate: the NATIVE admission gate is real for
+    /// `file.*` kinds. With the builtin exemption deleted from
+    /// `policy_block_on`, an UNBOUND file kind blocks loudly as
+    /// blocked_by_capability — the stale-store fixture (a workspace whose
+    /// store lacks the std.files rows fails loud, never hangs) — and the
+    /// same kind becomes claimable once the embedded std.files manifest's
+    /// capability/provider/binding rows are registered, exactly what
+    /// `register_locked_packages` seeds at store init in production.
+    #[test]
+    fn file_kind_blocks_unbound_and_claims_once_manifest_seeded() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("FilesGate", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        let effects = [NewEffect {
+            timeout_seconds: None,
+            effect_id: "read-1",
+            kind: "file.read",
+            target: None,
+            input_json: r#"{"store":"docs","root":".","path":"note.md","format":"text"}"#,
+            status: "queued",
+            idempotency_key: "rule=load;effect=read-1",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "load",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-load"),
+                marks: &[],
+            })
+            .expect("rule commits");
+
+        // Unbound (stale store): no worker may claim it, and a forced start
+        // blocks durably and loudly.
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert!(
+            claimable.is_empty(),
+            "unbound file kind must not be claimable: {claimable:?}"
+        );
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "read-1",
+                run_id: "run-read",
+                provider: "files",
+                worker_id: "worker-1",
+                lease_id: "lease-read",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("unbound file kind blocks at admission");
+        assert!(
+            matches!(&blocked, StoreError::PolicyBlocked { reason, .. } if reason.contains("file.read")),
+            "{blocked:?}"
+        );
+        assert_eq!(effect_status(&store, "read-1"), "blocked_by_capability");
+
+        // Seeded: on a store where the embedded std.files manifest registered
+        // first (production order — `register_locked_packages` runs at store
+        // init, before any worker pass), the same effect is claimable.
+        let mut seeded = SqliteStore::open_in_memory().expect("store opens");
+        seeded
+            .register_package_manifest(include_str!("../../../std/manifests/files.json"))
+            .expect("std.files manifest registers");
+        let version = seeded
+            .create_program_version(test_program_version("FilesGateSeeded", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = seeded
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        seeded
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "load",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-load"),
+                marks: &[],
+            })
+            .expect("rule commits");
+        let claimable = seeded
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert_eq!(claimable.len(), 1, "{claimable:?}");
+        assert_eq!(claimable[0].effect_id, "read-1");
+    }
+
+    /// std.tracker slice T4 gate: the NATIVE admission gate is real for
+    /// tracker kinds. With the builtin exemption deleted from
+    /// `policy_block_on`, an UNBOUND tracker kind blocks as
+    /// blocked_by_capability (no effect provider registered), and the same
+    /// kind becomes claimable once the embedded std.tracker manifest's
+    /// capability/provider/binding rows are registered — exactly what
+    /// `register_locked_packages` seeds at store init in production.
+    #[test]
+    fn tracker_kind_blocks_unbound_and_claims_once_manifest_seeded() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("TrackerGate", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        let effects = [NewEffect {
+            timeout_seconds: None,
+            effect_id: "claim-1",
+            kind: "tracker.claim",
+            target: None,
+            input_json: r#"{"id":"WS-1"}"#,
+            status: "queued",
+            idempotency_key: "rule=work;effect=claim-1",
+            required_capabilities_json: r#"["tracker.claim"]"#,
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "work",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-work"),
+                marks: &[],
+            })
+            .expect("rule commits");
+
+        // Unbound: no worker may claim it, and a forced start blocks durably.
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert!(
+            claimable.is_empty(),
+            "unbound tracker kind must not be claimable: {claimable:?}"
+        );
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "claim-1",
+                run_id: "run-claim",
+                provider: "queue",
+                worker_id: "worker-1",
+                lease_id: "lease-claim",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("unbound tracker kind blocks at admission");
+        assert!(
+            matches!(&blocked, StoreError::PolicyBlocked { reason, .. } if reason.contains("tracker.claim")),
+            "{blocked:?}"
+        );
+        assert_eq!(effect_status(&store, "claim-1"), "blocked_by_capability");
+
+        // Seeded: on a store where the embedded std.tracker manifest
+        // registered first (production order — `register_locked_packages`
+        // runs at store init, before any worker pass), the same effect is
+        // claimable.
+        let mut seeded = SqliteStore::open_in_memory().expect("store opens");
+        seeded
+            .register_package_manifest(include_str!("../../../std/manifests/tracker.json"))
+            .expect("std.tracker manifest registers");
+        let version = seeded
+            .create_program_version(test_program_version(
+                "TrackerGateSeeded",
+                "source-1",
+                "ir-1",
+            ))
+            .expect("program version creates");
+        let instance = seeded
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        seeded
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "work",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-work"),
+                marks: &[],
+            })
+            .expect("rule commits");
+        let claimable = seeded
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert_eq!(claimable.len(), 1, "{claimable:?}");
+        assert_eq!(claimable[0].effect_id, "claim-1");
     }
 
     #[test]

@@ -22,8 +22,8 @@ use whipplescript_store::{
 use crate::effect_config::EffectConfig;
 use crate::idempotency_key;
 use crate::rule_lowering::{
-    effect_binding_value, interpolate_prompt, json_from_str, parse_field_value, stable_hash_hex,
-    RuleContext,
+    effect_binding_value, empty_ir_program, eval_expr_value, guard_result, interpolate_prompt,
+    json_from_str, parse_field_value, stable_hash_hex, EvalScope, GuardStatus, RuleContext,
 };
 use crate::{HumanAskExecution, RuntimeKernel};
 
@@ -1003,6 +1003,297 @@ pub fn run_file_import_effect_generic<S: RuntimeStore>(
                     "run_id": run_id,
                     "status": "failed",
                     "value": effect_failure_base("file.import", &reason, &reason, &effect.effect_id, &run_id),
+                    "error": { "message": reason },
+                })
+                .to_string(),
+                Some(&terminal.event_id),
+                Some(&fact_key),
+            )?;
+            Ok(terminal)
+        }
+    }
+}
+
+/// Evaluate a `proj_query` predicate against one projection/fact row, reusing the
+/// guard expression kernel restricted to the row's fields. Returns `Err` on a
+/// predicate that cannot be parsed or does not evaluate to a boolean — never a
+/// silent false.
+pub fn evaluate_proj_predicate(predicate: &str, row: &Value) -> Result<bool, String> {
+    let expr = whipplescript_parser::parse_expression(predicate)
+        .map_err(|error| format!("could not parse predicate `{predicate}`: {error}"))?;
+    let empty_ir = empty_ir_program();
+    let scope = EvalScope {
+        context: None,
+        facts: &[],
+        effects: &[],
+        ir: &empty_ir,
+        projection: Some(row),
+        projection_schema: None,
+    };
+    match guard_result(eval_expr_value(&expr, &scope)) {
+        (GuardStatus::Matched, _, _) => Ok(true),
+        (GuardStatus::False, _, _) => Ok(false),
+        (GuardStatus::Error, _, error) => {
+            Err(error.unwrap_or_else(|| "predicate did not evaluate to a boolean".to_owned()))
+        }
+    }
+}
+
+/// CSV-escape one field (inverse of `split_csv_record`): quote when the value
+/// contains a comma, quote, or newline; double embedded quotes.
+fn csv_escape_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+/// Serialize export rows (std.files), the inverse of `decode_import_rows`. `jsonl`
+/// = one JSON object per line; `json` = a top-level array; `csv` = a header line
+/// from `fields` then one record per row (stable column order, values stringified).
+pub fn encode_export_rows(
+    format: &str,
+    rows: &[Value],
+    fields: &[String],
+) -> Result<String, String> {
+    let cell = |row: &Value, field: &str| -> String {
+        match row.as_object().and_then(|object| object.get(field)) {
+            Some(Value::String(text)) => text.clone(),
+            Some(other) => other.to_string(),
+            None => String::new(),
+        }
+    };
+    match format {
+        "jsonl" => {
+            let mut out = rows
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !rows.is_empty() {
+                out.push('\n');
+            }
+            Ok(out)
+        }
+        "json" => serde_json::to_string(&Value::Array(rows.to_vec()))
+            .map(|mut text| {
+                text.push('\n');
+                text
+            })
+            .map_err(|error| format!("json export serialize failed: {error}")),
+        "csv" => {
+            let mut out = fields
+                .iter()
+                .map(|field| csv_escape_field(field))
+                .collect::<Vec<_>>()
+                .join(",");
+            out.push('\n');
+            for row in rows {
+                let record = fields
+                    .iter()
+                    .map(|field| csv_escape_field(&cell(row, field)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                out.push_str(&record);
+                out.push('\n');
+            }
+            Ok(out)
+        }
+        other => Err(format!("unknown export format `{other}`")),
+    }
+}
+
+/// Host-agnostic core (DR-0033 chunk 3; relocated from the CLI in std.files
+/// slice F4 — crate location, not shape): export a `<Schema>` fact collection
+/// (optionally filtered by the `where` predicate, ordered deterministically by
+/// the store's `(name, key)` ordering — DR-0022) to a file through the
+/// `FileStore` seam over a held `RuntimeKernel<S>`. A success settles
+/// `file.export.completed` with the row count and a content hash; living in
+/// the kernel, it builds for wasm32 so exports run on the DO plane too.
+pub fn run_file_export_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    files: &dyn FileStore,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<StoredEvent, StoreError> {
+    let input = json_from_str(&effect.input_json);
+    let root = input
+        .get("root")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let format = input
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("jsonl")
+        .to_owned();
+    let schema = input
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let store_name = input
+        .get("store")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mode = input
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("create")
+        .to_owned();
+    let predicate = input
+        .get("predicate")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let allow = effect_allow_globs(&input);
+    let fields = input
+        .get("fields")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let full = Path::new(root).join(path);
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "file-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "file-lease"]);
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "files",
+        worker_id: "whip-files",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &json!({ "path": full.display().to_string(), "schema": schema }).to_string(),
+    })?;
+    let terminal_key = idempotency_key(&[instance_id, &effect.effect_id, "terminal"]);
+    let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
+
+    let outcome: Result<(usize, String), String> = (|| {
+        if let Some(reason) =
+            file_path_policy_error(path, store_name, &allow, "write").or_else(|| {
+                files.path_policy_error(Path::new(root), Path::new(path), store_name, "write")
+            })
+        {
+            return Err(reason);
+        }
+        // Resolve the collection: facts of <schema> [where predicate], ordered by
+        // the store's deterministic (name, key) ordering for reproducible output.
+        let facts = kernel
+            .store()
+            .list_facts(instance_id)
+            .map_err(|error| format!("{error:?}"))?;
+        let mut rows = Vec::new();
+        for fact in facts.iter().filter(|fact| fact.name == schema) {
+            let value: Value = serde_json::from_str(&fact.value_json)
+                .map_err(|error| format!("fact value is not JSON: {error}"))?;
+            if predicate.is_empty() || evaluate_proj_predicate(&predicate, &value)? {
+                rows.push(value);
+            }
+        }
+        let exists = files.exists(&full);
+        match mode.as_str() {
+            "create" if exists => {
+                return Err(format!(
+                    "write mode `create` requires `{path}` to not already exist"
+                ))
+            }
+            "replace" if !exists => {
+                return Err(format!(
+                    "write mode `replace` requires `{path}` to already exist"
+                ))
+            }
+            "create" | "replace" | "upsert" | "append" => {}
+            other => return Err(format!("unknown write mode `{other}`")),
+        }
+        let serialized = encode_export_rows(&format, &rows, &fields)?;
+        if let Some(parent) = full.parent() {
+            files
+                .create_dir_all(parent)
+                .map_err(|error| format!("create parent of `{path}`: {error}"))?;
+        }
+        if mode == "append" {
+            files
+                .append(&full, serialized.as_bytes())
+                .map_err(|error| format!("append to `{}` failed: {error}", full.display()))?;
+        } else {
+            files
+                .write(&full, serialized.as_bytes())
+                .map_err(|error| format!("write of `{}` failed: {error}", full.display()))?;
+        }
+        Ok((rows.len(), stable_hash_hex(&serialized)))
+    })();
+
+    match outcome {
+        Ok((row_count, content_hash)) => {
+            let value = json!({
+                "store": store_name,
+                "path": path,
+                "format": format,
+                "schema": schema,
+                "mode": mode,
+                "row_count": row_count,
+                "content_hash": content_hash,
+            });
+            let terminal = kernel.complete_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "files",
+                worker_id: "whip-files",
+                status: "completed",
+                exit_code: Some(0),
+                summary: Some(&format!("exported {row_count} rows to {}", full.display())),
+                metadata_json: &json!({ "value": value }).to_string(),
+                idempotency_key: Some(&terminal_key),
+            })?;
+            kernel.derive_fact(
+                instance_id,
+                "file.export.completed",
+                &effect.effect_id,
+                &json!({
+                    "effect_id": effect.effect_id,
+                    "run_id": run_id,
+                    "status": "completed",
+                    "value": value,
+                })
+                .to_string(),
+                Some(&terminal.event_id),
+                Some(&fact_key),
+            )?;
+            Ok(terminal)
+        }
+        Err(reason) => {
+            let terminal = kernel.fail_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "files",
+                worker_id: "whip-files",
+                status: "failed",
+                exit_code: None,
+                summary: Some(&reason),
+                metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
+                idempotency_key: Some(&terminal_key),
+            })?;
+            kernel.derive_fact(
+                instance_id,
+                "file.export.failed",
+                &effect.effect_id,
+                &json!({
+                    "effect_id": effect.effect_id,
+                    "run_id": run_id,
+                    "status": "failed",
+                    "value": effect_failure_base("file.export", &reason, &reason, &effect.effect_id, &run_id),
                     "error": { "message": reason },
                 })
                 .to_string(),

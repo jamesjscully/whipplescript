@@ -141,6 +141,27 @@ expired-and-reclaimed, and other-holder — normal typed failures per DR-0002
 "Source Operations". The `WorkItems` trait gains `renew_claim` plus
 expiry-aware `ready`/`claim`; all three implementations port.
 
+**Renew disposition as of 2026-07-14 (T4 landed, T3 still open).** The store
+plane of T3 already shipped with the A+blockers rebuild: `WorkItems::renew_claim`
+(holder-checked, monotonic, heartbeat-on-untimed) and expiry-aware
+`ready`/`claim` exist across all three implementations, model-verified by
+tracker-lease.maude, and `whip issue renew` drives them from the CLI. What T3
+still owes is the SURFACE: the `tracker.renew` effect kind + contract, the
+claim `ttl` clause, `renew <claim>` lowering, and the CLI `--ttl` flags. Until
+then the language-level `renew` verb parses ONLY as coord's lease renewal
+(`renew <acquire-binding>` → `lease.renew`, BodyEffectKind::LeaseRenew; the
+compile-time check rejects a renew naming anything but a same-rule acquire) —
+this is the spec-sanctioned pre-T3 state, not a blessed permanent split: the
+`renew` reserved-keyword privilege row already points at std.tracker, the
+embedded manifest seeds the `tracker.renew` capability/provider/binding trio
+and its construct row (sans contract, the std.coord `lease.renew` precedent),
+and T3 resolves the verb by binding-typed disambiguation (a renew naming a
+claim binding lowers to `tracker.renew`, mirroring the shipped `release`
+split). Landing a `tracker.renew` effect kind WITHOUT the claim-TTL half was
+rejected: with no way to create a timed claim, the kind could only ever
+heartbeat — a decorative effect kind, exactly the pretense this package
+forbids. T3 stays one slice.
+
 Slice C blast-radius items this design depends on (S3 scope, per M4: kind-map
 dedup first; store-open guard errs loudly on pending legacy `queue.*` effects;
 idempotency keys rekey): projection fact rename; harness todo-tool status
@@ -179,7 +200,12 @@ test (cli/main.rs:37468) anticipated exactly this. It contributes:
   each (today all four shipped contracts pass EMPTY lists,
   parser/lib.rs:3470-3510); typed output `TrackerClaim` on `tracker.claim`.
   The S4 lock-time check (contract caps ⊆ manifest capabilities[]) holds by
-  construction.
+  construction. *(Shipped shape 2026-07-14: FOUR contract rows —
+  `tracker.renew` rides sans contract until T3 lands its effect kind; it
+  ships only the capability/provider/binding trio plus its construct row,
+  the std.coord `lease.renew` precedent, spec/std-coord.md "Deferred with
+  cause". A `tracker.renew` contract row without a parser partner would be
+  manifest-only pretense; the drift test pins the absence.)*
 - **constructs**: `tracker` (declaration_block / metadata_only) + the five
   effect operations (effect_operation / `typed_effect_call` — see "Static
   checks" for the privilege-tuple correction). The ready-issue projection is
@@ -266,7 +292,14 @@ Each slice is independently gateable under the per-piece review discipline.
   contract cap absent from the manifest fails the lock. Teeth in v1 =
   compile-plane attribution + S4 invariant + turn-grant narrowing; runtime
   admission for builtin kinds stays core-gated and is documented as such (no
-  pretense of registry dispatch).
+  pretense of registry dispatch). *(2026-07-14, superseded at T4: once the
+  embedded manifest seeds capability/provider/binding rows at store init,
+  keeping the builtin `tracker.*` exemption would have been the pretense —
+  so T4 deleted it from the NATIVE policy gate (store/lib.rs
+  `policy_block_on`), mirroring std.coord slice 4: an unbound tracker kind
+  blocks as blocked_by_capability, and the embedded rows make it pass by
+  construction. The DO mirror keeps its exemption until the DO bootstrap
+  registers packages — intentional divergence, documented at both sites.)*
 - **T3 — renew end-to-end + claim TTL** (after S3; model FIRST per house
   discipline). Model: a small claim-lifecycle model (claim/renew/expire/
   release/terminal) with coverage AND bite — properties: an expired claim

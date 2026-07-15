@@ -29,9 +29,9 @@ use whipplescript_kernel::context_assembly::{
 use whipplescript_kernel::effect_config::EffectConfig;
 use whipplescript_kernel::effect_handlers::{
     run_capability_effect_generic, run_coordination_effect_generic, run_event_effect_generic,
-    run_file_effect_generic, run_file_import_effect_generic, run_file_write_effect_generic,
-    run_human_effect_generic, run_notify_effect_generic, run_queue_effect_generic,
-    CapabilityContract, DeliveryGovernance, FixtureCapabilityProvider,
+    run_file_effect_generic, run_file_export_effect_generic, run_file_import_effect_generic,
+    run_file_write_effect_generic, run_human_effect_generic, run_notify_effect_generic,
+    run_queue_effect_generic, CapabilityContract, DeliveryGovernance, FixtureCapabilityProvider,
 };
 use whipplescript_kernel::exec_http::{
     build_executor_exec_request, decode_cached_exec_result, exec_content_key, ingest_exec_stdout,
@@ -1000,6 +1000,16 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 effect,
             )?,
             "file.import" => run_file_import_effect_generic(
+                &mut self.kernel,
+                self.files,
+                self.instance_id,
+                effect,
+            )?,
+            // std.files slice F4: the export core moved from the CLI into
+            // kernel::effect_handlers (it was already generic over the
+            // FileStore seam), so exports now run on the DO plane like their
+            // three siblings — closing the export exception to DO parity.
+            "file.export" => run_file_export_effect_generic(
                 &mut self.kernel,
                 self.files,
                 self.instance_id,

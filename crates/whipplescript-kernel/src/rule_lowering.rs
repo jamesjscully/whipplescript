@@ -727,6 +727,19 @@ pub fn eval_call(name: &str, args: &[Expr], scope: &EvalScope<'_>) -> EvalValue 
         ("exists", [expr]) => EvalValue::Json(Value::Bool(
             !eval_expr_value(expr, scope).is_missing_or_null(),
         )),
+        ("empty", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
+            .map(|count| EvalValue::Json(Value::Bool(count == 0)))
+            .unwrap_or_else(|value| value),
+        ("empty", [expr]) => match eval_expr_value(expr, scope) {
+            EvalValue::Json(Value::Array(items)) => EvalValue::Json(Value::Bool(items.is_empty())),
+            EvalValue::Json(Value::Object(items)) => EvalValue::Json(Value::Bool(items.is_empty())),
+            EvalValue::Json(Value::String(value)) => EvalValue::Json(Value::Bool(value.is_empty())),
+            // Spec: for optional values `empty` is true for missing/null and
+            // otherwise delegates to the present inner value.
+            EvalValue::Json(Value::Null) | EvalValue::Missing => EvalValue::Json(Value::Bool(true)),
+            EvalValue::Error(message) => EvalValue::Error(message),
+            _ => EvalValue::error("unsupported value for empty"),
+        },
         _ => EvalValue::error("unknown expression function"),
     }
 }
@@ -5261,5 +5274,53 @@ release slot
         let own_only = lease_acquire_bindings(&unthreaded);
         rewrite_lease_releases(&mut unthreaded, &own_only);
         assert_eq!(unthreaded[0].kind, "tracker.release", "{unthreaded:?}");
+    }
+
+    /// Spec "Count And Empty" runtime semantics for `empty`: structural
+    /// emptiness for arrays/strings/queries, true for null/missing (the
+    /// optional case), and a typed error for scalars — never a coercion.
+    #[test]
+    fn eval_empty_follows_count_and_empty_spec() {
+        let ir = empty_ir_program();
+        let facts = [FactView {
+            fact_id: "f1".to_owned(),
+            program_version_id: None,
+            revision_epoch: 0,
+            name: "Task".to_owned(),
+            key: "t1".to_owned(),
+            value_json: "{\"done\": false}".to_owned(),
+            provenance_class: "rule".to_owned(),
+            source_span_json: None,
+        }];
+        let scope = EvalScope::assertions(&facts, &[], &ir);
+
+        let cases = [
+            ("empty([])", Some(true)),
+            ("empty([\"a\"])", Some(false)),
+            ("empty(\"\")", Some(true)),
+            ("empty(\"x\")", Some(false)),
+            ("empty(null)", Some(true)),
+            ("empty(Task where done == false)", Some(false)),
+            ("empty(Task where done == true)", Some(true)),
+            ("empty(Missing where done == true)", Some(true)),
+            // Scalars are a typed error, not a coercion.
+            ("empty(1)", None),
+            ("empty(true)", None),
+        ];
+        for (source, expected) in cases {
+            let expr = whipplescript_parser::parse_expression(source).expect(source);
+            let value = eval_expr_value(&expr, &scope);
+            match expected {
+                Some(expected) => assert_eq!(
+                    value,
+                    EvalValue::Json(Value::Bool(expected)),
+                    "for `{source}`"
+                ),
+                None => assert!(
+                    matches!(value, EvalValue::Error(_)),
+                    "`{source}` must be a typed error, got {value:?}"
+                ),
+            }
+        }
     }
 }

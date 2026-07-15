@@ -20,6 +20,16 @@ mod WHIPPLESCRIPT-PACKAGE-CONTRACT is
     unlockedDecl
     : -> PackageDeclId .
 
+  --- std.files slice F2 fixture (spec/std-files.md): the file.read
+  --- typed_effect_call contract with capability id equal to its effect kind
+  --- per M3 id==kind, plus a copy whose capability row is missing (the
+  --- unbound stale-store shape the admission gate must refuse).
+  ops fileReadDecl unboundFileReadDecl : -> PackageDeclId .
+  op fileReadKeyword : -> Keyword .
+  op fileReadCap : -> CapabilityId .
+  op fileReadResultType : -> TypeId .
+  op fileReadEff : -> EffectId .
+
   ops schemaCoercionKeyword trackerKeyword sharedKeyword recallKeyword : -> Keyword .
   ops topLevelScope ruleBodyScope workflowBodyScope expressionScope : -> DeclarationScope .
   ops schemaCoerce memoryQueryCap deployWrite : -> CapabilityId .

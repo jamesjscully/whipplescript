@@ -7,12 +7,14 @@ Stage: spec -> modeling -> implementation + testing -> review.
 > **Reserved-class prerequisites:** the `file store` declaration is `metadata_only`
 > (already authorable). `read`/`write`/`import`/`export` lower through
 > `typed_effect_call` — see the Construct Graph Contract below (each requires
-> `Capability<files.read>` etc. *and* declares `lowering class: typed_effect_call`;
+> `Capability<file.read>` etc. *and* declares `lowering class: typed_effect_call`;
 > the "capability-scoped" framing is the capability *requirement*, not the lowering
-> class). So porting `std.files` **requires promoting `typed_effect_call` to
-> package-authorable** (Stage P3) — `std.files` is that promotion's consumer.
-> Additional prerequisite: the **typed fact-batch admission** primitive for
-> `import`/`export`.
+> class). The promotion EXECUTED as attribution keeping the `file.*` kind strings
+> (spec/std-files.md E4, slice F5): the embedded std.files manifest registers the
+> four `typed_effect_call` construct rows and the admission rows behind them,
+> lowering keeps emitting the same builtin kinds, and durable history is
+> untouched — no rekey, no Route-B re-home. The **typed fact-batch admission**
+> primitive for `import`/`export` shipped with the import vertical.
 
 ## Implementation Status
 
@@ -27,21 +29,24 @@ Stage: spec -> modeling -> implementation + testing -> review.
 | `import jsonl` / `import json` / `import csv` | implemented end-to-end (runtime) — decode + per-row validate + atomic typed fact-batch admission |
 | `export jsonl` / `export json` / `export csv` | implemented end-to-end (runtime) — collection-valued projection (`where`-filtered) serialized with the write mode policy |
 
-**`read`/`write` v0 took Route B (builtin runtime-resolved effects), not the
-`typed_effect_call` package lowering** described in the Construct Graph Contract
-below. `read`/`write` lower to builtin `file.read`/`file.write` effect kinds that
-the worker resolves directly (no provider registration, no package manifest).
-This landed the read/write verticals without first building the full
-package-authoring stack; the Construct Graph Contract remains the target shape
-for `import`/`export` and for eventually re-homing `read`/`write` onto
-`typed_effect_call`.
+**Historical note (Route B, closed by std.files slice F2/F5):** v0 originally
+took Route B — builtin `file.*` effect kinds the worker resolved directly, with
+no provider registration and no package manifest, bypassing the admission gate.
+The typed_effect_call promotion later executed as **attribution keeping the
+`file.*` kind strings** (spec/std-files.md E4): the embedded std.files manifest
+registers the contracts/constructs/capability/provider/binding rows, the
+builtin-kind admission bypass was deleted from the native `policy_block_on`,
+and lowering still emits the same kinds (idempotency keys hash the kind string,
+so durable history is untouched).
 
-**One boundary layer from this spec is deferred for v0 `read`/`write`:** the
-`files.read` / `files.write` **capability grants** are not yet enforced.
-Requiring them with no grantor in scope would policy-block every operation, so v0
-treats the `file store` declaration's `root` **and** its `allow read/write [...]`
-globs as the scope boundary instead. The capability-grant layer (and the `tell
-... with access to` turn grant) is a follow-up.
+**The capability layer is live** (slice F2): each `file.*` contract requires
+exactly its own kind string (capability id == effect kind, M3), the embedded
+manifest seeds capability/provider/binding rows at store init, and an unbound
+`file.*` kind blocks loudly as `blocked_by_capability` (a stale store fails
+loud, never hangs). The `file store` declaration's `root` and `allow read/write
+[...]` globs remain the per-store path boundary on top of that gate, and the
+`tell ... with access to` turn grant is enforced as the store-policy
+intersection (Q3).
 
 **What v0 `read`/`write` *do* enforce** (matching Security And Policy below): both
 are effects (never run in guards/checks), require a declared `file store`, refuse
@@ -90,15 +95,19 @@ that mix layout, library-version drift, or model interpretation:
 ```text
 v0 codecs:      text, markdown, json, jsonl, csv, bytes   (all deterministic)
 v0 operations:  read, write, import, export
-v0 paths:       literal/static paths only
-v0 provider:    local
+v0 paths:       literal or dynamic `at <Expr>`; runtime authorization is the
+                authority (containment + globs + canonicalized symlink
+                re-check), literal paths additionally checked at compile time
+v0 provider:    local (the `provider` clause default; unknown providers are a
+                check error)
 ```
 
 Deferred to a later, separately-designed pass (see Deferred Scope):
 
 ```text
 docx and xlsx codecs        (version-stability + replay determinism design)
-dynamic `at <Expr>` paths    (path-security design)
+full dynamic-path security engine   (hostile-provider canonicalization design;
+                                     dynamic paths themselves are accepted)
 non-filesystem providers     (S3/GitHub/Drive/SharePoint path-namespace contract)
 ```
 
@@ -394,11 +403,14 @@ no reads or writes in guards
 every operation is an effect
 every operation requires a declared file store
 every operation checks read/write policy at runtime
-v0 paths are literal: the path is a string literal, statically checkable against
-  the store policy at compile time and re-checked at runtime
+paths may be literal or dynamic `at <Expr>`; runtime authorization is the
+  authority, and a LITERAL path is additionally validated against the store's
+  allow globs at compile time
 absolute paths are denied unless a provider explicitly supports them
 .. traversal is denied
-symlink traversal is denied by default or governed explicitly
+symlink escape is denied: the path is canonicalized after the policy match and
+  containment is re-checked against the canonicalized store root before the
+  operation (fail-closed, no disk content touched)
 writes require create/replace/upsert/append mode
 content hashes are recorded for reads and writes
 large or sensitive artifacts obey artifact retention/redaction policy
@@ -407,12 +419,15 @@ large or sensitive artifacts obey artifact retention/redaction policy
 The runtime must repeat authorization even if a source was checked elsewhere.
 Compiled source is not authority.
 
-Dynamic `at <Expr>` paths are deferred. They turn path authorization into a
-runtime security engine (canonicalization, traversal/symlink handling, glob
-intersection on every value), which is the highest-risk surface in this package
-and deserves its own design. v0's literal-path restriction keeps path
-authorization a static, auditable policy check; dynamic paths are added later
-with that dedicated design.
+Dynamic `at <Expr>` paths are ACCEPTED (decided posture, spec/std-files.md
+"Dynamic `at <Expr>` path security"): runtime authorization — root containment,
+`..`/absolute denial, allow-glob match, and the canonicalize-and-recheck symlink
+guard — runs per value before any disk access and is the authority. Literal
+paths additionally get the compile-time policy check, restoring static
+auditability without banning the dynamic form. The FULL dynamic-path security
+engine (canonicalization contract for hostile providers, per-value
+glob-intersection formalization) stays deferred until the first non-filesystem
+provider makes it load-bearing.
 
 ## Construct Graph Contract
 
@@ -438,7 +453,7 @@ lowering class: metadata_only (resource is a registry/capability identity,
 family: effect_operation
 shape: read <format> from <store: FileStoreRef> at <path: StringLiteral> [block] as <binding>
 requires: Resource<FileStore>
-requires: Capability<files.read>
+requires: Capability<file.read>
 provides: EffectHandle<FileReadResult<Format>>
 lowering class: typed_effect_call
 ```
@@ -450,7 +465,7 @@ family: effect_operation
 shape: import <format> <schema> from <store: FileStoreRef> at <path: StringLiteral> [block] as <binding>
 requires: Resource<FileStore>
 requires: Schema<T>
-requires: Capability<files.import>
+requires: Capability<file.import>
 provides: EffectHandle<FileImportResult<T>>
 admits: a typed fact batch of T on success, via the platform typed
   fact-batch admission primitive (not a package-level fact write)
@@ -465,7 +480,7 @@ family: effect_operation
 shape: write <format> to <store: FileStoreRef> at <path: StringLiteral> <block> as <binding>
 requires: Resource<FileStore>
 requires: Value<body | artifact>
-requires: Capability<files.write>
+requires: Capability<file.write>
 provides: EffectHandle<FileWriteResult>
 lowering class: typed_effect_call
 ```
@@ -478,7 +493,7 @@ shape: export <format> <schema> to <store: FileStoreRef> at <path: StringLiteral
 requires: Resource<FileStore>
 requires: Schema<T>
 requires: Value<rows of T>
-requires: Capability<files.export>
+requires: Capability<file.export>
 provides: EffectHandle<FileExportResult>
 lowering class: typed_effect_call
 ```
@@ -506,15 +521,19 @@ lifecycle and evidence.
 
 ## Capabilities
 
-Initial package capabilities:
+Package capability ids EQUAL effect kinds (M3 id==kind, spec/std-files.md
+"Spec amendments" 1):
 
 ```text
-files.read
-files.import
-files.write
-files.export
-files.turn_access
+file.read
+file.write
+file.import
+file.export
 ```
+
+There is no `files.turn_access` capability: turn grants are harness-plane
+authority-narrowing metadata on `agent.tell` (the third enforcement plane),
+recorded as evidence-metadata — not a capability id.
 
 Provider bindings may further constrain stores, paths, formats, maximum sizes,
 artifact retention, and write modes.
@@ -548,8 +567,10 @@ without replay reading the filesystem again.
 - No hidden fallback through `std.script`.
 - No model-backed extraction inside file codecs.
 - No filesystem reads during checks, guards, or replay.
-- No dynamic `at <Expr>` paths in v0 — literal paths only (dynamic paths are a
-  later, separately-designed feature).
+- No dynamic-path security ENGINE in v1 — dynamic `at <Expr>` paths are
+  accepted under runtime authorization (see Security And Policy); the hostile-
+  provider canonicalization/glob-intersection design is deferred to the first
+  non-filesystem provider.
 - No XLSX or DOCX codecs in v0 (deferred; see Deferred Scope).
 - No package-level fact writes — `import` rides on the platform fact-batch
   admission primitive.

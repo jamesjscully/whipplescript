@@ -1178,4 +1178,62 @@ mod branch_dispatch_tests {
         // A rebind to a different branch is refused (write-once birth).
         assert!(instance.bind_branch("main", "t2").is_err());
     }
+
+    /// DO parity for the relocated export core (std.files slice F4): the
+    /// `file.export` handler now lives in kernel::effect_handlers (it was
+    /// CLI-crate-bound, so exports could not execute on the DO plane at all),
+    /// and a plain instance drives it in-isolate — the serialized collection
+    /// lands on the DO file plane and the workflow reaches its terminal.
+    #[test]
+    fn do_instance_exports_fact_collection_through_the_relocated_core() {
+        let sql = Rc::new(store().sql);
+        let source = "workflow ExportParity\n\noutput result Result\n\n\
+             class Result {\n  status string\n}\n\n\
+             class Row {\n  id string\n}\n\n\
+             class Seeded {\n  note string\n}\n\n\
+             file store out_files {\n  root \"/ws\"\n}\n\n\
+             rule seed\n  when started\n=> {\n\
+             \x20 record Row { id \"a\" }\n\
+             \x20 record Seeded { note \"go\" }\n}\n\n\
+             rule dump\n  when Seeded as s\n=> {\n\
+             \x20 export jsonl Row to out_files at \"rows.jsonl\" {\n\
+             \x20   mode upsert\n  } as dumped\n\n\
+             \x20 after dumped succeeds as receipt {\n\
+             \x20   complete result {\n      status \"ok\"\n    }\n  }\n}\n";
+        let mut instance = DurableInstance::create(
+            Rc::clone(&sql),
+            source,
+            "{}",
+            "local/ExportParity",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        )
+        .expect("create");
+        assert!(
+            matches!(
+                instance.step(None, TEST_NOW_MS),
+                DurableStepOutcome::Terminal
+            ),
+            "the in-isolate export settles and the instance terminates"
+        );
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed")
+        );
+
+        // The golden serialized collection is on the DO file plane, keyed by
+        // the resolved full path — the same jsonl bytes the native handler
+        // writes (one JSON object per line, trailing newline).
+        let content = sql
+            .query(
+                "SELECT content FROM files WHERE key = ?1",
+                &[crate::do_store::text("/ws/rows.jsonl")],
+            )
+            .expect("file plane readable")
+            .first()
+            .map(|row| crate::do_store::as_text(&row[0]))
+            .expect("exported file exists");
+        assert_eq!(content, "{\"id\":\"a\"}\n");
+    }
 }

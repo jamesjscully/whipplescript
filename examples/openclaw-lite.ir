@@ -3,6 +3,7 @@ source_tags
 @service workflow OpenClawLite
 uses
   package std.memory
+  package std.tracker
 schemas
   class Heartbeat
     job string

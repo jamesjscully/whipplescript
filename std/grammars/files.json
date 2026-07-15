@@ -22,7 +22,7 @@
                 "kind": "scalar",
                 "required": true,
                 "list": false,
-                "unknown_hint": "file store fields are `root`, `allow read [...]`, `allow write [...]`",
+                "unknown_hint": "file store fields are `root`, `allow read [...]`, `allow write [...]`, `provider <name>`",
                 "missing_summary": "add `root \"<dir>\"` inside the file store block"
               },
               {
@@ -30,7 +30,7 @@
                 "kind": "glob",
                 "required": false,
                 "list": true,
-                "unknown_hint": "file store fields are `root`, `allow read [...]`, `allow write [...]`",
+                "unknown_hint": "file store fields are `root`, `allow read [...]`, `allow write [...]`, `provider <name>`",
                 "missing_summary": "add `root \"<dir>\"` inside the file store block"
               },
               {
@@ -38,8 +38,16 @@
                 "kind": "glob",
                 "required": false,
                 "list": true,
-                "unknown_hint": "file store fields are `root`, `allow read [...]`, `allow write [...]`",
+                "unknown_hint": "file store fields are `root`, `allow read [...]`, `allow write [...]`, `provider <name>`",
                 "missing_summary": "add `root \"<dir>\"` inside the file store block"
+              },
+              {
+                "name": "provider",
+                "kind": "identifier",
+                "required": false,
+                "list": false,
+                "unknown_hint": "file store fields are `root`, `allow read [...]`, `allow write [...]`, `provider <name>`",
+                "missing_summary": "add `provider local` inside the file store block"
               }
             ]
           }

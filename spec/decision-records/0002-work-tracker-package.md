@@ -2,7 +2,22 @@
 
 Status: proposed
 
-## Decision
+> **Interim status (2026-07).** The package identity + rename landed per
+> ecosystem-shape E6 (spec/std-tracker.md): `tracker` nouns, `tracker.*`
+> effect kinds with `required_capabilities = [kind]`, `whip issue` (replacing
+> `whip items`, one-way), and the embedded std.tracker manifest whose
+> capability/provider/binding rows make the native admission gate real for
+> tracker kinds. The "Local Provider" state model shipped in its A+blockers
+> scope (2026-07-08): an event-sourced provider (append-only tracker_events
+> log, disposable projections, runtime leases split from durable status)
+> behind the surviving `WorkItems` trait (store/items.rs). Still deferred to
+> a follow-on: conflicts/heads/state-tokens, the full relation-kind set,
+> comments/evidence, external providers with claim-strength, and the
+> `tracker.renew` EFFECT KIND + claim TTL surface (slice T3 — the store-level
+> `renew_claim` and `whip issue renew` are live; the language-level `renew`
+> verb still parses only as std.coord's lease renewal until T3). WS-N as
+> primary id remains a recorded interim deviation from "Portable Issue
+> Model".
 
 The record of work to be orchestrated is the issue tracker. `std.tracker`
 provides that issue tracker as a standard package: a durable local provider for

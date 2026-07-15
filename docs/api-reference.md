@@ -298,10 +298,14 @@ Other analyses:
   grant (DR-0025) that does not use the owned harness (`provider owned`, or a
   harness of kind `owned`); the grant is dead because sub-workflow tools are only
   resolved and offered in the owned brokered loop.
-- **`lint.missing_coercion_import`** / **`lint.missing_coord_import`** — the
-  program uses `coerce`/`decide`/`prompt` without `use std.coercion`, or
+- **`lint.missing_coercion_import`** / **`lint.missing_coord_import`** /
+  **`lint.missing_files_import`** / **`lint.missing_tracker_import`** — the
+  program uses `coerce`/`decide`/`prompt` without `use std.coercion`,
   coordination resources (`lease`/`ledger`/`counter` and their verbs) without
-  `use std.coord`. Advisory only (the graduated import ladder): the program
+  `use std.coord`, file stores (`file store` and the
+  `read`/`write`/`import`/`export` verbs) without `use std.files`, or the work
+  tracker (`tracker` and the `file`/`claim`/`release`/`finish` verbs) without
+  `use std.tracker`. Advisory only (the graduated import ladder): the program
   still runs, but the import names the std package that owns and configures
   the effects.
 
@@ -854,10 +858,10 @@ Exit behavior:
 ### Issue commands
 
 ```sh
-whip issue new --queue <Q> --title <T> [--body <B>] [--label <L>] [--actor <A>]
-whip issue list [--queue <Q>] [--status <S>]
+whip issue new --tracker <TR> --title <T> [--body <B>] [--label <L>] [--actor <A>]
+whip issue list [--tracker <TR>] [--status <S>]
 whip issue show <id>
-whip issue ready <queue> [--limit <N>]
+whip issue ready <tracker> [--limit <N>]
 whip issue claim <id> [--actor <A>]
 whip issue renew <id> [--actor <A>]
 whip issue release <id>

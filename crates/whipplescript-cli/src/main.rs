@@ -1544,6 +1544,94 @@ fn lint_missing_coord_import(ir: &IrProgram) -> Vec<LintFinding> {
     }]
 }
 
+/// ADVISORY import lint (spec/std-files.md "Manifest": import posture is a
+/// missing-import advisory only — the M5 graduated ladder, never an error;
+/// the hard `use std.files` requirement is explicitly deferred): `file store`
+/// declarations and the read/write/import/export verbs lower to `file.*`
+/// effects owned by std.files; a program using them without `use std.files`
+/// still runs, but the import is what names the package whose embedded
+/// manifest seeds the admission rows behind the effects. Detection reads the
+/// compiled IR (declared stores + lowered effect kinds), so it cannot wrongly
+/// flag prose that merely mentions a verb.
+fn lint_missing_files_import(ir: &IrProgram) -> Vec<LintFinding> {
+    if ir.uses.iter().any(|use_decl| use_decl.name == "std.files") {
+        return Vec::new();
+    }
+    let first_store = ir.file_stores.first().map(|store| store.name.clone());
+    let uses_file_effect = ir.rules.iter().any(|rule| {
+        rule.metadata.effects.iter().any(|effect| {
+            matches!(
+                effect.kind,
+                whipplescript_parser::IrEffectKind::FileRead
+                    | whipplescript_parser::IrEffectKind::FileWrite
+                    | whipplescript_parser::IrEffectKind::FileImport
+                    | whipplescript_parser::IrEffectKind::FileExport
+            )
+        })
+    });
+    if first_store.is_none() && !uses_file_effect {
+        return Vec::new();
+    }
+    vec![LintFinding {
+        code: "lint.missing_files_import",
+        severity: Severity::Warning,
+        message: "program uses file stores (`file store`, \
+                  `read`/`write`/`import`/`export`) without `use std.files`; add the \
+                  import to name the package that owns the file effects (advisory)"
+            .to_owned(),
+        name: first_store,
+        span: None,
+    }]
+}
+
+/// ADVISORY import lint (spec/std-tracker.md "Manifest": import bite per E5 is
+/// a missing-import advisory only — the M5 graduated ladder, never an error):
+/// `tracker` declarations and the file/claim/release/finish verbs lower to
+/// `tracker.*` effects owned by std.tracker; a program using them without
+/// `use std.tracker` still runs, but the import is what names the package
+/// whose embedded manifest seeds the admission rows behind the effects.
+/// Detection reads the compiled IR (declared trackers + lowered effect
+/// kinds), so it cannot wrongly flag prose that merely mentions a verb.
+fn lint_missing_tracker_import(ir: &IrProgram) -> Vec<LintFinding> {
+    if ir
+        .uses
+        .iter()
+        .any(|use_decl| use_decl.name == "std.tracker")
+    {
+        return Vec::new();
+    }
+    let first_tracker = ir.trackers.first().map(|tracker| tracker.name.clone());
+    // `TrackerRelease` is deliberately NOT a trigger: the bare `release` verb
+    // is shared with std.coord's lease release and the IR classifies BOTH as
+    // TrackerRelease (there is no IrEffectKind for lease.release — the kernel
+    // disambiguates by binding at lowering time), so keying on it would flag
+    // pure coordination programs (examples/coord-lease-renew.whip). A real
+    // tracker program always also declares a tracker or files/claims/finishes.
+    let uses_tracker_effect = ir.rules.iter().any(|rule| {
+        rule.metadata.effects.iter().any(|effect| {
+            matches!(
+                effect.kind,
+                whipplescript_parser::IrEffectKind::TrackerFile
+                    | whipplescript_parser::IrEffectKind::TrackerClaim
+                    | whipplescript_parser::IrEffectKind::TrackerFinish
+            )
+        })
+    });
+    if first_tracker.is_none() && !uses_tracker_effect {
+        return Vec::new();
+    }
+    vec![LintFinding {
+        code: "lint.missing_tracker_import",
+        severity: Severity::Warning,
+        message: "program uses the work tracker (`tracker`, \
+                  `file`/`claim`/`release`/`finish`) without `use std.tracker`; add the \
+                  import to name the package that owns the tracker effects (advisory)"
+            .to_owned(),
+        name: first_tracker,
+        span: None,
+    }]
+}
+
 /// Whole-token occurrence count of `name` in `text` (an identifier run is a maximal
 /// `[A-Za-z0-9_]+`), so `r` does not match inside `recall` or `r.field`'s neighbours.
 fn whole_token_count(text: &str, name: &str) -> usize {
@@ -1959,6 +2047,8 @@ fn lint_program(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
     let mut findings = lint_unused_coerces(ir);
     findings.extend(lint_missing_coercion_import(ir));
     findings.extend(lint_missing_coord_import(ir));
+    findings.extend(lint_missing_files_import(ir));
+    findings.extend(lint_missing_tracker_import(ir));
     findings.extend(lint_unused_coerce_results(ir));
     findings.extend(lint_unused_resources(ir));
     findings.extend(lint_noop_rules(ir));
@@ -12430,31 +12520,6 @@ fn scenario_run_kind(clauses: &[TestClause]) -> RunKind {
     RunKind::UntilIdle
 }
 
-/// Evaluate a `proj_query` predicate against one projection/fact row, reusing the
-/// guard expression kernel restricted to the row's fields. Returns `Err` on a
-/// predicate that cannot be parsed or does not evaluate to a boolean — never a
-/// silent false.
-fn evaluate_proj_predicate(predicate: &str, row: &Value) -> Result<bool, String> {
-    let expr = parse_expression(predicate)
-        .map_err(|error| format!("could not parse predicate `{predicate}`: {error}"))?;
-    let empty_ir = empty_ir_program();
-    let scope = EvalScope {
-        context: None,
-        facts: &[],
-        effects: &[],
-        ir: &empty_ir,
-        projection: Some(row),
-        projection_schema: None,
-    };
-    match guard_result(eval_expr_value(&expr, &scope)) {
-        (GuardStatus::Matched, _, _) => Ok(true),
-        (GuardStatus::False, _, _) => Ok(false),
-        (GuardStatus::Error, _, error) => {
-            Err(error.unwrap_or_else(|| "predicate did not evaluate to a boolean".to_owned()))
-        }
-    }
-}
-
 fn rule_committed_name(event: &EventView) -> Option<String> {
     serde_json::from_str::<Value>(&event.payload_json)
         .ok()?
@@ -16519,6 +16584,22 @@ const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
         "std.coord",
         include_str!("../../../std/manifests/coord.json"),
     ),
+    // Runtime identity for the files package (spec/std-files.md, slices
+    // F2/F5): four `file.*` effect contracts mirroring the parser-compiled
+    // ones (merge-folds, drift surfaces as `effect_contract_duplicate`), five
+    // construct rows (one `declaration_block`/`metadata_only` decl + four
+    // `effect_operation`/`typed_effect_call` verbs — making the catalog's
+    // "promoted for std.files" claim TRUE, E4: attribution + admission, no
+    // rekey), and the capability/provider/profile/binding rows that make the
+    // NATIVE admission gate real for `file.*` kinds (the builtin exemption is
+    // deleted, store/lib.rs `policy_block_on`; the DO mirror keeps its
+    // exemption until the DO bootstrap registers packages). The DECL GRAMMAR
+    // stays in std/grammars/files.json (build.rs-only): the manifest
+    // authorizes, it does not parse (M1).
+    (
+        "std.files",
+        include_str!("../../../std/manifests/files.json"),
+    ),
     (
         "std.memory",
         include_str!("../../../std/manifests/memory.json"),
@@ -16550,6 +16631,29 @@ const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
     // into the parser, so this manifest carries library identity and nothing
     // an enforcement point reads (no capabilities, no contracts).
     ("std.time", include_str!("../../../std/manifests/time.json")),
+    // Runtime identity for the work-tracker package (spec/std-tracker.md
+    // "Manifest", slice T4): four tracker effect contracts mirroring the
+    // parser-compiled ones (merge-folds, drift surfaces as
+    // `effect_contract_duplicate`), six construct rows (one
+    // `declaration_block`/`metadata_only` decl + five
+    // `effect_operation`/`typed_effect_call` verbs — the claim/renew/release
+    // rows are the first real exercisers of the reserved-keyword privilege
+    // tuples, admitted through the authorability door's privilege-tuple leg),
+    // and the capability/provider/profile/binding rows that make the NATIVE
+    // admission gate real for `tracker.*` kinds (the builtin exemption is
+    // deleted, store/lib.rs `policy_block_on`; the DO mirror keeps its
+    // exemption until the DO bootstrap registers packages). `tracker.renew`
+    // ships admission rows (capability/provider/binding) and its construct
+    // row but no contract: the tracker renew EFFECT KIND arrives with slice
+    // T3 (renew end-to-end + claim TTL, spec/std-tracker.md "Renew/TTL
+    // semantics") — the same sans-contract pattern as std.coord's
+    // `lease.renew` (spec/std-coord.md "Deferred with cause"). The DECL
+    // GRAMMAR stays in std/grammars/tracker.json (build.rs-only): the
+    // manifest authorizes, it does not parse (M1).
+    (
+        "std.tracker",
+        include_str!("../../../std/manifests/tracker.json"),
+    ),
 ];
 
 /// Whether `name` claims the reserved `std.*` package namespace. Std packages
@@ -23384,67 +23488,6 @@ fn run_file_import_effect(
     run_file_import_effect_generic(&mut kernel, &*files, instance_id, effect)
 }
 
-/// CSV-escape one field (inverse of `split_csv_record`): quote when the value
-/// contains a comma, quote, or newline; double embedded quotes.
-fn csv_escape_field(value: &str) -> String {
-    if value.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_owned()
-    }
-}
-
-/// Serialize export rows (std.files), the inverse of `decode_import_rows`. `jsonl`
-/// = one JSON object per line; `json` = a top-level array; `csv` = a header line
-/// from `fields` then one record per row (stable column order, values stringified).
-fn encode_export_rows(format: &str, rows: &[Value], fields: &[String]) -> Result<String, String> {
-    let cell = |row: &Value, field: &str| -> String {
-        match row.as_object().and_then(|object| object.get(field)) {
-            Some(Value::String(text)) => text.clone(),
-            Some(other) => other.to_string(),
-            None => String::new(),
-        }
-    };
-    match format {
-        "jsonl" => {
-            let mut out = rows
-                .iter()
-                .map(Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !rows.is_empty() {
-                out.push('\n');
-            }
-            Ok(out)
-        }
-        "json" => serde_json::to_string(&Value::Array(rows.to_vec()))
-            .map(|mut text| {
-                text.push('\n');
-                text
-            })
-            .map_err(|error| format!("json export serialize failed: {error}")),
-        "csv" => {
-            let mut out = fields
-                .iter()
-                .map(|field| csv_escape_field(field))
-                .collect::<Vec<_>>()
-                .join(",");
-            out.push('\n');
-            for row in rows {
-                let record = fields
-                    .iter()
-                    .map(|field| csv_escape_field(&cell(row, field)))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                out.push_str(&record);
-                out.push('\n');
-            }
-            Ok(out)
-        }
-        other => Err(format!("unknown export format `{other}`")),
-    }
-}
-
 /// Executes one `file.export` effect (std.files): resolve the collection of
 /// `<Schema>` facts (optionally filtered by the `where` predicate, ordered
 /// deterministically by the store's `(name, key)` ordering — DR-0022), serialize
@@ -23458,202 +23501,6 @@ fn run_file_export_effect(
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
     let files = file_store_for_instance(instance_id, &effect.effect_id);
     run_file_export_effect_generic(&mut kernel, &*files, instance_id, effect)
-}
-
-/// Host-agnostic core (DR-0033 chunk 3): export facts to a file through the
-/// `FileStore` seam over a held `RuntimeKernel<S>`.
-fn run_file_export_effect_generic<S: RuntimeStore>(
-    kernel: &mut RuntimeKernel<S>,
-    files: &dyn FileStore,
-    instance_id: &str,
-    effect: &ClaimableEffect,
-) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    let input = json_from_str(&effect.input_json);
-    let root = input
-        .get("root")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let path = input
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let format = input
-        .get("format")
-        .and_then(Value::as_str)
-        .unwrap_or("jsonl")
-        .to_owned();
-    let schema = input
-        .get("schema")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let store_name = input
-        .get("store")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let mode = input
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("create")
-        .to_owned();
-    let predicate = input
-        .get("predicate")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let allow = effect_allow_globs(&input);
-    let fields = input
-        .get("fields")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let full = Path::new(root).join(path);
-    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "file-run"]);
-    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "file-lease"]);
-    kernel.start_run(RunStart {
-        instance_id,
-        effect_id: &effect.effect_id,
-        run_id: &run_id,
-        provider: "files",
-        worker_id: "whip-files",
-        lease_id: &lease_id,
-        lease_expires_at: "2030-01-01T00:00:00Z",
-        metadata_json: &json!({ "path": full.display().to_string(), "schema": schema }).to_string(),
-    })?;
-    let terminal_key = idempotency_key(&[instance_id, &effect.effect_id, "terminal"]);
-    let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
-
-    let outcome: Result<(usize, String), String> = (|| {
-        if let Some(reason) =
-            file_path_policy_error(path, store_name, &allow, "write").or_else(|| {
-                files.path_policy_error(Path::new(root), Path::new(path), store_name, "write")
-            })
-        {
-            return Err(reason);
-        }
-        // Resolve the collection: facts of <schema> [where predicate], ordered by
-        // the store's deterministic (name, key) ordering for reproducible output.
-        let facts = kernel
-            .store()
-            .list_facts(instance_id)
-            .map_err(|error| format!("{error:?}"))?;
-        let mut rows = Vec::new();
-        for fact in facts.iter().filter(|fact| fact.name == schema) {
-            let value: Value = serde_json::from_str(&fact.value_json)
-                .map_err(|error| format!("fact value is not JSON: {error}"))?;
-            if predicate.is_empty() || evaluate_proj_predicate(&predicate, &value)? {
-                rows.push(value);
-            }
-        }
-        let exists = files.exists(&full);
-        match mode.as_str() {
-            "create" if exists => {
-                return Err(format!(
-                    "write mode `create` requires `{path}` to not already exist"
-                ))
-            }
-            "replace" if !exists => {
-                return Err(format!(
-                    "write mode `replace` requires `{path}` to already exist"
-                ))
-            }
-            "create" | "replace" | "upsert" | "append" => {}
-            other => return Err(format!("unknown write mode `{other}`")),
-        }
-        let serialized = encode_export_rows(&format, &rows, &fields)?;
-        if let Some(parent) = full.parent() {
-            files
-                .create_dir_all(parent)
-                .map_err(|error| format!("create parent of `{path}`: {error}"))?;
-        }
-        if mode == "append" {
-            files
-                .append(&full, serialized.as_bytes())
-                .map_err(|error| format!("append to `{}` failed: {error}", full.display()))?;
-        } else {
-            files
-                .write(&full, serialized.as_bytes())
-                .map_err(|error| format!("write of `{}` failed: {error}", full.display()))?;
-        }
-        Ok((rows.len(), stable_hash_hex(&serialized)))
-    })();
-
-    match outcome {
-        Ok((row_count, content_hash)) => {
-            let value = json!({
-                "store": store_name,
-                "path": path,
-                "format": format,
-                "schema": schema,
-                "mode": mode,
-                "row_count": row_count,
-                "content_hash": content_hash,
-            });
-            let terminal = kernel.complete_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "files",
-                worker_id: "whip-files",
-                status: "completed",
-                exit_code: Some(0),
-                summary: Some(&format!("exported {row_count} rows to {}", full.display())),
-                metadata_json: &json!({ "value": value }).to_string(),
-                idempotency_key: Some(&terminal_key),
-            })?;
-            kernel.derive_fact(
-                instance_id,
-                "file.export.completed",
-                &effect.effect_id,
-                &json!({
-                    "effect_id": effect.effect_id,
-                    "run_id": run_id,
-                    "status": "completed",
-                    "value": value,
-                })
-                .to_string(),
-                Some(&terminal.event_id),
-                Some(&fact_key),
-            )?;
-            Ok(terminal)
-        }
-        Err(reason) => {
-            let terminal = kernel.fail_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "files",
-                worker_id: "whip-files",
-                status: "failed",
-                exit_code: None,
-                summary: Some(&reason),
-                metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
-                idempotency_key: Some(&terminal_key),
-            })?;
-            kernel.derive_fact(
-                instance_id,
-                "file.export.failed",
-                &effect.effect_id,
-                &json!({
-                    "effect_id": effect.effect_id,
-                    "run_id": run_id,
-                    "status": "failed",
-                    "value": effect_failure_base("file.export", &reason, &reason, &effect.effect_id, &run_id),
-                    "error": { "message": reason },
-                })
-                .to_string(),
-                Some(&terminal.event_id),
-                Some(&fact_key),
-            )?;
-            Ok(terminal)
-        }
-    }
 }
 
 /// The wall-clock UTC instant as ISO-8601 — the coordination pass instant
@@ -29783,10 +29630,10 @@ fn artifacts(options: &CliOptions) -> ExitCode {
 }
 
 const ISSUE_USAGE: &str = "usage: whip issue <\
-new --queue Q --title T [--body B] [--label L]... [--actor A]|\
-list [--queue Q] [--status S]|\
+new --tracker TR --title T [--body B] [--label L]... [--actor A]|\
+list [--tracker TR] [--status S]|\
 show <id>|\
-ready <queue> [--limit N]|\
+ready <tracker> [--limit N]|\
 claim <id> [--actor A]|\
 renew <id> [--actor A]|\
 release <id>|\
@@ -29874,7 +29721,7 @@ fn issue(options: &CliOptions) -> ExitCode {
             let mut iter = args.iter().skip(1);
             while let Some(arg) = iter.next() {
                 match arg.as_str() {
-                    "--queue" => queue = iter.next().cloned(),
+                    "--tracker" => queue = iter.next().cloned(),
                     "--title" => title = iter.next().cloned(),
                     "--body" => item_body = iter.next().cloned().unwrap_or_default(),
                     "--actor" => actor = iter.next().cloned(),
@@ -29919,7 +29766,7 @@ fn issue(options: &CliOptions) -> ExitCode {
             let mut iter = args.iter().skip(1);
             while let Some(arg) = iter.next() {
                 match arg.as_str() {
-                    "--queue" => queue = iter.next().cloned(),
+                    "--tracker" => queue = iter.next().cloned(),
                     "--status" => status = iter.next().cloned(),
                     _ => {
                         eprintln!("{usage}");
@@ -29941,7 +29788,7 @@ fn issue(options: &CliOptions) -> ExitCode {
             }
             for item in listed {
                 println!(
-                    "{} [{}] queue={} {}{}",
+                    "{} [{}] tracker={} {}{}",
                     item.id,
                     item.status,
                     item.queue,
@@ -29964,7 +29811,7 @@ fn issue(options: &CliOptions) -> ExitCode {
                     if options.json {
                         emit_json(work_item_to_json(&item))
                     } else {
-                        println!("{} [{}] queue={}", item.id, item.status, item.queue);
+                        println!("{} [{}] tracker={}", item.id, item.status, item.queue);
                         println!("title: {}", item.title);
                         if !item.body.is_empty() {
                             println!("body: {}", item.body);
@@ -42016,6 +41863,339 @@ rule go
         );
     }
 
+    /// std.files slice F5 drift test, contracts leg: the manifest's four
+    /// `file.*` effect contracts must FOLD against the parser-compiled ones
+    /// (same id/version/library/kind/schemas/validation), so a shape drift
+    /// between manifest and compiler surfaces as `effect_contract_duplicate`
+    /// and fails here.
+    #[test]
+    fn files_manifest_contracts_fold_against_the_parser_compiled_ones() {
+        let source = r#"use std.files
+
+workflow FilesImport
+
+output result Done
+failure error Broken
+
+class Done { note string }
+class Broken { reason string }
+class Row { id string }
+
+file store docs {
+  root "fixtures"
+  allow read ["**/*"]
+  allow write ["out/**"]
+}
+
+rule go
+  when started
+=> {
+  read text from docs at "note.md" as loaded
+  import jsonl Row from docs at "rows.jsonl" as rows
+  export jsonl Row to docs at "out/rows.jsonl" { mode upsert } as dumped
+  write text to docs at "out/copy.md" { body "hi" mode upsert } as copied
+
+  after copied succeeds {
+    complete result { note "ok" }
+  }
+
+  after copied fails as oops {
+    fail error { reason oops.reason }
+  }
+}
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compiles");
+        let registry = contract_registry_for_ir(None, &ir).expect("registry resolves");
+        assert_eq!(registry.validate(), Vec::new());
+        for (kind, source_form, output_schema) in [
+            ("file.read", "read", "FileReadResult"),
+            ("file.write", "write", "FileWriteResult"),
+            ("file.import", "import", "FileImportResult"),
+            ("file.export", "export", "FileExportResult"),
+        ] {
+            let contracts: Vec<_> = registry
+                .effect_contracts
+                .iter()
+                .filter(|contract| contract.id == kind)
+                .collect();
+            assert_eq!(
+                contracts.len(),
+                1,
+                "manifest and parser `{kind}` contracts must fold into one: {contracts:?}"
+            );
+            let contract = contracts[0];
+            assert_eq!(contract.library_id, "std.files");
+            assert_eq!(contract.effect_kind, kind);
+            assert_eq!(
+                contract.required_capabilities,
+                [kind],
+                "capability id == effect kind (M3)"
+            );
+            assert_eq!(contract.output_schema.as_deref(), Some(output_schema));
+            assert_eq!(
+                contract.validation,
+                whipplescript_core::TypedOutputValidation::RuntimeBoundary
+            );
+            assert!(
+                contract.source_forms.iter().any(|form| form == source_form),
+                "{contract:?}"
+            );
+            assert_eq!(
+                contract.provider_kinds,
+                ["local"],
+                "the manifest contributes the `local` FileStore-seam provider kind"
+            );
+        }
+        // The five construct rows arrive from the embedded manifest merge —
+        // the catalog-honesty gate (E4): typed_effect_call's "promoted for
+        // std.files" claim is now TRUE via registered rows, keeping the
+        // `file.*` kind strings (attribution + admission, no rekey).
+        let files_constructs: Vec<_> = registry
+            .constructs
+            .iter()
+            .filter(|form| form.library_id == "std.files")
+            .collect();
+        assert_eq!(files_constructs.len(), 5, "{files_constructs:?}");
+        for keyword in ["read", "write", "import", "export"] {
+            assert!(
+                files_constructs.iter().any(|form| {
+                    form.keyword == keyword
+                        && form.lowering_target == "typed_effect_call"
+                        && form.scope == "rule_body"
+                        && form.target_capability.is_none()
+                }),
+                "missing typed_effect_call row for `{keyword}`: {files_constructs:?}"
+            );
+        }
+        assert!(
+            files_constructs.iter().any(|form| {
+                form.keyword == "file store"
+                    && form.lowering_target == "metadata_only"
+                    && form.scope == "top_level"
+            }),
+            "missing metadata_only row for `file store`: {files_constructs:?}"
+        );
+    }
+
+    /// std.files slice F5 drift test, declarations leg: the runtime manifest's
+    /// `declaration_block` rows must name exactly the decl constructs the
+    /// grammar-only manifest (std/grammars/files.json, build.rs-read) parses —
+    /// two spellings of one surface, kept in lockstep.
+    #[test]
+    fn files_manifest_decl_rows_agree_with_the_grammar_manifest() {
+        let runtime: Value =
+            serde_json::from_str(include_str!("../../../std/manifests/files.json"))
+                .expect("valid json");
+        let grammar: Value = serde_json::from_str(include_str!("../../../std/grammars/files.json"))
+            .expect("valid json");
+        let decl_rows = |manifest: &Value, family_filter: bool| -> BTreeSet<(String, String)> {
+            manifest["libraries"]
+                .as_array()
+                .expect("libraries")
+                .iter()
+                .flat_map(|library| {
+                    library
+                        .get("constructs")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .filter(|construct| {
+                    !family_filter
+                        || construct["construct_family"].as_str() == Some("declaration_block")
+                })
+                .map(|construct| {
+                    (
+                        construct["id"].as_str().expect("id").to_owned(),
+                        construct["keyword"].as_str().expect("keyword").to_owned(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            decl_rows(&runtime, true),
+            decl_rows(&grammar, false),
+            "runtime manifest decl rows and std/grammars/files.json must agree"
+        );
+    }
+
+    /// std.tracker slice T4 drift test, contracts leg: the manifest's four
+    /// tracker effect contracts must FOLD against the parser-compiled ones
+    /// (same id/version/library/kind/schemas/validation), so a shape drift
+    /// between manifest and compiler surfaces as `effect_contract_duplicate`
+    /// and fails here. `tracker.renew` is pinned CONTRACT-LESS: the effect
+    /// kind arrives with slice T3 (spec/std-tracker.md "Renew/TTL
+    /// semantics"), and until then the manifest seeds only its
+    /// capability/provider/binding trio (the std.coord `lease.renew`
+    /// precedent).
+    #[test]
+    fn tracker_manifest_contracts_fold_against_the_parser_compiled_ones() {
+        let source = r#"use std.tracker
+
+workflow TrackerImport
+
+output result Done
+failure error Busy
+
+class Done { note string }
+class Busy { reason string }
+
+tracker backlog {
+  provider builtin
+}
+
+rule file_ticket
+  when started
+=> {
+  file issue into backlog {
+    title "Add retry telemetry"
+    body "Record retry count and final outcome."
+  }
+}
+
+rule work_ready_item
+  when backlog has ready issue as issue
+=> {
+  claim issue as active_claim
+
+  after active_claim succeeds {
+    finish issue {
+      summary "done"
+    }
+    complete result { note "ok" }
+  }
+
+  after active_claim fails {
+    release issue
+    fail error { reason "busy" }
+  }
+}
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compiles");
+        let registry = contract_registry_for_ir(None, &ir).expect("registry resolves");
+        assert_eq!(registry.validate(), Vec::new());
+        for (kind, source_form) in [
+            ("tracker.file", "file"),
+            ("tracker.claim", "claim"),
+            ("tracker.release", "release"),
+            ("tracker.finish", "finish"),
+        ] {
+            let contracts: Vec<_> = registry
+                .effect_contracts
+                .iter()
+                .filter(|contract| contract.id == kind)
+                .collect();
+            assert_eq!(
+                contracts.len(),
+                1,
+                "manifest and parser `{kind}` contracts must fold into one: {contracts:?}"
+            );
+            let contract = contracts[0];
+            assert_eq!(contract.library_id, "std.tracker");
+            assert_eq!(contract.effect_kind, kind);
+            assert_eq!(
+                contract.required_capabilities,
+                [kind],
+                "contract carries the id==kind capability row (M3, slice T2)"
+            );
+            assert!(
+                contract.source_forms.iter().any(|form| form == source_form),
+                "{contract:?}"
+            );
+            assert!(
+                contract
+                    .provider_kinds
+                    .iter()
+                    .any(|provider| provider == "builtin-tracker"),
+                "the manifest contributes the admission-honesty provider kind: {contract:?}"
+            );
+        }
+        // The tracker.renew contract does NOT exist until T3 lands the effect
+        // kind — a contract row appearing here without its parser partner
+        // would be manifest-only pretense.
+        assert_eq!(
+            registry
+                .effect_contracts
+                .iter()
+                .filter(|contract| contract.id == "tracker.renew")
+                .count(),
+            0,
+            "tracker.renew stays contract-less until slice T3 (spec/std-tracker.md)"
+        );
+        // The six construct rows arrive from the embedded manifest merge; the
+        // claim/renew/release rows are the reserved-keyword privilege tuples'
+        // first real exercisers (typed_effect_call, corrected by T4).
+        let tracker_constructs: Vec<_> = registry
+            .constructs
+            .iter()
+            .filter(|form| form.library_id == "std.tracker")
+            .collect();
+        assert_eq!(tracker_constructs.len(), 6, "{tracker_constructs:?}");
+        for keyword in ["file", "claim", "renew", "release", "finish"] {
+            assert!(
+                tracker_constructs.iter().any(|form| form.keyword == keyword
+                    && form.lowering_target == "typed_effect_call"
+                    && form.scope == "rule_body"),
+                "missing typed_effect_call row for `{keyword}`: {tracker_constructs:?}"
+            );
+        }
+        assert!(
+            tracker_constructs
+                .iter()
+                .any(|form| form.keyword == "tracker"
+                    && form.lowering_target == "metadata_only"
+                    && form.scope == "top_level"),
+            "missing metadata_only row for the `tracker` declaration: {tracker_constructs:?}"
+        );
+    }
+
+    /// std.tracker slice T4 drift test, declarations leg: the runtime
+    /// manifest's `declaration_block` rows must name exactly the decl
+    /// constructs the grammar-only manifest (std/grammars/tracker.json,
+    /// build.rs-read) parses — two spellings of one surface, kept in lockstep.
+    #[test]
+    fn tracker_manifest_decl_rows_agree_with_the_grammar_manifest() {
+        let runtime: Value =
+            serde_json::from_str(include_str!("../../../std/manifests/tracker.json"))
+                .expect("valid json");
+        let grammar: Value =
+            serde_json::from_str(include_str!("../../../std/grammars/tracker.json"))
+                .expect("valid json");
+        let decl_rows = |manifest: &Value, family_filter: bool| -> BTreeSet<(String, String)> {
+            manifest["libraries"]
+                .as_array()
+                .expect("libraries")
+                .iter()
+                .flat_map(|library| {
+                    library
+                        .get("constructs")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .filter(|construct| {
+                    !family_filter
+                        || construct["construct_family"].as_str() == Some("declaration_block")
+                })
+                .map(|construct| {
+                    (
+                        construct["id"].as_str().expect("id").to_owned(),
+                        construct["keyword"].as_str().expect("keyword").to_owned(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            decl_rows(&runtime, true),
+            decl_rows(&grammar, false),
+            "runtime manifest decl rows and std/grammars/tracker.json must agree"
+        );
+    }
+
     #[test]
     fn embedded_std_manifests_parse() {
         // Guard: every real embedded manifest validates clean through the full
@@ -50669,6 +50849,7 @@ rule go
             root: ".".to_owned(),
             read_globs: vec!["src/**".to_owned()],
             write_globs: vec!["src/**".to_owned()],
+            provider: None,
         });
 
         let (_principal, authority_json) = authority_for_ir(&ir);

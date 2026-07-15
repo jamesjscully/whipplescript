@@ -8,6 +8,7 @@ description "Recall notes context before agent work via a locked vendor package"
 workflow PackageNotes
 
 use notes
+use std.tracker
 
 tracker backlog {
   provider builtin

@@ -335,3 +335,41 @@ search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
   requiredEffectCapability(coerceEff, schemaCoerce)
   =>*
   acceptedPackageContract(ambiguousKeywordDecl) .
+
+--- std.files slice F2 coverage: the file.read typed effect contract with
+--- capability id equal to its effect kind (M3 id==kind) is accepted and
+--- registers the typed contract the admission gate reads.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(fileReadDecl)
+  packageDeclKeyword(fileReadDecl, fileReadKeyword)
+  deterministicParse(fileReadDecl)
+  noKeywordConflict(fileReadDecl)
+  declarativeLowering(fileReadDecl)
+  noCustomControlFlow(fileReadDecl)
+  noHiddenAuthority(fileReadDecl)
+  noDirectFactWrite(fileReadDecl)
+  lockedContractVersion(fileReadDecl, v1)
+  declaredCapability(fileReadDecl, fileReadCap)
+  typedEffectContract(fileReadDecl, fileReadEff, fileReadResultType, v1)
+  requiredEffectCapability(fileReadEff, fileReadCap)
+  =>*
+  acceptedPackageContract(fileReadDecl)
+  registeredEffectContract(fileReadEff, fileReadResultType, fileReadCap, v1) .
+
+--- std.files slice F2 negative (bite): a file.read contract whose capability
+--- row is MISSING (the unbound stale-store shape) is never accepted, so no
+--- registry entry exists for the admission gate to bind against.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(unboundFileReadDecl)
+  packageDeclKeyword(unboundFileReadDecl, fileReadKeyword)
+  deterministicParse(unboundFileReadDecl)
+  noKeywordConflict(unboundFileReadDecl)
+  declarativeLowering(unboundFileReadDecl)
+  noCustomControlFlow(unboundFileReadDecl)
+  noHiddenAuthority(unboundFileReadDecl)
+  noDirectFactWrite(unboundFileReadDecl)
+  lockedContractVersion(unboundFileReadDecl, v1)
+  typedEffectContract(unboundFileReadDecl, fileReadEff, fileReadResultType, v1)
+  requiredEffectCapability(fileReadEff, fileReadCap)
+  =>*
+  acceptedPackageContract(unboundFileReadDecl) .

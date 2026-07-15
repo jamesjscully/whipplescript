@@ -5,7 +5,9 @@ Status: spec drafted 2026-06-09 (decided in design discussion; see
 Stage: spec -> modeling -> implementation + testing -> review.
 
 > **Superseded.** This file is the earlier queue/item formulation and is retained
-> for history. The current design is
+> for history. The current SURFACE (post-rename slice C: `tracker` declarations,
+> `tracker.*` effect kinds, `whip issue`, the embedded std.tracker manifest) is
+> [`std-tracker.md`](std-tracker.md); its substrate ADR is
 > [`std.tracker`](decision-records/0002-work-tracker-package.md) (issues are the
 > durable record of work; queues are ready-work projections) plus
 > [`std.coord`](coordination.md) for generic coordination resources. Two parts of

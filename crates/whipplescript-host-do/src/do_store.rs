@@ -3515,21 +3515,25 @@ fn do_policy_block<Sql: DoSql>(
     if let Some(block) = agent_target_policy_block(&effect)? {
         return Ok(Some(block));
     }
-    // Timers, builtin-queue verbs, and coordination verbs are runtime-resolved:
-    // no provider/capability/profile applies.
+    // Timers, builtin-tracker verbs, coordination verbs, and file verbs are
+    // runtime-resolved: no provider/capability/profile applies. (The tracker
+    // prefix was `queue.` before the S3 noun rename; the exemption follows
+    // the shipped `tracker.*` kind strings.)
     //
     // INTENTIONAL DIVERGENCE from the native mirror (store/lib.rs
-    // `policy_block_on`, std.coord slice 4): the native gate dropped its
-    // coordination exemption because the embedded std.coord manifest seeds
-    // capability/provider/binding rows at store init. The DO bootstrap seeds
-    // only coerce rows (do_instance.rs / do_worker.rs) and M7 defers DO
-    // manifest registration to the DO tracker, so removing the
-    // `lease.`/`ledger.`/`counter.` lines HERE would turn every in-DO
-    // coordination effect into blocked_by_capability. This exemption stays
-    // until the DO tracker's package-registration row lands
-    // (spec/std-coord.md "Deferred with cause").
+    // `policy_block_on`, std.coord slice 4 + std.files slice F2 + std.tracker
+    // slice T4): the native gate dropped its coordination, file, and tracker
+    // exemptions because the embedded std.coord / std.files / std.tracker
+    // manifests seed capability/provider/binding rows at store init. The DO
+    // bootstrap seeds only coerce rows (do_instance.rs / do_worker.rs) and M7
+    // defers DO manifest registration to the DO tracker, so removing the
+    // `lease.`/`ledger.`/`counter.`/`file.`/`tracker.` lines HERE would turn
+    // every in-DO coordination, file, or tracker effect into
+    // blocked_by_capability. These exemptions stay until the DO tracker's
+    // package-registration row lands (spec/std-coord.md / spec/std-files.md /
+    // spec/std-tracker.md "Deferred with cause").
     if effect.kind == "timer.wait"
-        || effect.kind.starts_with("queue.")
+        || effect.kind.starts_with("tracker.")
         || effect.kind.starts_with("lease.")
         || effect.kind.starts_with("ledger.")
         || effect.kind.starts_with("counter.")
@@ -9791,7 +9795,7 @@ mod tests {
             &[
                 text("eff_q"),
                 text("i1"),
-                text("queue.push"),
+                text("tracker.push"),
                 text("queued"),
                 text("{}"),
                 text("2026-01-01T00:00:00Z"),
@@ -9818,7 +9822,7 @@ mod tests {
             &[
                 text("eff_up"),
                 text("i1"),
-                text("queue.push"),
+                text("tracker.push"),
                 text("queued"),
                 text("{}"),
                 text("2026-01-01T00:00:02Z"),
@@ -9830,7 +9834,7 @@ mod tests {
             &[
                 text("eff_down"),
                 text("i1"),
-                text("queue.push"),
+                text("tracker.push"),
                 text("blocked_by_dependency"),
                 text("{}"),
                 text("2026-01-01T00:00:03Z"),
@@ -9899,7 +9903,7 @@ mod tests {
             &[
                 text("eff_1"),
                 text("i1"),
-                text("queue.push"),
+                text("tracker.push"),
                 text("queued"),
                 text("{\"a\":1}"),
             ],
@@ -9924,7 +9928,7 @@ mod tests {
             &[
                 text("eff_up"),
                 text("i1"),
-                text("queue.push"),
+                text("tracker.push"),
                 text("queued"),
                 text("{}"),
             ],
@@ -9935,7 +9939,7 @@ mod tests {
             &[
                 text("eff_dn"),
                 text("i1"),
-                text("queue.push"),
+                text("tracker.push"),
                 text("queued"),
                 text("{}"),
             ],
@@ -10663,7 +10667,7 @@ mod tests {
         }];
         let effects = [NewEffect {
             effect_id: "eff_1",
-            kind: "queue.push",
+            kind: "tracker.push",
             target: None,
             input_json: "{}",
             status: "queued",
@@ -10802,7 +10806,7 @@ mod tests {
 
         let effect_a = [NewEffect {
             effect_id: "eff_a",
-            kind: "queue.push",
+            kind: "tracker.push",
             target: None,
             input_json: "{}",
             status: "queued",
@@ -10831,7 +10835,7 @@ mod tests {
 
         let effect_b = [NewEffect {
             effect_id: "eff_b",
-            kind: "queue.push",
+            kind: "tracker.push",
             target: None,
             input_json: "{}",
             status: "queued",
@@ -11146,7 +11150,7 @@ mod tests {
                       key: &str| {
             let effects = [NewEffect {
                 effect_id,
-                kind: "queue.push",
+                kind: "tracker.push",
                 target: None,
                 input_json: "{}",
                 status: "queued",

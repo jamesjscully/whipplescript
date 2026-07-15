@@ -3,6 +3,8 @@ source_tags
 @service workflow MultiAgentBoundedConcurrency
 source_descriptions
 "Two agents with bounded capacity handing work to each other through a queue" workflow MultiAgentBoundedConcurrency
+uses
+  package std.tracker
 trackers
   tracker backlog provider=builtin
 agents
