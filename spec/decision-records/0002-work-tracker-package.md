@@ -10,14 +10,15 @@ Status: proposed
 > tracker kinds. The "Local Provider" state model shipped in its A+blockers
 > scope (2026-07-08): an event-sourced provider (append-only tracker_events
 > log, disposable projections, runtime leases split from durable status)
-> behind the surviving `WorkItems` trait (store/items.rs). Still deferred to
-> a follow-on: conflicts/heads/state-tokens, the full relation-kind set,
-> comments/evidence, external providers with claim-strength, and the
-> `tracker.renew` EFFECT KIND + claim TTL surface (slice T3 — the store-level
-> `renew_claim` and `whip issue renew` are live; the language-level `renew`
-> verb still parses only as std.coord's lease renewal until T3). WS-N as
-> primary id remains a recorded interim deviation from "Portable Issue
-> Model".
+> behind the surviving `WorkItems` trait (store/items.rs). T3 (the
+> `tracker.renew` EFFECT KIND + claim-TTL surface) SHIPPED 2026-07-15
+> (post-campaign Wave 2, commit 699a281): `renew <claim>` lowers to
+> `tracker.renew`, `claim <issue> ttl <dur>` sets a finite lease deadline,
+> `whip issue --ttl`. Still deferred to phase B (the DAG/conflict follow-on,
+> designed below): conflicts/heads/state-tokens, the full relation-kind set,
+> comments/evidence, external providers with claim-strength. WS-N as primary
+> id is the recorded interim deviation from "Portable Issue Model" that phase
+> B1 corrects (WS-N demoted to alias; see "Phase B1").
 
 The record of work to be orchestrated is the issue tracker. `std.tracker`
 provides that issue tracker as a standard package: a durable local provider for
@@ -524,6 +525,98 @@ heads
 
 Conflict resolution should be a command that appends a new resolving event whose
 parents include the conflicting heads.
+
+## Phase B1: the DAG / conflict core (design settled 2026-07-15, Jack)
+
+Phase A shipped the *single-writer, linear-log* tracker. Phase B1 is the
+*merge-friendly, distributed* core — the foundation multi-user / multi-agent
+workflows (e.g. gaugedesk's multi-writer workbench, which already versions its
+workspace) need. No concrete multi-writer scenario drives it *today*; it is
+built as foundation, hard-core-first (Jack's call), ahead of the additive
+phase-B2 items (full relation kinds, comments/evidence, external providers,
+DO `rebuild_projection` parity, cross-machine transport).
+
+**The reframe: heads come from MERGE, not internal branching.** A single
+SQLite with `Immediate` transactions can never fork — appends serialize.
+Multiple heads (concurrent tips of an issue's history) arise only when two
+independently-grown event logs are unioned. So the core is a **merge + fold
+engine**, and because events are content-addressed, *merge is trivial*: a
+set-union of events, deduplicated by id. All the semantics live in the
+deterministic **fold**.
+
+**Model / transport decoupling.** The DAG/conflict *model* lives entirely in
+the existing SQLite event log (`tracker_events` gains a `parents` link; event
+ids become content-hashes). It needs no file serialization to work. The
+portable `tx/**/*.json` layout, riding the workspace VCS, and cross-machine
+sync are *transport* choices — how two clones exchange event SETS — and are
+deferred to phase B2. To the fold, an event is an event regardless of how it
+arrived, so B1 is built transport-agnostically; the first transport (gaugedesk
+sharing an importable event set) is the cheapest and comes with B2.
+
+**Decisions:**
+
+1. **Event identity = content-hash (Merkle-DAG).** `event_id = H(kind, issue,
+   field, value, sorted parents, author, logical-clock)`. This is a
+   hash-chain: altering any past event changes its id and breaks every
+   downstream `parents` link, so a tampered issue is DETECTABLE, not silent —
+   an integrity property protecting workflow correctness (Jack's rationale).
+   Merge is set-union deduped by id; the same logical event minted in two
+   clones is the same id.
+
+2. **Issue identity = the content-hash of its `issue.created` event** (opaque,
+   merge-safe). Relations, parents, and merge identity all use it. Two
+   genuinely-independent creates get distinct ids (distinct author/clock);
+   two BYTE-IDENTICAL creates collapse to one issue — rare and acceptable, but
+   **the second submission surfaces a `duplicate_submission` warning** so the
+   collapse is visible, never silent (Jack).
+
+3. **`WS-N` = a stored-at-creation alias**, minted from a local monotonic
+   counter, stable for an issue's life *within a clone* — the "take WS-7" UX.
+   It is NEVER transaction identity (no parents, hashes, or import identity use
+   it). On merge, an incoming clone's aliases may collide with local ones; the
+   opaque id is stable, so colliding incomers are **re-aliased** (a
+   projection-time relabel), never the local issues.
+
+4. **Per-FIELD conflict detection.** The fold computes each field from its
+   *maximal* setting events (those not ancestors of another event setting the
+   same field). One maximal event → converged. Two concurrent maximal events
+   (neither an ancestor of the other) with DIFFERENT values → the field is
+   `conflicted`; with the SAME value → converged (no conflict). Concurrent
+   edits to DIFFERENT fields merge cleanly (no false conflict). A conflicted
+   issue is not ready.
+
+5. **`state_token` = H(sorted head ids)** per issue; optimistic concurrency in
+   the CLI: `whip issue set <id> <field> <v> --expect-state-token <t>` applies
+   only if the token still matches, else rejects (the caller re-reads/merges).
+
+6. **`resolve` = an event whose parents are the conflicting maximal events**,
+   setting the resolved value; it becomes the unique maximal setter →
+   `conflicted=false`, heads collapse.
+
+**Model-first (this is a distributed/confluence property). BUILT 2026-07-15:**
+`models/maude/tracker-merge.maude` (verdicts SSSSSNNNS in the formal gate)
+proves, with coverage AND bite (the whole log lives in a `t(_)` wrapper so a
+fold rule sees the entire soup — a bare `ev C` LHS would let `C` collapse to
+`none` and hide the other heads from the maximality guard):
+- **confluence** — the fold is a pure function of the event SET (merge order
+  independent);
+- **conflict soundness** — concurrent same-field different-value events ALWAYS
+  surface `conflicted` (bite: a fold that silently tiebreaks);
+- **non-conflict merge** — concurrent different-field events merge with no
+  false conflict;
+- **resolution completeness** — a resolve event collapses heads to one,
+  `conflicted=false`;
+- **no-lost-events** — `merge(A,B)` contains every event of A and B (folding a
+  superset never drops a previously-visible event).
+
+**B1 build slices (each gates-green, per-piece review):** (i) events carry
+`parents` + content-hash ids, issue id = created-event hash, WS-N demoted to
+a stored alias; (ii) the DAG-aware per-field fold with `conflicted`/
+`field_conflicts`/`heads`/`state_token` on every rich issue shape;
+(iii) `merge`/import-events (set-union, dedup, `duplicate_submission` warning);
+(iv) `resolve` command + `whip issue conflicts`; (v) optimistic
+`--expect-state-token`. `WorkItems` (frozen 8-method seam) gains only what the
+storage swap needs, transparently to `rule_pass`/`project_tracker_issues`.
 
 ## Discovery And Guarantees
 

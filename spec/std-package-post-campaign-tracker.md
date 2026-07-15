@@ -140,9 +140,12 @@ up; each carries a proposed direction where one exists.
       without a same-manifest provider row. Owner: Jack.
 - [~] ADR-0002 phase B (conflicts/heads/state-tokens, full relation kinds,
       comments/evidence, claim-strength/external sync, DO
-      rebuild_projection parity) — the largest unforced item; coord's event
-      vocabulary explicitly joins it (one event-sourcing campaign, not two).
-      Its own future campaign, sequenced last. Owner: a dedicated campaign.
+      rebuild_projection parity) — TAKEN ON 2026-07-15 as its own campaign,
+      hard-core-first (Jack). Design settled + model-first artifact landed
+      (ADR-0002 "Phase B1"; `tracker-merge.maude`). Now tracked in
+      **spec/tracker-phase-b-tracker.md** — work it THERE; this row only
+      records the hand-off. (coord's event vocabulary joins B2's transport,
+      still one event-sourcing story.)
 
 ## Adjacent (other campaigns' rows, slotted here only for sequencing)
 
