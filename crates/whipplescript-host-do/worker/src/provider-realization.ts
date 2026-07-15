@@ -1,4 +1,4 @@
-import { MODEL_AUTH_SENTINEL } from "./model-broker";
+import { MODEL_AUTH_SENTINEL } from "./model-broker.ts";
 
 export type HostedProvider =
   | "openai"
@@ -126,11 +126,6 @@ export function resolveAdmittedProvider(
 
   if (!env.WHIP_MODEL_BROKER_URL?.trim() || !env.WHIP_MODEL_BROKER_TOKEN?.trim()) {
     throw new Error(`admitted provider credential ${admission.credential_id} has no model broker`);
-  }
-  if (admission.provider === "openai-codex") {
-    throw new Error(
-      "openai-codex broker transport awaits the authenticated outbound session slice",
-    );
   }
   return {
     credential_id: admission.credential_id,

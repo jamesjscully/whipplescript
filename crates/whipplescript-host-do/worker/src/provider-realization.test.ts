@@ -30,6 +30,23 @@ test("signed admission dynamically realizes the model broker without a provider 
   });
 });
 
+test("codex admission uses only the authenticated local broker sentinel", () => {
+  const codex: HostTurnAdmission = {
+    ...admission,
+    credential_id: "gaugedesk:credential:v2:account:616c696365:openai-codex:1",
+    provider: "openai-codex",
+    model: "gpt-5.5",
+    base_url: "https://chatgpt.com",
+  };
+  const resolved = resolveAdmittedProvider(codex, {
+    WHIP_MODEL_BROKER_URL: "https://outbound-session.example/internal/local-model-egress",
+    WHIP_MODEL_BROKER_TOKEN: "session-token",
+  });
+  assert.equal(resolved.execution, "model-broker");
+  assert.equal(resolved.api_key, MODEL_AUTH_SENTINEL);
+  assert.equal(resolved.credential_id, codex.credential_id);
+});
+
 test("static bindings remain only as exact explicit worker-secret transitions", () => {
   const configured = {
     [admission.provider_binding_id]: {

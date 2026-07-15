@@ -1301,6 +1301,7 @@ export class WorkflowInstance implements DurableObject {
           api_key: binding.api_key,
           model: binding.model,
           max_tokens: 4096,
+          session_id: instanceId,
         }),
       );
       const driven = await this.driveInstance(
@@ -1393,6 +1394,7 @@ export class WorkflowInstance implements DurableObject {
           api_key: binding.api_key,
           model: binding.model,
           max_tokens: 4096,
+          session_id: instanceId,
         }),
       );
       const driven = await this.driveInstance(

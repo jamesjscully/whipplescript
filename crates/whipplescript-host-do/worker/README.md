@@ -56,6 +56,12 @@ reference:
    ```
    A static `model-broker` entry is rejected. Broker failure is fail-closed;
    the Worker never falls back to direct provider egress.
+
+   For a remote-DO development turn using GaugeDesk's locally sealed Codex
+   login, point the same broker variables at the authenticated outbound tunnel's
+   `/internal/local-model-egress` route. The Worker retains only the hop token
+   and broker sentinel; GaugeDesk refreshes and injects the short-lived access
+   token and account id locally.
 4. **Deploy**: `npm run deploy` (`wrangler deploy`).
 5. **Validate**: use the canonical managed route
    `/v1/tenants/:tenant/placements/:placement/host/...` (Bearer

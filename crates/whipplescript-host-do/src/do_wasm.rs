@@ -798,10 +798,13 @@ fn parse_incoming(
         .get("status")
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(200) as u16;
-    let body = value
+    let mut body = value
         .get("body")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    if let Some(stream) = body.as_str().filter(|stream| stream.contains("data:")) {
+        body = whipplescript_kernel::harness_model::assemble_codex_responses_sse(stream);
+    }
     Ok(Some(Ok(HttpResponse { status, body })))
 }
 
@@ -833,14 +836,16 @@ fn outcome_to_json(outcome: &DurableStepOutcome) -> String {
 /// reconciliation") — the same record the native door resolves from env +
 /// `whip auth` + the registry default. Defaults are owned once by std.coercion
 /// (`max_tokens` 4096, `timeout_secs` 120); the old DO-only 1024 drift is gone.
-/// The codex OAuth routing is a native-door affordance: this door carries
-/// explicit API keys only, so `codex_account_id` is always `None`.
+/// Codex brokered turns carry only sentinel authentication. The authenticated
+/// outbound local broker replaces both sentinel fields after admission; no
+/// OAuth material enters the Durable Object.
 fn parse_coerce_config(json: &str) -> Result<ResolvedCoercionConfig, String> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
     let backend = match value.get("provider").and_then(serde_json::Value::as_str) {
         Some("anthropic") => CoerceProvider::Anthropic,
         Some("openai") => CoerceProvider::OpenAi,
         Some("openai-generic") => CoerceProvider::OpenAiCompat,
+        Some("openai-codex") => CoerceProvider::OpenAi,
         other => return Err(format!("unknown coerce provider: {other:?}")),
     };
     let field = |name: &str| {
@@ -865,7 +870,9 @@ fn parse_coerce_config(json: &str) -> Result<ResolvedCoercionConfig, String> {
             .get("timeout_secs")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(whipplescript_kernel::coerce_native::DEFAULT_COERCE_TIMEOUT_SECS),
-        codex_account_id: None,
+        codex_account_id: (value.get("provider").and_then(serde_json::Value::as_str)
+            == Some("openai-codex"))
+        .then(|| field("account_id").unwrap_or_else(|| "whipplescript-model-broker".to_owned())),
     })
 }
 
@@ -875,10 +882,12 @@ fn parse_coerce_config(json: &str) -> Result<ResolvedCoercionConfig, String> {
 /// transport-free: the shell performs each round's `fetch`.
 fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
-    let provider = match value.get("provider").and_then(serde_json::Value::as_str) {
+    let provider_id = value.get("provider").and_then(serde_json::Value::as_str);
+    let provider = match provider_id {
         Some("anthropic") => CoerceProvider::Anthropic,
         Some("openai") => CoerceProvider::OpenAi,
         Some("openai-generic") => CoerceProvider::OpenAiCompat,
+        Some("openai-codex") => CoerceProvider::OpenAi,
         other => return Err(format!("unknown agent provider: {other:?}")),
     };
     let field = |name: &str| {
@@ -887,18 +896,26 @@ fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
     };
+    let api_key = field("api_key").ok_or("agent config needs api_key")?;
+    let model = field("model").ok_or("agent config needs model")?;
+    let base_url = field("base_url").ok_or("agent config needs base_url")?;
+    let max_tokens = value
+        .get("max_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(4096);
+    if provider_id == Some("openai-codex") {
+        return Ok(MessagesApiClient::new_codex(
+            api_key,
+            field("account_id").unwrap_or_else(|| "whipplescript-model-broker".to_owned()),
+            field("session_id").ok_or("codex agent config needs session_id")?,
+            model,
+            base_url,
+            max_tokens,
+            None,
+        ));
+    }
     Ok(MessagesApiClient::new(
-        provider,
-        field("api_key").ok_or("agent config needs api_key")?,
-        field("model").ok_or("agent config needs model")?,
-        field("base_url").ok_or("agent config needs base_url")?,
-        value
-            .get("max_tokens")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(4096),
-        // Constructed once per durable object, so no per-turn id here; the
-        // Anthropic cache_control breakpoint still applies (Decision 7).
-        None,
+        provider, api_key, model, base_url, max_tokens, None,
     ))
 }
 

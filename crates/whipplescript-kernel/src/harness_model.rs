@@ -857,6 +857,60 @@ fn parse_openai_response(body: &Value) -> ModelReply {
     }
 }
 
+/// Collapse a Codex Responses-API SSE stream into the response-shaped value
+/// consumed by the provider-neutral model loop. Hosts call this after transport;
+/// credential brokers remain byte relays and do not take ownership of provider
+/// response semantics.
+pub fn assemble_codex_responses_sse(raw: &str) -> Value {
+    let mut completed: Option<Value> = None;
+    let mut deltas = String::new();
+    let mut done_items: Vec<Value> = Vec::new();
+    for line in raw.lines() {
+        let Some(payload) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.completed") => completed = event.get("response").cloned(),
+            Some("response.output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    deltas.push_str(delta);
+                }
+            }
+            Some("response.output_item.done") => {
+                if let Some(item) = event.get("item") {
+                    done_items.push(item.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut completed = completed.unwrap_or(Value::Null);
+    let output_missing = completed
+        .get("output")
+        .and_then(Value::as_array)
+        .map(|output| output.is_empty())
+        .unwrap_or(true);
+    if output_missing && !done_items.is_empty() {
+        completed["output"] = Value::Array(done_items);
+    }
+    if !deltas.is_empty() {
+        let usage = completed.get("usage").cloned().unwrap_or(Value::Null);
+        let mut assembled = serde_json::json!({ "output_text": deltas, "usage": usage });
+        if let Some(output) = completed.get("output") {
+            assembled["output"] = output.clone();
+        }
+        return assembled;
+    }
+    completed
+}
+
 /// Pull a capped, single-line control-plane error message from a provider body.
 fn provider_error_excerpt(body: &Value) -> String {
     let message = body
@@ -880,6 +934,19 @@ mod tests {
     use super::*;
     use crate::harness_loop::ToolResultMsg;
     use std::cell::RefCell;
+
+    #[test]
+    fn codex_sse_assembly_preserves_text_tools_and_usage() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"{}\"}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n",
+        );
+        let body = assemble_codex_responses_sse(raw);
+        assert_eq!(body["output_text"], "hello");
+        assert_eq!(body["output"][0]["call_id"], "c1");
+        assert_eq!(body["usage"]["input_tokens"], 3);
+    }
 
     #[test]
     fn context_window_is_derived_from_the_model_not_configured() {
