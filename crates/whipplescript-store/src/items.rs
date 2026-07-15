@@ -65,6 +65,34 @@ pub struct WorkItem {
     pub updated_at: String,
 }
 
+/// One field whose value is disputed: its `bef`-maximal setters in the event
+/// DAG disagree (ADR-0002 phase B1 slice ii; `tracker-merge.maude` `conflict`).
+/// `values` are the distinct maximal-setter values, sorted for stable output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FieldConflict {
+    pub field: String,
+    pub values: Vec<String>,
+}
+
+/// The DAG view of one issue: its frontier (`heads`), a content-derived
+/// `state_token` over that frontier (the optimistic-concurrency token, slice v),
+/// and any per-field conflicts. An issue is `conflicted` iff `field_conflicts`
+/// is non-empty — and a conflicted issue is not ready. Heads and token are
+/// content-hashes (unit 1), so they are already merge-stable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssueConflicts {
+    pub heads: Vec<String>,
+    pub state_token: String,
+    pub field_conflicts: Vec<FieldConflict>,
+}
+
+impl IssueConflicts {
+    #[must_use]
+    pub fn conflicted(&self) -> bool {
+        !self.field_conflicts.is_empty()
+    }
+}
+
 #[cfg(feature = "native")]
 pub struct WorkItemStore {
     connection: Connection,
@@ -201,10 +229,20 @@ impl WorkItemStore {
         let rows = statement
             .query_map([queue], row_to_item)?
             .collect::<Result<Vec<_>, _>>()?;
+        // A conflicted issue is not ready (ADR-0002 phase B1 slice ii): its
+        // field values are in dispute, so handing it to a worker would race a
+        // resolution. The DAG conflict test is not expressible in the SQL
+        // predicate above, so filter it here (the candidate set is small).
+        let mut ready = Vec::with_capacity(rows.len());
+        for item in rows {
+            if !analyze_issue_dag(&load_issue_events(&self.connection, &item.id)?).conflicted() {
+                ready.push(item);
+            }
+        }
         // Ready items have no active lease by construction, so the overlay is a
         // no-op here; return them as the projection sees them (durable `open`,
         // unclaimed).
-        Ok(rows)
+        Ok(ready)
     }
 
     /// Atomic claim (`tracker-lease.maude` I1, exclusivity): grants a lease ONLY
@@ -416,6 +454,64 @@ impl WorkItemStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Sets one field of an issue (`issue.field_set`) — the mutation whose
+    /// events the conflict engine folds. Appends the event (chaining onto the
+    /// issue's current heads, so two independent sets across a merge FORK the
+    /// DAG) and updates the linear projection column for the known display
+    /// fields. Returns `false` if the issue does not exist.
+    pub fn set_field(&mut self, item_id: &str, field: &str, value: &str) -> StoreResult<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM tracker_issues WHERE issue_id = ?1",
+                [item_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let payload = json!({"field": field, "value": value});
+        tx_append_event(&tx, Some(item_id), "issue.field_set", &payload, None, &now)?;
+        // Fold into the linear projection column (the conflict view is computed
+        // on read from the DAG; the column is the last-writer display value).
+        if let Some(column) = projection_column(field) {
+            tx.execute(
+                &format!(
+                    "UPDATE tracker_issues SET {column} = ?2, updated_at = ?3 WHERE issue_id = ?1"
+                ),
+                params![item_id, value, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The DAG conflict view of one issue (ADR-0002 phase B1 slice ii): its
+    /// `heads`, the `state_token` over that frontier, and any field whose
+    /// `bef`-maximal setters disagree. `None` if the issue does not exist.
+    pub fn issue_conflicts(&self, item_id: &str) -> StoreResult<Option<IssueConflicts>> {
+        let exists: bool = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM tracker_issues WHERE issue_id = ?1",
+                [item_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+        let events = load_issue_events(&self.connection, item_id)?;
+        Ok(Some(analyze_issue_dag(&events)))
     }
 
     /// Rebuilds the disposable projections (`tracker_issues`,
@@ -699,6 +795,155 @@ fn tx_mark_lease_released(
         params![lease_id, now],
     )?;
     Ok(())
+}
+
+/// The `tracker_issues` display column an `issue.field_set` writes, if any.
+/// Unknown fields still record an event (so the conflict view sees them) but
+/// touch no column.
+#[cfg(feature = "native")]
+fn projection_column(field: &str) -> Option<&'static str> {
+    match field {
+        "title" => Some("title"),
+        "body" => Some("body"),
+        "status" => Some("status"),
+        _ => None,
+    }
+}
+
+/// SHA-256 hex of a string (the `state_token` hasher).
+#[cfg(feature = "native")]
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(s.as_bytes()))
+}
+
+/// One event as the conflict engine reads it (id + DAG parents + kind/payload).
+#[cfg(feature = "native")]
+struct IssueEvent {
+    event_id: String,
+    parents: Vec<String>,
+    kind: String,
+    payload: Value,
+}
+
+/// Load one issue's events in append order for DAG analysis.
+#[cfg(feature = "native")]
+fn load_issue_events(conn: &Connection, issue_id: &str) -> StoreResult<Vec<IssueEvent>> {
+    let mut statement = conn.prepare(
+        "SELECT event_id, parents_json, kind, payload_json FROM tracker_events \
+         WHERE issue_id = ?1 ORDER BY event_seq",
+    )?;
+    let rows = statement
+        .query_map([issue_id], |row| {
+            let event_id: Option<String> = row.get(0)?;
+            let parents_json: String = row.get(1)?;
+            let kind: String = row.get(2)?;
+            let payload_json: String = row.get(3)?;
+            Ok((event_id, parents_json, kind, payload_json))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(event_id, parents_json, kind, payload_json)| IssueEvent {
+            event_id: event_id.unwrap_or_default(),
+            parents: serde_json::from_str(&parents_json).unwrap_or_default(),
+            kind,
+            payload: serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({})),
+        })
+        .collect())
+}
+
+/// The DAG conflict analysis (ADR-0002 phase B1 slice ii, realizing
+/// `tracker-merge.maude`): compute the frontier (`heads`), a content `state_token`
+/// over it, and any field whose `bef`-maximal `issue.field_set` setters disagree.
+/// A setter is `bef`-maximal iff no OTHER setter of the same field has it as a
+/// transitive ancestor — i.e. nothing supersedes it along the DAG. A field with
+/// two or more distinct maximal values is conflicted; a linear history (one
+/// maximal setter) never is, and agreeing forks converge.
+#[cfg(feature = "native")]
+fn analyze_issue_dag(events: &[IssueEvent]) -> IssueConflicts {
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+    // Frontier: an event that nothing else lists as a parent.
+    let claimed: HashSet<&str> = events
+        .iter()
+        .flat_map(|e| e.parents.iter().map(String::as_str))
+        .collect();
+    let mut heads: Vec<String> = events
+        .iter()
+        .filter(|e| !e.event_id.is_empty() && !claimed.contains(e.event_id.as_str()))
+        .map(|e| e.event_id.clone())
+        .collect();
+    heads.sort();
+    heads.dedup();
+    let state_token = sha256_hex(&heads.join("\n"));
+
+    // Transitive-ancestor test over the parent map.
+    let parents: HashMap<&str, &[String]> = events
+        .iter()
+        .map(|e| (e.event_id.as_str(), e.parents.as_slice()))
+        .collect();
+    let is_ancestor = |ancestor: &str, of: &str| -> bool {
+        let mut stack: Vec<&str> = parents
+            .get(of)
+            .map(|ps| ps.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(x) = stack.pop() {
+            if x == ancestor {
+                return true;
+            }
+            if !seen.insert(x) {
+                continue;
+            }
+            if let Some(ps) = parents.get(x) {
+                stack.extend(ps.iter().map(String::as_str));
+            }
+        }
+        false
+    };
+
+    // Group the field-setting events by field.
+    let mut setters: BTreeMap<String, Vec<(&str, String)>> = BTreeMap::new();
+    for e in events {
+        if e.kind != "issue.field_set" || e.event_id.is_empty() {
+            continue;
+        }
+        let (Some(field), Some(value)) = (
+            e.payload.get("field").and_then(Value::as_str),
+            e.payload.get("value").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        setters
+            .entry(field.to_owned())
+            .or_default()
+            .push((e.event_id.as_str(), value.to_owned()));
+    }
+
+    let mut field_conflicts = Vec::new();
+    for (field, ss) in &setters {
+        let values: BTreeSet<String> = ss
+            .iter()
+            .filter(|(id, _)| {
+                !ss.iter()
+                    .any(|(other, _)| other != id && is_ancestor(id, other))
+            })
+            .map(|(_, val)| val.clone())
+            .collect();
+        if values.len() > 1 {
+            field_conflicts.push(FieldConflict {
+                field: field.clone(),
+                values: values.into_iter().collect(),
+            });
+        }
+    }
+
+    IssueConflicts {
+        heads,
+        state_token,
+        field_conflicts,
+    }
 }
 
 /// Fold one event into the projection tables — the shared step of both live
@@ -1087,6 +1332,201 @@ mod tests {
         // The claim event chains onto the created event: it is a child.
         assert_eq!(claim_parents, &[created_id.clone()]);
         assert_ne!(claim_id, created_id);
+    }
+
+    /// Inserts one event with EXPLICIT parents, bypassing the linear
+    /// head-chaining of `tx_append_event`. This is how a test manufactures a
+    /// DAG fork — two events sharing a parent — which single-writer appends
+    /// never produce (only a merge does). Returns the event's content id.
+    fn insert_event(
+        store: &WorkItemStore,
+        issue_id: &str,
+        kind: &str,
+        payload: &Value,
+        parents: &[String],
+        now: &str,
+    ) -> String {
+        let payload_json = payload.to_string();
+        let event_id = event_content_id(kind, Some(issue_id), &payload_json, None, parents, now);
+        let parents_json = serde_json::to_string(parents).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO tracker_events \
+                 (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+                params![event_id, parents_json, issue_id, kind, payload_json, now],
+            )
+            .unwrap();
+        event_id
+    }
+
+    fn heads_of(store: &WorkItemStore, id: &str) -> Vec<String> {
+        store.issue_conflicts(id).unwrap().unwrap().heads
+    }
+
+    /// ADR-0002 phase B1 slice ii, realizing `tracker-merge.maude`. Single
+    /// clone: a linear field history has one maximal setter, so it never
+    /// conflicts and the issue stays ready.
+    #[test]
+    fn linear_field_history_never_conflicts() {
+        let mut store = open_memory();
+        let it = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .expect("files");
+        assert!(store.set_field(&it.id, "title", "A").expect("set"));
+        assert!(store.set_field(&it.id, "title", "B").expect("set"));
+        let c = store.issue_conflicts(&it.id).expect("q").expect("exists");
+        assert!(!c.conflicted());
+        assert_eq!(c.heads.len(), 1, "linear frontier is a single head");
+        // The linear last-writer projection column tracks the latest set.
+        assert_eq!(store.get_item(&it.id).unwrap().unwrap().title, "B");
+        assert_eq!(store.ready_items("q").unwrap().len(), 1);
+    }
+
+    /// A fork whose two maximal setters DISAGREE conflicts, is reported per
+    /// field with both values, and is no longer ready.
+    #[test]
+    fn disagreeing_fork_conflicts_and_is_not_ready() {
+        let mut store = open_memory();
+        let it = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .expect("files");
+        let base = heads_of(&store, &it.id);
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "A"}),
+            &base,
+            "2020-01-01 00:00:01",
+        );
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "B"}),
+            &base,
+            "2020-01-01 00:00:02",
+        );
+        let c = store.issue_conflicts(&it.id).expect("q").expect("exists");
+        assert!(c.conflicted());
+        assert_eq!(c.field_conflicts.len(), 1);
+        assert_eq!(c.field_conflicts[0].field, "title");
+        assert_eq!(c.field_conflicts[0].values, vec!["A", "B"]);
+        assert_eq!(c.heads.len(), 2, "the fork has two heads");
+        assert!(
+            store.ready_items("q").unwrap().is_empty(),
+            "a conflicted issue is not ready"
+        );
+    }
+
+    /// A fork whose two maximal setters AGREE converges: distinct events (they
+    /// differ by clock) but one value, so no conflict — and still ready.
+    #[test]
+    fn agreeing_fork_converges() {
+        let mut store = open_memory();
+        let it = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .expect("files");
+        let base = heads_of(&store, &it.id);
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "A"}),
+            &base,
+            "2020-01-01 00:00:01",
+        );
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "A"}),
+            &base,
+            "2020-01-01 00:00:02",
+        );
+        let c = store.issue_conflicts(&it.id).expect("q").expect("exists");
+        assert!(!c.conflicted());
+        assert_eq!(c.heads.len(), 2);
+        assert_eq!(store.ready_items("q").unwrap().len(), 1);
+    }
+
+    /// A fork that sets DIFFERENT fields is not a conflict (soundness bite):
+    /// each field has a single maximal setter.
+    #[test]
+    fn different_fields_fork_does_not_conflict() {
+        let mut store = open_memory();
+        let it = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .expect("files");
+        let base = heads_of(&store, &it.id);
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "A"}),
+            &base,
+            "2020-01-01 00:00:01",
+        );
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "body", "value": "X"}),
+            &base,
+            "2020-01-01 00:00:02",
+        );
+        let c = store.issue_conflicts(&it.id).expect("q").expect("exists");
+        assert!(!c.conflicted());
+        assert_eq!(c.heads.len(), 2);
+    }
+
+    /// Resolution: an event parented on BOTH conflicting heads supersedes them,
+    /// leaving one maximal setter — the conflict clears and the frontier
+    /// collapses to the resolver. The `state_token` changes across the resolve.
+    #[test]
+    fn merge_resolution_clears_conflict() {
+        let mut store = open_memory();
+        let it = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .expect("files");
+        let base = heads_of(&store, &it.id);
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "A"}),
+            &base,
+            "2020-01-01 00:00:01",
+        );
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "B"}),
+            &base,
+            "2020-01-01 00:00:02",
+        );
+        let conflicted = store.issue_conflicts(&it.id).unwrap().unwrap();
+        assert!(conflicted.conflicted());
+        let token_before = conflicted.state_token.clone();
+
+        // Resolve: a single setter descending from both heads.
+        let heads = heads_of(&store, &it.id);
+        assert_eq!(heads.len(), 2);
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "C"}),
+            &heads,
+            "2020-01-01 00:00:03",
+        );
+        let resolved = store.issue_conflicts(&it.id).unwrap().unwrap();
+        assert!(!resolved.conflicted(), "resolver supersedes both forks");
+        assert_eq!(resolved.heads.len(), 1);
+        assert_ne!(resolved.state_token, token_before, "the frontier changed");
     }
 
     /// Drive the store through the `WorkItems` trait as a `dyn` object: proves
