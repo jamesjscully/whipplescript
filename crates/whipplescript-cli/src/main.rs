@@ -29604,6 +29604,8 @@ renew <id> [--actor A] [--ttl D]|\
 release <id>|\
 finish <id> [--summary S]|complete <id> [--summary S]|\
 fail <id> [--actor A]|\
+set <id> <field> <value>|\
+conflicts <id>|conflicts --tracker TR|\
 dep add <blocked> [depends-on] <blocker>|\
 rebuild>";
 
@@ -29788,8 +29790,22 @@ fn issue(options: &CliOptions) -> ExitCode {
             };
             match store.get_item(id) {
                 Ok(Some(item)) => {
+                    let conflicts = match store.issue_conflicts(id) {
+                        Ok(view) => view,
+                        Err(error) => return report_store_error("failed to read conflicts", error),
+                    };
                     if options.json {
-                        emit_json(work_item_to_json(&item))
+                        let mut value = work_item_to_json(&item);
+                        if let (Some(map), Some(view)) = (value.as_object_mut(), &conflicts) {
+                            map.insert("conflicted".to_owned(), json!(view.conflicted()));
+                            map.insert("heads".to_owned(), json!(view.heads));
+                            map.insert("state_token".to_owned(), json!(view.state_token));
+                            map.insert(
+                                "field_conflicts".to_owned(),
+                                issue_conflicts_to_json(id, view)["field_conflicts"].clone(),
+                            );
+                        }
+                        emit_json(value)
                     } else {
                         println!("{} [{}] tracker={}", item.id, item.status, item.queue);
                         println!("title: {}", item.title);
@@ -29804,6 +29820,14 @@ fn issue(options: &CliOptions) -> ExitCode {
                         }
                         if let Some(filed) = &item.filed_by {
                             println!("filed by: {filed}");
+                        }
+                        if let Some(view) = &conflicts {
+                            if view.conflicted() {
+                                println!("CONFLICTED (not ready):");
+                                for fc in &view.field_conflicts {
+                                    println!("  {}: {}", fc.field, fc.values.join(" | "));
+                                }
+                            }
                         }
                         ExitCode::SUCCESS
                     }
@@ -29964,6 +29988,86 @@ fn issue(options: &CliOptions) -> ExitCode {
                 Err(error) => report_store_error("failed to add dependency", error),
             }
         }
+        "set" => {
+            // `set <id> <field> <value>`: append an `issue.field_set`. Two
+            // independent sets that meet at a merge fork the field; the conflict
+            // view (`issue conflicts`) surfaces the disagreement.
+            let (Some(id), Some(field), Some(value)) = (args.get(1), args.get(2), args.get(3))
+            else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.set_field(id, field, value) {
+                Ok(true) => emit_issue_row(&store, id, &format!("{field} set"), options.json),
+                Ok(false) => {
+                    eprintln!("issue `{id}` was not found");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to set field", error),
+            }
+        }
+        "conflicts" => {
+            // `conflicts <id>` reports one issue's DAG conflict view;
+            // `conflicts --tracker <q>` lists every conflicted issue in a tracker.
+            if let Some(queue) = flag_value(args, "--tracker") {
+                let listed = match store.list_items(Some(&queue), None) {
+                    Ok(items) => items,
+                    Err(error) => return report_store_error("failed to list issues", error),
+                };
+                let mut rows = Vec::new();
+                for item in listed {
+                    match store.issue_conflicts(&item.id) {
+                        Ok(Some(view)) if view.conflicted() => rows.push((item, view)),
+                        Ok(_) => {}
+                        Err(error) => return report_store_error("failed to read conflicts", error),
+                    }
+                }
+                if options.json {
+                    return emit_json(Value::Array(
+                        rows.iter()
+                            .map(|(item, view)| issue_conflicts_to_json(&item.id, view))
+                            .collect(),
+                    ));
+                }
+                if rows.is_empty() {
+                    println!("no conflicted issues in {queue}");
+                }
+                for (item, view) in rows {
+                    println!("{} {}", item.id, item.title);
+                    for fc in &view.field_conflicts {
+                        println!("  {} in dispute: {}", fc.field, fc.values.join(" | "));
+                    }
+                }
+                ExitCode::SUCCESS
+            } else if let Some(id) = args.get(1).filter(|arg| !arg.starts_with('-')) {
+                match store.issue_conflicts(id) {
+                    Ok(Some(view)) => {
+                        if options.json {
+                            return emit_json(issue_conflicts_to_json(id, &view));
+                        }
+                        println!("{id} state-token: {}", view.state_token);
+                        println!("heads: {}", view.heads.join(", "));
+                        if view.field_conflicts.is_empty() {
+                            println!("no field conflicts");
+                        } else {
+                            println!("conflicted fields:");
+                            for fc in &view.field_conflicts {
+                                println!("  {}: {}", fc.field, fc.values.join(" | "));
+                            }
+                        }
+                        ExitCode::SUCCESS
+                    }
+                    Ok(None) => {
+                        eprintln!("issue `{id}` was not found");
+                        ExitCode::FAILURE
+                    }
+                    Err(error) => report_store_error("failed to read conflicts", error),
+                }
+            } else {
+                eprintln!("{usage}");
+                ExitCode::from(2)
+            }
+        }
         "rebuild" => match store.rebuild_projection() {
             Ok(()) => {
                 if options.json {
@@ -29995,6 +30099,21 @@ fn work_item_to_json(item: &whipplescript_store::items::WorkItem) -> Value {
         "filed_by": item.filed_by,
         "created_at": item.created_at,
         "updated_at": item.updated_at,
+    })
+}
+
+/// The DAG conflict view of one issue as JSON (ADR-0002 phase B1 slice ii):
+/// the frontier, its content `state_token`, and any per-field disputes.
+fn issue_conflicts_to_json(id: &str, view: &whipplescript_store::items::IssueConflicts) -> Value {
+    json!({
+        "id": id,
+        "conflicted": view.conflicted(),
+        "heads": view.heads,
+        "state_token": view.state_token,
+        "field_conflicts": view.field_conflicts.iter().map(|fc| json!({
+            "field": fc.field,
+            "values": fc.values,
+        })).collect::<Vec<_>>(),
     })
 }
 
