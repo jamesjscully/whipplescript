@@ -30,7 +30,7 @@ file store inbox {
 
 # Public reply back to the customer (governance: public).
 channel public_reply {
-  provider slack
+  provider fixture
   destination "#out"
 }
 

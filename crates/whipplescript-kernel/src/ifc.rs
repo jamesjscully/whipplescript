@@ -3122,7 +3122,7 @@ class R { ok bool }
 class Ticket { id string  status "open" }
 
 file store ledger { root "./ledger"  allow read ["**"] }
-channel reply { provider slack  destination "#out" }
+channel reply { provider fixture  destination "#out" }
 
 table seed as Ticket [ { id "T1"  status "open" } ]
 
@@ -3517,7 +3517,7 @@ class Customer { id string  ssn string }
 class PublicView { ok bool }
 
 channel reply {
-  provider slack
+  provider fixture
   destination "#ops"
 }
 
@@ -4293,7 +4293,7 @@ workflow IfcInbound
 output result R
 class R { ok bool }
 
-channel intake { provider slack  destination "#in" }
+channel intake { provider fixture  destination "#in" }
 file store ledger { root "./ledger"  allow write ["**"] }
 
 rule ingest
@@ -4789,7 +4789,7 @@ workflow IfcSurface {
 
   agent coder { provider fixture  profile "p"  capacity 1 }
   file store crm { root "./crm"  allow read ["**"] }
-  channel out { provider slack  destination "#out" }
+  channel out { provider fixture  destination "#out" }
 
   table seed as Ticket [ { id "T1"  status "open" } ]
 

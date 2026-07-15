@@ -134,11 +134,22 @@ pub fn verify_contract_registry_platform_vocabulary(
                 "{construct_label} uses lowering_target `{lowering_target}` incompatible with construct_family `{family}`"
             ));
         }
+        let library_id = construct
+            .get("library_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if !lowering.package_authorable
             && !registry_construct_is_embedded_std_copy(construct, embedded_manifests)
+            && !privilege_tuple_authorizes_internal_lowering(
+                library_id,
+                keyword,
+                family,
+                scope,
+                lowering_target,
+            )
         {
             return Err(format!(
-                "{construct_label}.lowering_target `{lowering_target}` is platform-internal and cannot be used by package constructs (only platform-embedded std manifests may use internal lowerings)"
+                "{construct_label}.lowering_target `{lowering_target}` is platform-internal and cannot be used by package constructs (only platform-embedded std manifests or platform-catalog privilege tuples may use internal lowerings)"
             ));
         }
         if let Some(required_scope) = lowering.required_scope {
@@ -205,6 +216,34 @@ pub fn verify_contract_registry_platform_vocabulary(
         )?;
     }
     Ok(())
+}
+
+/// Authorability door, privilege-tuple leg (std.coord slice 4; M5
+/// "Authorability door"): a platform-catalog reserved-keyword privilege tuple
+/// whose `lowering_target` is a non-package-authorable class ALSO authorizes
+/// that class — for exactly that (library, keyword, family, scope, lowering)
+/// tuple and nothing else. The catalog is compiled into the platform, so a
+/// third party can never mint a tuple; a non-privileged manifest carrying the
+/// same construct row is still rejected. Second leg alongside the S6d-5
+/// embedded-copy key (`manifest_is_embedded_copy`); modeled in
+/// models/maude/std-construct-authorization.maude (`[door-privileged]`, with
+/// keyword- and library-coordinate bite fixtures).
+pub fn privilege_tuple_authorizes_internal_lowering(
+    library_id: &str,
+    keyword: &str,
+    construct_family: &str,
+    scope: &str,
+    lowering_target: &str,
+) -> bool {
+    PLATFORM_CONSTRUCT_CATALOG
+        .reserved_keyword_privilege(
+            library_id,
+            keyword,
+            construct_family,
+            scope,
+            lowering_target,
+        )
+        .is_some()
 }
 
 pub fn reserved_keyword_privilege_error(
@@ -463,12 +502,11 @@ pub fn package_operator_providers(
 /// platform copy compiled into the binary — unforgeable by third parties, and
 /// a same-name different-content file gains nothing.
 ///
-/// The door admits `package_authorable: false` lowering classes only for such
-/// a copy. Today neither embedded manifest declares a non-authorable lowering
-/// (every std construct is `capability_call`), so the door is exercised only
-/// by tests; it exists so future decl-family std manifests (`signal_source` /
-/// `clock_source` / `resource_effect`) can ship embedded. A privilege-tuple
-/// catalog for third parties stays deferred.
+/// The door admits `package_authorable: false` lowering classes for such a
+/// copy — the embedded leg. Its second leg is the platform-catalog privilege
+/// tuple (`privilege_tuple_authorizes_internal_lowering`, std.coord slice 4):
+/// std.coord's embedded manifest declares four `resource_effect` constructs,
+/// admitted through either leg. Third parties hold neither key.
 pub fn manifest_is_embedded_copy(raw_json: &str, embedded: &[(&str, &str)]) -> bool {
     embedded
         .iter()
@@ -707,9 +745,18 @@ pub fn validate_package_manifest_consistency(
                         ));
                     }
                 }
-                if !lowering.package_authorable && !privileged {
+                if !lowering.package_authorable
+                    && !privileged
+                    && !privilege_tuple_authorizes_internal_lowering(
+                        &form.library_id,
+                        &form.keyword,
+                        &form.construct_family,
+                        &form.scope,
+                        &form.lowering_target,
+                    )
+                {
                     problems.push(format!(
-                        "construct `{}` uses platform-internal lowering_target `{}`; package constructs must use an authorable platform lowering (only platform-embedded std manifests may use internal lowerings)",
+                        "construct `{}` uses platform-internal lowering_target `{}`; package constructs must use an authorable platform lowering (only platform-embedded std manifests or platform-catalog privilege tuples may use internal lowerings)",
                         form.id, form.lowering_target
                     ));
                 }

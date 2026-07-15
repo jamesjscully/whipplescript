@@ -3,6 +3,7 @@ source_tags
 @service workflow GastownLite
 uses
   package std.coercion
+  package std.coord
 schemas
   class Workspace
     name string
@@ -37,7 +38,7 @@ rules
     writes
       schema:WorkspaceReady
     record_sources
-      schema:WorkspaceReady construct=table_row span=902..941
+      schema:WorkspaceReady construct=table_row span=916..955
     body_hash be140b933c7ae3a2
   rule file_ticket
     when started
@@ -78,9 +79,9 @@ rules
       log_entry --succeeds--> effect9
       log_entry --succeeds--> effect10
     case_branches
-      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"merge" guard=- body_hash=104d5324dd84bda4 span=2276..2283
-      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"revise" guard=- body_hash=fb9e3c965f9df749 span=2460..2468
-      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"blocked" guard=- body_hash=e73625310a0c4637 span=2510..2519
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"merge" guard=- body_hash=104d5324dd84bda4 span=2290..2297
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"revise" guard=- body_hash=fb9e3c965f9df749 span=2474..2482
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"blocked" guard=- body_hash=e73625310a0c4637 span=2524..2533
     body_hash 6f028d2403a11cdd
 rule_dependencies
   table_workspaces --schema:WorkspaceReady--> implement_ready_ticket

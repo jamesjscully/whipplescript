@@ -1505,14 +1505,20 @@ with weaker guarantees.
 use std.messaging
 
 channel release_room {
-  provider slack
+  provider local
   workspace ops
   destination "#release"
 }
 ```
 
-`provider` is required; `workspace` and `destination` are optional provider
-config. Secrets and credentials are always references in provider config, never
+`provider` is required and must name one of the v1 messaging providers —
+`local` (file-backed mailbox, bidirectional), `desktop` (native notification,
+outbound-only), `stdio` (bidirectional over process stdio), or `fixture` — or
+a provider's full binding id (`std.messaging.local`). An unknown provider
+identifier is a check error, and per-provider capability reports condition
+what the channel admits: `when message from` a `desktop` channel is a check
+error because its report is outbound-only. `workspace` and `destination` are
+optional provider config. Secrets and credentials are always references in provider config, never
 literal source values. Declaring a channel auto-registers the `std.messaging`
 library in the program's library contract, which covers inbound
 `when message from <channel>`; the outbound `send` construct additionally
@@ -1539,9 +1545,20 @@ rule notify
 `std.messaging` package: add `use std.messaging` to the workflow and `send`
 needs **no** package lock — the manifest ships inside the `whip` binary
 (third-party constructs still require `whip package sync`). The named channel must be
-declared — `send via <unknown>` is a compile error. Under the fixture provider
-`send` records a delivery receipt without contacting a real platform; live
-Slack/email delivery is provider-configured.
+declared — `send via <unknown>` is a compile error.
+
+The `as <binding>` receipt is the typed `MessageSendReceipt` (`message_id`,
+`channel`, `provider`, `status`, `provider_message_id`, `thread_id`,
+`destination`, `accepted_at`): `message_id` is the durable outbound id (stable
+across replay), `provider` is the binding-resolved provider id that accepted
+the message, `status` is `accepted` in v1, and correlation fields the provider
+cannot report are empty strings. A failed send is not a receipt — it settles
+`capability.call.failed` and routes to `after <binding> fails as f`. Dispatch
+is binding-driven: the channel's declared provider resolves against the
+`messaging.send` capability bindings the embedded manifest seeds (`local` →
+the file-backed mailbox at `<store>.mailbox.jsonl`, `desktop` → a native
+notification, `stdio` → a stdout marker line, `fixture` → a deterministic
+in-process receipt). Inspect local deliveries with `whip mailbox`.
 
 The generic inbound envelope is the built-in `Message` schema (`message_id`,
 `channel`, `provider`, `received_at`, `sender`, `sender_claims`, `thread_id`,

@@ -15,9 +15,13 @@ Human review is core because restricted automation needs a clear escape hatch.
 
 ```text
 human.ask
-human.notify
-human.approve
 ```
+
+`human.ask` is the only human-review effect that exists in code (`human.notify`
+and `human.approve` never shipped and are removed from this contract). The
+direction — rehoming the ask/answer TRANSPORT onto `std.messaging.local` in
+two gated steps while the typed surface stays core — is owned by
+spec/std-messaging.md "Human-review migration onto messaging".
 
 `human.ask` creates an inbox item:
 

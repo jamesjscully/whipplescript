@@ -1777,6 +1777,11 @@ struct SemanticContext {
     counters: BTreeSet<String>,
     /// Declared `channel` names (std.messaging); `send via <channel>` must name one.
     channels: BTreeSet<String>,
+    /// Declared channel providers by channel name (std.messaging): the
+    /// capability-report-conditioned checks (send requires outbound-capable,
+    /// `when message from` requires inbound-capable) resolve the report
+    /// through this map.
+    channel_providers: BTreeMap<String, String>,
     /// Declared `memory pool` names (std.memory); `recall`/`learn`/`curate`
     /// must name one (MEM-1 check 1).
     memory_pools: BTreeSet<String>,
@@ -5708,6 +5713,7 @@ impl SemanticContext {
         let mut ledgers = BTreeSet::new();
         let mut counters = BTreeSet::new();
         let mut channels = BTreeSet::new();
+        let mut channel_providers = BTreeMap::new();
         let mut memory_pools = BTreeSet::new();
 
         for item in &program.items {
@@ -5745,6 +5751,8 @@ impl SemanticContext {
                 }
                 Item::Channel(channel) => {
                     channels.insert(channel.name.name.clone());
+                    channel_providers
+                        .insert(channel.name.name.clone(), channel.provider.name.clone());
                 }
                 Item::MemoryPool(pool) => {
                     memory_pools.insert(pool.name.name.clone());
@@ -5768,6 +5776,7 @@ impl SemanticContext {
             ledgers,
             counters,
             channels,
+            channel_providers,
             memory_pools,
         }
     }
@@ -6308,15 +6317,26 @@ impl SchemaIndex {
             ],
         );
         // The typed receipt a `send via <channel> { ... } as r` binding sees
-        // (std.messaging; the `messaging.send` contract's output schema). The
-        // real local-mailbox provider returns exactly these fields; the fixture
-        // provider is a partial stand-in and does not populate them.
+        // (std.messaging; the `messaging.send` contract's output schema —
+        // spec/std-messaging.md "MessageSendReceipt"). Every provider returns
+        // the full shape; correlation fields the provider cannot report
+        // (`provider_message_id`, `thread_id`, `destination`) are empty
+        // strings, and `accepted_at` is the provider-acknowledged instant.
+        // Failure is NOT a receipt: it settles `capability.call.failed` with
+        // the DR-0032 EffectError base and routes to `fails as`. `status` is
+        // `accepted` in v1 (`delivered` is reserved for providers whose report
+        // includes it; none exists yet).
         index.insert_class(
             "MessageSendReceipt",
             [
-                ("provider_message_id", string_ty()),
+                ("message_id", string_ty()),
                 ("channel", string_ty()),
-                ("delivered", bool_ty()),
+                ("provider", string_ty()),
+                ("status", string_ty()),
+                ("provider_message_id", string_ty()),
+                ("thread_id", string_ty()),
+                ("destination", string_ty()),
+                ("accepted_at", string_ty()),
             ],
         );
         index
@@ -6484,13 +6504,6 @@ fn string_ty() -> TypeSyntax {
     }
 }
 
-fn bool_ty() -> TypeSyntax {
-    TypeSyntax::Primitive {
-        name: "bool".to_owned(),
-        span: zero_span(),
-    }
-}
-
 fn array_ty(inner: TypeSyntax) -> TypeSyntax {
     TypeSyntax::Array {
         inner: Box::new(inner),
@@ -6583,9 +6596,29 @@ fn lower_channel(channel: ChannelDecl, ir: &mut IrProgram, diagnostics: &mut Vec
         );
         return;
     }
-    // The construct-side accepts any declared provider; runtime provider
-    // availability (and the outbound/inbound feature checks in
-    // spec/messaging.md "Static Checks") is later runtime-stage work.
+    // Conditioned check 5 (spec/std-messaging.md "Static checks"): a channel
+    // `provider` identifier must resolve to a provider capability report —
+    // short name or full binding provider id. Unknown identifiers would lower
+    // to a `messaging.send` no binding can route (or an inbound observation no
+    // provider delivers), so they are rejected at compile time.
+    if channel_provider_report(&channel.provider.name).is_none() {
+        let known = CHANNEL_PROVIDER_REPORTS
+            .iter()
+            .map(|report| report.short_name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: channel.provider.span,
+            message: format!(
+                "channel `{}` names unknown messaging provider `{}`",
+                channel.name.name, channel.provider.name
+            ),
+            suggestion: Some(format!("declare one of the v1 providers: {known}")),
+        });
+        // Fall through: the channel still lowers so `send via`/`when message
+        // from` sites do not cascade an unknown-channel error on top.
+    }
     ir.channels.push(IrChannel {
         name: channel.name.name,
         provider: channel.provider.name,
@@ -6593,6 +6626,85 @@ fn lower_channel(channel: ChannelDecl, ir: &mut IrProgram, diagnostics: &mut Vec
         destination: channel.destination.map(|destination| destination.value),
         span: channel.span,
     });
+}
+
+/// std.messaging v1 provider capability report (spec/std-messaging.md
+/// "Capability reports + conditioned checks"). Reports are DATA, never code
+/// (M8): these compiled constants are mirrored by the embedded std.messaging
+/// manifest's `bindings[].config.report` rows, and the conditioned static
+/// checks below admit syntax only when the selected provider's report
+/// supports it. Report axes are messaging.md "Provider Capability Report"
+/// narrowed for v1: `delivery_receipts` ⊆ {accepted, failed}; `identity` ⊆
+/// {anonymous, claimed_actor} (no verified_actor provider exists, so any
+/// check demanding verified identity fails closed); `content` ⊆
+/// {text, markdown}.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelProviderReport {
+    /// The short channel-declaration identifier (`provider <short_name>`).
+    pub short_name: &'static str,
+    /// The binding-row provider id the short name resolves to.
+    pub provider_id: &'static str,
+    /// `outbound_only` | `inbound_only` | `bidirectional`.
+    pub direction: &'static str,
+    /// `anonymous` | `claimed_actor`.
+    pub identity: &'static str,
+    /// Interaction families the provider can deliver callbacks for.
+    pub interactions: &'static [&'static str],
+    /// Payload content kinds the provider accepts.
+    pub content: &'static [&'static str],
+    /// Receipt statuses the provider can report.
+    pub delivery_receipts: &'static [&'static str],
+}
+
+/// The four v1 std.messaging providers (spec/std-messaging.md "Providers").
+pub const CHANNEL_PROVIDER_REPORTS: &[ChannelProviderReport] = &[
+    ChannelProviderReport {
+        short_name: "fixture",
+        provider_id: "fixture",
+        direction: "bidirectional",
+        identity: "claimed_actor",
+        interactions: &["buttons", "reactions"],
+        content: &["text", "markdown"],
+        delivery_receipts: &["accepted", "failed"],
+    },
+    ChannelProviderReport {
+        short_name: "local",
+        provider_id: "std.messaging.local",
+        direction: "bidirectional",
+        identity: "claimed_actor",
+        interactions: &["buttons", "reactions"],
+        content: &["text", "markdown"],
+        delivery_receipts: &["accepted", "failed"],
+    },
+    ChannelProviderReport {
+        short_name: "desktop",
+        provider_id: "std.messaging.desktop",
+        direction: "outbound_only",
+        identity: "anonymous",
+        interactions: &[],
+        content: &["text"],
+        delivery_receipts: &["accepted", "failed"],
+    },
+    ChannelProviderReport {
+        short_name: "stdio",
+        provider_id: "std.messaging.stdio",
+        direction: "bidirectional",
+        identity: "claimed_actor",
+        interactions: &["buttons"],
+        content: &["text", "markdown"],
+        delivery_receipts: &["accepted", "failed"],
+    },
+];
+
+/// Resolve a channel's declared `provider <p>` identifier against the v1
+/// provider reports: the short name (`local`) or the full binding provider id
+/// (`std.messaging.local`) both resolve. `None` = unknown identifier, a check
+/// error (spec/std-messaging.md open question 2 resolved: short names resolved
+/// against contributed provider kinds, unknown = check error).
+pub fn channel_provider_report(provider: &str) -> Option<&'static ChannelProviderReport> {
+    CHANNEL_PROVIDER_REPORTS
+        .iter()
+        .find(|report| report.short_name == provider || report.provider_id == provider)
 }
 
 /// The built-in resource gauges: deterministic observables already in the
@@ -8249,6 +8361,33 @@ fn validate_message_from_channels(
                         .to_owned(),
                 ),
             });
+            continue;
+        }
+        // Capability-report-conditioned check (spec/std-messaging.md "Static
+        // checks"): inbound observation requires the channel provider's report
+        // `direction` ∈ {inbound_only, bidirectional}. Desktop channels are a
+        // check error here — send/receive-capable are distinguishable (the v1
+        // acceptance test). Unknown providers already errored at the channel
+        // declaration, so they are not re-flagged here.
+        if let Some(report) = semantic
+            .channel_providers
+            .get(channel)
+            .and_then(|provider| channel_provider_report(provider))
+        {
+            if report.direction == "outbound_only" {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: when.span,
+                    message: format!(
+                        "`when message from {channel}` observes a channel whose provider `{}` is outbound-only (its capability report cannot deliver inbound messages)",
+                        report.short_name
+                    ),
+                    suggestion: Some(
+                        "route inbound observation through an inbound-capable provider (`local`, `stdio`, `fixture`)"
+                            .to_owned(),
+                    ),
+                });
+            }
         }
     }
 }
@@ -8289,6 +8428,34 @@ fn validate_send_channels(
                                                 .to_owned(),
                                         ),
                                     });
+                                } else if let Some(report) = semantic
+                                    .channel_providers
+                                    .get(&channel.source)
+                                    .and_then(|provider| channel_provider_report(provider))
+                                {
+                                    // Capability-report-conditioned check
+                                    // (spec/std-messaging.md "Static checks"):
+                                    // outbound `send via` requires the provider
+                                    // report `direction` ∈ {outbound_only,
+                                    // bidirectional}. No v1 provider is
+                                    // inbound-only, so this arm has no
+                                    // reachable negative today; it exists so a
+                                    // future inbound-only provider fails
+                                    // closed at check time, not at dispatch.
+                                    if report.direction == "inbound_only" {
+                                        diagnostics.push(Diagnostic {
+                                            related: Vec::new(),
+                                            span: effect.span,
+                                            message: format!(
+                                                "`send via {}` targets a channel whose provider `{}` is inbound-only (its capability report cannot accept outbound sends)",
+                                                channel.source, report.short_name
+                                            ),
+                                            suggestion: Some(
+                                                "send through an outbound-capable provider (`local`, `desktop`, `stdio`, `fixture`)"
+                                                    .to_owned(),
+                                            ),
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -22410,7 +22577,7 @@ class Trigger { id string }
 
 agent worker { provider fixture  profile "r"  capacity 1 }
 
-channel alerts { provider slack  destination "#ops" }
+channel alerts { provider fixture  destination "#ops" }
 
 table seed as Trigger [ { id "t" } ]
 
@@ -22742,7 +22909,7 @@ workflow B1gMatrix {
   }
 
   channel ops_room {
-    provider slack
+    provider fixture
   }
 
   agent worker {
@@ -31372,7 +31539,7 @@ workflow ChannelDecl
 use std.messaging
 
 channel release_room {
-  provider slack
+  provider fixture
   workspace ops
   destination "#release"
 }
@@ -31395,7 +31562,7 @@ rule j
         assert_eq!(ir.channels.len(), 1);
         let channel = &ir.channels[0];
         assert_eq!(channel.name, "release_room");
-        assert_eq!(channel.provider, "slack");
+        assert_eq!(channel.provider, "fixture");
         assert_eq!(channel.workspace.as_deref(), Some("ops"));
         assert_eq!(channel.destination.as_deref(), Some("#release"));
         // The channel construct auto-registers std.messaging in the contract
@@ -31448,7 +31615,7 @@ rule j
 workflow DupChannel
 
 channel room {
-  provider slack
+  provider fixture
 }
 channel room {
   provider discord
@@ -31484,7 +31651,7 @@ rule j
 workflow Inbound
 
 channel release_room {
-  provider slack
+  provider fixture
 }
 
 output result Decision
@@ -31510,7 +31677,7 @@ rule react
 workflow Inbound
 
 channel release_room {
-  provider slack
+  provider fixture
 }
 
 output result Decision
@@ -31529,6 +31696,179 @@ rule react
                 .contains("`when message from typo_room` names an unknown channel")),
             "expected unknown-channel diagnostic, got {:?}",
             bad.diagnostics
+        );
+    }
+
+    #[test]
+    fn unknown_channel_provider_is_a_check_error() {
+        // spec/std-messaging.md "Static checks": a channel `provider`
+        // identifier must resolve to a v1 provider capability report; a
+        // free-form name (`slack` shipped in old demos) is a check error.
+        let compiled = compile_program(
+            r##"
+@service
+workflow UnknownProvider
+
+channel ops_room {
+  provider slack
+  destination "#ops"
+}
+
+output result R
+class R { v string }
+signal go.now { x string }
+rule j
+  when go.now as g
+=> { complete result { v "ok" } }
+"##,
+        );
+        let unknown = compiled
+            .diagnostics
+            .iter()
+            .find(|d| {
+                d.message
+                    .contains("channel `ops_room` names unknown messaging provider `slack`")
+            })
+            .expect("expected unknown-provider diagnostic");
+        assert!(
+            unknown
+                .suggestion
+                .as_deref()
+                .is_some_and(|s| s.contains("fixture") && s.contains("desktop")),
+            "suggestion lists the v1 providers: {:?}",
+            unknown.suggestion
+        );
+    }
+
+    #[test]
+    fn desktop_channel_is_outbound_only_at_check_time() {
+        // The v1 acceptance test (spec/std-messaging.md "Static checks"):
+        // send/receive-capable providers are DISTINGUISHABLE. `send via` a
+        // desktop channel passes; `when message from` the same channel is a
+        // check error conditioned on the provider's capability report.
+        let send_ok = compile_program(
+            r#"
+@service
+workflow DesktopSend
+
+use std.messaging
+
+channel alerts {
+  provider desktop
+}
+
+output result R
+class R { v string }
+signal go.now { x string }
+
+rule j
+  when go.now as g
+=> {
+  send via alerts {
+    text "ping"
+  } as sent
+
+  after sent succeeds {
+    complete result { v "ok" }
+  }
+}
+"#,
+        );
+        assert!(
+            send_ok.diagnostics.is_empty(),
+            "outbound send over desktop passes: {:?}",
+            send_ok.diagnostics
+        );
+
+        let inbound_bad = compile_program(
+            r#"
+@service
+workflow DesktopInbound
+
+channel alerts {
+  provider desktop
+}
+
+output result R
+class R { v string }
+
+rule react
+  when message from alerts as msg
+=> { complete result { v msg.text } }
+"#,
+        );
+        assert!(
+            inbound_bad.diagnostics.iter().any(|d| d.message.contains(
+                "`when message from alerts` observes a channel whose provider `desktop` is outbound-only"
+            )),
+            "expected outbound-only diagnostic, got {:?}",
+            inbound_bad.diagnostics
+        );
+
+        // A bidirectional provider (`local`) admits both directions.
+        let bidirectional = compile_program(
+            r#"
+@service
+workflow LocalInbound
+
+channel alerts {
+  provider local
+}
+
+output result R
+class R { v string }
+
+rule react
+  when message from alerts as msg
+=> { complete result { v msg.text } }
+"#,
+        );
+        assert!(
+            bidirectional.diagnostics.is_empty(),
+            "bidirectional provider admits inbound observation: {:?}",
+            bidirectional.diagnostics
+        );
+    }
+
+    #[test]
+    fn channel_provider_reports_cover_the_v1_matrix() {
+        // Report data is load-bearing for the conditioned checks: pin the v1
+        // provider set, direction axis, and short-name/provider-id resolution.
+        let shorts: Vec<&str> = CHANNEL_PROVIDER_REPORTS
+            .iter()
+            .map(|r| r.short_name)
+            .collect();
+        assert_eq!(shorts, ["fixture", "local", "desktop", "stdio"]);
+        for report in CHANNEL_PROVIDER_REPORTS {
+            assert!(
+                matches!(
+                    report.direction,
+                    "outbound_only" | "inbound_only" | "bidirectional"
+                ),
+                "direction vocabulary: {}",
+                report.direction
+            );
+            assert!(
+                matches!(report.identity, "anonymous" | "claimed_actor"),
+                "identity ladder is v1-narrowed (no verified_actor): {}",
+                report.identity
+            );
+            assert_eq!(report.delivery_receipts, &["accepted", "failed"]);
+            assert_eq!(
+                channel_provider_report(report.short_name),
+                Some(report),
+                "short name resolves"
+            );
+            assert_eq!(
+                channel_provider_report(report.provider_id),
+                Some(report),
+                "provider id resolves"
+            );
+        }
+        assert_eq!(channel_provider_report("slack"), None);
+        assert_eq!(
+            channel_provider_report("desktop").map(|r| r.direction),
+            Some("outbound_only")
         );
     }
 

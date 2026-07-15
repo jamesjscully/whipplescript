@@ -9831,6 +9831,93 @@ rule run
 }
 
 #[test]
+fn lint_advises_std_coord_import_for_coordination_programs() {
+    // spec/std-coord.md "Manifest": import bite is an ADVISORY missing-import
+    // lint only (the M5 graduated ladder) — coordination verbs without
+    // `use std.coord` warn (exit 0), and the same program with the import is
+    // clean.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("lint-coord-import");
+    let program = |import: &str| {
+        format!(
+            r#"{import}workflow CoordImport
+
+output result Done
+failure error Busy
+
+class Ticket {{
+  id string
+}}
+
+class Done {{
+  note string
+}}
+
+class Busy {{
+  reason string
+}}
+
+lease deploy_slot {{
+  key Ticket
+  slots 1
+  ttl 60s
+}}
+
+rule seed
+  when started
+=> {{
+  record Ticket {{ id "prod" }}
+}}
+
+rule go
+  when Ticket as t
+=> {{
+  acquire deploy_slot for t.id until ttl as slot
+
+  after slot held {{
+    release slot
+    complete result {{ note "ok" }}
+  }}
+
+  after slot contended {{
+    fail error {{ reason "busy" }}
+  }}
+}}
+"#
+        )
+    };
+    let without = dir.join("without-import.whip");
+    let with = dir.join("with-import.whip");
+    fs::write(&without, program("")).expect("write workflow");
+    fs::write(&with, program("use std.coord\n\n")).expect("write workflow");
+    let codes = |path: &Path| -> Vec<String> {
+        let output = Command::new(bin)
+            .args(["--json", "lint", path.to_str().expect("present")])
+            .output()
+            .expect("whip lint runs");
+        assert!(output.status.success(), "advisory lint must exit 0");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint report JSON");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f.get("code").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert!(
+        codes(&without).contains(&"lint.missing_coord_import".to_owned()),
+        "coordination verbs without `use std.coord` fire the advisory"
+    );
+    assert!(
+        !codes(&with).contains(&"lint.missing_coord_import".to_owned()),
+        "the import silences the advisory"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn coercion_status_reports_fixture_rung_and_fingerprint() {
     // `whip coercion status` golden (spec/std-coercion.md slice 4): the
     // fixture path reports provider `fixture`, selecting rung 4, and the

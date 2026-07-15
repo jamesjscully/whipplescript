@@ -554,7 +554,7 @@ agent worker {
 }
 
 channel alerts {
-  provider slack
+  provider fixture
   destination "#ops"
 }
 
@@ -604,6 +604,57 @@ rule notify
             .and_then(Value::as_str),
         Some("alerts")
     );
+
+    // The named `fixture` provider returns the FULL typed MessageSendReceipt
+    // (spec/std-messaging.md "MessageSendReceipt"), not the generic fixture
+    // `{summary, target}` stand-in: the succeeded fact's value carries every
+    // receipt field, deterministically (fixture accepted_at stays empty).
+    let facts = run_json(bin, &["--store", store_str, "--json", "facts", instance]);
+    let receipt = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded"))
+        .and_then(|fact| fact.pointer("/value/value"))
+        .expect("send receipt value")
+        .clone();
+    assert_eq!(
+        receipt.get("channel").and_then(Value::as_str),
+        Some("alerts")
+    );
+    assert_eq!(
+        receipt.get("provider").and_then(Value::as_str),
+        Some("fixture")
+    );
+    assert_eq!(
+        receipt.get("status").and_then(Value::as_str),
+        Some("accepted")
+    );
+    assert_eq!(
+        receipt.get("destination").and_then(Value::as_str),
+        Some("#ops"),
+        "the channel's fixed destination is echoed in the receipt"
+    );
+    let message_id = receipt
+        .get("message_id")
+        .and_then(Value::as_str)
+        .expect("message_id");
+    let provider_message_id = receipt
+        .get("provider_message_id")
+        .and_then(Value::as_str)
+        .expect("provider_message_id");
+    assert!(!message_id.is_empty());
+    assert!(!provider_message_id.is_empty());
+    assert_ne!(
+        message_id, provider_message_id,
+        "the provider correlation handle is minted distinct from the durable id"
+    );
+    assert_eq!(
+        receipt.get("accepted_at").and_then(Value::as_str),
+        Some(""),
+        "the fixture acknowledges nothing; accepted_at stays deterministic-empty"
+    );
+    assert!(receipt.get("thread_id").is_some());
 
     let _ = fs::remove_file(store);
     let _ = fs::remove_file(source);
@@ -657,6 +708,84 @@ fn send_via_local_channel_delivers_to_local_mailbox() {
     assert_eq!(
         record.get("provider").and_then(Value::as_str),
         Some("local")
+    );
+
+    // The local receipt is the full MessageSendReceipt: binding-resolved
+    // provider id, real provider-acknowledged instant, correlation handle
+    // distinct from the durable message id (spec/std-messaging.md).
+    let facts = run_json(bin, &["--store", store_str, "--json", "facts", instance]);
+    let receipt = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded"))
+        .and_then(|fact| fact.pointer("/value/value"))
+        .expect("send receipt value")
+        .clone();
+    assert_eq!(
+        receipt.get("provider").and_then(Value::as_str),
+        Some("std.messaging.local")
+    );
+    assert_eq!(
+        receipt.get("status").and_then(Value::as_str),
+        Some("accepted")
+    );
+    let accepted_at = receipt
+        .get("accepted_at")
+        .and_then(Value::as_str)
+        .expect("accepted_at");
+    assert!(
+        !accepted_at.is_empty(),
+        "the local provider reports a real provider-acknowledged instant"
+    );
+    assert_ne!(
+        receipt.get("message_id").and_then(Value::as_str),
+        receipt.get("provider_message_id").and_then(Value::as_str),
+    );
+    // The mailbox row mirrors the receipt correlation.
+    assert_eq!(
+        record.get("provider_message_id").and_then(Value::as_str),
+        receipt.get("provider_message_id").and_then(Value::as_str),
+    );
+    assert_eq!(
+        record.get("accepted_at").and_then(Value::as_str),
+        Some(accepted_at)
+    );
+
+    // `whip mailbox outbound` lists the delivered row (the operator door,
+    // spec/std-messaging.md open question 1).
+    let listed = run_json(
+        bin,
+        &["--store", store_str, "--json", "mailbox", "outbound"],
+    );
+    let messages = listed
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("mailbox messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].get("message_id").and_then(Value::as_str),
+        record.get("message_id").and_then(Value::as_str),
+    );
+    // Channel filtering: a non-matching filter lists nothing.
+    let filtered = run_json(
+        bin,
+        &[
+            "--store",
+            store_str,
+            "--json",
+            "mailbox",
+            "outbound",
+            "--channel",
+            "nope",
+        ],
+    );
+    assert_eq!(
+        filtered
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
     );
 
     let _ = fs::remove_file(store);
@@ -800,6 +929,29 @@ fn inbound_local_channel_admits_messages_from_inbox_idempotently() {
         "no duplicate Received facts after the idempotent re-poll"
     );
 
+    // `whip mailbox inbound <channel>` lists the received rows with their
+    // admission ordinals (the operator read door over the local inbox).
+    let listed = run_json(
+        bin,
+        &[
+            "--store", store_str, "--json", "mailbox", "inbound", "inbox",
+        ],
+    );
+    let messages = listed
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("inbound messages");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].get("ordinal").and_then(Value::as_u64), Some(0));
+    assert_eq!(
+        messages[0].get("text").and_then(Value::as_str),
+        Some("first message")
+    );
+    assert_eq!(
+        messages[1].get("thread_id").and_then(Value::as_str),
+        Some("t7")
+    );
+
     let _ = fs::remove_file(&store);
     let _ = fs::remove_file(&inbox);
 }
@@ -848,6 +1000,345 @@ fn send_via_stdio_channel_writes_marker_to_stdout() {
     let _ = fs::remove_file(store);
 }
 
+/// A desktop-channel workflow source shared by the desktop provider tests:
+/// outbound-only `send via` with `after … succeeds` and `fails as` branches.
+fn desktop_workflow_source() -> String {
+    r##"
+@service
+workflow DesktopNotify
+
+use std.messaging
+
+output result Done
+failure error NotifyFailed
+
+class Trigger { id string }
+class Done { ok string }
+class NotifyFailed { why string }
+
+channel alerts {
+  provider desktop
+  destination "Ops Alerts"
+}
+
+table seed as Trigger [
+  { id "t" }
+]
+
+rule notify
+  when Trigger as t
+=> {
+  send via alerts {
+    text "disk almost full"
+  } as sent
+
+  after sent succeeds {
+    complete result {
+      ok "notified"
+    }
+  }
+  after sent fails as f {
+    fail error {
+      why f.reason
+    }
+  }
+}
+"##
+    .to_owned()
+}
+
+/// std.messaging.desktop (spec/std-messaging.md slice 4): a `send via` on a
+/// channel declaring `provider desktop` spawns the notifier subprocess
+/// (`WHIPPLESCRIPT_DESKTOP_NOTIFIER` resolves it — here a fake that records
+/// its argv), the workflow completes, and the receipt names the desktop
+/// provider with no correlation handle. Outbound-only is enforced at CHECK
+/// time (`when message from` a desktop channel is a check error — covered by
+/// the parser suite), so this test is pure send.
+#[test]
+fn send_via_desktop_channel_spawns_notifier_and_completes() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("send-desktop", "sqlite");
+    let source = temp_path("send-desktop", "whip");
+    let notifier = temp_path("fake-notifier", "sh");
+    let argv_log = temp_path("fake-notifier-argv", "log");
+    fs::write(&source, desktop_workflow_source()).expect("write source");
+    fs::write(
+        &notifier,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 0\n",
+            argv_log.display()
+        ),
+    )
+    .expect("write notifier");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&notifier, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    let store_str = store.to_str().expect("utf-8");
+    let output = Command::new(bin)
+        .env("WHIPPLESCRIPT_DESKTOP_NOTIFIER", &notifier)
+        .args([
+            "--store",
+            store_str,
+            "--json",
+            "dev",
+            source.to_str().expect("utf-8"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("dev runs");
+    assert!(
+        output.status.success(),
+        "dev failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find(['{']).expect("json")..]).expect("dev json");
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    assert_eq!(instance_status(bin, store_str, instance), "completed");
+
+    // The fake notifier ran with the notify-send argument shape:
+    // `<title> <body>` — title = the channel's fixed destination, body = text.
+    let argv = fs::read_to_string(&argv_log).expect("notifier argv recorded");
+    assert_eq!(argv, "Ops Alerts\ndisk almost full\n");
+
+    // Receipt: desktop provider id, accepted, no correlation handle.
+    let facts = run_json(bin, &["--store", store_str, "--json", "facts", instance]);
+    let receipt = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded"))
+        .and_then(|fact| fact.pointer("/value/value"))
+        .expect("send receipt value")
+        .clone();
+    assert_eq!(
+        receipt.get("provider").and_then(Value::as_str),
+        Some("std.messaging.desktop")
+    );
+    assert_eq!(
+        receipt.get("status").and_then(Value::as_str),
+        Some("accepted")
+    );
+    assert_eq!(
+        receipt.get("provider_message_id").and_then(Value::as_str),
+        Some(""),
+        "desktop has no provider correlation handle"
+    );
+    assert_eq!(
+        receipt.get("destination").and_then(Value::as_str),
+        Some("Ops Alerts")
+    );
+    assert!(receipt
+        .get("accepted_at")
+        .and_then(Value::as_str)
+        .is_some_and(|at| !at.is_empty()));
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(notifier);
+    let _ = fs::remove_file(argv_log);
+}
+
+/// A nonzero notifier exit settles `capability.call.failed` with the DR-0032
+/// EffectError base and routes to `fails as` (spec/std-messaging.md slice 4:
+/// failure is not a receipt).
+#[test]
+fn desktop_notifier_failure_settles_capability_call_failed() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("desktop-fail", "sqlite");
+    let source = temp_path("desktop-fail", "whip");
+    let notifier = temp_path("fake-notifier-fail", "sh");
+    fs::write(&source, desktop_workflow_source()).expect("write source");
+    fs::write(
+        &notifier,
+        "#!/bin/sh\necho 'no notification daemon' >&2\nexit 3\n",
+    )
+    .expect("write notifier");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&notifier, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    let store_str = store.to_str().expect("utf-8");
+    let output = Command::new(bin)
+        .env("WHIPPLESCRIPT_DESKTOP_NOTIFIER", &notifier)
+        .args([
+            "--store",
+            store_str,
+            "--json",
+            "dev",
+            source.to_str().expect("utf-8"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("dev runs");
+    assert!(
+        output.status.success(),
+        "dev failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find(['{']).expect("json")..]).expect("dev json");
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    // The `fails as` branch drove the typed failure terminal.
+    assert_eq!(instance_status(bin, store_str, instance), "failed");
+
+    let facts = run_json(bin, &["--store", store_str, "--json", "facts", instance]);
+    let failed = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("capability.call.failed"))
+        .expect("capability.call.failed fact")
+        .clone();
+    // DR-0032 EffectError base rides `value`; the notifier's stderr and exit
+    // status are in the reason.
+    assert_eq!(
+        failed.pointer("/value/value/kind").and_then(Value::as_str),
+        Some("capability.call")
+    );
+    let reason = failed
+        .pointer("/value/value/reason")
+        .and_then(Value::as_str)
+        .expect("failure reason");
+    assert!(
+        reason.contains("no notification daemon") && reason.contains("3"),
+        "failure carries the notifier stderr + exit status: {reason}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(notifier);
+}
+
+/// `whip message` slice-3 upgrades (spec/std-messaging.md local provider
+/// notes): `--by` records the claimed-actor identity, `received_at` is a real
+/// instant (it was `""`), and the message id is minted per DELIVERY — sending
+/// identical text twice is TWO distinct messages (the old content-keyed id
+/// silently deduped the second).
+#[test]
+fn whip_message_mints_distinct_ids_per_delivery() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("message-mint", "sqlite");
+    let source = temp_path("message-mint", "whip");
+    fs::write(
+        &source,
+        r#"
+@service
+workflow Minted
+
+use std.messaging
+
+channel room {
+  provider fixture
+}
+
+output result Done
+class Done { n string }
+
+rule react
+  when message from room as msg
+=> {
+  record Seen {
+    text msg.text
+  }
+}
+
+class Seen { text string }
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let source_str = source.to_str().expect("utf-8");
+    let dev = dev_until_idle(bin, store_str, source_str, &[]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // The SAME text, twice.
+    for _ in 0..2 {
+        let output = Command::new(bin)
+            .args([
+                "--store",
+                store_str,
+                "message",
+                &instance,
+                "--channel",
+                "room",
+                "--text",
+                "ship it",
+                "--by",
+                "alice",
+                "--program",
+                source_str,
+            ])
+            .output()
+            .expect("message runs");
+        assert!(
+            output.status.success(),
+            "whip message failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let facts = run_json(bin, &["--store", store_str, "--json", "facts", &instance]);
+    let messages: Vec<&Value> = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("message.room"))
+        .collect();
+    assert_eq!(
+        messages.len(),
+        2,
+        "identical text re-sent is a DISTINCT delivery: {facts}"
+    );
+    let ids: Vec<&str> = messages
+        .iter()
+        .filter_map(|fact| fact.pointer("/value/message_id").and_then(Value::as_str))
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1], "delivery-ordinal-minted ids are distinct");
+    for message in &messages {
+        assert_eq!(
+            message.pointer("/value/sender").and_then(Value::as_str),
+            Some("alice"),
+            "--by records the claimed-actor identity"
+        );
+        assert!(
+            message
+                .pointer("/value/received_at")
+                .and_then(Value::as_str)
+                .is_some_and(|at| !at.is_empty()),
+            "received_at is a real instant"
+        );
+    }
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
 /// Inbound messaging (spec/messaging.md): `whip message` injects a `Message` on a
 /// declared channel and a `when message from <channel> as msg` rule fires, binding
 /// the envelope. The fixture-parity counterpart of outbound `send`; live providers
@@ -866,7 +1357,7 @@ workflow Inbound
 use std.messaging
 
 channel release_room {
-  provider slack
+  provider fixture
 }
 
 output result Decision

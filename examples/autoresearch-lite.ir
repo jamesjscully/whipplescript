@@ -3,6 +3,7 @@ workflow_contracts
   output result ref<ResearchResult>
   failure error ref<ResearchStopped>
 uses
+  package std.coord
   package std.script
 schemas
   class ResearchProject
@@ -29,7 +30,7 @@ rules
     writes
       schema:ResearchProject
     record_sources
-      schema:ResearchProject construct=table_row span=677..709
+      schema:ResearchProject construct=table_row span=691..723
     body_hash 5aff8984f3a70a7b
   rule table_hypotheses
     when started
@@ -38,7 +39,7 @@ rules
     writes
       schema:Hypothesis
     record_sources
-      schema:Hypothesis construct=table_row span=748..880
+      schema:Hypothesis construct=table_row span=762..894
     body_hash d72cc951a42a0e91
   rule run_budgeted_experiment
     when Hypothesis as hypothesis where hypothesis.status == "queued"

@@ -57,4 +57,27 @@ search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
   declaresInternalClass(vendorKit, fetch) lockProvides(vendorKit)
   =>* classAuthorized(fetch) RESIDUAL:Cfg .
 
+--- Coverage (door, privilege-tuple leg): a manifest whose (library, keyword)
+--- pair carries a platform-catalog privilege tuple targeting the internal
+--- class may author it WITHOUT being the embedded copy -- the std.coord
+--- resource_effect posture (slice 4).
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  declaresInternalClass(stdMemory, recall) catalogPrivilege(stdMemory, recall)
+  =>* classAuthorized(recall) RESIDUAL:Cfg .
+
+--- Bite (tuple keyword coordinate is exact): a catalog tuple for a DIFFERENT
+--- keyword grants nothing -- a non-privileged construct row stays rejected.
+--- If [door-privileged] matched on the package alone, this would find a
+--- solution.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  declaresInternalClass(vendorKit, fetch) catalogPrivilege(vendorKit, send)
+  =>* classAuthorized(fetch) RESIDUAL:Cfg .
+
+--- Bite (tuple library coordinate is exact): a tuple held by another library
+--- never authorizes a different library's identical construct row. If
+--- [door-privileged] matched on the keyword alone, this would find a solution.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  declaresInternalClass(vendorKit, recall) catalogPrivilege(stdMemory, recall)
+  =>* classAuthorized(recall) RESIDUAL:Cfg .
+
 quit .

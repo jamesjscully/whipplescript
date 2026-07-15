@@ -67,13 +67,27 @@ mod WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION is
 
   --- Authorability door (S6d-5). Some platform lowering classes are NOT
   --- package-authorable (resource_effect, signal_source, clock_source, ...):
-  --- a manifest construct in such a class is admitted only when the manifest
-  --- is EMBEDDED -- compiled into the binary is the privilege key. A lock
-  --- grants supply-chain authority but never class authority.
+  --- a manifest construct in such a class is admitted only through a
+  --- platform-owned privilege key. A lock grants supply-chain authority but
+  --- never class authority. The door has TWO legs:
+  ---
+  ---   embedded leg (S6d-5): the manifest IS the platform copy compiled into
+  ---     the binary (byte-identity) -- unforgeable by third parties.
+  ---   privilege-tuple leg (std.coord slice 4, M5 "Authorability door"): the
+  ---     PLATFORM CATALOG carries a reserved-keyword privilege tuple whose
+  ---     lowering target is the non-authorable class; the tuple authorizes
+  ---     that class for exactly that (library, keyword) pair. The catalog is
+  ---     compiled into the platform, so third parties can never mint a tuple,
+  ---     and a tuple for a different keyword or a different library grants
+  ---     nothing -- rows are exact tuples.
   op embedded : Pkg -> Cfg [ctor] .     --- the manifest ships compiled into the binary
   op declaresInternalClass : Pkg Use -> Cfg [ctor] . --- construct in a non-authorable class
   op classAuthorized : Use -> Cfg [ctor] . --- the internal-class construct is admitted
+  op catalogPrivilege : Pkg Use -> Cfg [ctor] . --- catalog tuple: (library, keyword) may use the class
 
   rl [door-embedded] : declaresInternalClass(P, U) embedded(P)
     => classAuthorized(U) embedded(P) .
+
+  rl [door-privileged] : declaresInternalClass(P, U) catalogPrivilege(P, U)
+    => classAuthorized(U) catalogPrivilege(P, U) .
 endm

@@ -58,6 +58,7 @@ lowering-class-lifecycle.maude	SSSSSSSSSSSNNNNNNNNNNNNNNN
 lowering-runtime-handoff.maude	SSSSSNNNNNNNNNNNNN
 merge-confluence.maude	SNSNNN
 merge-slice.maude	SSNSNSNSNS
+messaging-capability-report.maude	SSSSNNNN
 milestone-signal.maude	SSNNN
 native-provider-lifecycle.maude	SSSNN
 op-undo.maude	SNSSSN
@@ -83,7 +84,7 @@ selective-undo.maude	SNSSN
 settle-stopping.maude	NSSSN
 skills-never-grant.maude	SSNN
 stat-cache.maude	SNSNSSNS
-std-construct-authorization.maude	SSSNNNNSN
+std-construct-authorization.maude	SSSNNNNSNSNN
 subworkflow-attestation.maude	SSNSN
 subworkflow-convergence.maude	SSSSNNN
 subworkflow-lease.maude	SSSN

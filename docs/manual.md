@@ -241,6 +241,75 @@ Operate the backlog from the CLI with `whip issue new`, `whip issue list`,
 `WS-1`; items an agent files mid-turn carry run-identity provenance. Full
 syntax is in the [language reference](language-reference.md#work-queues).
 
+## Coordinate shared resources
+
+When concurrent workflows contend for something scarce — a deploy slot, a
+request budget, an audit trail — declare one of the three coordination
+resources (`use std.coord`) and branch on the atomic verbs instead of building
+locks out of facts:
+
+| Resource | Declaration | Verb | Outcomes |
+|---|---|---|---|
+| Lease (bounded mutex/semaphore) | `lease name { key Type slots N ttl 10m }` | `acquire <lease> for <key> [until ttl] as x` / `release x` / `renew x [until <dur>] as r` | `held` / `contended` |
+| Ledger (append-only log) | `ledger name { entry Schema partition by <field> retain 30d }` | `append <Schema> { ... } to <ledger> as x` | `appended` |
+| Counter (capped budget) | `counter name { key Type cap N reset hourly\|daily\|weekly\|monthly [timezone "<IANA zone>"] }` | `consume <counter> for <key> amount <n> as x` | `ok` / `over` |
+
+Every attempt is atomic and every outcome is a branch, never an error — handle
+both sides or the checker flags the rule:
+
+```whip
+use std.coord
+
+lease deploy_slot {
+  key Ticket
+  slots 1
+  ttl 10m
+}
+
+rule ship
+  when Ticket as t
+=> {
+  acquire deploy_slot for t.id until ttl as slot
+
+  after slot held {
+    release slot
+    complete result { note "shipped" }
+  }
+
+  after slot contended {
+    fail error { reason "another deploy holds the slot" }
+  }
+}
+```
+
+The safety rails are structural: every lease is TTL-bounded, every ledger is
+retention-pruned, every counter is capped with a periodic reset (declare
+`timezone` or the boundary anchors to UTC and the checker warns). A held lease
+must be released on the `held` branch or reach a terminal — if the progression
+ends any other way (cancel included), the runtime auto-releases it, so a
+crashed holder can never wedge the slot; `until ttl` holds expire on their own.
+`release` is one verb over two resources: releasing an `acquire` binding frees
+the lease, releasing a claimed work item returns it to the tracker.
+
+Resources are private to the declaring program by default; add `shared` to the
+declaration block to coordinate across workflows in the same workspace.
+Coordination state is workspace-scoped and outlives disposable run stores
+(`.whipplescript/coordination.sqlite`, or `WHIPPLESCRIPT_COORDINATION_STORE`).
+Inspect it from the CLI:
+
+```bash
+whip [--json] leases [<resource>]
+whip [--json] ledger [<ledger>] [--partition <value>]
+whip [--json] counters [<counter>]
+```
+
+Admission is real: the effects run under the `lease.acquire` /
+`lease.release` / `ledger.append` / `counter.consume` capabilities that the
+embedded `std.coord` package registers at store init — zero operator setup,
+but an operator profile can narrow them like any other capability. Full
+syntax is in the [language reference](language-reference.md) and the CLI
+detail in the [API reference](api-reference.md).
+
 ## Time and deadlines
 
 Keep time out of guards — guards must stay pure. Express deadlines as effects:

@@ -175,7 +175,7 @@ script run_tests {
 }
 
 channel ops {
-  provider slack
+  provider fixture
   destination "#builds"
 }
 

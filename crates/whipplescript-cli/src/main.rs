@@ -203,6 +203,7 @@ fn main() -> ExitCode {
         Some("inbox") => inbox(&options),
         Some("signal") => signal(&options),
         Some("message") => message_command(&options),
+        Some("mailbox") => mailbox_command(&options),
         Some("otel-export") => otel_export(&options),
         Some("telemetry") => telemetry(&options),
         Some("coercion") => coercion(&options),
@@ -701,7 +702,8 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "auth" => "usage: whip auth <status | set <openai|anthropic> <key>>",
         "deploy" => "usage: whip deploy [--worker-dir <path>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]",
         "executor" => "usage: whip executor [--bind <addr:port>]   (Class-A exec sidecar; default 127.0.0.1:8080)",
-        "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--from <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
+        "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--by <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
+        "mailbox" => "usage: whip mailbox <outbound [--channel <name>] [--limit <n>] | inbound <channel> [--limit <n>]> (the local messaging provider's delivered/received JSONL files)",
         _ => return None,
     })
 }
@@ -1498,6 +1500,50 @@ fn lint_missing_coercion_import(ir: &IrProgram) -> Vec<LintFinding> {
     }]
 }
 
+/// ADVISORY import lint (spec/std-coord.md "Manifest": import bite is a
+/// missing-import advisory only — the M5 graduated ladder, never an error):
+/// the coordination declarations and verbs lower to `lease.*` / `ledger.*` /
+/// `counter.*` effects owned by std.coord; a program using them without
+/// `use std.coord` still runs, but the import is what names the package whose
+/// embedded manifest seeds the admission rows behind the effects. Detection
+/// reads the compiled IR (declared resources + lowered effect kinds), so it
+/// cannot wrongly flag prose that merely mentions a verb.
+fn lint_missing_coord_import(ir: &IrProgram) -> Vec<LintFinding> {
+    if ir.uses.iter().any(|use_decl| use_decl.name == "std.coord") {
+        return Vec::new();
+    }
+    let first_resource = ir
+        .leases
+        .first()
+        .map(|lease| lease.name.clone())
+        .or_else(|| ir.ledgers.first().map(|ledger| ledger.name.clone()))
+        .or_else(|| ir.counters.first().map(|counter| counter.name.clone()));
+    let uses_coordination_effect = ir.rules.iter().any(|rule| {
+        rule.metadata.effects.iter().any(|effect| {
+            matches!(
+                effect.kind,
+                whipplescript_parser::IrEffectKind::LeaseAcquire
+                    | whipplescript_parser::IrEffectKind::LeaseRenew
+                    | whipplescript_parser::IrEffectKind::LedgerAppend
+                    | whipplescript_parser::IrEffectKind::CounterConsume
+            )
+        })
+    });
+    if first_resource.is_none() && !uses_coordination_effect {
+        return Vec::new();
+    }
+    vec![LintFinding {
+        code: "lint.missing_coord_import",
+        severity: Severity::Warning,
+        message: "program uses coordination resources (`lease`/`ledger`/`counter`, \
+                  `acquire`/`append`/`consume`/`release`) without `use std.coord`; add the \
+                  import to name the package that owns the coordination effects (advisory)"
+            .to_owned(),
+        name: first_resource,
+        span: None,
+    }]
+}
+
 /// Whole-token occurrence count of `name` in `text` (an identifier run is a maximal
 /// `[A-Za-z0-9_]+`), so `r` does not match inside `recall` or `r.field`'s neighbours.
 fn whole_token_count(text: &str, name: &str) -> usize {
@@ -1912,6 +1958,7 @@ fn lint_mark_consumption_boundaries(ir: &IrProgram) -> Vec<LintFinding> {
 fn lint_program(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
     let mut findings = lint_unused_coerces(ir);
     findings.extend(lint_missing_coercion_import(ir));
+    findings.extend(lint_missing_coord_import(ir));
     findings.extend(lint_unused_coerce_results(ir));
     findings.extend(lint_unused_resources(ir));
     findings.extend(lint_noop_rules(ir));
@@ -16453,6 +16500,25 @@ const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
         "std.coercion",
         include_str!("../../../std/manifests/coercion.json"),
     ),
+    // Runtime identity for the coordination package (spec/std-coord.md
+    // "Manifest", slice 4): four coordination effect contracts (mirroring the
+    // parser-compiled ones — merge-folds, drift surfaces as
+    // `effect_contract_duplicate`), seven construct rows (three
+    // `declaration_block`/`metadata_only` decls + four
+    // `effect_operation`/`resource_effect` verbs — the catalog's first
+    // `resource_effect` producer, admitted through the authorability door's
+    // privilege-tuple leg), and the capability/provider/profile/binding rows
+    // that make the NATIVE admission gate real for coordination kinds (the
+    // builtin exemption is deleted, store/lib.rs `policy_block_on`).
+    // `lease.renew` ships admission rows (capability/provider/binding) but no
+    // contract: the verb is live in lowering + handler while its contract
+    // surface rides the std.tracker renew design (spec/std-coord.md "Deferred
+    // with cause"). The DECL GRAMMAR stays in std/grammars/coord.json
+    // (build.rs-only): the manifest authorizes, it does not parse (M1).
+    (
+        "std.coord",
+        include_str!("../../../std/manifests/coord.json"),
+    ),
     (
         "std.memory",
         include_str!("../../../std/manifests/memory.json"),
@@ -20369,7 +20435,9 @@ fn resolve_due_inbound_messages(
                 "message_id": message_id,
                 "channel": channel.name,
                 "provider": "local",
-                "received_at": "",
+                // Worker-boundary admission instant (wall reads live on worker
+                // passes): the envelope records WHEN the line was admitted.
+                "received_at": wall_clock_instant(),
                 "sender": field("sender"),
                 "sender_claims": "{}",
                 "thread_id": field("thread_id"),
@@ -22359,41 +22427,86 @@ fn run_capability_effect(
         .map(|target| store.capability_bound_provider(instance_id, target))
         .transpose()?
         .flatten();
+    // Binding-driven messaging dispatch (spec/std-messaging.md
+    // "Channel→binding provider selection"): the channel's declared provider
+    // identifier resolves against the `capability_bindings` rows bound for
+    // `messaging.send` (seeded by the embedded std.messaging manifest), and
+    // the matching row's provider id names the implementation. The
+    // program×capability `capability_bound` gate stayed the policy check
+    // upstream; this is the explicit channel-scoped selection step on top.
+    let messaging_selection = if effect.target.as_deref() == Some("messaging.send") {
+        let bindings = store.capability_bindings_for(instance_id, "messaging.send")?;
+        Some(resolve_messaging_binding(
+            &bindings,
+            capability_input_provider(effect).as_deref(),
+        ))
+    } else {
+        None
+    };
     let mut kernel = RuntimeKernel::new(store);
     let contract = PackageLockCapabilityContract(package_lock);
-    // A `messaging.send` whose channel declares `provider local` is delivered by the
-    // native file-backed local mailbox (selected from the effect's threaded channel
-    // provider, not a binding row). Then the binding-owned name→impl map: a
-    // `memory-provider` binding (memory.query/memory.write) routes to the file-backed
-    // MemoryCapabilityProvider. Every unmapped provider name — and every unbound
-    // capability — falls back to the fixture, which keeps all existing capability
-    // tests byte-identical.
-    if effect.target.as_deref() == Some("messaging.send")
-        && capability_input_provider(effect).as_deref() == Some("local")
-    {
-        let mailbox = LocalMailboxCapabilityProvider {
-            mailbox_path: store_path.with_extension("mailbox.jsonl"),
+    // Provider map: messaging.send routes by resolved binding provider id;
+    // a `memory-provider` binding (memory.query/memory.write) routes to the
+    // file-backed MemoryCapabilityProvider. Every unbound capability falls
+    // back to the fixture, which keeps all existing capability tests
+    // byte-identical.
+    if let Some(selection) = messaging_selection {
+        return match selection {
+            Ok(provider_id) => match provider_id.as_str() {
+                "std.messaging.local" => {
+                    let mailbox = LocalMailboxCapabilityProvider {
+                        mailbox_path: store_path.with_extension("mailbox.jsonl"),
+                    };
+                    run_capability_effect_generic(
+                        &mut kernel,
+                        instance_id,
+                        effect,
+                        &options.effect_config(),
+                        &contract,
+                        &mailbox,
+                    )
+                }
+                "std.messaging.desktop" => run_capability_effect_generic(
+                    &mut kernel,
+                    instance_id,
+                    effect,
+                    &options.effect_config(),
+                    &contract,
+                    &DesktopCapabilityProvider,
+                ),
+                "std.messaging.stdio" => run_capability_effect_generic(
+                    &mut kernel,
+                    instance_id,
+                    effect,
+                    &options.effect_config(),
+                    &contract,
+                    &StdioCapabilityProvider,
+                ),
+                // The named `fixture` messaging provider (spec/std-messaging.md
+                // slice 1): registry-honest selection, full typed receipt.
+                _ => run_capability_effect_generic(
+                    &mut kernel,
+                    instance_id,
+                    effect,
+                    &options.effect_config(),
+                    &contract,
+                    &MessagingFixtureCapabilityProvider,
+                ),
+            },
+            // No/ambiguous binding for the channel's provider: settle
+            // `capability.call.failed` (routes to `fails as`), not a worker
+            // error — the effect outcome is the honest surface.
+            Err(reason) => run_capability_effect_generic(
+                &mut kernel,
+                instance_id,
+                effect,
+                &options.effect_config(),
+                &contract,
+                &UnroutableCapabilityProvider { reason },
+            ),
         };
-        run_capability_effect_generic(
-            &mut kernel,
-            instance_id,
-            effect,
-            &options.effect_config(),
-            &contract,
-            &mailbox,
-        )
-    } else if effect.target.as_deref() == Some("messaging.send")
-        && capability_input_provider(effect).as_deref() == Some("stdio")
-    {
-        run_capability_effect_generic(
-            &mut kernel,
-            instance_id,
-            effect,
-            &options.effect_config(),
-            &contract,
-            &StdioCapabilityProvider,
-        )
-    } else if bound_provider.as_deref() == Some("memory-provider") {
+    }
+    if bound_provider.as_deref() == Some("memory-provider") {
         let memory = MemoryCapabilityProvider {
             store_path: store_path.with_extension("memory.sqlite"),
         };
@@ -22427,11 +22540,86 @@ fn capability_input_provider(effect: &ClaimableEffect) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Native, file-backed local mailbox provider (S5 first real `CapabilityProvider`).
-/// Selected only for `messaging.send` on channels declaring `provider local`.
-/// Appends one JSON line per delivered message to a mailbox file derived from
-/// the store path. Deterministic: the message id is derived from the effect id
-/// (no wall-clock, no randomness), so replay yields identical mailbox contents.
+/// Resolve a channel's declared `provider <p>` identifier against the
+/// `capability_bindings` rows bound for `messaging.send` (spec/std-messaging.md
+/// "Channel→binding provider selection"): `p` matches a binding whose provider
+/// id is exactly `p` or `std.messaging.<p>` (the short-name resolution the
+/// static checker mirrors). Exactly one distinct provider id must match —
+/// unknown or ambiguous identifiers are a dispatch failure (the static check
+/// already rejects unknown identifiers at compile time; this is the runtime
+/// backstop for programs compiled before the check existed). A missing
+/// provider field (pre-selection programs) resolves as `fixture`.
+fn resolve_messaging_binding(
+    bindings: &[whipplescript_store::CapabilityBindingView],
+    channel_provider: Option<&str>,
+) -> Result<String, String> {
+    let requested = channel_provider.unwrap_or("fixture");
+    let qualified = format!("std.messaging.{requested}");
+    let matches: BTreeSet<&str> = bindings
+        .iter()
+        .filter_map(|binding| binding.provider.as_deref())
+        .filter(|provider| *provider == requested || *provider == qualified)
+        .collect();
+    match matches.len() {
+        1 => Ok(matches.into_iter().next().expect("one match").to_owned()),
+        0 => {
+            let bound = bindings
+                .iter()
+                .filter_map(|binding| binding.provider.as_deref())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "channel provider `{requested}` resolves to no `messaging.send` binding (bound providers: {bound})"
+            ))
+        }
+        _ => Err(format!(
+            "channel provider `{requested}` is ambiguous across `messaging.send` bindings: {}",
+            matches.into_iter().collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+/// The full `MessageSendReceipt` value (spec/std-messaging.md
+/// "MessageSendReceipt"): every provider returns this shape. `message_id` is
+/// effect-key derived (stable across replay); correlation fields the provider
+/// cannot report (`provider_message_id`, `thread_id`, `destination`) are empty
+/// strings — the package output-schema validator carries no optional marker —
+/// and `status` is `accepted` (no v1 provider reports `delivered`). Failure is
+/// NOT a receipt: providers settle `capability.call.failed` instead.
+fn message_send_receipt(
+    effect: &ClaimableEffect,
+    provider_id: &str,
+    provider_message_id: &str,
+    accepted_at: &str,
+) -> Value {
+    let input: Value = serde_json::from_str(&effect.input_json).unwrap_or_default();
+    let message = input.pointer("/message");
+    let field = |name: &str| {
+        message
+            .and_then(|m| m.get(name))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    json!({
+        "message_id": idempotency_key(&[&effect.effect_id, "messaging-message"]),
+        "channel": field("channel"),
+        "provider": provider_id,
+        "status": "accepted",
+        "provider_message_id": provider_message_id,
+        "thread_id": field("thread_id"),
+        "destination": field("destination"),
+        "accepted_at": accepted_at,
+    })
+}
+
+/// Native, file-backed local mailbox provider (`std.messaging.local`, the
+/// reference provider). Selected by the `binding-messaging-send-local` binding
+/// when a channel declares `provider local`. Appends one JSON line per
+/// delivered message to a mailbox file derived from the store path. The
+/// message id is derived from the effect id (stable across replay — replay
+/// re-reads the recorded receipt, it never re-runs the provider);
+/// `accepted_at` is a worker-boundary wall-clock read, where wall reads live.
 struct LocalMailboxCapabilityProvider {
     mailbox_path: PathBuf,
 }
@@ -22467,6 +22655,11 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for LocalMailboxC
             .unwrap_or("local");
         // Deterministic message id: derived from the effect id, never wall-clock.
         let message_id = idempotency_key(&[&effect.effect_id, "messaging-message"]);
+        // The provider correlation handle is minted DISTINCT from the durable
+        // message id (spec/std-messaging.md provider table: correlation =
+        // provider_message_id, thread_id).
+        let provider_message_id = idempotency_key(&[&effect.effect_id, "provider-message"]);
+        let accepted_at = wall_clock_instant();
 
         let mut record = serde_json::Map::new();
         record.insert("message_id".to_owned(), Value::String(message_id.clone()));
@@ -22478,7 +22671,15 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for LocalMailboxC
         if let Some(thread_id) = message.and_then(|m| m.pointer("/thread_id")) {
             record.insert("thread_id".to_owned(), thread_id.clone());
         }
+        if let Some(destination) = message.and_then(|m| m.pointer("/destination")) {
+            record.insert("destination".to_owned(), destination.clone());
+        }
         record.insert("provider".to_owned(), Value::String(provider.to_owned()));
+        record.insert(
+            "provider_message_id".to_owned(),
+            Value::String(provider_message_id.clone()),
+        );
+        record.insert("accepted_at".to_owned(), Value::String(accepted_at.clone()));
 
         let mut line =
             serde_json::to_string(&Value::Object(record)).unwrap_or_else(|_| "{}".to_owned());
@@ -22498,19 +22699,21 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for LocalMailboxC
             };
         }
 
-        CapabilityOutcome::Produced(json!({
-            "provider_message_id": message_id,
-            "channel": channel,
-            "delivered": true,
-        }))
+        CapabilityOutcome::Produced(message_send_receipt(
+            effect,
+            "std.messaging.local",
+            &provider_message_id,
+            &accepted_at,
+        ))
     }
 }
 
-/// Native stdio messaging provider: `send via <channel>` where the channel
-/// declares `provider stdio` writes one marker line per message to the process
-/// stdout (`[messaging.stdio] channel=… text=…`). Deterministic message id from
-/// the effect id (no wall-clock). Non-breaking: only channels declaring
-/// `provider stdio` route here; every other channel keeps its existing provider.
+/// Native stdio messaging provider (`std.messaging.stdio`, outbound half):
+/// writes one marker line per message to the process stdout
+/// (`[messaging.stdio] channel=… text=…`). The bidirectional JSONL
+/// child-process adapter (spec/std-messaging.md slice 5) is deferred — the
+/// child command/lifecycle configuration surface is not yet specified — so
+/// this outbound seam is what ships.
 struct StdioCapabilityProvider;
 
 impl whipplescript_kernel::effect_handlers::CapabilityProvider for StdioCapabilityProvider {
@@ -22538,13 +22741,231 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for StdioCapabili
             .and_then(|m| m.pointer("/text"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let message_id = idempotency_key(&[&effect.effect_id, "messaging-message"]);
+        let provider_message_id = idempotency_key(&[&effect.effect_id, "provider-message"]);
         println!("[messaging.stdio] channel={channel} text={text}");
-        CapabilityOutcome::Produced(json!({
-            "provider_message_id": message_id,
-            "channel": channel,
-            "delivered": true,
-        }))
+        CapabilityOutcome::Produced(message_send_receipt(
+            effect,
+            "std.messaging.stdio",
+            &provider_message_id,
+            &wall_clock_instant(),
+        ))
+    }
+}
+
+/// The named `fixture` messaging provider (spec/std-messaging.md slice 1):
+/// selected registry-honestly via the `binding-messaging-send-fixture`
+/// binding, returning the full typed `MessageSendReceipt` (the anonymous
+/// generic-fixture `{summary, target}` stand-in is gone for messaging).
+/// Deterministic: ids derive from the effect id and `accepted_at` stays empty
+/// — the fixture acknowledges nothing — so fixture runs replay byte-stable.
+/// Honors `--fail` (`config.outcome_failed`) like the generic fixture.
+struct MessagingFixtureCapabilityProvider;
+
+impl whipplescript_kernel::effect_handlers::CapabilityProvider
+    for MessagingFixtureCapabilityProvider
+{
+    fn produce(
+        &self,
+        effect: &ClaimableEffect,
+        config: &EffectConfig,
+    ) -> whipplescript_kernel::effect_handlers::CapabilityOutcome {
+        use whipplescript_kernel::effect_handlers::CapabilityOutcome;
+        if config.outcome_failed {
+            return CapabilityOutcome::Failed {
+                error_kind: "fixture_failure".to_owned(),
+                message: "fixture messaging failure".to_owned(),
+            };
+        }
+        let provider_message_id = idempotency_key(&[&effect.effect_id, "provider-message"]);
+        CapabilityOutcome::Produced(message_send_receipt(
+            effect,
+            "fixture",
+            &provider_message_id,
+            "",
+        ))
+    }
+}
+
+/// A capability provider for a `messaging.send` whose channel provider
+/// resolved to no (or several) bindings: settles `capability.call.failed`
+/// with the resolution reason so the failure routes to `fails as` instead of
+/// erroring the worker pass.
+struct UnroutableCapabilityProvider {
+    reason: String,
+}
+
+impl whipplescript_kernel::effect_handlers::CapabilityProvider for UnroutableCapabilityProvider {
+    fn produce(
+        &self,
+        _effect: &ClaimableEffect,
+        _config: &EffectConfig,
+    ) -> whipplescript_kernel::effect_handlers::CapabilityOutcome {
+        whipplescript_kernel::effect_handlers::CapabilityOutcome::Failed {
+            error_kind: "messaging_unroutable".to_owned(),
+            message: self.reason.clone(),
+        }
+    }
+}
+
+/// The desktop notifier command for one outbound message — PURE construction
+/// (spec/std-messaging.md slice 4: command construction testable without
+/// spawning). `notifier` is the resolved notifier program: anything ending in
+/// `osascript` builds a `display notification` AppleScript invocation
+/// (arguments embedded as JSON-escaped AppleScript string literals);
+/// everything else gets the `notify-send <summary> <body>` argument shape.
+fn desktop_notify_command(notifier: &str, title: &str, body: &str) -> (String, Vec<String>) {
+    let is_osascript = Path::new(notifier)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "osascript");
+    if is_osascript {
+        // JSON string encoding is a valid AppleScript string literal
+        // (double-quoted, backslash escapes), so titles/bodies cannot break
+        // out of the expression.
+        let script = format!(
+            "display notification {} with title {}",
+            Value::String(body.to_owned()),
+            Value::String(title.to_owned()),
+        );
+        (notifier.to_owned(), vec!["-e".to_owned(), script])
+    } else {
+        (notifier.to_owned(), vec![title.to_owned(), body.to_owned()])
+    }
+}
+
+/// Strip markdown decoration to plain notification text (desktop report:
+/// `content ⊆ {text}`, markdown stripped — spec/std-messaging.md provider
+/// notes). Minimal and lossless on words: emphasis/code markers dropped,
+/// `[text](url)` keeps the text, leading heading/quote markers dropped.
+fn markdown_to_text(markdown: &str) -> String {
+    let mut lines = Vec::new();
+    for line in markdown.lines() {
+        let trimmed = line
+            .trim_start()
+            .trim_start_matches(['#', '>'])
+            .trim_start();
+        let mut out = String::new();
+        let mut chars = trimmed.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '*' | '`' | '_' | '~' => {}
+                '[' => {
+                    // [text](url) -> text; a bare `[` stays.
+                    let rest: String = chars.clone().collect();
+                    if let Some(close) = rest.find(']') {
+                        if rest[close..].starts_with("](") {
+                            if let Some(end) = rest[close..].find(')') {
+                                out.push_str(&rest[..close]);
+                                // Advance by CHAR count of the consumed byte
+                                // range (link text may be non-ASCII).
+                                let consumed = rest[..close + end + 1].chars().count();
+                                for _ in 0..consumed {
+                                    chars.next();
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    out.push('[');
+                }
+                other => out.push(other),
+            }
+        }
+        lines.push(out);
+    }
+    lines.join("\n").trim().to_owned()
+}
+
+/// Native desktop notification provider (`std.messaging.desktop`,
+/// spec/std-messaging.md slice 4): OUTBOUND-ONLY — the static checker rejects
+/// `when message from` on desktop channels — with no correlation and no
+/// interactions (its capability report). Markdown is stripped to text. The
+/// notifier binary resolves `WHIPPLESCRIPT_DESKTOP_NOTIFIER` (tests point it
+/// at a fake), then the platform default: `osascript` on macOS, `notify-send`
+/// elsewhere. Command construction is pure (`desktop_notify_command`); the
+/// spawn is the same std::process subprocess seam exec providers use. A
+/// nonzero exit or spawn failure settles `capability.call.failed` with the
+/// DR-0032 EffectError base.
+struct DesktopCapabilityProvider;
+
+impl DesktopCapabilityProvider {
+    fn notifier() -> String {
+        if let Ok(notifier) = env::var("WHIPPLESCRIPT_DESKTOP_NOTIFIER") {
+            if !notifier.trim().is_empty() {
+                return notifier;
+            }
+        }
+        if cfg!(target_os = "macos") {
+            "osascript".to_owned()
+        } else {
+            "notify-send".to_owned()
+        }
+    }
+}
+
+impl whipplescript_kernel::effect_handlers::CapabilityProvider for DesktopCapabilityProvider {
+    fn produce(
+        &self,
+        effect: &ClaimableEffect,
+        _config: &EffectConfig,
+    ) -> whipplescript_kernel::effect_handlers::CapabilityOutcome {
+        use whipplescript_kernel::effect_handlers::CapabilityOutcome;
+        let input: Value = match serde_json::from_str(&effect.input_json) {
+            Ok(value) => value,
+            Err(err) => {
+                return CapabilityOutcome::Failed {
+                    error_kind: "messaging_delivery".to_owned(),
+                    message: format!("invalid messaging.send input: {err}"),
+                };
+            }
+        };
+        let message = input.pointer("/message");
+        let field = |name: &str| {
+            message
+                .and_then(|m| m.get(name))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let channel = field("channel");
+        let destination = field("destination");
+        let text = field("text");
+        // Desktop content is text-only: an empty `text` falls back to the
+        // stripped markdown body.
+        let body = if text.is_empty() {
+            markdown_to_text(&field("markdown"))
+        } else {
+            text
+        };
+        let title = if destination.is_empty() {
+            channel.clone()
+        } else {
+            destination.clone()
+        };
+        let (program, args) = desktop_notify_command(&Self::notifier(), &title, &body);
+        match std::process::Command::new(&program)
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(output) if output.status.success() => CapabilityOutcome::Produced(
+                // Desktop has no correlation handle (report: correlation =
+                // none); the receipt carries an empty provider_message_id.
+                message_send_receipt(effect, "std.messaging.desktop", "", &wall_clock_instant()),
+            ),
+            Ok(output) => CapabilityOutcome::Failed {
+                error_kind: "messaging_delivery".to_owned(),
+                message: format!(
+                    "desktop notifier `{program}` exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            },
+            Err(err) => CapabilityOutcome::Failed {
+                error_kind: "messaging_delivery".to_owned(),
+                message: format!("desktop notifier `{program}` failed to spawn: {err}"),
+            },
+        }
     }
 }
 
@@ -30079,7 +30500,7 @@ fn signal(options: &CliOptions) -> ExitCode {
 /// fixture-parity ingestion path that mirrors how outbound `send` runs under the
 /// fixture provider; live messaging providers (Slack/email) stay credential-gated.
 fn message_command(options: &CliOptions) -> ExitCode {
-    let usage = "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--from <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]";
+    let usage = "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--by <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]";
     let mut instance_id = None;
     let mut channel = None;
     let mut text = None;
@@ -30103,7 +30524,11 @@ fn message_command(options: &CliOptions) -> ExitCode {
                 index += 1;
                 markdown = options.args.get(index).cloned();
             }
-            "--from" => {
+            // `--by` is the claimed-actor identity flag (spec/std-messaging.md
+            // provider table: local identity = claimed, CLI `--by`), matching
+            // `whip inbox answer --by`. `--from` stays accepted as an alias so
+            // existing operator invocations keep working.
+            "--by" | "--from" => {
                 index += 1;
                 sender = options.args.get(index).cloned();
             }
@@ -30165,24 +30590,6 @@ fn message_command(options: &CliOptions) -> ExitCode {
     }
     let text = text.unwrap_or_default();
     let markdown = markdown.unwrap_or_default();
-    let message_id = idempotency_key(&[&instance_id, &channel, &text, &markdown]);
-    // The generic `Message` envelope (spec/messaging.md); structured sub-payloads
-    // are JSON strings, provider context lives in `raw_ref`.
-    let payload = json!({
-        "message_id": message_id,
-        "channel": channel,
-        "provider": "fixture",
-        "received_at": "",
-        "sender": sender.clone().unwrap_or_default(),
-        "sender_claims": "{}",
-        "thread_id": thread_id.clone().unwrap_or_default(),
-        "text": text,
-        "markdown": markdown,
-        "attachments": [],
-        "interaction": "{}",
-        "raw_ref": "",
-        "correlation": "{}",
-    });
     let fact_name = format!("message.{channel}");
     let store = match open_store_or_exit(options) {
         Ok(store) => store,
@@ -30196,6 +30603,44 @@ fn message_command(options: &CliOptions) -> ExitCode {
         }
         Err(error) => return report_store_error("failed to load instance", error),
     }
+    // Mint a UNIQUE message id per DELIVERY (spec/std-messaging.md local
+    // provider notes): the id is keyed by the channel's delivery ordinal —
+    // the count of messages already admitted on this channel — never by
+    // content, so re-sending identical text is a DISTINCT message while
+    // admission idempotency (the ordinal-keyed keys below) still dedups
+    // replays of the SAME delivery.
+    let delivery_ordinal = match store.list_events(&instance_id) {
+        Ok(events) => events
+            .into_iter()
+            .filter(|event| event.source == "external" && event.event_type == fact_name)
+            .count(),
+        Err(error) => return report_store_error("failed to read message ordinal", error),
+    };
+    let message_id = idempotency_key(&[
+        &instance_id,
+        &channel,
+        "delivery",
+        &delivery_ordinal.to_string(),
+    ]);
+    // The generic `Message` envelope (spec/messaging.md); structured sub-payloads
+    // are JSON strings, provider context lives in `raw_ref`. `received_at` is a
+    // real operator-boundary instant (it was `""` before slice 3), and `sender`
+    // carries the `--by` claimed-actor identity.
+    let payload = json!({
+        "message_id": message_id,
+        "channel": channel,
+        "provider": "fixture",
+        "received_at": wall_clock_instant(),
+        "sender": sender.clone().unwrap_or_default(),
+        "sender_claims": "{}",
+        "thread_id": thread_id.clone().unwrap_or_default(),
+        "text": text,
+        "markdown": markdown,
+        "attachments": [],
+        "interaction": "{}",
+        "raw_ref": "",
+        "correlation": "{}",
+    });
     let payload_json = payload.to_string();
     let mut kernel = RuntimeKernel::new(store);
     let received = match kernel.ingest_external_event(
@@ -30321,6 +30766,153 @@ fn memory_command(options: &CliOptions) -> ExitCode {
             }
             for row in rows {
                 println!("{}\t{}", row.memory_id, row.text.replace('\n', " "));
+            }
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("{usage}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `whip mailbox` (spec/std-messaging.md open question 1 resolved): the
+/// operator's read surface over the LOCAL messaging provider's files —
+/// `outbound` lists the delivered rows in `<store>.mailbox.jsonl` (what
+/// `send via` a `local` channel wrote), `inbound <channel>` lists the
+/// received rows in `<store>.inbox.<channel>.jsonl` (what the worker-pass
+/// poll admits). Read-only: injection stays `whip message`, and the live
+/// `whip inbox` surface is untouched (human-review migration step 1 is a
+/// separate, gated slice).
+fn mailbox_command(options: &CliOptions) -> ExitCode {
+    let usage =
+        "usage: whip mailbox <outbound [--channel <name>] [--limit <n>] | inbound <channel> [--limit <n>]>";
+    let mut args = options.args.iter().map(String::as_str);
+    let subcommand = args.next();
+    let mut positional = None;
+    let mut channel_filter = None;
+    let mut limit = None;
+    while let Some(arg) = args.next() {
+        match arg {
+            "--channel" => channel_filter = args.next().map(str::to_owned),
+            "--limit" => limit = args.next().and_then(|raw| raw.parse::<usize>().ok()),
+            other if other.starts_with('-') => {
+                eprintln!("unknown mailbox option `{other}`");
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+            value if positional.is_none() => positional = Some(value.to_owned()),
+            _ => {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    // Shared JSONL reader: absent file = empty mailbox (nothing delivered /
+    // received yet), matching the provider and poll semantics.
+    let read_rows = |path: &Path| -> Result<Vec<Value>, ExitCode> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                eprintln!("failed to read {}: {error}", path.display());
+                return Err(ExitCode::from(2));
+            }
+        };
+        Ok(contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .enumerate()
+            .map(
+                |(ordinal, line)| match serde_json::from_str::<Value>(line) {
+                    Ok(mut record) => {
+                        if let Some(object) = record.as_object_mut() {
+                            object.insert("ordinal".to_owned(), json!(ordinal));
+                        }
+                        record
+                    }
+                    Err(_) => json!({ "ordinal": ordinal, "malformed": line }),
+                },
+            )
+            .collect())
+    };
+    let tail = |mut rows: Vec<Value>| -> Vec<Value> {
+        if let Some(limit) = limit {
+            if rows.len() > limit {
+                rows.drain(..rows.len() - limit);
+            }
+        }
+        rows
+    };
+    match subcommand {
+        Some("outbound") => {
+            let path = options.store_path.with_extension("mailbox.jsonl");
+            let rows = match read_rows(&path) {
+                Ok(rows) => rows,
+                Err(code) => return code,
+            };
+            let rows = tail(
+                rows.into_iter()
+                    .filter(|row| match &channel_filter {
+                        Some(channel) => {
+                            row.get("channel").and_then(Value::as_str) == Some(channel)
+                        }
+                        None => true,
+                    })
+                    .collect(),
+            );
+            if options.json {
+                return emit_json(json!({
+                    "mailbox": path.display().to_string(),
+                    "messages": rows,
+                }));
+            }
+            if rows.is_empty() {
+                println!("no outbound messages at {}", path.display());
+            }
+            for row in rows {
+                let field = |name: &str| row.get(name).and_then(Value::as_str).unwrap_or_default();
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    field("message_id"),
+                    field("channel"),
+                    field("accepted_at"),
+                    field("text").replace('\n', " ")
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Some("inbound") => {
+            let Some(channel) = positional else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let path = options
+                .store_path
+                .with_extension(format!("inbox.{channel}.jsonl"));
+            let rows = match read_rows(&path) {
+                Ok(rows) => rows,
+                Err(code) => return code,
+            };
+            let rows = tail(rows);
+            if options.json {
+                return emit_json(json!({
+                    "inbox": path.display().to_string(),
+                    "channel": channel,
+                    "messages": rows,
+                }));
+            }
+            if rows.is_empty() {
+                println!("no inbound messages at {}", path.display());
+            }
+            for row in rows {
+                let field = |name: &str| row.get(name).and_then(Value::as_str).unwrap_or_default();
+                println!(
+                    "#{}\t{}\t{}",
+                    row.get("ordinal").and_then(Value::as_u64).unwrap_or(0),
+                    field("sender"),
+                    field("text").replace('\n', " ")
+                );
             }
             ExitCode::SUCCESS
         }
@@ -41156,12 +41748,282 @@ coerce review() -> Review {
         );
     }
 
+    /// A minimal manifest whose one construct is a `resource_effect` row —
+    /// the non-authorable class whose only producers are platform-catalog
+    /// privilege tuples (std.coord slice 4). `{LIB}` / `{KW}` are substituted
+    /// per test.
+    const RESOURCE_EFFECT_MANIFEST_TEMPLATE: &str = r#"{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "{LIB}",
+  "name": "{LIB}",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "{LIB}",
+      "version": "0.1.0",
+      "constructs": [
+        {
+          "id": "lease.acquire",
+          "construct_family": "effect_operation",
+          "keyword": "{KW}",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Resource" }],
+          "provides": [{ "kind": "EffectHandle" }],
+          "lowering_target": "resource_effect"
+        }
+      ]
+    }
+  ]
+}
+"#;
+
+    /// std.coord slice 4 privilege acceptance (std-tracker.json claim-keyword
+    /// precedent, extended through the authorability wall): a manifest whose
+    /// (library, keyword, family, scope, lowering) tuple is in the platform
+    /// catalog may author a `resource_effect` construct WITHOUT being the
+    /// embedded byte-identical copy — the privilege-tuple leg of the door.
+    /// The embedded set is explicitly EMPTY so byte-identity cannot be the
+    /// key that admitted it.
+    #[test]
+    fn package_manifest_privilege_tuple_admits_resource_effect_construct() {
+        let manifest = RESOURCE_EFFECT_MANIFEST_TEMPLATE
+            .replace("{LIB}", "std.coord")
+            .replace("{KW}", "acquire");
+        let manifest =
+            package_manifest_from_json_with_embedded(Path::new("coord.json"), manifest, &[])
+                .expect("the catalog privilege tuple authorizes the resource_effect class");
+        assert_eq!(manifest.registry.constructs.len(), 1);
+        assert_eq!(
+            manifest.registry.constructs[0].lowering_target,
+            "resource_effect"
+        );
+    }
+
+    /// Negative fixture (slice 4 gate): a NON-privileged manifest cannot
+    /// author a `resource_effect` construct — no catalog tuple, no row. Both
+    /// coordinates bite: a vendor library with the same keyword, and the
+    /// privileged library with a keyword outside its tuples.
+    #[test]
+    fn package_manifest_without_privilege_tuple_cannot_author_resource_effect() {
+        let vendor = RESOURCE_EFFECT_MANIFEST_TEMPLATE
+            .replace("{LIB}", "acme.coord")
+            .replace("{KW}", "acquire");
+        let error =
+            package_manifest_from_json_with_embedded(Path::new("acme-coord.json"), vendor, &[])
+                .expect_err("a vendor library holds no resource_effect tuple");
+        assert!(
+            error.contains("platform-internal lowering_target `resource_effect`"),
+            "{error}"
+        );
+
+        let wrong_keyword = RESOURCE_EFFECT_MANIFEST_TEMPLATE
+            .replace("{LIB}", "std.coord")
+            .replace("{KW}", "seize");
+        let error = package_manifest_from_json_with_embedded(
+            Path::new("coord-seize.json"),
+            wrong_keyword,
+            &[],
+        )
+        .expect_err("std.coord holds no tuple for an un-cataloged keyword");
+        assert!(
+            error.contains("platform-internal lowering_target `resource_effect`"),
+            "{error}"
+        );
+    }
+
+    /// std.coord slice 4 drift test, contracts leg: the manifest's four
+    /// coordination effect contracts must FOLD against the parser-compiled
+    /// ones (same id/version/library/kind/schemas/validation), so a shape
+    /// drift between manifest and compiler surfaces as
+    /// `effect_contract_duplicate` and fails here.
+    #[test]
+    fn coord_manifest_contracts_fold_against_the_parser_compiled_ones() {
+        let source = r#"use std.coord
+
+workflow CoordImport
+
+output result Done
+failure error Busy
+
+class Ticket { id string }
+class Done { note string }
+class Busy { reason string }
+class Note { text string }
+class AuditEntry { area string text string }
+
+lease deploy_slot {
+  key Ticket
+  slots 1
+  ttl 60s
+}
+
+ledger audit_log {
+  entry AuditEntry
+  partition by area
+  retain 7d
+}
+
+counter request_budget {
+  key Ticket
+  cap 5
+  reset daily
+  timezone "UTC"
+}
+
+rule seed
+  when started
+=> {
+  record Ticket { id "prod" }
+}
+
+rule audit
+  when Ticket as t
+=> {
+  consume request_budget for t.id amount 1 as spend
+  append AuditEntry { area t.id text "went" } to audit_log as entry
+
+  after spend ok {
+    record Note { text "ok" }
+  }
+
+  after spend over {
+    record Note { text "over" }
+  }
+}
+
+rule go
+  when Ticket as t
+=> {
+  acquire deploy_slot for t.id until ttl as slot
+
+  after slot held {
+    release slot
+    complete result { note "ok" }
+  }
+
+  after slot contended {
+    fail error { reason "busy" }
+  }
+}
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compiles");
+        let registry = contract_registry_for_ir(None, &ir).expect("registry resolves");
+        assert_eq!(registry.validate(), Vec::new());
+        for (kind, source_form) in [
+            ("lease.acquire", "acquire"),
+            ("ledger.append", "append"),
+            ("counter.consume", "consume"),
+        ] {
+            let contracts: Vec<_> = registry
+                .effect_contracts
+                .iter()
+                .filter(|contract| contract.id == kind)
+                .collect();
+            assert_eq!(
+                contracts.len(),
+                1,
+                "manifest and parser `{kind}` contracts must fold into one: {contracts:?}"
+            );
+            let contract = contracts[0];
+            assert_eq!(contract.library_id, "std.coord");
+            assert_eq!(contract.effect_kind, kind);
+            assert_eq!(
+                contract.required_capabilities,
+                [kind],
+                "the manifest contributes the id==kind capability row (M3)"
+            );
+            assert!(
+                contract.source_forms.iter().any(|form| form == source_form),
+                "{contract:?}"
+            );
+        }
+        // The lease.release contract has no parser-compiled partner (the
+        // release verb has no IrEffectKind); the manifest copy stands alone.
+        assert_eq!(
+            registry
+                .effect_contracts
+                .iter()
+                .filter(|contract| contract.id == "lease.release")
+                .count(),
+            1
+        );
+        // The seven construct rows arrive from the embedded manifest merge.
+        let coord_constructs: Vec<_> = registry
+            .constructs
+            .iter()
+            .filter(|form| form.library_id == "std.coord")
+            .collect();
+        assert_eq!(coord_constructs.len(), 7, "{coord_constructs:?}");
+        for keyword in ["acquire", "release", "append", "consume"] {
+            assert!(
+                coord_constructs.iter().any(|form| form.keyword == keyword
+                    && form.lowering_target == "resource_effect"
+                    && form.scope == "rule_body"),
+                "missing resource_effect row for `{keyword}`: {coord_constructs:?}"
+            );
+        }
+        for keyword in ["lease", "ledger", "counter"] {
+            assert!(
+                coord_constructs.iter().any(|form| form.keyword == keyword
+                    && form.lowering_target == "metadata_only"
+                    && form.scope == "top_level"),
+                "missing metadata_only row for `{keyword}`: {coord_constructs:?}"
+            );
+        }
+    }
+
+    /// std.coord slice 4 drift test, declarations leg: the runtime manifest's
+    /// `declaration_block` rows must name exactly the decl constructs the
+    /// grammar-only manifest (std/grammars/coord.json, build.rs-read) parses —
+    /// two spellings of one surface, kept in lockstep.
+    #[test]
+    fn coord_manifest_decl_rows_agree_with_the_grammar_manifest() {
+        let runtime: Value =
+            serde_json::from_str(include_str!("../../../std/manifests/coord.json"))
+                .expect("valid json");
+        let grammar: Value = serde_json::from_str(include_str!("../../../std/grammars/coord.json"))
+            .expect("valid json");
+        let decl_rows = |manifest: &Value, family_filter: bool| -> BTreeSet<(String, String)> {
+            manifest["libraries"]
+                .as_array()
+                .expect("libraries")
+                .iter()
+                .flat_map(|library| {
+                    library
+                        .get("constructs")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .filter(|construct| {
+                    !family_filter
+                        || construct["construct_family"].as_str() == Some("declaration_block")
+                })
+                .map(|construct| {
+                    (
+                        construct["id"].as_str().expect("id").to_owned(),
+                        construct["keyword"].as_str().expect("keyword").to_owned(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            decl_rows(&runtime, true),
+            decl_rows(&grammar, false),
+            "runtime manifest decl rows and std/grammars/coord.json must agree"
+        );
+    }
+
     #[test]
     fn embedded_std_manifests_parse() {
         // Guard: every real embedded manifest validates clean through the full
-        // manifest validation (`embedded_std_manifests` panics otherwise). None
-        // declares a non-authorable lowering today, so the authorability door is
-        // exercised only by the synthetic tests above.
+        // manifest validation (`embedded_std_manifests` panics otherwise).
+        // std.coord's four `resource_effect` construct rows exercise the
+        // authorability door for real (both legs: byte-identity when loaded
+        // through `package_manifest_from_json`, and the catalog privilege
+        // tuples — see the slice-4 tests above).
         let manifests = embedded_std_manifests();
         assert_eq!(manifests.len(), EMBEDDED_STD_MANIFESTS.len());
         for ((name, _), manifest) in EMBEDDED_STD_MANIFESTS.iter().zip(&manifests) {
@@ -42545,6 +43407,202 @@ rule start
         assert_eq!(contract, &expected_contract);
     }
 
+    /// The embedded std.messaging manifest's `bindings[]` rows are the M2
+    /// load-bearing selection rows (spec/std-messaging.md "Manifest"): one per
+    /// v1 provider, each carrying that provider's capability report in the
+    /// binding config — mirroring the parser's compiled
+    /// `CHANNEL_PROVIDER_REPORTS` constants (reports are DATA in two mirrored
+    /// homes; this test is the drift gate between them).
+    #[test]
+    fn messaging_manifest_bindings_mirror_parser_capability_reports() {
+        let (_, json) = EMBEDDED_STD_MANIFESTS
+            .iter()
+            .find(|(name, _)| *name == "std.messaging")
+            .expect("std.messaging embedded manifest");
+        let manifest: Value = serde_json::from_str(json).expect("valid json");
+        let bindings = manifest["bindings"].as_array().expect("bindings");
+        let reports = whipplescript_parser::CHANNEL_PROVIDER_REPORTS;
+        assert_eq!(
+            bindings.len(),
+            reports.len(),
+            "one binding row per v1 provider"
+        );
+        for report in reports {
+            let binding = bindings
+                .iter()
+                .find(|binding| binding["provider"] == report.provider_id)
+                .unwrap_or_else(|| panic!("binding for provider `{}`", report.provider_id));
+            assert_eq!(binding["capability"], "messaging.send");
+            assert_eq!(
+                binding["program_id"],
+                Value::Null,
+                "v1 messaging bindings are global"
+            );
+            let manifest_report = &binding["config"]["report"];
+            assert_eq!(
+                manifest_report["direction"], report.direction,
+                "direction mirrors the parser report for `{}`",
+                report.short_name
+            );
+            assert_eq!(manifest_report["identity"], report.identity);
+            let interactions: Vec<&str> = manifest_report["interactions"]
+                .as_array()
+                .expect("interactions")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            assert_eq!(interactions, report.interactions);
+            let receipts: Vec<&str> = manifest_report["delivery_receipts"]
+                .as_array()
+                .expect("delivery_receipts")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            assert_eq!(receipts, report.delivery_receipts);
+        }
+        // Every binding's provider has a matching providers[] row (the
+        // manifest-consistency validator's cross-check), and the default
+        // profile allows messaging.send.
+        let provider_kinds: Vec<&str> = manifest["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .filter_map(|provider| provider["provider_kind"].as_str())
+            .collect();
+        for report in reports {
+            assert!(provider_kinds.contains(&report.provider_id));
+        }
+        let profiles = manifest["profiles"].as_array().expect("profiles");
+        assert!(profiles.iter().any(|profile| {
+            profile["allowed_capabilities"]
+                .as_array()
+                .is_some_and(|caps| caps.iter().any(|cap| cap == "messaging.send"))
+        }));
+        // The contract's output schema is exactly the 8-field receipt.
+        let output_schema = manifest
+            .pointer("/libraries/0/effect_contracts/0/output_schema")
+            .and_then(Value::as_object)
+            .expect("output schema");
+        let fields: Vec<&str> = output_schema.keys().map(String::as_str).collect();
+        assert_eq!(
+            fields,
+            [
+                "accepted_at",
+                "channel",
+                "destination",
+                "message_id",
+                "provider",
+                "provider_message_id",
+                "status",
+                "thread_id",
+            ]
+        );
+    }
+
+    /// Channel→binding provider resolution (spec/std-messaging.md
+    /// "Channel→binding provider selection"): short names resolve to exactly
+    /// one bound provider id; unknown and ambiguous identifiers fail with the
+    /// bound set named; a missing provider field resolves as `fixture`.
+    #[test]
+    fn resolve_messaging_binding_selects_exactly_one_provider() {
+        let binding = |id: &str, provider: &str| whipplescript_store::CapabilityBindingView {
+            binding_id: id.to_owned(),
+            program_id: None,
+            capability: "messaging.send".to_owned(),
+            provider: Some(provider.to_owned()),
+            config_json: "{}".to_owned(),
+        };
+        let bindings = vec![
+            binding("seed", "builtin-messaging"),
+            binding("b-fixture", "fixture"),
+            binding("b-local", "std.messaging.local"),
+            binding("b-desktop", "std.messaging.desktop"),
+            binding("b-stdio", "std.messaging.stdio"),
+        ];
+        // Short names resolve to the qualified binding provider id.
+        assert_eq!(
+            resolve_messaging_binding(&bindings, Some("local")).as_deref(),
+            Ok("std.messaging.local")
+        );
+        assert_eq!(
+            resolve_messaging_binding(&bindings, Some("desktop")).as_deref(),
+            Ok("std.messaging.desktop")
+        );
+        // Exact provider ids resolve as themselves.
+        assert_eq!(
+            resolve_messaging_binding(&bindings, Some("std.messaging.stdio")).as_deref(),
+            Ok("std.messaging.stdio")
+        );
+        assert_eq!(
+            resolve_messaging_binding(&bindings, Some("fixture")).as_deref(),
+            Ok("fixture")
+        );
+        // Pre-selection programs (no threaded provider) keep the fixture.
+        assert_eq!(
+            resolve_messaging_binding(&bindings, None).as_deref(),
+            Ok("fixture")
+        );
+        // Unknown identifiers fail, naming the bound set.
+        let unknown = resolve_messaging_binding(&bindings, Some("slack"))
+            .expect_err("unknown provider is a dispatch failure");
+        assert!(
+            unknown.contains("`slack`") && unknown.contains("std.messaging.local"),
+            "{unknown}"
+        );
+        // A short name matching BOTH a bare and a qualified binding is
+        // ambiguous (exactly-one rule).
+        let mut ambiguous = bindings.clone();
+        ambiguous.push(binding("b-local-bare", "local"));
+        let error = resolve_messaging_binding(&ambiguous, Some("local"))
+            .expect_err("two distinct matches are ambiguous");
+        assert!(error.contains("ambiguous"), "{error}");
+        // Duplicate rows naming the SAME provider id (program-scoped + global)
+        // are not ambiguous.
+        let mut duplicated = bindings.clone();
+        duplicated.push(binding("b-local-program", "std.messaging.local"));
+        assert_eq!(
+            resolve_messaging_binding(&duplicated, Some("local")).as_deref(),
+            Ok("std.messaging.local")
+        );
+    }
+
+    /// Desktop notifier command construction is PURE and platform-shaped
+    /// (spec/std-messaging.md slice 4): notify-send argument order, osascript
+    /// AppleScript embedding with quote-safe escaping.
+    #[test]
+    fn desktop_notify_command_builds_platform_invocations() {
+        let (program, args) = desktop_notify_command("notify-send", "Ops", "disk almost full");
+        assert_eq!(program, "notify-send");
+        assert_eq!(args, ["Ops", "disk almost full"]);
+
+        let (program, args) =
+            desktop_notify_command("/usr/bin/osascript", "Ops \"quoted\"", "body \\ slash");
+        assert_eq!(program, "/usr/bin/osascript");
+        assert_eq!(args[0], "-e");
+        assert_eq!(
+            args[1], r#"display notification "body \\ slash" with title "Ops \"quoted\"""#,
+            "arguments embed as JSON-escaped AppleScript string literals"
+        );
+
+        // A fake notifier override keeps the notify-send shape.
+        let (program, args) = desktop_notify_command("/tmp/fake-notifier.sh", "t", "b");
+        assert_eq!(program, "/tmp/fake-notifier.sh");
+        assert_eq!(args, ["t", "b"]);
+    }
+
+    /// Markdown strips to notification text (desktop report content ⊆ {text}).
+    #[test]
+    fn markdown_strips_to_plain_text() {
+        assert_eq!(
+            markdown_to_text("# Alert\n\n**disk** is `90%` _full_ — see [runbook](https://x.y/z)"),
+            "Alert\n\ndisk is 90% full — see runbook"
+        );
+        assert_eq!(markdown_to_text("> quoted *emphasis*"), "quoted emphasis");
+        // A bare `[` without a link tail survives.
+        assert_eq!(markdown_to_text("array[0] stays"), "array[0] stays");
+        assert_eq!(markdown_to_text(""), "");
+    }
+
     #[test]
     fn send_requires_std_messaging_import_and_validates_lock_free_with_it() {
         // `send` migrated from an ambient parser builtin to the embedded
@@ -42562,7 +43620,7 @@ class Trigger {{
 }}
 
 channel alerts {{
-  provider slack
+  provider fixture
   destination "#ops"
 }}
 

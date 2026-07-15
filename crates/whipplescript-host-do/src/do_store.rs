@@ -3517,6 +3517,17 @@ fn do_policy_block<Sql: DoSql>(
     }
     // Timers, builtin-queue verbs, and coordination verbs are runtime-resolved:
     // no provider/capability/profile applies.
+    //
+    // INTENTIONAL DIVERGENCE from the native mirror (store/lib.rs
+    // `policy_block_on`, std.coord slice 4): the native gate dropped its
+    // coordination exemption because the embedded std.coord manifest seeds
+    // capability/provider/binding rows at store init. The DO bootstrap seeds
+    // only coerce rows (do_instance.rs / do_worker.rs) and M7 defers DO
+    // manifest registration to the DO tracker, so removing the
+    // `lease.`/`ledger.`/`counter.` lines HERE would turn every in-DO
+    // coordination effect into blocked_by_capability. This exemption stays
+    // until the DO tracker's package-registration row lands
+    // (spec/std-coord.md "Deferred with cause").
     if effect.kind == "timer.wait"
         || effect.kind.starts_with("queue.")
         || effect.kind.starts_with("lease.")

@@ -3,6 +3,7 @@ workflow_contracts
   output result ref<Done>
   failure error ref<Tripped>
 uses
+  package std.coord
   package std.script
 schemas
   class Done

@@ -1363,6 +1363,13 @@ fn e2e_malformed_coordination_input_fails_typed_instead_of_defaulting() {
     )
     .expect("stores open");
     let mut kernel = RuntimeKernel::new(stores);
+    // The native admission gate is REAL for coordination kinds (std.coord
+    // slice 4): mirror production, where the embedded manifest registers at
+    // store init.
+    kernel
+        .store()
+        .register_package_manifest(include_str!("../../../std/manifests/coord.json"))
+        .expect("std.coord manifest registers");
     let version = kernel
         .create_program_version(ProgramVersionInput {
             program_name: "CoordHonesty",
@@ -1501,6 +1508,13 @@ fn e2e_counter_period_is_timezone_anchored_and_replay_deterministic() {
     )
     .expect("stores open");
     let mut kernel = RuntimeKernel::new(stores);
+    // The native admission gate is REAL for coordination kinds (std.coord
+    // slice 4): mirror production, where the embedded manifest registers at
+    // store init.
+    kernel
+        .store()
+        .register_package_manifest(include_str!("../../../std/manifests/coord.json"))
+        .expect("std.coord manifest registers");
     let version = kernel
         .create_program_version(ProgramVersionInput {
             program_name: "CoordTz",

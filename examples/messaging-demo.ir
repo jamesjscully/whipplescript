@@ -11,7 +11,7 @@ schemas
   class Handled
     reply string
 channels
-  channel ops_room provider=slack destination="#ops"
+  channel ops_room provider=fixture destination="#ops"
 rules
   rule acknowledge_message
     when message from ops_room as msg

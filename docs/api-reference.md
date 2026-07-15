@@ -298,6 +298,12 @@ Other analyses:
   grant (DR-0025) that does not use the owned harness (`provider owned`, or a
   harness of kind `owned`); the grant is dead because sub-workflow tools are only
   resolved and offered in the owned brokered loop.
+- **`lint.missing_coercion_import`** / **`lint.missing_coord_import`** — the
+  program uses `coerce`/`decide`/`prompt` without `use std.coercion`, or
+  coordination resources (`lease`/`ledger`/`counter` and their verbs) without
+  `use std.coord`. Advisory only (the graduated import ladder): the program
+  still runs, but the import names the std package that owns and configures
+  the effects.
 
 Every finding resolves to the source span of the declaration it concerns. The text
 output prefixes each finding with `:line:col` (1-based) and `--json` emits one finding
@@ -958,7 +964,7 @@ workflow execution.
 
 ```sh
 whip message <instance> --channel <name> --text <text> \
-  [--markdown <md>] [--from <sender>] [--thread <id>] \
+  [--markdown <md>] [--by <sender>] [--thread <id>] \
   --program <workflow.whip> [--root <workflow>]
 ```
 
@@ -966,8 +972,24 @@ Injects an inbound channel message into a running instance. It compiles the
 program, checks that `<name>` names a declared `channel`, builds the generic
 `Message` envelope, and derives a `message.<channel>` fact that rules match with
 `when message from <channel> as x`. A message needs at least one of `--text` or
-`--markdown`; an undeclared channel or a missing instance is a usage error. JSON
-output includes the recorded event and derived fact ids.
+`--markdown`; an undeclared channel or a missing instance is a usage error.
+`--by` records the claimed-actor sender identity (`--from` is accepted as an
+alias); `received_at` is the injection instant, and the message id is minted
+per delivery, so re-sending identical text is a distinct message. JSON output
+includes the recorded event and derived fact ids.
+
+### `mailbox`
+
+```sh
+whip mailbox outbound [--channel <name>] [--limit <n>]
+whip mailbox inbound <channel> [--limit <n>]
+```
+
+The read surface over the LOCAL messaging provider's files. `outbound` lists
+the rows `send via` a `local` channel delivered to `<store>.mailbox.jsonl`
+(optionally filtered by channel); `inbound <channel>` lists the received rows
+in `<store>.inbox.<channel>.jsonl` with their admission ordinals. Read-only —
+injection stays `whip message`. `--json` emits the full records.
 
 ## Cloud deployment and runtime
 
@@ -1374,7 +1396,7 @@ This section is a compact index of source constructs.
 | Agent | `agent name { profile "..."; capacity N; skills [...] }` | Logical provider target and policy metadata. |
 | Coerce | `coerce fn(args...) -> Type { prompt """markdown ... """ }` | Declared coerce-backed effect. |
 | Flow | `flow name when ... { step; step; ... }` | A rule whose body is a multi-step sequence; lowers to `flow.<name>.seg<N>` rules. |
-| Channel | `channel name { provider slack destination "#ops" }` | Named messaging endpoint for inbound `when message from` and outbound `send via`. |
+| Channel | `channel name { provider local destination "#ops" }` | Named messaging endpoint for inbound `when message from` and outbound `send via`; the provider must be one of `local`, `desktop`, `stdio`, `fixture`. |
 | Source | `source clock\|file\|http as name { ... observe as obs emit <signal> { ... } }` | Ingress source (clock schedule, file, or GET-only http fetch) whose `emit` clause admits observed input as a typed signal (the `event.emit` effect kind). |
 | File store | `file store name { root "..." allow read [...] allow write [...] }` | Policy boundary over a provider-backed document root for `read text`/`write text`/`import`/`export`. |
 | Tracker | `tracker name { provider builtin }` | Declared vendor-neutral work-item backlog. |

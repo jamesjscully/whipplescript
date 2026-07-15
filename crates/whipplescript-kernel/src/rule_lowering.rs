@@ -1124,7 +1124,8 @@ pub fn lower_rule(
     }
 
     let mut parsed_effects = parse_effect_statements(&pre_terminal_body, &context);
-    rewrite_lease_releases(&mut parsed_effects, &rule.body);
+    let acquire_bindings = lease_acquire_bindings(&parsed_effects);
+    rewrite_lease_releases(&mut parsed_effects, &acquire_bindings);
     let parsed_effects = parsed_effects;
     let mut node_to_effect_id = std::collections::BTreeMap::new();
     let mut binding_to_effect_id = std::collections::BTreeMap::new();
@@ -1334,7 +1335,12 @@ pub fn lower_rule(
             });
         }
         let mut selected_effects = parse_effect_statements(&selected_after_body, &after_context);
-        rewrite_lease_releases(&mut selected_effects, &rule.body);
+        // An after-block release resolves against the main-body acquires PLUS
+        // any acquire parsed in this block itself (sibling after-blocks stay
+        // invisible, matching the binding→effect-id data flow below).
+        let mut after_acquire_bindings = acquire_bindings.clone();
+        after_acquire_bindings.extend(lease_acquire_bindings(&selected_effects));
+        rewrite_lease_releases(&mut selected_effects, &after_acquire_bindings);
         for effect in &mut selected_effects {
             effect.after.get_or_insert_with(|| AfterScope {
                 binding: after.binding.clone(),
@@ -2164,30 +2170,41 @@ pub fn coordination_key_string(value: &Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
-/// `release <x>` is queue-or-lease by referent: a binding acquired in this
-/// rule body is a lease release (spec/coordination.md); anything else stays
-/// the queue verb.
-pub fn rewrite_lease_releases(effects: &mut [ParsedEffect], rule_body: &str) {
-    let acquires = rule_body
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            trimmed
-                .starts_with("acquire ")
-                .then(|| binding_after_as(trimmed))
-                .flatten()
-        })
-        .collect::<std::collections::BTreeSet<_>>();
+/// `release <x>` is queue-or-lease by referent: a binding bound by a
+/// `lease.acquire` effect visible to this release is a lease release
+/// (spec/coordination.md); anything else stays the queue verb. Resolution is
+/// binding-typed over the PARSED effects (std.coord slice 5), never a raw
+/// body-line scan — so an `acquire … as <b>` line inside a record block or
+/// prompt text can no longer forge a lease referent, and a release of a
+/// work-item binding stays `tracker.release`.
+pub fn rewrite_lease_releases(
+    effects: &mut [ParsedEffect],
+    acquire_bindings: &std::collections::BTreeSet<String>,
+) {
     for effect in effects {
         if effect.kind == "tracker.release"
             && effect
                 .args
                 .first()
-                .is_some_and(|binding| acquires.contains(binding))
+                .is_some_and(|binding| acquire_bindings.contains(binding))
         {
             effect.kind = "lease.release".to_owned();
         }
     }
+}
+
+/// The lease-acquire result bindings among `effects` — the referent set
+/// `rewrite_lease_releases` resolves against. The pre-terminal and after-block
+/// lowerings parse separately, so the caller computes this from the
+/// PRE-TERMINAL parse and threads it to both rewrite sites (an after-block
+/// release must still see main-body acquires), unioning each after block's own
+/// acquires for its site.
+pub fn lease_acquire_bindings(effects: &[ParsedEffect]) -> std::collections::BTreeSet<String> {
+    effects
+        .iter()
+        .filter(|effect| effect.kind == "lease.acquire")
+        .filter_map(|effect| effect.binding.clone())
+        .collect()
 }
 
 pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffect> {
@@ -3833,6 +3850,13 @@ pub fn parsed_effect_input_json(
             // without new plumbing. If the channel isn't declared in the IR, omit.
             if let Some(decl) = ir.channels.iter().find(|c| c.name == channel) {
                 message.insert("provider".to_owned(), Value::String(decl.provider.clone()));
+                // The channel's fixed destination rides along so the provider
+                // can echo it in the receipt (spec/std-messaging.md
+                // "MessageSendReceipt": `destination string?`; v1 addressing
+                // is fixed_destination only).
+                if let Some(destination) = &decl.destination {
+                    message.insert("destination".to_owned(), Value::String(destination.clone()));
+                }
             }
             message.insert("channel".to_owned(), Value::String(channel));
             message.insert("text".to_owned(), parse_field_value(&text_expr, context));
@@ -5147,4 +5171,95 @@ pub fn split_args(args: &str) -> Vec<String> {
         values.push(value.to_owned());
     }
     values
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// std.coord slice 5 regression: release disambiguation is binding-typed
+    /// over the PARSED effects. An `acquire … as <b>` line inside prompt text
+    /// or a record block is NOT an acquire effect, so a release of a
+    /// work-item binding with the same name stays `tracker.release`. The old
+    /// raw body-line scan (`starts_with("acquire ")` over every rule-body
+    /// line) wrongly rewrote both of these to `lease.release`.
+    #[test]
+    fn release_ignores_acquire_lines_in_prompts_and_record_blocks() {
+        let body = r#"
+tell helper as turn """markdown
+acquire deploy_slot for k as w
+"""
+record Note {
+  acquire "deploy_slot for k as w"
+}
+claim item as w
+release w
+"#;
+        let mut effects = parse_effect_statements(body, &RuleContext::default());
+        let acquires = lease_acquire_bindings(&effects);
+        assert!(
+            acquires.is_empty(),
+            "prompt/record text must not mint acquire bindings: {acquires:?}"
+        );
+        rewrite_lease_releases(&mut effects, &acquires);
+        let release = effects
+            .iter()
+            .find(|effect| effect.args.first().map(String::as_str) == Some("w"))
+            .expect("release parses");
+        assert_eq!(
+            release.kind, "tracker.release",
+            "a work-item release must stay tracker.release: {effects:?}"
+        );
+    }
+
+    /// A real acquire binding in the same parse rewrites its release.
+    #[test]
+    fn release_of_parsed_acquire_binding_becomes_lease_release() {
+        let body = r#"
+acquire deploy_slot for t.id until ttl as slot
+release slot
+"#;
+        let mut effects = parse_effect_statements(body, &RuleContext::default());
+        let acquires = lease_acquire_bindings(&effects);
+        rewrite_lease_releases(&mut effects, &acquires);
+        assert!(
+            effects.iter().any(|effect| effect.kind == "lease.release"),
+            "{effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| effect.kind == "tracker.release"),
+            "{effects:?}"
+        );
+    }
+
+    /// The after-block lowering parses separately (rule_lowering::lower_rule
+    /// site 2): an after-block release must still see MAIN-BODY acquires, via
+    /// the threaded pre-terminal acquire-binding set.
+    #[test]
+    fn after_block_release_sees_pre_terminal_acquires_through_threading() {
+        let pre_terminal_body = r#"
+acquire deploy_slot for t.id until ttl as slot
+"#;
+        let after_body = r#"
+release slot
+"#;
+        let pre_terminal = parse_effect_statements(pre_terminal_body, &RuleContext::default());
+        let acquire_bindings = lease_acquire_bindings(&pre_terminal);
+
+        let mut selected = parse_effect_statements(after_body, &RuleContext::default());
+        let mut after_acquires = acquire_bindings.clone();
+        after_acquires.extend(lease_acquire_bindings(&selected));
+        rewrite_lease_releases(&mut selected, &after_acquires);
+        assert_eq!(selected.len(), 1, "{selected:?}");
+        assert_eq!(selected[0].kind, "lease.release", "{selected:?}");
+
+        // Without the threading the same release would stay tracker.release —
+        // the property the threading exists for.
+        let mut unthreaded = parse_effect_statements(after_body, &RuleContext::default());
+        let own_only = lease_acquire_bindings(&unthreaded);
+        rewrite_lease_releases(&mut unthreaded, &own_only);
+        assert_eq!(unthreaded[0].kind, "tracker.release", "{unthreaded:?}");
+    }
 }

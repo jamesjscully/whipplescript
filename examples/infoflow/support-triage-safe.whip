@@ -36,7 +36,7 @@ file store audit_log {
 }
 
 channel public_reply {
-  provider slack
+  provider fixture
   destination "#out"
 }
 

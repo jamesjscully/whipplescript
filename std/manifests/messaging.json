@@ -17,9 +17,14 @@
             "text": "string"
           },
           "output_schema": {
+            "message_id": "string",
             "channel": "string",
-            "delivered": "bool",
-            "provider_message_id": "string"
+            "provider": "string",
+            "status": "string",
+            "provider_message_id": "string",
+            "thread_id": "string",
+            "destination": "string",
+            "accepted_at": "string"
           },
           "required_capabilities": ["messaging.send"],
           "provider_kinds": ["messaging"],
@@ -74,6 +79,104 @@
       "schema": {
         "input": {
           "text": "string"
+        }
+      }
+    }
+  ],
+  "providers": [
+    {
+      "id": "provider-messaging-fixture",
+      "provider_kind": "fixture",
+      "capability": "messaging.send",
+      "config": {}
+    },
+    {
+      "id": "provider-messaging-local",
+      "provider_kind": "std.messaging.local",
+      "capability": "messaging.send",
+      "config": {}
+    },
+    {
+      "id": "provider-messaging-desktop",
+      "provider_kind": "std.messaging.desktop",
+      "capability": "messaging.send",
+      "config": {}
+    },
+    {
+      "id": "provider-messaging-stdio",
+      "provider_kind": "std.messaging.stdio",
+      "capability": "messaging.send",
+      "config": {}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "profile-messaging-user",
+      "name": "messaging-user",
+      "description": "Allow outbound messaging sends over declared channels.",
+      "enforcement_mode": "enforce",
+      "allowed_capabilities": ["messaging.send"],
+      "config": {}
+    }
+  ],
+  "bindings": [
+    {
+      "id": "binding-messaging-send-fixture",
+      "program_id": null,
+      "capability": "messaging.send",
+      "provider": "fixture",
+      "config": {
+        "report": {
+          "direction": "bidirectional",
+          "identity": "claimed_actor",
+          "interactions": ["buttons", "reactions"],
+          "content": ["text", "markdown"],
+          "delivery_receipts": ["accepted", "failed"]
+        }
+      }
+    },
+    {
+      "id": "binding-messaging-send-local",
+      "program_id": null,
+      "capability": "messaging.send",
+      "provider": "std.messaging.local",
+      "config": {
+        "report": {
+          "direction": "bidirectional",
+          "identity": "claimed_actor",
+          "interactions": ["buttons", "reactions"],
+          "content": ["text", "markdown"],
+          "delivery_receipts": ["accepted", "failed"]
+        }
+      }
+    },
+    {
+      "id": "binding-messaging-send-desktop",
+      "program_id": null,
+      "capability": "messaging.send",
+      "provider": "std.messaging.desktop",
+      "config": {
+        "report": {
+          "direction": "outbound_only",
+          "identity": "anonymous",
+          "interactions": [],
+          "content": ["text"],
+          "delivery_receipts": ["accepted", "failed"]
+        }
+      }
+    },
+    {
+      "id": "binding-messaging-send-stdio",
+      "program_id": null,
+      "capability": "messaging.send",
+      "provider": "std.messaging.stdio",
+      "config": {
+        "report": {
+          "direction": "bidirectional",
+          "identity": "claimed_actor",
+          "interactions": ["buttons"],
+          "content": ["text", "markdown"],
+          "delivery_receipts": ["accepted", "failed"]
         }
       }
     }

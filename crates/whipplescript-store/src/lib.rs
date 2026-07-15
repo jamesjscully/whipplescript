@@ -414,6 +414,22 @@ pub struct CapabilityBinding<'a> {
     pub config_json: &'a str,
 }
 
+/// One `capability_bindings` row as READ back for provider selection
+/// (spec/std-messaging.md "Channel→binding provider selection"): where
+/// `capability_bound_provider` collapses to a single name, this view carries
+/// every binding bound for a capability — provider id plus the binding's
+/// `config_json` (the capability report for messaging bindings) — so a
+/// channel-scoped selection step can resolve its declared provider against
+/// the full bound set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityBindingView {
+    pub binding_id: String,
+    pub program_id: Option<String>,
+    pub capability: String,
+    pub provider: Option<String>,
+    pub config_json: String,
+}
+
 /// One project-instruction document (AGENTS.md / CLAUDE.md) registered for the
 /// durable object's store-backed context resolution (context-assembly Phase 3
 /// item 4). `position` is the injection order (root-most first, nearest-cwd
@@ -3010,6 +3026,51 @@ impl SqliteStore {
             .optional()?
             .unwrap_or_default();
         capability_bound_provider(&self.connection, &program_id, capability)
+    }
+
+    /// Every binding bound for `capability` visible to the program running
+    /// `instance_id` (program-scoped rows first, then global `NULL` rows;
+    /// stable `binding_id` order within each scope). This is the
+    /// channel-scoped provider-selection read (spec/std-messaging.md
+    /// "Channel→binding provider selection"): the `capability_bound` gate
+    /// stays the program×capability policy check, and dispatch resolves a
+    /// channel's declared provider against these rows' provider ids, taking
+    /// the matching row's `config_json` capability report.
+    pub fn capability_bindings_for(
+        &self,
+        instance_id: &str,
+        capability: &str,
+    ) -> StoreResult<Vec<CapabilityBindingView>> {
+        let program_id = self
+            .connection
+            .query_row(
+                "SELECT program_id FROM instances WHERE instance_id = ?1",
+                [instance_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT binding_id, program_id, capability, provider, config_json
+            FROM capability_bindings
+            WHERE capability = ?1
+              AND (program_id = ?2 OR program_id IS NULL)
+            ORDER BY (program_id IS NULL) ASC, binding_id ASC
+            "#,
+        )?;
+        let rows = statement
+            .query_map(params![capability, program_id], |row| {
+                Ok(CapabilityBindingView {
+                    binding_id: row.get(0)?,
+                    program_id: row.get(1)?,
+                    capability: row.get(2)?,
+                    provider: row.get(3)?,
+                    config_json: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// The `effect_providers.config_json` for `(effect_kind, provider)` — the
@@ -7490,14 +7551,19 @@ fn policy_block_on(
         return Ok(Some(block));
     }
 
-    // Timers, builtin-tracker verbs, and coordination verbs
-    // (spec/coordination.md) are resolved by the runtime itself on worker
-    // passes: no provider, capability, or profile applies.
+    // Timers and builtin-tracker verbs are resolved by the runtime itself on
+    // worker passes: no provider, capability, or profile applies.
+    //
+    // Coordination kinds (`lease.*` / `ledger.*` / `counter.*`) are NOT
+    // exempt here (std.coord slice 4): the embedded std.coord manifest seeds
+    // their capability/provider/binding rows at store init, so the admission
+    // gate is REAL for them — an unbound coordination kind blocks as
+    // blocked_by_capability. INTENTIONAL DIVERGENCE from the DO mirror
+    // (host-do/do_store.rs `do_policy_block_on`), which keeps its coordination
+    // exemption until the DO tracker's package-registration row seeds the same
+    // rows in the DO bootstrap (spec/std-coord.md "Deferred with cause").
     if effect.kind == "timer.wait"
         || effect.kind.starts_with("tracker.")
-        || effect.kind.starts_with("lease.")
-        || effect.kind.starts_with("ledger.")
-        || effect.kind.starts_with("counter.")
         || effect.kind == "signal.emit"
         || effect.kind.starts_with("file.")
     {
@@ -16114,6 +16180,119 @@ mod tests {
             .expect("claimable effects load");
         assert_eq!(claimable.len(), 1);
         assert_eq!(claimable[0].effect_id, "query");
+    }
+
+    /// std.coord slice 4 gate: the NATIVE admission gate is real for
+    /// coordination kinds. With the builtin exemption deleted from
+    /// `policy_block_on`, an UNBOUND coordination kind blocks as
+    /// blocked_by_capability (no effect provider registered), and the same
+    /// kind becomes claimable once the embedded std.coord manifest's
+    /// capability/provider/binding rows are registered — exactly what
+    /// `register_locked_packages` seeds at store init in production.
+    #[test]
+    fn coordination_kind_blocks_unbound_and_claims_once_manifest_seeded() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("CoordGate", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        let effects = [NewEffect {
+            timeout_seconds: None,
+            effect_id: "acquire-1",
+            kind: "lease.acquire",
+            target: None,
+            input_json: r#"{"resource":"deploy_slot","key":"prod","slots":1,"ttl_seconds":60}"#,
+            status: "queued",
+            idempotency_key: "rule=grab;effect=acquire-1",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "grab",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-grab"),
+                marks: &[],
+            })
+            .expect("rule commits");
+
+        // Unbound: no worker may claim it, and a forced start blocks durably.
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert!(
+            claimable.is_empty(),
+            "unbound coordination kind must not be claimable: {claimable:?}"
+        );
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "acquire-1",
+                run_id: "run-acquire",
+                provider: "coordination",
+                worker_id: "worker-1",
+                lease_id: "lease-acquire",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("unbound coordination kind blocks at admission");
+        assert!(
+            matches!(&blocked, StoreError::PolicyBlocked { reason, .. } if reason.contains("lease.acquire")),
+            "{blocked:?}"
+        );
+        assert_eq!(effect_status(&store, "acquire-1"), "blocked_by_capability");
+
+        // Seeded: on a store where the embedded std.coord manifest registered
+        // first (production order — `register_locked_packages` runs at store
+        // init, before any worker pass), the same effect is claimable.
+        let mut seeded = SqliteStore::open_in_memory().expect("store opens");
+        seeded
+            .register_package_manifest(include_str!("../../../std/manifests/coord.json"))
+            .expect("std.coord manifest registers");
+        let version = seeded
+            .create_program_version(test_program_version("CoordGateSeeded", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = seeded
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        seeded
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "grab",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-grab"),
+                marks: &[],
+            })
+            .expect("rule commits");
+        let claimable = seeded
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert_eq!(claimable.len(), 1, "{claimable:?}");
+        assert_eq!(claimable[0].effect_id, "acquire-1");
     }
 
     #[test]

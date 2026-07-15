@@ -37,9 +37,11 @@ an internal implementation-stage marker.
   agent turns or `coerce` calls runs in parallel and `agent { capacity N }` has
   runtime meaning.
 - Messaging construct surface: outbound `send via <channel>` and inbound
-  `when message from <channel> as msg` (binding the built-in `Message`), driven
-  under the fixture provider (`whip message` injects an inbound message); live
-  Slack/email delivery is experimental.
+  `when message from <channel> as msg` (binding the built-in `Message`), with
+  binding-driven local providers — `local` (file-backed mailbox + inbox poll,
+  inspected with `whip mailbox`), `desktop` (outbound-only native
+  notification), `stdio`, and `fixture` (`whip message` injects an inbound
+  message); live Slack/email delivery stays deferred.
 - Credential management: `whip auth status` and `whip auth set <openai|anthropic>
   <key>` store LLM credentials for the native `coerce` path (owner-only config).
 - Lifecycle controls: `pause`, `resume`, `cancel`, `retry`, and workflow

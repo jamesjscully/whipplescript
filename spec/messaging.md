@@ -80,7 +80,7 @@ A `channel` is a named route through a provider:
 use std.messaging
 
 channel release_room {
-  provider slack
+  provider local
   workspace ops
   destination "#release"
 }
@@ -102,10 +102,11 @@ values.
 package manifest: `use std.messaging` authorizes it with no package lock (the
 binary is its own supply chain — not a third-party supply-chain construct; see
 `models/maude/std-construct-authorization.maude`). The named
-channel must be declared (`send via <unknown>` is a compile error). Under the
-fixture provider the effect records a delivery receipt; live providers below are
-the roadmap. Inbound `when message from <channel>` still needs a runtime
-messaging provider and remains deferred.
+channel must be declared (`send via <unknown>` is a compile error). Inbound
+shipped at fixture parity (`whip message` injection plus the local-inbox
+worker poll); the local, desktop, and stdio-outbound providers below are
+built (spec/std-messaging.md), selected by binding-driven dispatch from the
+channel's declared provider.
 
 `send` creates a durable outbound message effect:
 
@@ -255,15 +256,29 @@ report supports it. For example, desktop notifications are outbound-only and
 cannot satisfy a `when message from channel` rule or `source interaction`
 declaration.
 
+Reports are no longer prose-only: they are machine-checked data
+(spec/std-messaging.md "Capability reports"), compiled as the parser's
+`CHANNEL_PROVIDER_REPORTS` constants and mirrored by the embedded
+`std.messaging` manifest's `bindings[].config.report` rows (a drift test pins
+the two). The checker validates channel declarations and directions against
+them at check time; v1 narrows `delivery_receipts ⊆ {accepted, failed}` (no
+provider reports `delivered`) and `identity ⊆ {anonymous, claimed_actor}`.
+
 ## Initial Provider Scope
 
 The initial `std.messaging` provider set should stay deliberately small:
 
 ```text
+fixture                bidirectional deterministic in-process provider
 std.messaging.local    bidirectional store-backed local mailbox
 std.messaging.desktop  outbound-only desktop notifications
 std.messaging.stdio    bidirectional development/test message stream
 ```
+
+`fixture` is a NAMED first-class provider (M2 fixture-as-named-provider):
+selected registry-honestly through its own capability binding, returning the
+full typed receipt. v1 narrowing: `delivery_receipts ⊆ {accepted, failed}` —
+`delivered` waits for the first provider with delivery callbacks.
 
 ### `std.messaging.local`
 
