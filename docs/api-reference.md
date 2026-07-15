@@ -44,7 +44,7 @@ for any command.
 | Variable | Meaning |
 | --- | --- |
 | `WHIPPLESCRIPT_STORE` | Default store path when `--store` is omitted. |
-| `WHIPPLESCRIPT_ITEMS_STORE` | Path for the builtin work-queue tracker (defaults to `.whipplescript/items.sqlite`). |
+| `WHIPPLESCRIPT_ITEMS_STORE` | Path for the builtin issue tracker's store (defaults to `.whipplescript/items.sqlite`). |
 | `WHIPPLESCRIPT_COORDINATION_STORE` | Path for workspace-scoped lease, ledger, and counter state (defaults to `.whipplescript/coordination.sqlite`). |
 | `WHIPPLESCRIPT_EXEC_ALLOW` | Dev-profile raw `exec "<command>"` allow-list: colon-separated glob prefixes such as `scripts/*:bin/ci-*`. Unset/empty, raw exec blocks at admission (`security.script_disabled`); commands outside a non-empty list fail without running. The program must also `use std.script`. |
 | `WHIPPLESCRIPT_EXEC_PROFILE` | `dev` (default) or `hosted`. Hosted rejects raw exec strings and requires script capabilities. |
@@ -897,8 +897,8 @@ whip issue dep add <blocked> depends-on <blocker>
 whip issue rebuild
 ```
 
-Issue commands operate the builtin work-queue tracker (see
-[work queues](language-reference.md#work-queues)). The builtin tracker is
+Issue commands operate the builtin issue tracker (see
+[trackers](language-reference.md#trackers)). The builtin tracker is
 workspace-scoped, stores items in `.whipplescript/items.sqlite` (override with
 `WHIPPLESCRIPT_ITEMS_STORE`), and issues sequential ids `WS-1`, `WS-2`, and so
 on. `--status` filters on the status categories `open`, `in_progress`,

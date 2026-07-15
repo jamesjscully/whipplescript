@@ -17,7 +17,7 @@ the export kernel-lift gap honestly. Where it contradicts the substrate, see
   declaration and turn grants are SHIPPED end-to-end (spec/files.md
   "Implementation Status"; kernel handlers at
   crates/whipplescript-kernel/src/effect_handlers.rs:494, :621, :853; export at
-  crates/whipplescript-cli/src/main.rs:23185).
+  now kernel/effect_handlers.rs `run_file_export_effect_generic` — lifted in F4).
 - **Why it belongs as a package.** Files are an external resource boundary
   (spec/files.md "Framing") with its own capability vocabulary, provider seam
   (FileStore), and IFC face — a semantic domain per shape note "Semantic
@@ -205,9 +205,11 @@ stays deferred (see below); the local provider's threat model is closed by
 `file.read`/`file.write`/`file.import` are host-agnostic kernel handlers over
 the FileStore seam and run on the DO/wasm plane. `file.export` is ALREADY
 generic over the same seams: `run_file_export_effect_generic<S: RuntimeStore>`
-takes a held `RuntimeKernel<S>` plus `&dyn FileStore` (cli/main.rs:23185,
+takes a held `RuntimeKernel<S>` plus `&dyn FileStore` (now
+kernel/effect_handlers.rs `run_file_export_effect_generic`,
 DO-tracker chunk 3c) and the generic instance-step executor already
-dispatches it (main.rs:20116). What remains is **crate location, not shape**:
+dispatches it from both native dispatch arms. What remained was **crate
+location, not shape** — executed as F4:
 the fn lives in the cli crate, which is not built for wasm32, so exports
 still cannot execute on the DO plane. Slice F4 is therefore a relocation —
 move the already-generic core into kernel::effect_handlers and re-point the
@@ -277,7 +279,7 @@ Each independently gateable under the per-piece review discipline.
   error; dynamic in-policy path still succeeds. Model: none (single-op path
   authorization; negative fixtures carry the bite).
 - **F4 — export handler relocation.** Move the already-generic
-  run_file_export_effect_generic (cli/main.rs:23185, chunk 3c) into
+  run_file_export_effect_generic (chunk 3c; SHIPPED to kernel in F4) into
   kernel::effect_handlers and re-point the two dispatch arms (main.rs:20116,
   :20542); no signature or behavior change. Tests: existing export e2e
   (control_plane.rs:906) green; wasm32 target builds; native/relocated parity

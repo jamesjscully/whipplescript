@@ -445,8 +445,7 @@ VALUES
     ('provider_human_ask_builtin', 'human.ask', 'builtin-human-review', 'human.ask'),
     ('provider_event_emit_builtin', 'event.emit', 'builtin-event', 'event.emit'),
     ('provider_workflow_invoke_builtin', 'workflow.invoke', 'builtin-workflow-runtime', 'workflow.invoke'),
-    ('provider_capability_call_builtin', 'capability.call', 'builtin-package-call', 'capability.call'),
-    ('provider_messaging_send_builtin', 'capability.call', 'builtin-messaging', 'messaging.send');
+    ('provider_capability_call_builtin', 'capability.call', 'builtin-package-call', 'capability.call');
 
 INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities)
 VALUES
@@ -464,7 +463,6 @@ VALUES
     ('binding_event_emit_builtin', NULL, 'event.emit', 'builtin-event'),
     ('binding_workflow_invoke_builtin', NULL, 'workflow.invoke', 'builtin-workflow-runtime'),
     ('binding_capability_call_builtin', NULL, 'capability.call', 'builtin-package-call'),
-    ('binding_messaging_send_builtin', NULL, 'messaging.send', 'builtin-messaging'),
     ('binding_repo_read_builtin', NULL, 'repo.read', 'builtin-agent-harness'),
     ('binding_repo_write_builtin', NULL, 'repo.write', 'builtin-agent-harness'),
     ('binding_command_run_builtin', NULL, 'command.run', 'builtin-agent-harness');

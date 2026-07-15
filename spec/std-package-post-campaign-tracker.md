@@ -13,18 +13,18 @@ or a design note before any code).
 
 ## Wave 0 — hygiene batch (mechanical, pre-v0.4-cut)
 
-- [ ] improve.rs re-point: `native_coerce_turn` consumes
+- [x] (2026-07-15, gates: improve_loop 18 + coerce suite) improve.rs re-point: `native_coerce_turn` consumes
       `ResolvedCoercionConfig` directly; delete the documented
       `From<ResolvedCoercionConfig> for NativeCoerceConfig` compat view in
       coerce_runtime.rs (left because improve.rs was another session's file
       during the coercion build — see 484a2b7's deferral note).
-- [ ] Dead seed row: `binding_messaging_send_builtin` (provider
+- [x] (2026-07-15, both rows removed from 0001; store 226 + messaging suites green) Dead seed row: `binding_messaging_send_builtin` (provider
       `builtin-messaging`, migrations/0001:~467) matches no channel provider
       since binding-driven dispatch (21bb4e4). Pre-release one-way removal.
-- [ ] do_worker.rs vacuous branch test: the "plain plane untouched" assertion
+- [x] (2026-07-15; query fixed to `key` + error no longer swallowed; host-do 73) do_worker.rs vacuous branch test: the "plain plane untouched" assertion
       queries `files WHERE path LIKE …` but the column is `key`, so it passes
       via `unwrap_or(0)` on the SQL error (flagged in the f1876ca build).
-- [ ] Doc staleness sweep: docs/language-reference.md "Work queues" prose
+- [x] (2026-07-15; Trackers section renamed w/ honest status vocabulary — durable open/closed/canceled + in_progress overlay; anchors updated; flagged spec refs → symbol names; docs gates green) Doc staleness sweep: docs/language-reference.md "Work queues" prose
       (pre-S3 nouns, "done/cancelled" vs shipped closed/canceled),
       docs/api-reference.md "builtin work-queue tracker" line, and stale code
       line-references in spec/std-messaging.md / spec/std-files.md /

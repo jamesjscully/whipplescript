@@ -72,7 +72,7 @@ use whipplescript_parser::{
     parse_expression, BinaryOp, DependencyPredicate as IrDependencyPredicate, Diagnostic,
     EffectStatus as TestEffectStatus, ExpectTarget, Expr, ExprLiteral, ExprObjectField,
     FormatOutput, GivenClause, HarnessClass, IrConstructUse, IrEffectDependency, IrEffectKind,
-    IrEffectNode, IrExecTarget, IrInclude, IrPrimitiveType, IrProgram, IrProjectionRead, IrRule,
+    IrEffectNode, IrExecTarget, IrInclude, IrProgram, IrProjectionRead, IrRule,
     IrSchema, IrTest, IrType, IrWorkflowContract, IrWorkflowContractKind, Item, ProjQueryKind,
     QueryKind, RuleStatus, RunKind, SourceSpan, StubPayload, TestClause, TestField, UnaryOp,
 };
@@ -19079,7 +19079,7 @@ fn workflow_input_fact_name(contract: &IrWorkflowContract) -> String {
 // against the declaration through the same functions, so the CLI delegates
 // (S0 dedup — a shape change touches exactly one definition).
 use whipplescript_kernel::rule_lowering::{
-    json_matches_ir_type, validate_json_for_ir_type, validate_json_for_object,
+    validate_json_for_ir_type,
 };
 
 fn step(options: &CliOptions) -> ExitCode {
@@ -20178,7 +20178,7 @@ fn items_store_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".whipplescript/items.sqlite"))
 }
 
-use whipplescript_kernel::time_pass::{clock_emit_payload, TimePassReport};
+use whipplescript_kernel::time_pass::TimePassReport;
 #[cfg(test)]
 use whipplescript_kernel::time_pass::{due_calendar_occurrences, select_clock_occurrences};
 #[cfg(test)]
@@ -44613,7 +44613,8 @@ rule start
             config_json: "{}".to_owned(),
         };
         let bindings = vec![
-            binding("seed", "builtin-messaging"),
+            // A stray binding naming a provider no channel declares stays inert.
+            binding("stray", "builtin-messaging"),
             binding("b-fixture", "fixture"),
             binding("b-local", "std.messaging.local"),
             binding("b-desktop", "std.messaging.desktop"),

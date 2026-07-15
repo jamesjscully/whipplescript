@@ -1419,9 +1419,11 @@ fn native_coerce_turn(
                  WHIPPLESCRIPT_COERCE_PROVIDER or run `whip auth`)"
             )
         })?;
-    let transport = crate::coerce_runtime::UreqCoerceTransport::new(config.timeout);
+    let transport = crate::coerce_runtime::UreqCoerceTransport::new(
+        std::time::Duration::from_secs(config.timeout_secs),
+    );
     let client = whipplescript_kernel::coerce_native::NativeCoerceClient {
-        provider: config.provider,
+        provider: config.backend,
         base_url: config.base_url.clone(),
         api_key: config.api_key.clone(),
         model: config.model.clone(),

@@ -233,38 +233,8 @@ pub fn resolve_coercion_selection(
 /// `Err` is a binding-time configuration/credential failure. Kept for
 /// surfaces without a runtime store (the improve loop's judge/proposer
 /// transport); store-backed call sites use [`resolve_coercion_selection`].
-pub fn resolve_native_coerce_config() -> Result<Option<NativeCoerceConfig>, String> {
-    Ok(resolve_coercion_selection(None, None)?
-        .config
-        .map(Into::into))
-}
-
-/// Pre-unification view of [`ResolvedCoercionConfig`] (old field names/types)
-/// kept ONLY for `resolve_native_coerce_config`'s remaining consumer
-/// (`improve::native_coerce_turn`, owned by the improve surface); re-point
-/// that call and delete this. New code uses the canonical record.
-pub struct NativeCoerceConfig {
-    pub provider: CoerceProvider,
-    pub base_url: String,
-    pub api_key: String,
-    pub model: String,
-    pub max_tokens: u32,
-    pub timeout: Duration,
-    pub codex_account_id: Option<String>,
-}
-
-impl From<ResolvedCoercionConfig> for NativeCoerceConfig {
-    fn from(config: ResolvedCoercionConfig) -> Self {
-        Self {
-            provider: config.backend,
-            base_url: config.base_url,
-            api_key: config.api_key,
-            model: config.model,
-            max_tokens: config.max_tokens,
-            timeout: Duration::from_secs(config.timeout_secs),
-            codex_account_id: config.codex_account_id,
-        }
-    }
+pub fn resolve_native_coerce_config() -> Result<Option<ResolvedCoercionConfig>, String> {
+    Ok(resolve_coercion_selection(None, None)?.config)
 }
 
 fn resolve_selection_inner(

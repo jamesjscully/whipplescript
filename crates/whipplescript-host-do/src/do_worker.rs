@@ -1161,14 +1161,14 @@ mod branch_dispatch_tests {
             None
         );
 
-        // The plain DO file plane never saw the write.
+        // The plain DO file plane never saw the write. The files table keys on
+        // `key`, and the query must not be allowed to fail silently — a broken
+        // query would make this isolation assertion pass vacuously.
         let plain_rows = sql
-            .query("SELECT COUNT(*) FROM files WHERE path LIKE '%note.md'", &[])
-            .map(|rows| {
-                rows.first()
-                    .map(|row| crate::do_store::as_i64(&row[0]))
-                    .unwrap_or(0)
-            })
+            .query("SELECT COUNT(*) FROM files WHERE key LIKE '%note.md'", &[])
+            .expect("plain file plane queries")
+            .first()
+            .map(|row| crate::do_store::as_i64(&row[0]))
             .unwrap_or(0);
         assert_eq!(
             plain_rows, 0,

@@ -691,13 +691,13 @@ rule start
 | `when Class as x [where ...]` | An unconsumed fact of `Class`. |
 | `when human answered <label> as x` | A `human.answer.received` fact from an answered inbox item. |
 | `when <agent> completed turn ... [as x]` | An `agent.turn.completed` fact. A declared agent name matches only that agent's turns; the generic word `worker` matches any agent. |
-| `when <tracker> has ready issue as x` | An issue that is ready to be claimed in a [work queue](#work-queues). |
+| `when <tracker> has ready issue as x` | An issue that is ready to be claimed in a [tracker](#trackers). |
 | `when fact <dotted.name> as x [where ...]` | The general form: any derived fact whose name matches the dotted path. |
 
 All of the readiness patterns above are sugar over `when fact`. `when human
 answered signoff as x` is shorthand for matching a `human.answer.received`
 fact; `when reviewer completed turn as x` matches `agent.turn.completed`; and
-`when backlog has ready issue as x` matches a work-queue readiness fact. Reach
+`when backlog has ready issue as x` matches a tracker readiness fact. Reach
 for the general `when fact <dotted.name>` form when the event you need does
 not yet have a dedicated phrase, for example
 `when fact agent.turn.completed as turn`.
@@ -798,7 +798,7 @@ becomes an effect, and a later rule branches on its completion.
 | `coerce fn(...) as x` | Enqueue a typed `schema.coerce` effect. |
 | `decide "..." -> { ... } as x` | Enqueue an inline typed model decision (see [Inline `decide`](#inline-decide)). |
 | `askHuman [as x] [choices [...]] "..."` | Enqueue a human review request. |
-| `file issue into <tracker> { ... }` | File a new issue into a [work queue](#work-queues). |
+| `file issue into <tracker> { ... }` | File a new issue into a [tracker](#trackers). |
 | `claim <item> [as x]` | Claim a queue item; already-claimed is a branchable failure. |
 | `release <item>` | Return a claimed item to the queue. |
 | `finish <item> [{ summary ... }]` | Mark a queue item done. |
@@ -1206,10 +1206,10 @@ segment actually references are carried.
 
 The [flow design record](https://github.com/jamesjscully/whipplescript/blob/main/spec/flow.md) documents the lowering in full.
 
-## Work queues
+## Trackers
 
-A work queue is vendor-neutral, durable issue tracking declared in source.
-Use it when work arrives as a backlog of items to be claimed, worked, and
+A tracker is vendor-neutral, durable issue tracking declared in source.
+Use it when work arrives as a backlog of issues to be claimed, worked, and
 finished, rather than as facts seeded up front:
 
 ```whip
@@ -1218,12 +1218,14 @@ tracker backlog {
 }
 ```
 
-The `builtin` tracker is workspace-scoped: it stores items in
+The `builtin` tracker is workspace-scoped: it stores issues in
 `.whipplescript/items.sqlite` (override with `WHIPPLESCRIPT_ITEMS_STORE`) and
-issues sequential ids `WS-1`, `WS-2`, and so on. Items have a status in one of
-four categories — `open`, `in_progress`, `done`, `cancelled`.
+issues sequential ids `WS-1`, `WS-2`, and so on. An issue's durable status is
+`open`, `closed`, or `canceled`; `in_progress` is a claim overlay — it appears
+while an active lease holds the issue and vanishes when the lease releases or
+expires, never as stored status.
 
-Rule and flow bodies act on the queue with these verbs:
+Rule and flow bodies act on the tracker with these verbs:
 
 ```whip
 file issue into backlog { title "Fix login" body "Users report 500s." }
@@ -1271,8 +1273,8 @@ When an agent files an item mid-turn through the CLI, the runtime stamps it
 with run-identity provenance from the `WHIPPLESCRIPT_RUN_ID` environment
 variable, so backlog growth is traceable to the run that caused it.
 
-The [work-queues design record](https://github.com/jamesjscully/whipplescript/blob/main/spec/work-queues.md) covers the model in
-detail.
+The [std.tracker design](https://github.com/jamesjscully/whipplescript/blob/main/spec/std-tracker.md) covers the model in
+detail (the older work-queues record is superseded and banners to it).
 
 ## Time and deadlines
 

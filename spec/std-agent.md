@@ -22,7 +22,8 @@ with real behavioral differences (cancellation, sessions, tool policy), and
 today those differences live as scattered string convention — hard-matched
 preset names in each adapter, hidden default tool
 policy inside sidecar JavaScript (scripts/claude-agent-sdk-sidecar.mjs:182-186),
-a compiled-in closed provider-kind check (parser/lib.rs:6038-6043), and a
+a compiled-in closed provider-kind check (`is_supported_harness_kind`,
+DELETED in slice 3 — kinds are registry-derived now), and a
 catalog advertising Claude cancellation DR-0017 says not to advertise
 (kernel/provider.rs:746). The package's job is to make each of those claims a
 centralized, inspectable, truthful piece of data.
@@ -157,7 +158,7 @@ unknown` when that report ships (slice 7, over slice 5's schema).
 
 DR-0009 resolved the registry OPEN ("Provider catalog openness"); the code is
 still closed: `is_supported_harness_kind` hardcodes the kind set
-(parser/lib.rs:6038-6043) and the agent `provider` clause checks against it
+(the deleted `is_supported_harness_kind`) and the agent `provider` clause checks against it
 (parser/lib.rs:6108-6120). This design replaces both with registry-driven
 validation: the set of known provider kinds = kinds contributed by the
 `providers` sections of embedded std manifests plus locked third-party
@@ -169,7 +170,7 @@ manifest → `error` naming it an unknown provider (missing package).
 ### Operator CLI
 
 One v1 item: the existing `whip agent` subcommand is an unrelated IFC-check
-REPL (main.rs:12044); per ecosystem shape "Names" it is renamed
+REPL (`whip_infoflow`, cli/main.rs; renamed in slice 1); per ecosystem shape "Names" it is renamed
 **`whip infoflow`** (one-way, no alias), freeing the `whip agent`/`whip
 agents` namespace. The DR-0009 CLI suite is deferred; `whip doctor
 --providers` remains the operator door.
@@ -234,7 +235,7 @@ capabilities.
 None meet the rule of three for the generic tier; each is a core check this
 spec names as its owner:
 
-1. **Provider-kind-known** (registry-driven; replaces parser/lib.rs:6038-6043)
+1. **Provider-kind-known** (registry-driven; replaced `is_supported_harness_kind` in slice 3)
    with the missing-package/missing-import diagnostic split above.
 2. **`requires [feature.class]` vs accepted feature report** — unreportable
    required class = error; probed/compiled mismatch = warning.

@@ -156,7 +156,7 @@ Provider notes:
   injection path, upgraded: real `received_at` (today filled with `""`,
   main.rs:29584), `--by` actor identity, and a minted unique
   `provider_message_id` — fixing the silent dedup where message_id =
-  idempotency_key(instance, channel, text, markdown) (main.rs:29577); resending
+  idempotency_key(instance, channel, text, markdown) (`whip message`, cli/main.rs; superseded by the delivery-ordinal ids shipped 21bb4e4); resending
   identical text becomes distinct messages, while admission idempotency still
   dedups replays of the SAME delivery. Store-backed ⇒ DO-portable once mailbox
   tables ride RuntimeStore.
