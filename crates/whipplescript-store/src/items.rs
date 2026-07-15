@@ -156,11 +156,22 @@ impl WorkItemStore {
             "metadata": metadata,
             "filed_by": filed_by,
         });
-        tx_append_event(
+        let payload_json = payload.to_string();
+        // The issue's opaque MERGE identity = the content-hash of its creation
+        // event (issue_id excluded — it derives FROM this). WS-N is only a local
+        // alias for it; the event log is keyed by content_id.
+        let content_id =
+            event_content_id("issue.created", None, &payload_json, filed_by, &[], &now);
+        tx.execute(
+            "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
+            params![content_id, item_id],
+        )?;
+        tx_append_raw(
             &tx,
-            Some(&item_id),
+            Some(&content_id),
+            Some(&content_id),
             "issue.created",
-            &payload,
+            &payload_json,
             filed_by,
             &now,
         )?;
@@ -246,7 +257,14 @@ impl WorkItemStore {
         // predicate above, so filter it here (the candidate set is small).
         let mut ready = Vec::with_capacity(rows.len());
         for item in rows {
-            if !analyze_issue_dag(&load_issue_events(&self.connection, &item.id)?).conflicted() {
+            let conflicted = match content_id_of(&self.connection, &item.id)? {
+                Some(content_id) => {
+                    analyze_issue_dag(&load_issue_events(&self.connection, &content_id)?)
+                        .conflicted()
+                }
+                None => false,
+            };
+            if !conflicted {
                 ready.push(item);
             }
         }
@@ -297,10 +315,13 @@ impl WorkItemStore {
         }
         // No active lease: mint a stable, rebuild-deterministic lease id (the
         // k-th acquire on this issue) and grant. A plain claim writes NO durable
-        // status — readiness changes through the lease overlay.
+        // status — readiness changes through the lease overlay. The acquire count
+        // is over the event log, which is keyed by the opaque content_id.
+        let content_id = content_id_of(&tx, item_id)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {item_id}")))?;
         let n: i64 = tx.query_row(
             "SELECT COUNT(*) FROM tracker_events WHERE issue_id = ?1 AND kind = 'claim.acquired'",
-            [item_id],
+            [&content_id],
             |row| row.get(0),
         )?;
         let lease_id = format!("L-{item_id}-{n}");
@@ -456,7 +477,14 @@ impl WorkItemStore {
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = tx_now(&tx)?;
-        let payload = json!({"from": from, "to": to, "kind": "blocks"});
+        // The event payload references issues by opaque content_id (merge-stable
+        // across clones); the projection keeps aliases (the readiness join is
+        // alias-keyed and clone-local).
+        let from_cid = content_id_of(&tx, from)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {from}")))?;
+        let to_cid = content_id_of(&tx, to)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {to}")))?;
+        let payload = json!({"from": from_cid, "to": to_cid, "kind": "blocks"});
         tx_append_event(&tx, Some(to), "relation.added", &payload, None, &now)?;
         tx.execute(
             "INSERT OR IGNORE INTO tracker_relations (from_issue, to_issue, kind, dep_kind) \
@@ -522,13 +550,15 @@ impl WorkItemStore {
             tx.commit()?;
             return Ok(SetFieldOutcome::NotFound);
         }
-        let current = analyze_issue_dag(&load_issue_events(&tx, item_id)?).state_token;
+        let content_id = content_id_of(&tx, item_id)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {item_id}")))?;
+        let current = analyze_issue_dag(&load_issue_events(&tx, &content_id)?).state_token;
         if current != expect_token {
             tx.commit()?;
             return Ok(SetFieldOutcome::StateChanged { actual: current });
         }
         tx_apply_field_set(&tx, item_id, field, value, &now)?;
-        let after = analyze_issue_dag(&load_issue_events(&tx, item_id)?).state_token;
+        let after = analyze_issue_dag(&load_issue_events(&tx, &content_id)?).state_token;
         tx.commit()?;
         Ok(SetFieldOutcome::Applied { state_token: after })
     }
@@ -549,7 +579,10 @@ impl WorkItemStore {
         if !exists {
             return Ok(None);
         }
-        let events = load_issue_events(&self.connection, item_id)?;
+        let Some(content_id) = content_id_of(&self.connection, item_id)? else {
+            return Ok(None);
+        };
+        let events = load_issue_events(&self.connection, &content_id)?;
         Ok(Some(analyze_issue_dag(&events)))
     }
 
@@ -565,6 +598,12 @@ impl WorkItemStore {
         tx.execute_batch(
             "DELETE FROM tracker_issues; DELETE FROM tracker_relations; DELETE FROM tracker_leases;",
         )?;
+        // The event log is keyed by opaque content_id; the projections are
+        // alias-keyed. `tracker_aliases` (durable, NOT wiped) is the bridge.
+        let alias_of: std::collections::HashMap<String, String> = tx
+            .prepare("SELECT content_id, alias FROM tracker_aliases")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
         let events: Vec<(Option<String>, String, String, String)> = tx
             .prepare(
                 "SELECT issue_id, kind, payload_json, created_at FROM tracker_events ORDER BY event_seq",
@@ -573,9 +612,13 @@ impl WorkItemStore {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        for (issue_id, kind, payload_json, created_at) in &events {
+        for (content_id, kind, payload_json, created_at) in &events {
             let payload: Value = serde_json::from_str(payload_json).unwrap_or_else(|_| json!({}));
-            fold_event(&tx, issue_id.as_deref(), kind, &payload, created_at)?;
+            let issue_alias = content_id
+                .as_deref()
+                .and_then(|c| alias_of.get(c))
+                .map(String::as_str);
+            fold_event(&tx, issue_alias, kind, &payload, created_at, &alias_of)?;
         }
         tx.commit()?;
         Ok(())
@@ -609,9 +652,18 @@ impl WorkItemStore {
 }
 
 /// The append-only tracker schema (native file and the DO share this shape).
-/// `tracker_events` is INSERT-only — the source of truth; the rest are
-/// disposable projections folded from it. `tracker_counter` mints the sequential
-/// `WS-N` alias.
+/// `tracker_events` is INSERT-only — the source of truth; `tracker_issues` /
+/// `tracker_relations` / `tracker_leases` are disposable projections folded from
+/// it. `tracker_aliases` is NOT a projection: it is durable clone-local naming
+/// state (content-hash issue id ↔ human `WS-N`), survives a rebuild, and is
+/// re-assigned locally on merge-import — the WS-N of clone A is not the WS-N of
+/// clone B. `tracker_counter` mints the sequential `WS-N`.
+///
+/// Identity (ADR-0002 phase B1 slice i unit 2): an issue's MERGE identity is the
+/// content-hash of its `issue.created` event (`content_id`), carried in every
+/// event's `issue_id` and in relation payloads, so two clones' logs union
+/// correctly. `WS-N` is only a local alias for a human; the projection tables
+/// stay keyed by it (clone-local), the event log by the opaque `content_id`.
 #[cfg(feature = "native")]
 const TRACKER_SCHEMA_SQL: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -660,6 +712,10 @@ CREATE TABLE IF NOT EXISTS tracker_counter (
     next_id INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO tracker_counter (singleton, next_id) VALUES (1, 1);
+CREATE TABLE IF NOT EXISTS tracker_aliases (
+    content_id TEXT PRIMARY KEY,
+    alias TEXT NOT NULL UNIQUE
+);
 CREATE INDEX IF NOT EXISTS idx_tracker_issues_queue ON tracker_issues(queue, status);
 CREATE INDEX IF NOT EXISTS idx_tracker_leases_issue ON tracker_leases(issue_id, released_at);
 CREATE INDEX IF NOT EXISTS idx_tracker_events_issue ON tracker_events(issue_id, kind);
@@ -734,29 +790,87 @@ fn tx_issue_heads(tx: &Transaction<'_>, issue_id: &str) -> StoreResult<Vec<Strin
     Ok(heads)
 }
 
-/// Append one immutable event (INSERT only — never updated or deleted). Its
-/// parents are the issue's current heads and its `event_id` is the content hash
-/// over the whole event, so the log is a Merkle-DAG (ADR-0002 phase B1).
+/// Resolve a human `WS-N` alias to its opaque `content_id` merge identity.
+#[cfg(feature = "native")]
+fn content_id_of(conn: &Connection, alias: &str) -> StoreResult<Option<String>> {
+    conn.query_row(
+        "SELECT content_id FROM tracker_aliases WHERE alias = ?1",
+        [alias],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Append one immutable event keyed by the issue's opaque `content_id` (INSERT
+/// only). Its parents are the issue's current heads; its `event_id` is the
+/// content hash over the whole event, so the log is a Merkle-DAG. Pass
+/// `event_id_override` only for the `issue.created` root, whose id IS the issue's
+/// `content_id` (identity = the creation event). Deduped by `event_id` on merge.
+#[cfg(feature = "native")]
+fn tx_append_raw(
+    tx: &Transaction<'_>,
+    issue_content_id: Option<&str>,
+    event_id_override: Option<&str>,
+    kind: &str,
+    payload_json: &str,
+    actor: Option<&str>,
+    now: &str,
+) -> StoreResult<String> {
+    let parents = match issue_content_id {
+        Some(id) => tx_issue_heads(tx, id)?,
+        None => Vec::new(),
+    };
+    let event_id = match event_id_override {
+        Some(id) => id.to_owned(),
+        None => event_content_id(kind, issue_content_id, payload_json, actor, &parents, now),
+    };
+    let parents_json = serde_json::to_string(&parents)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO tracker_events \
+         (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            event_id,
+            parents_json,
+            issue_content_id,
+            kind,
+            payload_json,
+            actor,
+            now
+        ],
+    )?;
+    Ok(event_id)
+}
+
+/// Append one event for an issue given by its `WS-N` alias — the door for every
+/// mutation the CLI drives (which speaks WS-N). Resolves the alias to the opaque
+/// `content_id` the event log is keyed by, so the log stays merge-stable while
+/// callers keep using the human handle.
 #[cfg(feature = "native")]
 fn tx_append_event(
     tx: &Transaction<'_>,
-    issue_id: Option<&str>,
+    alias: Option<&str>,
     kind: &str,
     payload: &Value,
     actor: Option<&str>,
     now: &str,
 ) -> StoreResult<()> {
-    let parents = match issue_id {
-        Some(id) => tx_issue_heads(tx, id)?,
-        None => Vec::new(),
+    let content_id = match alias {
+        Some(a) => Some(
+            content_id_of(tx, a)?
+                .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {a}")))?,
+        ),
+        None => None,
     };
-    let payload_json = payload.to_string();
-    let event_id = event_content_id(kind, issue_id, &payload_json, actor, &parents, now);
-    let parents_json = serde_json::to_string(&parents)?;
-    tx.execute(
-        "INSERT INTO tracker_events (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![event_id, parents_json, issue_id, kind, payload_json, actor, now],
+    tx_append_raw(
+        tx,
+        content_id.as_deref(),
+        None,
+        kind,
+        &payload.to_string(),
+        actor,
+        now,
     )?;
     Ok(())
 }
@@ -1012,8 +1126,10 @@ fn analyze_issue_dag(events: &[IssueEvent]) -> IssueConflicts {
 
 /// Fold one event into the projection tables — the shared step of both live
 /// application and `rebuild_projection`, so a rebuild is bit-identical. `issue_id`
-/// is the event row's subject column (the issue for issue/claim events, the
-/// blocked issue for `relation.added`).
+/// is the alias of the event's subject issue (already resolved from the event's
+/// opaque `content_id`). `alias_of` maps content_id → alias so `relation.added`
+/// payloads (which reference issues by opaque id) fold into the alias-keyed
+/// projection.
 #[cfg(feature = "native")]
 fn fold_event(
     tx: &Transaction<'_>,
@@ -1021,6 +1137,7 @@ fn fold_event(
     kind: &str,
     payload: &Value,
     created_at: &str,
+    alias_of: &std::collections::HashMap<String, String>,
 ) -> StoreResult<()> {
     let str_of = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_owned);
     match kind {
@@ -1070,12 +1187,21 @@ fn fold_event(
         "issue.canceled" => fold_set_status(tx, issue_id, payload, "canceled", created_at)?,
         "issue.reopened" => fold_set_status(tx, issue_id, payload, "open", created_at)?,
         "relation.added" => {
+            // The payload references issues by opaque content_id; the projection
+            // is alias-keyed. Skip the edge if either endpoint has no local alias
+            // (an imported relation whose issue we do not yet hold).
+            let (Some(from), Some(to)) = (
+                str_of("from").and_then(|c| alias_of.get(&c).cloned()),
+                str_of("to").and_then(|c| alias_of.get(&c).cloned()),
+            ) else {
+                return Ok(());
+            };
             tx.execute(
                 "INSERT OR IGNORE INTO tracker_relations (from_issue, to_issue, kind, dep_kind) \
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
-                    str_of("from"),
-                    str_of("to"),
+                    from,
+                    to,
                     str_of("kind").unwrap_or_else(|| "blocks".to_owned()),
                     str_of("dep_kind"),
                 ],
@@ -1343,8 +1469,9 @@ mod tests {
         assert_eq!(second.filed_by.as_deref(), Some("turn-1"));
     }
 
-    /// Reads the raw event log for one issue in append order.
-    fn events_for(store: &WorkItemStore, issue_id: &str) -> Vec<(String, Vec<String>, String)> {
+    /// Reads the raw event log for one issue (given by alias) in append order.
+    fn events_for(store: &WorkItemStore, alias: &str) -> Vec<(String, Vec<String>, String)> {
+        let content_id = content_id_of(&store.connection, alias).unwrap().unwrap();
         store
             .connection
             .prepare(
@@ -1352,7 +1479,7 @@ mod tests {
                  WHERE issue_id = ?1 ORDER BY event_seq",
             )
             .unwrap()
-            .query_map([issue_id], |row| {
+            .query_map([&content_id], |row| {
                 let id: String = row.get(0)?;
                 let parents_json: String = row.get(1)?;
                 let kind: String = row.get(2)?;
@@ -1398,20 +1525,104 @@ mod tests {
         assert_ne!(claim_id, created_id);
     }
 
+    /// ADR-0002 phase B1 slice i unit 2: the event log is keyed by the opaque
+    /// content_id (merge identity), NOT the clone-local WS-N alias; the alias
+    /// table bridges the two. Identity = the creation event's id.
+    #[test]
+    fn events_are_keyed_by_opaque_content_id_not_alias() {
+        let mut store = open_memory();
+        let filed = store
+            .file_item("backlog", "Fix login", "repro", &[], &json!({}), None)
+            .expect("files");
+        assert_eq!(filed.id, "WS-1");
+
+        let content_id = content_id_of(&store.connection, "WS-1")
+            .unwrap()
+            .expect("alias resolves");
+        assert_eq!(content_id.len(), 64, "content_id is a SHA-256");
+
+        // No event row carries the WS-N alias; every event's issue_id is the id.
+        let alias_rows: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM tracker_events WHERE issue_id = 'WS-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alias_rows, 0, "no event is keyed by the alias");
+        let id_rows: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM tracker_events WHERE issue_id = ?1",
+                [&content_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(id_rows, 1, "the created event is keyed by content_id");
+        // Identity = the creation event: the created event's id IS the content_id.
+        let (created_id, _, _) = &events_for(&store, "WS-1")[0];
+        assert_eq!(created_id, &content_id);
+    }
+
+    /// A rebuild reconstructs the alias-keyed projection from the content_id-keyed
+    /// event log via the durable `tracker_aliases` bridge — bit-identical to the
+    /// live projection, across issues / field sets / dependencies / claims.
+    #[test]
+    fn rebuild_reproduces_projection_through_the_alias_bridge() {
+        let mut store = open_memory();
+        let a = store
+            .file_item("q", "A title", "", &[], &json!({}), None)
+            .expect("files");
+        let b = store
+            .file_item("q", "B title", "", &[], &json!({}), None)
+            .expect("files");
+        store.set_field(&a.id, "title", "A retitled").expect("set");
+        store.add_blocks(&b.id, &a.id).expect("dep"); // b blocks a
+        store.claim_item(&b.id, "worker-1", None).expect("claim");
+
+        let before = store.get_item(&a.id).unwrap().unwrap();
+        let ready_before = store.ready_items("q").unwrap();
+
+        store.rebuild_projection().expect("rebuild");
+
+        let after = store.get_item(&a.id).unwrap().unwrap();
+        assert_eq!(after.id, "WS-1");
+        assert_eq!(after.title, "A retitled", "field_set folded through");
+        assert_eq!(after, before, "projection is bit-identical after rebuild");
+        // a is still blocked by open b; b is claimed → neither ready, same as before.
+        assert_eq!(
+            store.ready_items("q").unwrap().len(),
+            ready_before.len(),
+            "readiness (deps + leases) reproduced"
+        );
+        // The dependency edge survived the content_id→alias round-trip.
+        let edges: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM tracker_relations WHERE from_issue = ?1 AND to_issue = ?2",
+                params![b.id, a.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(edges, 1, "relation folded back to aliases");
+    }
+
     /// Inserts one event with EXPLICIT parents, bypassing the linear
     /// head-chaining of `tx_append_event`. This is how a test manufactures a
     /// DAG fork — two events sharing a parent — which single-writer appends
     /// never produce (only a merge does). Returns the event's content id.
     fn insert_event(
         store: &WorkItemStore,
-        issue_id: &str,
+        alias: &str,
         kind: &str,
         payload: &Value,
         parents: &[String],
         now: &str,
     ) -> String {
+        let content_id = content_id_of(&store.connection, alias).unwrap().unwrap();
         let payload_json = payload.to_string();
-        let event_id = event_content_id(kind, Some(issue_id), &payload_json, None, parents, now);
+        let event_id = event_content_id(kind, Some(&content_id), &payload_json, None, parents, now);
         let parents_json = serde_json::to_string(parents).unwrap();
         store
             .connection
@@ -1419,7 +1630,7 @@ mod tests {
                 "INSERT INTO tracker_events \
                  (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
-                params![event_id, parents_json, issue_id, kind, payload_json, now],
+                params![event_id, parents_json, content_id, kind, payload_json, now],
             )
             .unwrap();
         event_id
