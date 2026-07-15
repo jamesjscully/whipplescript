@@ -1,10 +1,16 @@
 # Std-package post-campaign tails — sequenced tracker
 
-Status: active. Registered 2026-07-15 at the std-package campaign close-out
+Status: active — **all buildable waves (0-3) SHIPPED 2026-07-15**; only the
+demand-gated (`[~]`, awaiting their documented triggers) and design-heavy
+(`[~]`, awaiting a ruling/design) items remain, which is their correct
+terminal state. Registered 2026-07-15 at the std-package campaign close-out
 (commit 171a9e0; constitution checklist + design-tracker Current Rule both
 flipped). This tracker sequences everything the campaign deferred with cause.
 The campaign itself is CLOSED — do not reopen per-package v1 scope here; each
 item below cites the design doc that owns its definition.
+
+Buildable-wave commits: Wave 0 3e91a1a · Wave 1 91f91dd · Wave 1b 58ed654 ·
+Wave 2 699a281 · Wave 3 36660bc.
 
 Sequencing principle: items split by NATURE, not just priority — **buildable
 now** (Waves 0-3, in order), **demand-gated** (built when their documented
