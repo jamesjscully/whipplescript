@@ -37,22 +37,33 @@ transport is B2.
       import exists. Building it earlier would be a large correctness-critical
       rewire tested only indirectly. Slice ii below is key-agnostic (folds "the
       issue's events"), so it does not block on this.
-- [ ] Slice ii — DAG-aware per-field conflict engine (the hard core): compute
-      each field from its bef-maximal setters over the event DAG; a field with
-      ≥2 disagreeing maximal setters is `conflicted`. `conflicted` /
-      `field_conflicts` / `heads` / `state_token` on every rich issue shape
-      (`show`/`list`/`ready`/JSON). A conflicted issue is not ready. Realizes
-      `tracker-merge.maude` (SSSSSNNNS). Testable now via hand-inserted forked
-      events (a fork otherwise arises only from merge).
-- [ ] Slice iii — merge / import-events (carries slice-i unit 2): set-union
+- [x] Slice ii — DAG-aware per-field conflict engine (2026-07-15, commit
+      d7e8819; store tests `linear_field_history_never_conflicts` /
+      `disagreeing_fork_conflicts_and_is_not_ready` / `agreeing_fork_converges`
+      / `different_fields_fork_does_not_conflict` / `merge_resolution_clears_conflict`).
+      `set_field` emits `issue.field_set`; `issue_conflicts` computes each field
+      from its `bef`-maximal setters over the DAG; ≥2 disagreeing maximal setters
+      is a conflict. `heads`/`state_token`/`conflicted`/`field_conflicts` +
+      readiness excludes conflicted. Realizes `tracker-merge.maude` (SSSSSNNNS).
+      CLI (commit b529e87): `issue set`, `issue conflicts <id>` /
+      `--tracker`, and `issue show` (text+JSON) carry the conflict view.
+      Residual: `list`/`ready` JSON enrichment (cheap follow-up; `show` +
+      dedicated `conflicts` cover the surface now).
+- [ ] Slice i unit 2 + Slice iii — merge / import-events (co-built): set-union
       deduped by content-hash + the WS-N→opaque-id flip / re-aliasing; on a
       byte-identical `issue.created` re-submission, a `duplicate_submission`
-      WARNING (never a silent collapse).
-- [ ] Slice iv — resolution: a `resolve` command appending an event whose
-      parents are the conflicting heads → conflict clears; `whip issue
-      conflicts [--json]`.
-- [ ] Slice v — optimistic concurrency: `whip issue set <id> <field> <v>
-      --expect-state-token <t>` applies only if the token still matches.
+      WARNING (never a silent collapse). **DECISION CHECKPOINT for Jack** — the
+      merge/import semantics + the identity flip are the design-loaded remainder;
+      pause here for direction before building.
+- [~] Slice iv — resolution: the conflict-clearing SEMANTICS ship (a `set` on a
+      conflicted issue parents on all heads → supersedes both → clears; store
+      test `merge_resolution_clears_conflict`, and `issue conflicts` reads).
+      A dedicated `resolve` verb is sugar deferred to the merge slice (a
+      conflict is only creatable via merge, so the verb is exercised there).
+- [x] Slice v — optimistic concurrency (2026-07-15, commit 2961f9b; store test
+      `optimistic_set_guards_on_state_token`): `whip issue set <id> <field> <v>
+      --expect-state-token <t>` applies only if the token still matches, else
+      refused with the actual token; check + append share one Immediate tx.
 
 Per-slice gates: model already covers the invariants; each slice adds direct
 store/CLI tests + keeps the frozen `WorkItems` seam and
