@@ -120,6 +120,82 @@ assert exists(Item where status == "open")
     let _ = fs::remove_file(source);
 }
 
+/// A `where` guard on a bindingless trigger (`when started`) is enforced at
+/// runtime, not silently dropped. Bindingless triggers previously skipped guard
+/// evaluation entirely, so a false guard still fired the rule — the exact
+/// silent-no-op class this suite pins. The same `count(... where ...)` guard is
+/// exercised to keep it aligned with the bound-trigger B1c coverage above.
+#[test]
+fn started_trigger_guard_is_enforced() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+
+    // True guard (exactly two "done") fires the started rule and completes;
+    // false guard (not three) must NOT fire, so the instance never completes.
+    for (label, guard, expected_completed) in [
+        (
+            "true-guard",
+            r#"count(Item where status == "done") == 2"#,
+            true,
+        ),
+        (
+            "false-guard",
+            r#"count(Item where status == "done") == 3"#,
+            false,
+        ),
+    ] {
+        let store = temp_path(&format!("started-guard-{label}"), "sqlite");
+        let source = temp_path(&format!("started-guard-{label}"), "whip");
+        fs::write(&source, started_guard_program(guard)).expect("write source");
+        let store_str = store.to_str().expect("utf-8");
+        let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &[]);
+        let instance = dev
+            .get("instance_id")
+            .and_then(Value::as_str)
+            .expect("instance id");
+        let completed = instance_status(bin, store_str, instance) == "completed";
+        assert_eq!(
+            completed, expected_completed,
+            "{label}: started-guard enforcement wrong (completed={completed})"
+        );
+        let _ = fs::remove_file(store);
+        let _ = fs::remove_file(source);
+    }
+}
+
+fn started_guard_program(guard: &str) -> String {
+    format!(
+        r#"
+workflow StartedGuard
+
+output result Report
+
+class Item {{
+  id string
+  status string
+}}
+
+class Report {{
+  ok int
+}}
+
+table items as Item [
+  {{ id "a" status "done" }}
+  {{ id "b" status "done" }}
+  {{ id "c" status "open" }}
+]
+
+rule finish
+  when started
+  where {guard}
+=> {{
+  complete result {{
+    ok 1
+  }}
+}}
+"#
+    )
+}
+
 /// Templates in record/payload string fields render against bindings.
 #[test]
 fn templates_in_payload_fields_render() {

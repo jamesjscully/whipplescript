@@ -194,9 +194,33 @@ pub fn ready_contexts(
             if started_event_id.is_none() {
                 return ReadyContexts::empty(guard_reports);
             }
+            contexts = filter_bindingless_guard(
+                rule,
+                when,
+                contexts,
+                facts,
+                effects,
+                ir,
+                &mut guard_reports,
+            );
+            if contexts.is_empty() {
+                return ReadyContexts::empty(guard_reports);
+            }
             continue;
         }
         if pattern.ends_with(" is available") {
+            contexts = filter_bindingless_guard(
+                rule,
+                when,
+                contexts,
+                facts,
+                effects,
+                ir,
+                &mut guard_reports,
+            );
+            if contexts.is_empty() {
+                return ReadyContexts::empty(guard_reports);
+            }
             continue;
         }
         if let Some((schema, binding)) = pattern.split_once(" as ") {
@@ -255,6 +279,18 @@ pub fn ready_contexts(
             if !satisfied {
                 return ReadyContexts::empty(guard_reports);
             }
+            contexts = filter_bindingless_guard(
+                rule,
+                when,
+                contexts,
+                facts,
+                effects,
+                ir,
+                &mut guard_reports,
+            );
+            if contexts.is_empty() {
+                return ReadyContexts::empty(guard_reports);
+            }
             continue;
         }
         return ReadyContexts::empty(guard_reports);
@@ -263,6 +299,48 @@ pub fn ready_contexts(
         contexts,
         guard_reports,
     }
+}
+
+/// Apply a bindingless trigger's `where` guard (`started`, `<agent> is
+/// available`, `<agent> completed turn`, `<tracker> has ready issue`, ...) to
+/// the current contexts. These triggers bind no fact, so the guard evaluates
+/// against global facts. The guard used to be honored ONLY on `<Class> as
+/// <binding>` triggers, so a guard on a bindingless trigger was silently
+/// dropped and the rule fired even when the guard was false — the exact
+/// silent-no-op class B1 exists to eliminate. Reuses the same `eval_guard` as
+/// the bound path, so the "a rule fires only when its guard holds" invariant is
+/// uniform. A guardless trigger returns the contexts unchanged.
+fn filter_bindingless_guard(
+    rule: &IrRule,
+    when: &IrWhen,
+    contexts: Vec<RuleContext>,
+    facts: &[FactView],
+    effects: &[EffectView],
+    ir: &IrProgram,
+    guard_reports: &mut Vec<GuardReport>,
+) -> Vec<RuleContext> {
+    let Some(guard) = &when.guard else {
+        return contexts;
+    };
+    let mut kept = Vec::new();
+    for context in contexts {
+        let report = eval_guard(
+            &rule.name,
+            &when.source,
+            &guard.source,
+            &guard.expr,
+            &context,
+            facts,
+            effects,
+            ir,
+        );
+        let matched = report.matched;
+        guard_reports.push(report);
+        if matched {
+            kept.push(context);
+        }
+    }
+    kept
 }
 
 /// For `<tracker> has ready issue` patterns, only the named tracker's projected
