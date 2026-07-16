@@ -50675,7 +50675,7 @@ class Done {
 rule finish
   when Task as task where task.status == "queued"
 => {
-  consume task
+  done task
   record Done {
     status "done"
   }

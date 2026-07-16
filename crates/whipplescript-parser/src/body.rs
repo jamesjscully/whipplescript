@@ -91,11 +91,11 @@ pub struct BodyAst {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BodyStmt {
     Record(RecordStmt),
-    /// `done x` / `done x -> record ...`; `consume` sets `deprecated_consume`.
+    /// `done x` / `done x -> record ...` — marks a fact terminal, optionally
+    /// replacing it with a record.
     Done {
         binding: String,
         replacement: Option<RecordStmt>,
-        deprecated_consume: bool,
         span: SourceSpan,
     },
     Effect(EffectStmt),
@@ -1155,10 +1155,11 @@ impl<'a> BodyParser<'a> {
         match keyword.as_str() {
             "record" => self.parse_record_statement().map(BodyStmt::Record),
             // `consume <counter> for <key> ...` is the counter verb
-            // (spec/coordination.md); bare `consume <binding>` stays the
-            // deprecated done-alias.
+            // (spec/coordination.md). The bare `consume <binding>` alias for
+            // `done` was removed after its deprecation window (shipped v0.2).
             "consume" if self.looks_like_counter_consume() => self.parse_counter_consume(),
-            "done" | "consume" => self.parse_done_statement(),
+            "consume" => self.removed_consume_alias(),
+            "done" => self.parse_done_statement(),
             "tell" => self.parse_tell(),
             "coerce" => self.parse_coerce_call(),
             "askHuman" => self.parse_ask_human(),
@@ -1243,10 +1244,7 @@ impl<'a> BodyParser<'a> {
 
     fn parse_done_statement(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
-        let keyword = match self.advance()?.tok {
-            Tok::Ident(value) => value,
-            _ => return None,
-        };
+        self.pos += 1; // `done`
         let binding = self.ident_text("fact binding after `done`")?;
         let replacement = if matches!(self.peek().map(|t| &t.tok), Some(Tok::Arrow)) {
             self.pos += 1;
@@ -1263,9 +1261,28 @@ impl<'a> BodyParser<'a> {
         Some(BodyStmt::Done {
             binding,
             replacement,
-            deprecated_consume: keyword == "consume",
             span: self.span_from(start),
         })
+    }
+
+    /// The bare `consume <binding>` alias for `done` was removed after its
+    /// deprecation window (one release; shipped in v0.2). Emit a clear
+    /// diagnostic instead of the generic unknown-statement error. The live
+    /// counter verb `consume <counter> for ...` is dispatched ahead of this by
+    /// `looks_like_counter_consume`, so only the removed alias reaches here.
+    fn removed_consume_alias(&mut self) -> Option<BodyStmt> {
+        let span = self.span_here();
+        self.error(
+            span,
+            "`consume` was removed; use `done`",
+            Some("replace `consume` with `done`".to_owned()),
+        );
+        // Swallow the whole statement (binding and any `-> record { ... }`) so
+        // the removed alias yields ONE diagnostic, not a cascade from the
+        // leftover binding being re-scanned as an unknown statement.
+        self.pos += 1; // past `consume`
+        self.recover();
+        None
     }
 
     /// Parse `{ field value ... }`. Values are expressions; in `from` blocks a
@@ -3789,7 +3806,6 @@ mod tests {
         let BodyStmt::Done {
             binding,
             replacement,
-            deprecated_consume,
             ..
         } = &ast.statements[0]
         else {
@@ -3797,19 +3813,40 @@ mod tests {
         };
         assert_eq!(binding, "task");
         assert!(replacement.is_some());
-        assert!(!deprecated_consume);
     }
 
     #[test]
-    fn flags_consume_as_deprecated() {
-        let ast = parse_ok("consume task");
-        let BodyStmt::Done {
-            deprecated_consume, ..
-        } = &ast.statements[0]
-        else {
-            panic!("expected done");
-        };
-        assert!(deprecated_consume);
+    fn consume_done_alias_is_removed() {
+        // The bare `consume <binding>` alias for `done` was removed; it now
+        // errors with a migration hint rather than parsing as a done terminal.
+        let (ast, diagnostics) = parse_rule_body("consume task", 0, BodyMode::Rule);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("`consume` was removed")),
+            "expected a removed-alias diagnostic, got {diagnostics:?}"
+        );
+        assert!(
+            !matches!(ast.statements.first(), Some(BodyStmt::Done { .. })),
+            "removed alias must not parse as a done terminal"
+        );
+    }
+
+    #[test]
+    fn counter_consume_verb_still_parses() {
+        // The live counter verb `consume <counter> for ...` is unaffected.
+        let ast = parse_ok("consume budget for t.id amount 1 as spend");
+        assert!(
+            matches!(
+                ast.statements.first(),
+                Some(BodyStmt::Effect(EffectStmt {
+                    kind: BodyEffectKind::CounterConsume { .. },
+                    ..
+                }))
+            ),
+            "counter consume must still parse, got {:?}",
+            ast.statements.first()
+        );
     }
 
     #[test]

@@ -1603,9 +1603,11 @@ pub fn consume_statements(body: &str) -> Vec<String> {
     body.lines()
         .filter_map(|line| {
             let line = line.trim().trim_end_matches(';');
+            // `done <binding>` consumes the matched fact. (The bare `consume`
+            // alias was removed; `consume <counter> for ...` is a distinct
+            // counter verb and is not an identifier here, so it never matches.)
             let binding = line
-                .strip_prefix("consume ")
-                .or_else(|| line.strip_prefix("done "))?
+                .strip_prefix("done ")?
                 .split("->")
                 .next()
                 .unwrap_or_default()

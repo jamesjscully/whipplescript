@@ -4522,7 +4522,6 @@ fn lower_program(
                     &rule.name.name,
                     &mut ir,
                 );
-                warn_deprecated_consume(&rule, &mut warnings);
                 lower_rule(
                     rule,
                     &semantic,
@@ -4705,26 +4704,6 @@ fn warn_inert_memory_grant_on_native_adapter(ir: &IrProgram, warnings: &mut Vec<
                     });
                 }
             }
-        }
-    }
-}
-
-fn warn_deprecated_consume(rule: &RuleDecl, warnings: &mut Vec<Diagnostic>) {
-    for line in rule.body.text.lines() {
-        let line = line.trim().trim_end_matches(';');
-        let mut words = line.split_whitespace();
-        let is_counter_consume = words.next() == Some("consume")
-            && words.next().is_some()
-            && words.next() == Some("for");
-        if (line == "consume" || line.starts_with("consume ")) && !is_counter_consume {
-            warnings.push(Diagnostic {
-                related: Vec::new(),
-                span: rule.body.span,
-                message: format!("rule `{}` uses deprecated `consume`", rule.name.name),
-                suggestion: Some(
-                    "use `done` instead; `consume` will be removed in a future release".to_owned(),
-                ),
-            });
         }
     }
 }
@@ -17630,11 +17609,13 @@ fn parse_effect_line(line: &str) -> Option<(IrEffectKind, Option<String>)> {
 }
 
 fn parse_consume_line(line: &str) -> Option<String> {
+    // `done <binding>` consumes the matched fact. The bare `consume` alias for
+    // `done` was removed; `consume <counter> for ...` is the distinct counter
+    // verb (multi-word, so it never satisfies the identifier check below).
     let binding = line
         .trim()
         .trim_end_matches(';')
-        .strip_prefix("consume ")
-        .or_else(|| line.trim().trim_end_matches(';').strip_prefix("done "))?
+        .strip_prefix("done ")?
         .split("->")
         .next()
         .unwrap_or_default()
@@ -31740,7 +31721,7 @@ class Task {
 rule finish
   when Task as task
 => {
-  consume task
+  done task
 }
 "#;
         let compiled = compile_program(source);
@@ -31762,7 +31743,7 @@ class Task {
 rule finish
   when Task as task
 => {
-  consume missing
+  done missing
 }
 "#;
         let compiled = compile_program(source);

@@ -824,9 +824,6 @@ becomes an effect, and a later rule branches on its completion.
 | `complete output { ... }` | Emit the declared workflow output; the instance completes. |
 | `fail failure { ... }` | Emit the declared failure payload; the instance fails. |
 
-`consume binding` is a deprecated alias for `done binding`; it compiles with
-a warning and will be removed — prefer `done`.
-
 The bare `emit <name>` action has been removed from the language; `emit` must be
 followed by `signal` (directed event injection to a peer instance) or `milestone`
 (a child-milestone projection — see below). Workflows otherwise append durable
