@@ -85,6 +85,12 @@ identity change (one-way; the opaque id is new primary identity).
 
 ## B2 — additive (after B1)
 
+Status: **richer model + DO parity + cross-machine transport all SHIPPED
+2026-07-15**; only external providers (demand-gated) and provenance-based
+duplicate-submission suppression (low priority) remain — the multi-writer /
+multi-machine tracker Jack set out to build works end-to-end (native ⇄ DO event
+format, and clones reconcile by sharing a folder).
+
 The **richer model** (relations + comments/evidence) SHIPPED 2026-07-15 (Jack's
 first B2 pick):
 
@@ -116,13 +122,21 @@ Remaining B2 (in the order I'd take them):
       + wasm-safe) so both backends mint identical ids and detect conflicts
       identically. A single DO is single-writer, so the value is event-format
       INTEROP (a DO log and a native log now merge).
-- [~] Cross-machine transport: portable `.whip/tracker/tx/**/*.json` and/or the
-      WorkspaceVcs integration (the gaugedesk multi-writer exchange). Trigger:
-      the first real cross-machine / cross-clone sync. (export/import already
-      give the event-level primitive; this is the on-disk/sync format.)
+- [x] Cross-machine transport (2026-07-15, commit d40b932; store test
+      `dir_sync_reconciles_two_clones`): the event log serializes as
+      content-addressed files at `<dir>/<aa>/<event_id>.json` (git-object
+      sharding), so a write is idempotent and two clones' directories union by
+      the set of files. `export_to_dir`/`import_from_dir`/`sync_dir`; CLI `issue
+      export --to DIR`, `import --from DIR`, `sync DIR`. Verified two working
+      dirs sharing a folder diverge → sync → BYTE-IDENTICAL frontier (same
+      state_token) with the conflict surfaced in both. WorkspaceVcs integration
+      is a heavier alternative left for if/when a workspace-native exchange is
+      wanted; the portable-file form covers drop-a-folder / rsync / synced-drive.
 - [~] External providers with claim-strength (GitHub/Linear/Jira adapters
       normalizing into tracker events; weak/advisory claims surface as such).
       DEMAND-GATED — build against a concrete integration target, not
       speculatively.
 - [~] provenance-based `duplicate_submission` suppression (quiet incremental
-      re-sync) — needs per-event origin; natural rider on transport.
+      re-sync) — needs per-event origin. `sync` already suppresses the per-event
+      warning (a repeated reconcile expects overlap); the genuine-duplicate case
+      still can't be distinguished without provenance. Low priority.
