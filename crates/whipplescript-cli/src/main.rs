@@ -29608,6 +29608,8 @@ set <id> <field> <value> [--expect-state-token T]|\
 conflicts <id>|conflicts --tracker TR|\
 dep add <blocked> [depends-on] <blocker> [--kind K]|\
 link <from> <kind> <to>|unlink <from> <kind> <to>|\
+note <id> <text>|comments <id>|\
+evidence <id> [--kind K --ref R --note N]|\
 export|import <path|->|\
 rebuild>";
 
@@ -29855,6 +29857,25 @@ fn issue(options: &CliOptions) -> ExitCode {
                                     .map(|d| format!(" ({d})"))
                                     .unwrap_or_default();
                                 println!("relation: {} {} {}{dep}", r.from, r.kind, r.to);
+                            }
+                        }
+                        if let Ok(list) = store.comments(id) {
+                            for c in &list {
+                                println!(
+                                    "comment [{}]: {}",
+                                    c.author.as_deref().unwrap_or("?"),
+                                    c.body
+                                );
+                            }
+                        }
+                        if let Ok(list) = store.evidence(id) {
+                            for e in &list {
+                                println!(
+                                    "evidence [{}]: {} {}",
+                                    e.kind.as_deref().unwrap_or("evidence"),
+                                    e.reference.as_deref().unwrap_or(""),
+                                    e.note.as_deref().unwrap_or(""),
+                                );
                             }
                         }
                         ExitCode::SUCCESS
@@ -30186,6 +30207,128 @@ fn issue(options: &CliOptions) -> ExitCode {
             }
             Err(error) => report_store_error("failed to rebuild projection", error),
         },
+        "note" => {
+            // `note <id> <text...>`: add a comment to an issue.
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let body = args
+                .iter()
+                .skip(2)
+                .take_while(|arg| !arg.starts_with("--"))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if body.is_empty() {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+            let author = issue_actor(flag_value(args, "--actor"));
+            match store.add_comment(id, Some(&author), &body) {
+                Ok(Some(_)) => emit_issue_row(&store, id, "comment added", options.json),
+                Ok(None) => {
+                    eprintln!("issue `{id}` was not found");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to add comment", error),
+            }
+        }
+        "comments" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.comments(id) {
+                Ok(list) => {
+                    if options.json {
+                        return emit_json(Value::Array(
+                            list.iter()
+                                .map(|c| {
+                                    json!({
+                                        "id": c.id, "author": c.author,
+                                        "body": c.body, "created_at": c.created_at,
+                                    })
+                                })
+                                .collect(),
+                        ));
+                    }
+                    if list.is_empty() {
+                        println!("no comments on {id}");
+                    }
+                    for c in list {
+                        println!(
+                            "[{}] {}: {}",
+                            c.created_at,
+                            c.author.as_deref().unwrap_or("?"),
+                            c.body
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(error) => report_store_error("failed to read comments", error),
+            }
+        }
+        "evidence" => {
+            // `evidence <id> [--kind K] [--ref R] [--note N]`: add evidence if any
+            // field flag is given, else list the issue's evidence.
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let kind = flag_value(args, "--kind");
+            let reference = flag_value(args, "--ref");
+            let note = flag_value(args, "--note");
+            if kind.is_some() || reference.is_some() || note.is_some() {
+                let added_by = issue_actor(flag_value(args, "--actor"));
+                match store.add_evidence(
+                    id,
+                    kind.as_deref(),
+                    reference.as_deref(),
+                    note.as_deref(),
+                    Some(&added_by),
+                ) {
+                    Ok(Some(_)) => emit_issue_row(&store, id, "evidence attached", options.json),
+                    Ok(None) => {
+                        eprintln!("issue `{id}` was not found");
+                        ExitCode::FAILURE
+                    }
+                    Err(error) => report_store_error("failed to attach evidence", error),
+                }
+            } else {
+                match store.evidence(id) {
+                    Ok(list) => {
+                        if options.json {
+                            return emit_json(Value::Array(
+                                list.iter()
+                                    .map(|e| {
+                                        json!({
+                                            "id": e.id, "kind": e.kind, "reference": e.reference,
+                                            "note": e.note, "added_by": e.added_by,
+                                            "created_at": e.created_at,
+                                        })
+                                    })
+                                    .collect(),
+                            ));
+                        }
+                        if list.is_empty() {
+                            println!("no evidence on {id}");
+                        }
+                        for e in list {
+                            println!(
+                                "[{}] {}: {} {}",
+                                e.created_at,
+                                e.kind.as_deref().unwrap_or("evidence"),
+                                e.reference.as_deref().unwrap_or(""),
+                                e.note.as_deref().unwrap_or(""),
+                            );
+                        }
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => report_store_error("failed to read evidence", error),
+                }
+            }
+        }
         "export" => {
             // Dump the content-addressed event log as JSON — the unit another
             // clone unions in (`issue import`). Always JSON (it is data).

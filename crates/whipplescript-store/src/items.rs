@@ -99,6 +99,27 @@ pub struct Relation {
     pub dep_kind: Option<String>,
 }
 
+/// A comment on an issue (`comment.added`). `id` is the comment's content hash.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Comment {
+    pub id: String,
+    pub author: Option<String>,
+    pub body: String,
+    pub created_at: String,
+}
+
+/// A piece of evidence attached to an issue (`evidence.added`) — a reference /
+/// artifact / note supporting it. `id` is the evidence's content hash.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Evidence {
+    pub id: String,
+    pub kind: Option<String>,
+    pub reference: Option<String>,
+    pub note: Option<String>,
+    pub added_by: Option<String>,
+    pub created_at: String,
+}
+
 /// One field whose value is disputed: its `bef`-maximal setters in the event
 /// DAG disagree (ADR-0002 phase B1 slice ii; `tracker-merge.maude` `conflict`).
 /// `values` are the distinct maximal-setter values, sorted for stable output.
@@ -648,6 +669,125 @@ impl WorkItemStore {
         Ok(rows)
     }
 
+    /// Adds a comment to an issue (`comment.added`, ADR-0002 phase B2). Returns
+    /// the comment's content-hash id. Merge-stable: the event is keyed by the
+    /// issue's content_id and deduped by its own hash, so a comment made in one
+    /// clone folds exactly once after import. Returns `None` if the issue is
+    /// unknown.
+    pub fn add_comment(
+        &mut self,
+        item_id: &str,
+        author: Option<&str>,
+        body: &str,
+    ) -> StoreResult<Option<String>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let Some(content_id) = content_id_of(&tx, item_id)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let payload = json!({"author": author, "body": body});
+        let comment_id = tx_append_raw(
+            &tx,
+            Some(&content_id),
+            None,
+            "comment.added",
+            &payload.to_string(),
+            author,
+            &now,
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO tracker_comments (comment_id, issue_id, author, body, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![comment_id, item_id, author, body, now],
+        )?;
+        tx.commit()?;
+        Ok(Some(comment_id))
+    }
+
+    /// An issue's comments in chronological order.
+    pub fn comments(&self, item_id: &str) -> StoreResult<Vec<Comment>> {
+        let mut statement = self.connection.prepare(
+            "SELECT comment_id, author, body, created_at FROM tracker_comments \
+             WHERE issue_id = ?1 ORDER BY created_at, comment_id",
+        )?;
+        let rows = statement
+            .query_map([item_id], |row| {
+                Ok(Comment {
+                    id: row.get(0)?,
+                    author: row.get(1)?,
+                    body: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Attaches evidence to an issue (`evidence.added`, ADR-0002 phase B2) — a
+    /// reference / artifact / note. Returns the evidence's content-hash id, or
+    /// `None` if the issue is unknown. Merge-stable and deduped like comments.
+    pub fn add_evidence(
+        &mut self,
+        item_id: &str,
+        kind: Option<&str>,
+        reference: Option<&str>,
+        note: Option<&str>,
+        added_by: Option<&str>,
+    ) -> StoreResult<Option<String>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let Some(content_id) = content_id_of(&tx, item_id)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let payload = json!({
+            "kind": kind, "reference": reference, "note": note, "added_by": added_by,
+        });
+        let evidence_id = tx_append_raw(
+            &tx,
+            Some(&content_id),
+            None,
+            "evidence.added",
+            &payload.to_string(),
+            added_by,
+            &now,
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO tracker_evidence \
+             (evidence_id, issue_id, kind, reference, note, added_by, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![evidence_id, item_id, kind, reference, note, added_by, now],
+        )?;
+        tx.commit()?;
+        Ok(Some(evidence_id))
+    }
+
+    /// An issue's attached evidence in chronological order.
+    pub fn evidence(&self, item_id: &str) -> StoreResult<Vec<Evidence>> {
+        let mut statement = self.connection.prepare(
+            "SELECT evidence_id, kind, reference, note, added_by, created_at \
+             FROM tracker_evidence WHERE issue_id = ?1 ORDER BY created_at, evidence_id",
+        )?;
+        let rows = statement
+            .query_map([item_id], |row| {
+                Ok(Evidence {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    reference: row.get(2)?,
+                    note: row.get(3)?,
+                    added_by: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Sets one field of an issue (`issue.field_set`) — the mutation whose
     /// events the conflict engine folds. Appends the event (chaining onto the
     /// issue's current heads, so two independent sets across a merge FORK the
@@ -749,7 +889,8 @@ impl WorkItemStore {
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(
-            "DELETE FROM tracker_issues; DELETE FROM tracker_relations; DELETE FROM tracker_leases;",
+            "DELETE FROM tracker_issues; DELETE FROM tracker_relations; DELETE FROM tracker_leases; \
+             DELETE FROM tracker_comments; DELETE FROM tracker_evidence;",
         )?;
         // The event log is keyed by opaque content_id; the projections are
         // alias-keyed. `tracker_aliases` (durable, NOT wiped) is the bridge.
@@ -757,21 +898,36 @@ impl WorkItemStore {
             .prepare("SELECT content_id, alias FROM tracker_aliases")?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<_, _>>()?;
-        let events: Vec<(Option<String>, String, String, String)> = tx
+        let events: Vec<(Option<String>, Option<String>, String, String, String)> = tx
             .prepare(
-                "SELECT issue_id, kind, payload_json, created_at FROM tracker_events ORDER BY event_seq",
+                "SELECT event_id, issue_id, kind, payload_json, created_at \
+                 FROM tracker_events ORDER BY event_seq",
             )?
             .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        for (content_id, kind, payload_json, created_at) in &events {
+        for (event_id, content_id, kind, payload_json, created_at) in &events {
             let payload: Value = serde_json::from_str(payload_json).unwrap_or_else(|_| json!({}));
             let issue_alias = content_id
                 .as_deref()
                 .and_then(|c| alias_of.get(c))
                 .map(String::as_str);
-            fold_event(&tx, issue_alias, kind, &payload, created_at, &alias_of)?;
+            fold_event(
+                &tx,
+                event_id.as_deref(),
+                issue_alias,
+                kind,
+                &payload,
+                created_at,
+                &alias_of,
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -969,6 +1125,22 @@ INSERT OR IGNORE INTO tracker_counter (singleton, next_id) VALUES (1, 1);
 CREATE TABLE IF NOT EXISTS tracker_aliases (
     content_id TEXT PRIMARY KEY,
     alias TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS tracker_comments (
+    comment_id TEXT PRIMARY KEY,
+    issue_id TEXT NOT NULL,
+    author TEXT,
+    body TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS tracker_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    issue_id TEXT NOT NULL,
+    kind TEXT,
+    reference TEXT,
+    note TEXT,
+    added_by TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_tracker_issues_queue ON tracker_issues(queue, status);
 CREATE INDEX IF NOT EXISTS idx_tracker_leases_issue ON tracker_leases(issue_id, released_at);
@@ -1406,6 +1578,7 @@ fn analyze_issue_dag(events: &[IssueEvent]) -> IssueConflicts {
 #[cfg(feature = "native")]
 fn fold_event(
     tx: &Transaction<'_>,
+    event_id: Option<&str>,
     issue_id: Option<&str>,
     kind: &str,
     payload: &Value,
@@ -1496,6 +1669,42 @@ fn fold_event(
                     str_of("kind").unwrap_or_else(|| "blocks".to_owned())
                 ],
             )?;
+        }
+        "comment.added" => {
+            // Keyed by the comment's own event_id (content hash) so a merge /
+            // re-import folds each comment exactly once.
+            if let (Some(comment_id), Some(issue)) = (event_id, issue_id) {
+                tx.execute(
+                    "INSERT OR IGNORE INTO tracker_comments \
+                     (comment_id, issue_id, author, body, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        comment_id,
+                        issue,
+                        str_of("author"),
+                        str_of("body").unwrap_or_default(),
+                        created_at,
+                    ],
+                )?;
+            }
+        }
+        "evidence.added" => {
+            if let (Some(evidence_id), Some(issue)) = (event_id, issue_id) {
+                tx.execute(
+                    "INSERT OR IGNORE INTO tracker_evidence \
+                     (evidence_id, issue_id, kind, reference, note, added_by, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        evidence_id,
+                        issue,
+                        str_of("kind"),
+                        str_of("reference"),
+                        str_of("note"),
+                        str_of("added_by"),
+                        created_at,
+                    ],
+                )?;
+            }
         }
         "claim.acquired" => {
             tx.execute(
@@ -2245,6 +2454,52 @@ mod tests {
         assert!(store
             .add_relation(&a.id, &b.id, "related", Some("hard"))
             .is_err());
+    }
+
+    /// ADR-0002 phase B2: comments and evidence attach to an issue, survive a
+    /// rebuild, and fold exactly once through a merge (keyed by content hash).
+    #[test]
+    fn comments_and_evidence_attach_and_merge_once() {
+        let mut a = open_memory();
+        let issue = a
+            .file_item("q", "Task", "", &[], &json!({}), None)
+            .expect("files");
+        a.add_comment(&issue.id, Some("worker-1"), "looks done")
+            .expect("comment");
+        a.add_evidence(
+            &issue.id,
+            Some("log"),
+            Some("s3://run/42.log"),
+            Some("green"),
+            Some("worker-1"),
+        )
+        .expect("evidence");
+
+        let comments = a.comments(&issue.id).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "looks done");
+        assert_eq!(comments[0].author.as_deref(), Some("worker-1"));
+        let evidence = a.evidence(&issue.id).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].reference.as_deref(), Some("s3://run/42.log"));
+
+        // Survive a rebuild.
+        a.rebuild_projection().unwrap();
+        assert_eq!(a.comments(&issue.id).unwrap().len(), 1);
+        assert_eq!(a.evidence(&issue.id).unwrap().len(), 1);
+
+        // Merge into a second clone: the comment + evidence fold exactly once,
+        // and a re-import does not duplicate them.
+        let mut b = open_memory();
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        assert_eq!(b.comments("WS-1").unwrap().len(), 1, "comment merged once");
+        assert_eq!(b.evidence("WS-1").unwrap().len(), 1, "evidence merged once");
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        assert_eq!(
+            b.comments("WS-1").unwrap().len(),
+            1,
+            "re-import does not dup"
+        );
     }
 
     /// Import is idempotent and content-dedups: re-importing the same log adds no
