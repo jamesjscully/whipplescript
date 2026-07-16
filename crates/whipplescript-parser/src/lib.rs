@@ -7949,7 +7949,7 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
             SourceValue::String(literal) => literal.span,
             SourceValue::Number(_, span) => *span,
         };
-        if !(is_file && source.watch.is_none()) && !is_http {
+        if !(is_http || is_file && source.watch.is_none()) {
             diagnostics.push(Diagnostic {
                 related: Vec::new(),
                 span,
@@ -11062,6 +11062,7 @@ fn collect_claim_bindings(statements: &[body::BodyStmt]) -> BTreeSet<String> {
     bindings
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_effects(
     statements: &[body::BodyStmt],
     rule_name: &str,

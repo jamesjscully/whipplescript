@@ -901,7 +901,9 @@ impl WorkItemStore {
             .prepare("SELECT content_id, alias FROM tracker_aliases")?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<_, _>>()?;
-        let events: Vec<(Option<String>, Option<String>, String, String, String)> = tx
+        // (event_id, issue_id/content_id, kind, payload_json, created_at)
+        type ProjectionEventRow = (Option<String>, Option<String>, String, String, String);
+        let events: Vec<ProjectionEventRow> = tx
             .prepare(
                 "SELECT event_id, issue_id, kind, payload_json, created_at \
                  FROM tracker_events ORDER BY event_seq",
