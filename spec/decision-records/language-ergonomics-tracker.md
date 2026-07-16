@@ -1,5 +1,11 @@
 # Language ergonomics tracker (v2 surface)
 
+**Status: CLOSED 2026-07-16** — every row is shipped and verified (all `[x]`,
+no open items). Kept as the historical decomposition of the v2 language surface;
+re-surface on demand by pulling any still-relevant follow-up into an active
+tracker. The last open item, the B1a lowering-move, was completed by the
+durable-object sans-IO refactor (DR-0033 chunk 1b).
+
 Source: ergonomics/design evaluation of 2026-06-09 (follow-up to
 [`review-change-plan.md`](../review-change-plan.md), all items of which shipped).
 
@@ -39,8 +45,9 @@ form, ledger `has entry for` projection sugar, TLA+ formalization of the
 store-tested coordination invariants, exec `with` stdin, time arithmetic.
 Row 18 (C9, decided 2026-06-11) hardens `exec` for hosted deployments:
 **complete through review** (`--exec-profile`/`--script-manifest`, content-pinned
-capabilities; `soft_middle::hosted_exec_*`). The **sole remaining open item in
-this tracker is the B1a lowering-move** ([B1](#b1-harden-the-soft-middle-priority-1)).
+capabilities; `soft_middle::hosted_exec_*`). **All rows complete — this tracker
+is closed** (2026-07-16); the B1a lowering-move, its last item, was completed by
+the DO sans-IO refactor (DR-0033 chunk 1b).
 
 | # | Workstream | Design | Spec | Model | Impl + test | Review |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -269,23 +276,19 @@ flow triage
 > fact` matcher + `manual review requested` removed; work queues + `whip items`;
 > `exec` + `WHIPPLESCRIPT_EXEC_ALLOW`; rule-coverage lint; `--exec-profile`/C9).
 >
-> **2026-07-16 closeout.** The two open carry-overs are resolved and B1 was
+> **2026-07-16 closeout — tracker fully done.** All carry-overs resolved and B1
 > re-verified live: `consume` removed (commit 2729e63); dynamic rule-coverage is
 > `scripts/check-rule-coverage.sh` (row 9); B1b–f verified live + covered by
-> `tests/soft_middle.rs`; and a real bindingless-trigger guard silent-drop found
-> while verifying B1c was fixed (B1c′, commit d5b0586). **The one remaining item
-> in this whole tracker is the B1a lowering-move:**
-> - **B1a (lowering-move):** the body AST shipped, but *moving the rule-body → IR
->   lowering out of the CLI crate* is still open (`main.rs` ~55k lines) — folds in
->   review-change-plan §4.11.
->   *Ordering note:* the durable-object sans-IO refactor
->   (`../durable-object-runtime-tracker.md`) already moved the *rule pass* into
->   `whipplescript-kernel` (`rule_pass`/`instance_machine`); what remains in the
->   CLI file is the *worker effect executor* (`run_*_effect` I/O handlers), which
->   that tracker separately plans to re-home. The lowering-move targets the
->   *compile path* (source → IR), a largely separate region of the file, so the
->   two are unlikely to collide — but stage the lowering-move as its own slices
->   and rebase around any concurrent executor-re-home work.
+> `tests/soft_middle.rs`; a real bindingless-trigger guard silent-drop found
+> while verifying B1c was fixed (B1c′, commit d5b0586); and the last item, the
+> **B1a lowering-move, is DONE** — the source→IR lowering is in
+> `whipplescript-parser` and the runtime rule-lowering closure was lifted into
+> `whipplescript-kernel` by the DO sans-IO refactor (DR-0033 chunk 1b); `main.rs`
+> builds no IR (audit under B1a). The 2026-07-01 note flagged the move as open;
+> the DO refactor completed it, as that note's ordering guidance anticipated.
+> **No open items remain — this tracker is closed** (see TRACKERS.md). The
+> worker effect executor (`run_*_effect` I/O handlers) still in the CLI file is a
+> separate concern owned by `../durable-object-runtime-tracker.md`, not this one.
 >
 > **B1g closed 2026-07-02:** the pull-forward was kept: the no-silent-no-op
 > sweep now has a deterministic accepted-body matrix in
@@ -299,15 +302,23 @@ flow triage
 The root cause is shared: rule bodies are raw strings re-scanned line by
 line at lowering time, and guards/assertions use two different evaluators.
 
-- [~] **B1a.** Parse rule bodies into a real AST in the parser crate
-      (absorbs the deferred "move lowering out of the CLI" item from the
-      previous plan). **AST SHIPPED** (`parser/src/body.rs` — every statement
-      form is grammar; unknown tokens are spanned parse errors, verified by the
-      B1g accepted-body matrices). REMAINING: *move the rule-body → IR lowering
-      out of the 55k-line `whipplescript-cli/src/main.rs` into the parser/kernel
-      crates* — the last genuinely-open item in this tracker. Own campaign
-      (still-live raw-text scanners in the lowering are the reason B1c/the
-      bindingless-guard bug hid there). Sequencing note below re: the DO refactor.
+- [x] **B1a.** Parse rule bodies into a real AST in the parser crate + move
+      rule-body lowering out of the CLI crate (absorbs review-change-plan §4.11).
+      **DONE (verified 2026-07-16).** (1) AST: `parser/src/body.rs` — every
+      statement form is grammar; unknown tokens are spanned parse errors (B1g
+      matrices). (2) Lowering location: the source→IR lowering is entirely in
+      `whipplescript-parser` (`lower_rule`/`lower_when_clause`/`analyze_rule`,
+      driven by `compile_program`), and the runtime rule-lowering closure
+      (`lower_rule`/`ready_contexts`) was lifted into the wasm-clean
+      `whipplescript-kernel` by the DO sans-IO refactor (DR-0033 chunk 1b) —
+      exactly the "do the move jointly with the DO refactor" the ordering note
+      called for. Audit of `main.rs`: it constructs **no** `IrProgram`/`IrRule`,
+      has no `fn lower*` (only `lowered_ir_*` IR-report validators and `lint_*`
+      body analyses), and produces IR only via the parser's `compile_program`.
+      The move that the 2026-07-01 note flagged open was completed by the DO
+      refactor. (Residual raw-text scanners in the runtime lowering — e.g.
+      `consume_statements` — now live in the kernel, not the CLI, and are a
+      code-quality tail, not a CLI-location item.)
 - [x] **B1b.** One expression evaluator shared by guards, assertions, and
       payload lowering — shipped; guards and asserts evaluate identical
       filtered-query expressions identically (test
