@@ -1188,8 +1188,10 @@ fn tx_now(tx: &Transaction<'_>) -> StoreResult<String> {
 /// forger, who could otherwise compute a colliding event. Two byte-identical
 /// events (same kind/issue/payload/actor/parents/clock) share an id and dedup on
 /// merge; the distinguishing `created_at` keeps genuine re-submissions distinct.
-#[cfg(feature = "native")]
-fn event_content_id(
+///
+/// Backend-agnostic (shared by the native rusqlite store and the durable-object
+/// `DoSql` store — DO parity) so both mint identical ids for identical events.
+pub fn event_content_id(
     kind: &str,
     issue_id: Option<&str>,
     payload_json: &str,
@@ -1422,9 +1424,8 @@ fn tx_apply_field_set(
 
 /// The `tracker_issues` display column an `issue.field_set` writes, if any.
 /// Unknown fields still record an event (so the conflict view sees them) but
-/// touch no column.
-#[cfg(feature = "native")]
-fn projection_column(field: &str) -> Option<&'static str> {
+/// touch no column. Backend-agnostic (native + DO share it).
+pub fn projection_column(field: &str) -> Option<&'static str> {
     match field {
         "title" => Some("title"),
         "body" => Some("body"),
@@ -1433,20 +1434,21 @@ fn projection_column(field: &str) -> Option<&'static str> {
     }
 }
 
-/// SHA-256 hex of a string (the `state_token` hasher).
-#[cfg(feature = "native")]
-fn sha256_hex(s: &str) -> String {
+/// SHA-256 hex of a string (the `state_token` hasher). Backend-agnostic.
+pub fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(s.as_bytes()))
 }
 
 /// One event as the conflict engine reads it (id + DAG parents + kind/payload).
-#[cfg(feature = "native")]
-struct IssueEvent {
-    event_id: String,
-    parents: Vec<String>,
-    kind: String,
-    payload: Value,
+/// Backend-agnostic: both the native and DO stores load their rows into this
+/// shape and call `analyze_issue_dag`, so the conflict logic lives in one place.
+#[derive(Clone, Debug)]
+pub struct IssueEvent {
+    pub event_id: String,
+    pub parents: Vec<String>,
+    pub kind: String,
+    pub payload: Value,
 }
 
 /// Load one issue's events in append order for DAG analysis.
@@ -1482,9 +1484,9 @@ fn load_issue_events(conn: &Connection, issue_id: &str) -> StoreResult<Vec<Issue
 /// A setter is `bef`-maximal iff no OTHER setter of the same field has it as a
 /// transitive ancestor — i.e. nothing supersedes it along the DAG. A field with
 /// two or more distinct maximal values is conflicted; a linear history (one
-/// maximal setter) never is, and agreeing forks converge.
-#[cfg(feature = "native")]
-fn analyze_issue_dag(events: &[IssueEvent]) -> IssueConflicts {
+/// maximal setter) never is, and agreeing forks converge. Backend-agnostic —
+/// the native and DO stores share this exact analysis (DO parity).
+pub fn analyze_issue_dag(events: &[IssueEvent]) -> IssueConflicts {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     // Frontier: an event that nothing else lists as a parent.
