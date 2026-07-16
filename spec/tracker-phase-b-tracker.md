@@ -104,9 +104,18 @@ first B2 pick):
 
 Remaining B2 (in the order I'd take them):
 
-- [~] DO `rebuild_projection` parity — the durable-object tracker (`do_store.rs`)
-      is still on the pre-phase-B schema (WS-N-keyed, no event_id/parents/DAG);
-      port the B1+B2 model so the edge host matches native. Correctness/parity.
+- [x] DO-plane parity (2026-07-15, commits `share the pure core` + 4207f12; DO
+      test `do_tracker_is_content_addressed_and_merges_to_a_conflict`; host-do
+      81 + wasm32 build green): ported the full B1+B2 model to the durable-object
+      tracker (`do_store.rs`) over `DoSql` — content-addressed Merkle-DAG events +
+      content_id identity + `tracker_aliases`, UNIQUE(event_id), conflict-aware
+      readiness, `set_field`/`issue_conflicts`, relation taxonomy,
+      comments/evidence, `export_events`/`import_events` + re-aliasing +
+      `rebuild_tracker_projection`. Shares the pure DAG/hash core from
+      `whipplescript_store::items` (un-gated from `native`, sha2 made non-optional
+      + wasm-safe) so both backends mint identical ids and detect conflicts
+      identically. A single DO is single-writer, so the value is event-format
+      INTEROP (a DO log and a native log now merge).
 - [~] Cross-machine transport: portable `.whip/tracker/tx/**/*.json` and/or the
       WorkspaceVcs integration (the gaugedesk multi-writer exchange). Trigger:
       the first real cross-machine / cross-clone sync. (export/import already
