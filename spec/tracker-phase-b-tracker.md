@@ -1,7 +1,10 @@
 # std.tracker phase B — the DAG / conflict campaign
 
-Status: active — **B1 hard core COMPLETE 2026-07-15** (commits eac8baf→6463fe3);
-only B2 additive items remain. Scope is ADR-0002's deferred phase B
+Status: **B1 + B2 COMPLETE 2026-07-15/16** (B1 eac8baf→6463fe3; B2 richer
+model, DO parity, cross-machine transport, genuine duplicate detection). The
+sole open item is external-provider adapters, which are demand-gated (build
+against a concrete integration target, not speculatively). Scope is ADR-0002's
+deferred phase B
 (spec/decision-records/0002-work-tracker-package.md "Phase B1"), taken on
 hard-core-first per Jack: the merge-friendly / distributed tracker that
 multi-user / multi-agent workflows (gaugedesk's multi-writer workbench) need.
@@ -85,11 +88,12 @@ identity change (one-way; the opaque id is new primary identity).
 
 ## B2 — additive (after B1)
 
-Status: **richer model + DO parity + cross-machine transport all SHIPPED
-2026-07-15**; only external providers (demand-gated) and provenance-based
-duplicate-submission suppression (low priority) remain — the multi-writer /
-multi-machine tracker Jack set out to build works end-to-end (native ⇄ DO event
-format, and clones reconcile by sharing a folder).
+Status: **richer model + DO parity + cross-machine transport + genuine
+duplicate detection all SHIPPED 2026-07-15/16**; only external providers
+(demand-gated — needs a concrete integration target, not buildable
+speculatively) remain. The multi-writer / multi-machine tracker Jack set out to
+build works end-to-end (native ⇄ DO event format, clones reconcile by sharing a
+folder, genuine duplicate submissions are surfaced while re-sync stays quiet).
 
 The **richer model** (relations + comments/evidence) SHIPPED 2026-07-15 (Jack's
 first B2 pick):
@@ -136,7 +140,18 @@ Remaining B2 (in the order I'd take them):
       normalizing into tracker events; weak/advisory claims surface as such).
       DEMAND-GATED — build against a concrete integration target, not
       speculatively.
-- [~] provenance-based `duplicate_submission` suppression (quiet incremental
-      re-sync) — needs per-event origin. `sync` already suppresses the per-event
-      warning (a repeated reconcile expects overlap); the genuine-duplicate case
-      still can't be distinguished without provenance. Low priority.
+- [x] Genuine duplicate detection (2026-07-16, commit c6e4539; store tests
+      `reimport_is_a_silent_idempotent_resync` +
+      `independent_same_issue_submissions_warn_as_duplicates`): the earlier
+      `duplicate_submission` warning was misconceived — it fired on the
+      `changes==0` branch (a byte-identical event re-arriving), which under
+      content-addressing is an IDEMPOTENT re-transmit, not a duplicate, so it was
+      a false-positive machine and the reason `sync` was not quiet. The insight:
+      content-addressing already supplies identity (no per-event provenance
+      needed). A re-transmit shares one content id → deduped silently (counted in
+      `skipped`); a GENUINE duplicate is two DISTINCT `issue.created` events
+      describing the same work (same queue + title) → surfaced by local alias,
+      advisory only, resolved via a `duplicates` relation, never a silent
+      collapse. Native (`items.rs`) + DO (`do_store.rs`) kept in lockstep; CLI
+      `sync` now surfaces the genuine warnings. Verified end-to-end through the
+      CLI (two clones filing one issue → warned; re-sync → quiet).
