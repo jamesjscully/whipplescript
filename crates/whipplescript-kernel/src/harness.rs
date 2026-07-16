@@ -747,7 +747,7 @@ pub(crate) const CONTROL_PLANE_SECRET_ENV: &[&str] = &[
 
 /// Remove whip's control-plane secrets from a child command's inherited
 /// environment. Applied to every provider subprocess spawn.
-pub(crate) fn strip_control_plane_secrets(command: &mut Command) {
+pub fn strip_control_plane_secrets(command: &mut Command) {
     strip_env_vars(command, CONTROL_PLANE_SECRET_ENV);
 }
 
@@ -755,14 +755,15 @@ pub(crate) fn strip_control_plane_secrets(command: &mut Command) {
 /// only needs its OWN family's credentials, so — least privilege — each spawn
 /// strips the OTHER families' keys: the Claude sidecar has no business seeing
 /// an OpenAI key, nor the codex app-server an Anthropic key. (The child's own
-/// family is left inherited; it may read it directly.)
-#[cfg(feature = "codex")]
-pub(crate) const ANTHROPIC_CREDENTIAL_ENV: &[&str] = &["ANTHROPIC_API_KEY"];
+/// family is left inherited; it may read it directly.) `ANTHROPIC_CREDENTIAL_ENV`
+/// is unconditional pub: the external whipplescript-provider-codex crate strips
+/// it when spawning the codex app-server (DR-0024 split).
+pub const ANTHROPIC_CREDENTIAL_ENV: &[&str] = &["ANTHROPIC_API_KEY"];
 #[cfg(feature = "claude")]
 pub(crate) const OPENAI_CREDENTIAL_ENV: &[&str] = &["OPENAI_API_KEY"];
 
 /// Remove the named env vars from a child command's inherited environment.
-pub(crate) fn strip_env_vars(command: &mut Command, names: &[&str]) {
+pub fn strip_env_vars(command: &mut Command, names: &[&str]) {
     for name in names {
         command.env_remove(name);
     }

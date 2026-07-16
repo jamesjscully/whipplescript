@@ -102,7 +102,12 @@ impl NativeAgentTurnObservation {
         }
     }
 
-    fn new(kind: AgentTurnLifecycleKind, provider_event_type: impl Into<String>) -> Self {
+    // These builders are `pub` because provider *adapters* — now in their own
+    // crates (whipplescript-provider-codex / -claude, DR-0024 split) — assemble
+    // observations from raw provider events via `normalize_*` functions they own.
+    // The shape-only redaction (`payload_shape` → `json_shape`) stays kernel-side
+    // so every provider inherits the same egress boundary.
+    pub fn new(kind: AgentTurnLifecycleKind, provider_event_type: impl Into<String>) -> Self {
         Self {
             kind,
             provider_event_type: provider_event_type.into(),
@@ -114,87 +119,30 @@ impl NativeAgentTurnObservation {
         }
     }
 
-    fn provider_error(mut self, provider_error: Option<String>) -> Self {
+    pub fn provider_error(mut self, provider_error: Option<String>) -> Self {
         self.provider_error = provider_error;
         self
     }
 
-    fn session_id(mut self, session_id: Option<String>) -> Self {
+    pub fn session_id(mut self, session_id: Option<String>) -> Self {
         self.provider_session_id = session_id;
         self
     }
 
-    fn turn_id(mut self, turn_id: Option<String>) -> Self {
+    pub fn turn_id(mut self, turn_id: Option<String>) -> Self {
         self.provider_turn_id = turn_id;
         self
     }
 
-    fn payload_shape(mut self, payload: &Value) -> Self {
+    pub fn payload_shape(mut self, payload: &Value) -> Self {
         self.provider_payload_shape = json_shape(payload);
         self
     }
 }
 
-#[cfg(feature = "codex")]
-pub fn normalize_codex_app_server_event(message: &Value) -> Option<NativeAgentTurnObservation> {
-    let method = message.get("method").and_then(Value::as_str)?;
-    let params = message.get("params").unwrap_or(&Value::Null);
-    let kind = match method {
-        "turn/started" => AgentTurnLifecycleKind::Started,
-        "turn/completed" => codex_terminal_kind(params),
-        "turn/diff/updated" | "item/fileChange/patchUpdated" => {
-            AgentTurnLifecycleKind::ArtifactCaptured
-        }
-        "item/tool/call" | "item/tool/requestUserInput" => AgentTurnLifecycleKind::ToolRequested,
-        "item/started" | "item/completed" => AgentTurnLifecycleKind::Streamed,
-        method if method.contains("/requestApproval") => AgentTurnLifecycleKind::ToolRequested,
-        _ => return None,
-    };
-    Some(
-        NativeAgentTurnObservation::new(kind, method)
-            .session_id(
-                params
-                    .get("threadId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            )
-            .turn_id(
-                params
-                    .get("turnId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            )
-            .payload_shape(params)
-            .provider_error(codex_terminal_error(params)),
-    )
-}
-
-/// The Codex app-server reports a terminal failure reason under
-/// `params.turn.error.message` (with `codexErrorInfo` as a machine code). This is
-/// a control-plane error string, not model output.
-#[cfg(feature = "codex")]
-fn codex_terminal_error(params: &Value) -> Option<String> {
-    params
-        .pointer("/turn/error/message")
-        .or_else(|| params.pointer("/error/message"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-#[cfg(feature = "codex")]
-fn codex_terminal_kind(params: &Value) -> AgentTurnLifecycleKind {
-    match params
-        .get("status")
-        .or_else(|| params.pointer("/turn/status"))
-        .or_else(|| params.get("reason"))
-        .and_then(Value::as_str)
-    {
-        Some("cancelled" | "interrupted" | "canceled") => AgentTurnLifecycleKind::Cancelled,
-        Some("failed" | "error") => AgentTurnLifecycleKind::Failed,
-        Some("timed_out" | "timeout") => AgentTurnLifecycleKind::TimedOut,
-        _ => AgentTurnLifecycleKind::Completed,
-    }
-}
+// `normalize_codex_app_server_event` and its `codex_terminal_*` helpers moved to
+// the whipplescript-provider-codex crate (DR-0024 split): event-shape knowledge
+// belongs with the adapter that speaks the protocol, not the kernel.
 
 #[cfg(feature = "claude")]
 pub fn normalize_claude_agent_sdk_event(
@@ -252,44 +200,6 @@ fn json_shape(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn normalizes_codex_started_diff_tool_and_cancelled_terminal() {
-        let started = normalize_codex_app_server_event(&json!({
-            "method": "turn/started",
-            "params": {"threadId": "thread-1", "turnId": "turn-1"},
-        }))
-        .expect("started normalizes");
-        assert_eq!(started.kind, AgentTurnLifecycleKind::Started);
-        assert_eq!(started.provider_session_id.as_deref(), Some("thread-1"));
-        assert_eq!(started.provider_turn_id.as_deref(), Some("turn-1"));
-
-        let diff = normalize_codex_app_server_event(&json!({
-            "method": "turn/diff/updated",
-            "params": {"diff": "secret diff"},
-        }))
-        .expect("diff normalizes");
-        assert_eq!(diff.kind, AgentTurnLifecycleKind::ArtifactCaptured);
-        assert!(!diff
-            .provider_payload_shape
-            .to_string()
-            .contains("secret diff"));
-
-        let tool = normalize_codex_app_server_event(&json!({
-            "method": "item/commandExecution/requestApproval",
-            "params": {"command": "cat secret.txt"},
-        }))
-        .expect("tool normalizes");
-        assert_eq!(tool.kind, AgentTurnLifecycleKind::ToolRequested);
-
-        let terminal = normalize_codex_app_server_event(&json!({
-            "method": "turn/completed",
-            "params": {"status": "interrupted"},
-        }))
-        .expect("terminal normalizes");
-        assert_eq!(terminal.kind, AgentTurnLifecycleKind::Cancelled);
-        assert!(terminal.terminal);
-    }
 
     #[test]
     fn normalizes_claude_terminal_events() {

@@ -4,8 +4,6 @@ pub mod agent_profile;
 pub mod artifact_manifest;
 #[cfg(feature = "claude")]
 pub mod claude_agent_sdk;
-#[cfg(feature = "codex")]
-pub mod codex_app_server;
 pub mod coerce;
 pub mod coerce_native;
 pub mod context_assembly;
@@ -6051,7 +6049,6 @@ rule wait
         assert_eq!(replayed_artifacts[0].artifact_id, artifacts[0].artifact_id);
     }
 
-    #[cfg(feature = "codex")]
     #[test]
     fn native_provider_lifecycle_observation_records_event_and_fact() {
         let store = SqliteStore::open_in_memory().expect("store opens");
@@ -6067,19 +6064,18 @@ rule wait
         let instance_id = kernel
             .create_instance(&version, "{}")
             .expect("instance creates");
-        let observation = native_lifecycle::normalize_codex_app_server_event(&json!({
-            "method": "turn/completed",
-            "params": {
-                "threadId": "session-1",
-                "turnId": "turn-1",
-                "status": "cancelled",
-                "message": {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "secret"}],
-                },
-            },
-        }))
-        .expect("codex event normalizes");
+        // Provider-agnostic: build the observation via the kernel's own
+        // shape-only `fixture` constructor rather than reaching into a provider
+        // crate's normalizer (that redaction is tested where the normalizer now
+        // lives, whipplescript-provider-codex). This test owns the kernel's
+        // record path: event + fact + evidence, no content leak.
+        let observation = native_lifecycle::NativeAgentTurnObservation::fixture(
+            AgentTurnLifecycleKind::Cancelled,
+            "turn/completed",
+            Some("session-1".to_owned()),
+            Some("turn-1".to_owned()),
+            json!({"type": "object", "keys": 4}),
+        );
         assert_eq!(observation.kind, AgentTurnLifecycleKind::Cancelled);
 
         kernel

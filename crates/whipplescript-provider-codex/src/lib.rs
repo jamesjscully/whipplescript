@@ -1,4 +1,11 @@
-//! Minimal Codex App Server JSON-RPC transport client.
+//! Codex App Server provider adapter for WhippleScript.
+//!
+//! An external, opt-in provider crate (DR-0024 provider-crate split): the kernel
+//! has no compile-time knowledge of Codex. This crate owns the Codex protocol
+//! (JSON-RPC transport, event normalization, policy mapping) and registers a
+//! [`ProviderCapability`] into whatever catalog the host assembles via
+//! [`capability`]. It depends on `whipplescript-kernel` for the shared provider
+//! vocabulary and the kernel-side redaction boundary.
 
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -8,14 +15,113 @@ use std::{
 
 use serde_json::{json, Value};
 
-use crate::{
-    native_lifecycle::{normalize_codex_app_server_event, AgentTurnLifecycleKind},
+use whipplescript_kernel::{
+    native_lifecycle::{AgentTurnLifecycleKind, NativeAgentTurnObservation},
     provider::{
         CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
         NativeProviderBoundaryError, NativeProviderCancellation, NativeProviderEvent,
         NativeProviderEventKind, NativeProviderTurnRequest, ProviderCapability,
     },
 };
+
+/// The provider-kind identifier this crate registers under. Opaque to the kernel.
+pub const PROVIDER_KIND: &str = "codex";
+/// The adapter-surface identifier this crate speaks.
+pub const SURFACE: &str = "codex_app_server";
+
+/// The Codex capability entry. The host assembles this into the effective
+/// provider catalog it passes to `validate_provider_binding` — the kernel does
+/// not carry it (open registry).
+pub fn capability() -> ProviderCapability {
+    ProviderCapability {
+        provider_kind: PROVIDER_KIND.to_owned(),
+        surface: SURFACE.to_owned(),
+        protocol_version: Some("codex-app-server-local-schema".to_owned()),
+        session_identity_fields: ["thread_id", "turn_id", "item_id"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        stream_event_kinds: [
+            "turn/started",
+            "turn/completed",
+            "turn/diff/updated",
+            "approval/requested",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        tool_policy: "codex_approvals".to_owned(),
+        cancellation_depths: vec![CancellationDepth::NativeStop],
+        artifact_manifest: true,
+        health_checks: ["codex_cli", "app_server_schema", "auth_status"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        auth_requirements: vec!["codex_login_or_openai_api_key".to_owned()],
+    }
+}
+
+/// Normalize a raw Codex app-server JSON-RPC message into the kernel's
+/// provider-agnostic lifecycle observation (shape-only payload; the kernel's
+/// redaction boundary is applied via `payload_shape`). Event-shape knowledge
+/// lives here with the adapter that speaks the protocol.
+pub fn normalize_codex_app_server_event(message: &Value) -> Option<NativeAgentTurnObservation> {
+    let method = message.get("method").and_then(Value::as_str)?;
+    let params = message.get("params").unwrap_or(&Value::Null);
+    let kind = match method {
+        "turn/started" => AgentTurnLifecycleKind::Started,
+        "turn/completed" => codex_terminal_kind(params),
+        "turn/diff/updated" | "item/fileChange/patchUpdated" => {
+            AgentTurnLifecycleKind::ArtifactCaptured
+        }
+        "item/tool/call" | "item/tool/requestUserInput" => AgentTurnLifecycleKind::ToolRequested,
+        "item/started" | "item/completed" => AgentTurnLifecycleKind::Streamed,
+        method if method.contains("/requestApproval") => AgentTurnLifecycleKind::ToolRequested,
+        _ => return None,
+    };
+    Some(
+        NativeAgentTurnObservation::new(kind, method)
+            .session_id(
+                params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            )
+            .turn_id(
+                params
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            )
+            .payload_shape(params)
+            .provider_error(codex_terminal_error(params)),
+    )
+}
+
+/// The Codex app-server reports a terminal failure reason under
+/// `params.turn.error.message` (with `codexErrorInfo` as a machine code). This is
+/// a control-plane error string, not model output.
+fn codex_terminal_error(params: &Value) -> Option<String> {
+    params
+        .pointer("/turn/error/message")
+        .or_else(|| params.pointer("/error/message"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn codex_terminal_kind(params: &Value) -> AgentTurnLifecycleKind {
+    match params
+        .get("status")
+        .or_else(|| params.pointer("/turn/status"))
+        .or_else(|| params.get("reason"))
+        .and_then(Value::as_str)
+    {
+        Some("cancelled" | "interrupted" | "canceled") => AgentTurnLifecycleKind::Cancelled,
+        Some("failed" | "error") => AgentTurnLifecycleKind::Failed,
+        Some("timed_out" | "timeout") => AgentTurnLifecycleKind::TimedOut,
+        _ => AgentTurnLifecycleKind::Completed,
+    }
+}
 
 #[derive(Debug)]
 pub enum CodexAppServerError {
@@ -221,9 +327,12 @@ impl StdioCodexAppServerTransport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        crate::harness::strip_control_plane_secrets(&mut builder);
+        whipplescript_kernel::harness::strip_control_plane_secrets(&mut builder);
         // Codex is the OpenAI-family backend; it never needs an Anthropic key.
-        crate::harness::strip_env_vars(&mut builder, crate::harness::ANTHROPIC_CREDENTIAL_ENV);
+        whipplescript_kernel::harness::strip_env_vars(
+            &mut builder,
+            whipplescript_kernel::harness::ANTHROPIC_CREDENTIAL_ENV,
+        );
         let mut child = builder.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| {
             CodexAppServerError::Protocol("app-server process did not expose stdin".to_owned())
@@ -370,7 +479,7 @@ pub fn build_codex_app_server_policy(
     // Table-driven (kernel/agent_profile.rs; spec/std-agent.md slice 4): a
     // preset maps to Codex only when its row says so; unknown names and
     // unmapped presets fail closed.
-    match crate::agent_profile::agent_profile_preset(profile) {
+    match whipplescript_kernel::agent_profile::agent_profile_preset(profile) {
         Some(preset) if preset.codex_mapped => {}
         _ => {
             return Err(codex_policy_error(
@@ -409,7 +518,7 @@ fn require_codex_writer(
 ) -> Result<(), CodexAppServerPolicyError> {
     // A destructive capability is granted only when the preset's table row
     // carries it (spec/std-agent.md slice 4) — not by a hard-matched name.
-    let grants = crate::agent_profile::agent_profile_preset(profile)
+    let grants = whipplescript_kernel::agent_profile::agent_profile_preset(profile)
         .is_some_and(|preset| preset.codex_mapped && preset.grants_capability(capability));
     if !grants {
         return Err(codex_policy_error(
@@ -522,9 +631,7 @@ impl<T: CodexAppServerTransport> CodexAppServerAdapter<T> {
                 }),
             ));
         }
-        if request.provider_kind != "codex"
-            || request.surface != "codex_app_server"
-        {
+        if request.provider_kind != "codex" || request.surface != "codex_app_server" {
             return Err(self.boundary_error(
                 "surface_mismatch",
                 "Codex adapter only accepts codex_app_server requests",
@@ -584,7 +691,7 @@ impl<T: CodexAppServerTransport> CodexAppServerAdapter<T> {
                     "message": error
                         .get("message")
                         .and_then(Value::as_str)
-                        .map(crate::provider::redact_sensitive_metadata),
+                        .map(whipplescript_kernel::provider::redact_sensitive_metadata),
                 }),
             ),
             CodexAppServerError::Timeout(message) => (message, true, json!({"kind": "timeout"})),
@@ -1166,7 +1273,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use crate::provider::{builtin_provider_capabilities, NativeProviderAdapter};
+    use whipplescript_kernel::provider::NativeProviderAdapter;
 
     #[derive(Default)]
     struct FakeTransport {
@@ -1184,13 +1291,52 @@ mod tests {
     }
 
     fn codex_capability() -> ProviderCapability {
-        builtin_provider_capabilities()
-            .into_iter()
-            .find(|capability| {
-                capability.provider_kind == "codex"
-                    && capability.surface == "codex_app_server"
-            })
-            .expect("codex capability")
+        super::capability()
+    }
+
+    #[test]
+    fn normalizes_codex_started_diff_tool_and_cancelled_terminal() {
+        let started = normalize_codex_app_server_event(&json!({
+            "method": "turn/started",
+            "params": {"threadId": "thread-1", "turnId": "turn-1"},
+        }))
+        .expect("started normalizes");
+        assert_eq!(started.kind, AgentTurnLifecycleKind::Started);
+        assert_eq!(started.provider_session_id.as_deref(), Some("thread-1"));
+        assert_eq!(started.provider_turn_id.as_deref(), Some("turn-1"));
+
+        let diff = normalize_codex_app_server_event(&json!({
+            "method": "turn/diff/updated",
+            "params": {"diff": "secret diff"},
+        }))
+        .expect("diff normalizes");
+        assert_eq!(diff.kind, AgentTurnLifecycleKind::ArtifactCaptured);
+        assert!(!diff
+            .provider_payload_shape
+            .to_string()
+            .contains("secret diff"));
+
+        let tool = normalize_codex_app_server_event(&json!({
+            "method": "item/commandExecution/requestApproval",
+            "params": {"command": "cat secret.txt"},
+        }))
+        .expect("tool normalizes");
+        assert_eq!(tool.kind, AgentTurnLifecycleKind::ToolRequested);
+
+        let terminal = normalize_codex_app_server_event(&json!({
+            "method": "turn/completed",
+            "params": {"status": "interrupted"},
+        }))
+        .expect("terminal normalizes");
+        assert_eq!(terminal.kind, AgentTurnLifecycleKind::Cancelled);
+        assert!(terminal.terminal);
+    }
+
+    #[test]
+    fn capability_matches_the_registered_surface() {
+        let capability = super::capability();
+        assert_eq!(capability.provider_kind, super::PROVIDER_KIND);
+        assert_eq!(capability.surface, super::SURFACE);
     }
 
     fn native_codex_request() -> NativeProviderTurnRequest {

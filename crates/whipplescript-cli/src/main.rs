@@ -29,10 +29,6 @@ use whipplescript_kernel::claude_agent_sdk::{
     ClaudeAgentSdkAdapter, ClaudeAgentSdkClient, StdioClaudeAgentSdkTransport,
     WHIP_SIDECAR_PROTOCOL,
 };
-#[cfg(feature = "codex")]
-use whipplescript_kernel::codex_app_server::{
-    CodexAppServerAdapter, CodexAppServerClient, StdioCodexAppServerTransport,
-};
 use whipplescript_kernel::exec_http::{ingest_exec_stdout, ExecIngest};
 use whipplescript_kernel::package_registry::*;
 use whipplescript_kernel::{
@@ -75,6 +71,10 @@ use whipplescript_parser::{
     IrEffectNode, IrExecTarget, IrInclude, IrProgram, IrProjectionRead, IrRule, IrSchema, IrTest,
     IrType, IrWorkflowContract, IrWorkflowContractKind, Item, ProjQueryKind, QueryKind, RuleStatus,
     RunKind, SourceSpan, StubPayload, TestClause, TestField, UnaryOp,
+};
+#[cfg(feature = "codex")]
+use whipplescript_provider_codex::{
+    CodexAppServerAdapter, CodexAppServerClient, StdioCodexAppServerTransport,
 };
 use whipplescript_store::{
     ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, CheckpointCapture,
@@ -749,7 +749,7 @@ fn doctor(options: &CliOptions) -> ExitCode {
         }),
     };
     let tools = doctor_tool_checks();
-    let provider_capabilities = builtin_provider_capabilities();
+    let provider_capabilities = effective_provider_capabilities();
     let provider_configs = doctor_provider_config_checks(
         &doctor_options.provider_config_paths,
         &provider_capabilities,
@@ -1132,7 +1132,7 @@ fn doctor_provider_config_checks(
 fn validate_doctor_provider_config_json(config_json: &str) -> Vec<ProviderValidationResult> {
     validate_doctor_provider_config_json_with_bindings(
         config_json,
-        &builtin_provider_capabilities(),
+        &effective_provider_capabilities(),
     )
     .0
 }
@@ -20926,7 +20926,7 @@ fn run_agent_effect(
     // pass runs the effect once the binding is supplied.
     if matches!(provider_selection.kind.as_str(), "codex" | "claude") {
         if let Some(config) = provider_selection.provider_config.as_ref() {
-            let validation = validate_provider_binding(config, &builtin_provider_capabilities());
+            let validation = validate_provider_binding(config, &effective_provider_capabilities());
             if validation
                 .iter()
                 .any(|result| result.code == "missing_credentials_ref")
@@ -21309,7 +21309,7 @@ fn provider_binding_for_harness(
         let config_json = fs::read_to_string(path)?;
         let (_results, bindings) = validate_doctor_provider_config_json_with_bindings(
             &config_json,
-            &builtin_provider_capabilities(),
+            &effective_provider_capabilities(),
         );
         for binding in bindings {
             if binding.config.provider_id != harness {
@@ -21581,6 +21581,19 @@ fn is_claude_native_provider(provider: &str) -> bool {
     normalized == "claude" || normalized.starts_with("claude-")
 }
 
+/// The effective provider capability catalog for this `whip` build: the kernel's
+/// builtins (fixture/command/schema-coercer, plus the still-in-kernel claude
+/// adapter) extended with each external provider crate compiled in. This is the
+/// composition root of the open registry (DR-0024) — the kernel no longer names
+/// codex, so the CLI assembles it in here from the provider crate's `capability()`.
+fn effective_provider_capabilities() -> Vec<whipplescript_kernel::provider::ProviderCapability> {
+    #[allow(unused_mut)]
+    let mut caps = builtin_provider_capabilities();
+    #[cfg(feature = "codex")]
+    caps.push(whipplescript_provider_codex::capability());
+    caps
+}
+
 #[cfg(feature = "codex")]
 fn codex_app_server_adapter(
     provider: &str,
@@ -21606,13 +21619,7 @@ fn codex_app_server_adapter(
     let transport = StdioCodexAppServerTransport::spawn(&command, &args).map_err(|error| {
         StoreError::Conflict(format!("failed to launch Codex app-server: {error:?}"))
     })?;
-    let capability = builtin_provider_capabilities()
-        .into_iter()
-        .find(|capability| {
-            capability.provider_kind == "codex"
-                && capability.surface == "codex_app_server"
-        })
-        .ok_or_else(|| StoreError::Conflict("missing built-in Codex capability".to_owned()))?;
+    let capability = whipplescript_provider_codex::capability();
     Ok(
         CodexAppServerAdapter::new(provider, capability, CodexAppServerClient::new(transport))
             .with_inactivity_budget(native_provider_inactivity_budget()),
@@ -21710,8 +21717,7 @@ fn claude_agent_sdk_adapter(
     let capability = builtin_provider_capabilities()
         .into_iter()
         .find(|capability| {
-            capability.provider_kind == "claude"
-                && capability.surface == "claude_agent_sdk"
+            capability.provider_kind == "claude" && capability.surface == "claude_agent_sdk"
         })
         .ok_or_else(|| StoreError::Conflict("missing built-in Claude capability".to_owned()))?;
     let mut client = ClaudeAgentSdkClient::new(transport);

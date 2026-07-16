@@ -625,9 +625,7 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkAdapter<T> {
                 request.to_json_redacted(),
             ));
         }
-        if request.provider_kind != "claude"
-            || request.surface != "claude_agent_sdk"
-        {
+        if request.provider_kind != "claude" || request.surface != "claude_agent_sdk" {
             return Err(self.boundary_error(
                 "surface_mismatch",
                 "Claude adapter only accepts claude_agent_sdk requests",
@@ -1074,8 +1072,7 @@ mod tests {
         builtin_provider_capabilities()
             .into_iter()
             .find(|capability| {
-                capability.provider_kind == "claude"
-                    && capability.surface == "claude_agent_sdk"
+                capability.provider_kind == "claude" && capability.surface == "claude_agent_sdk"
             })
             .expect("claude capability")
     }

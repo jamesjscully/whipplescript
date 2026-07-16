@@ -378,7 +378,11 @@ const COMMAND_REPORT: &[FeatureReportEntry] = &[
 /// The Codex App Server adapter's compiled report (std.agent.codex, slice 7):
 /// live-validated interrupt (catalog depth `native_stop`) and config-file
 /// model selection; nothing else is dispatched by the adapter.
-#[cfg(feature = "codex")]
+// Un-gated after the codex adapter moved to whipplescript-provider-codex
+// (DR-0024): this is static feature-report VOCABULARY (what codex supports), not
+// adapter code, so the kernel keeps advertising it regardless of which provider
+// crates a given host builds. Making AGENT_FEATURE_REPORTS externally extensible
+// (so external crates contribute their own report) is a tracked follow-on.
 const CODEX_REPORT: &[FeatureReportEntry] = &[
     unsupported("context.compact"),
     unsupported("context.auto_compact"),
@@ -485,7 +489,6 @@ pub const AGENT_FEATURE_REPORTS: &[AgentFeatureReport] = &[
         provider_kind: "command",
         entries: COMMAND_REPORT,
     },
-    #[cfg(feature = "codex")]
     AgentFeatureReport {
         provider_kind: "codex",
         entries: CODEX_REPORT,

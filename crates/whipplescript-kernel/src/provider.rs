@@ -653,28 +653,12 @@ fn native_boundary_error(
 }
 
 pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
-    // Codex/Claude are optional providers (DR-0024): their capability entries are
-    // present only when the corresponding feature is built. Fixture, Command,
-    // and the owned harness are always available.
+    // Open registry (DR-0024): this returns only the kernel's OWN builtins
+    // (fixture, command, schema-coercer). External providers — codex lives in
+    // `whipplescript-provider-codex`, claude in `whipplescript-provider-claude`,
+    // and any third party in its own crate — own their `ProviderCapability` and
+    // the host extends this catalog with `capability()` from each crate it built.
     let mut caps: Vec<ProviderCapability> = Vec::new();
-    #[cfg(feature = "codex")]
-    caps.push(ProviderCapability {
-        provider_kind: "codex".to_owned(),
-        surface: "codex_app_server".to_owned(),
-        protocol_version: Some("codex-app-server-local-schema".to_owned()),
-        session_identity_fields: strings(&["thread_id", "turn_id", "item_id"]),
-        stream_event_kinds: strings(&[
-            "turn/started",
-            "turn/completed",
-            "turn/diff/updated",
-            "approval/requested",
-        ]),
-        tool_policy: "codex_approvals".to_owned(),
-        cancellation_depths: vec![CancellationDepth::NativeStop],
-        artifact_manifest: true,
-        health_checks: strings(&["codex_cli", "app_server_schema", "auth_status"]),
-        auth_requirements: strings(&["codex_login_or_openai_api_key"]),
-    });
     #[cfg(feature = "claude")]
     caps.push(ProviderCapability {
         provider_kind: "claude".to_owned(),
@@ -817,7 +801,7 @@ fn json_shape(value: &Value) -> Value {
     }
 }
 
-pub(crate) fn redact_sensitive_metadata(value: &str) -> String {
+pub fn redact_sensitive_metadata(value: &str) -> String {
     if value.contains("sk-")
         || value.contains("ANTHROPIC_API_KEY")
         || value.contains("OPENAI_API_KEY")
@@ -955,15 +939,15 @@ mod tests {
 
     #[test]
     fn builtin_capabilities_capture_distinct_native_surfaces() {
+        // Open registry (DR-0024): the kernel builtin catalog no longer includes
+        // codex (moved to whipplescript-provider-codex; the host appends its
+        // `capability()`). It still carries claude (pending extraction) and the
+        // always-present command surface.
         let capabilities = builtin_provider_capabilities();
 
-        assert!(capabilities.iter().any(|capability| {
-            capability.provider_kind == "codex"
-                && capability.surface == "codex_app_server"
-                && capability
-                    .stream_event_kinds
-                    .contains(&"turn/diff/updated".to_owned())
-        }));
+        assert!(capabilities
+            .iter()
+            .all(|capability| capability.provider_kind != "codex"));
         assert!(capabilities.iter().any(|capability| {
             capability.provider_kind == "claude"
                 && capability.surface == "claude_agent_sdk"
@@ -1270,10 +1254,21 @@ mod tests {
             }
         }
 
-        let capability = builtin_provider_capabilities()
-            .into_iter()
-            .find(|capability| capability.provider_kind == "codex")
-            .expect("codex capability exists");
+        // Self-contained synthetic capability — this test exercises the
+        // NativeProviderAdapter trait mechanics (start/stream/cancel), not the
+        // catalog, so it does not depend on any provider being registered.
+        let capability = ProviderCapability {
+            provider_kind: "codex".to_owned(),
+            surface: "codex_app_server".to_owned(),
+            protocol_version: None,
+            session_identity_fields: Vec::new(),
+            stream_event_kinds: Vec::new(),
+            tool_policy: "none".to_owned(),
+            cancellation_depths: vec![CancellationDepth::NativeStop],
+            artifact_manifest: false,
+            health_checks: Vec::new(),
+            auth_requirements: Vec::new(),
+        };
         let mut adapter = FakeNativeAdapter {
             capability,
             started: false,
@@ -1331,18 +1326,31 @@ mod tests {
         )
         .expect("config parses");
 
+        // Synthetic catalog: a native_stop-capable surface. No kernel builtin
+        // advertises native_stop anymore (codex moved to its own crate,
+        // DR-0024), so the depth-guard logic is exercised against an assembled
+        // capability rather than the builtin set.
+        let capabilities = vec![ProviderCapability {
+            provider_kind: "codex".to_owned(),
+            surface: "codex_app_server".to_owned(),
+            protocol_version: None,
+            session_identity_fields: Vec::new(),
+            stream_event_kinds: Vec::new(),
+            tool_policy: "none".to_owned(),
+            cancellation_depths: vec![CancellationDepth::NativeStop],
+            artifact_manifest: false,
+            health_checks: Vec::new(),
+            auth_requirements: Vec::new(),
+        }];
+
         validate_native_cancellation_depth(
             &config,
-            &builtin_provider_capabilities(),
+            &capabilities,
             CancellationDepth::CooperativeRequest,
         )
         .expect("cooperative request is within native-stop depth");
-        validate_native_cancellation_depth(
-            &config,
-            &builtin_provider_capabilities(),
-            CancellationDepth::NativeStop,
-        )
-        .expect("native stop request matches configured depth");
+        validate_native_cancellation_depth(&config, &capabilities, CancellationDepth::NativeStop)
+            .expect("native stop request matches configured depth");
     }
 
     #[test]
@@ -1390,8 +1398,7 @@ mod tests {
         let claude = capabilities
             .iter()
             .find(|capability| {
-                capability.provider_kind == "claude"
-                    && capability.surface == "claude_agent_sdk"
+                capability.provider_kind == "claude" && capability.surface == "claude_agent_sdk"
             })
             .expect("claude capability registered");
         assert_eq!(claude.cancellation_depths, vec![CancellationDepth::None]);

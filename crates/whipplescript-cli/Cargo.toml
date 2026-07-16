@@ -14,6 +14,7 @@ categories = ["command-line-utilities", "development-tools"]
 whipplescript-core = { version = "0.4.0", path = "../whipplescript-core" }
 whipplescript-kernel = { version = "0.4.0", path = "../whipplescript-kernel", default-features = false, features = ["native"] }
 whipplescript-parser = { version = "0.4.0", path = "../whipplescript-parser" }
+whipplescript-provider-codex = { version = "0.4.0", path = "../whipplescript-provider-codex", optional = true }
 whipplescript-store = { version = "0.4.0", path = "../whipplescript-store" }
 regex = "1"
 serde_json = "1"
@@ -29,10 +30,11 @@ htmd = "0.5"
 
 [features]
 # Codex/Claude delegating providers are optional (DR-0024); the owned harness is
-# the built-in path. Default-on preserves behavior; `--no-default-features`
-# builds a whip without them.
+# the built-in path. `codex` now pulls in the external whipplescript-provider-codex
+# crate (kernel-independent); `claude` still forwards the kernel's in-tree adapter
+# pending its own extraction. `--no-default-features` builds a whip without them.
 default = ["codex", "claude"]
-codex = ["whipplescript-kernel/codex"]
+codex = ["dep:whipplescript-provider-codex"]
 claude = ["whipplescript-kernel/claude"]
 
 [dev-dependencies]
