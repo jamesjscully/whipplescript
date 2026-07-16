@@ -7846,15 +7846,9 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             if changes == 1 {
                 report.imported += 1;
             } else {
+                // Byte-identical event already held: an idempotent re-transmit
+                // (content-addressing makes re-sync free), NOT a duplicate.
                 report.skipped += 1;
-                if event.kind == "issue.created" {
-                    report.duplicate_submissions.push(
-                        event
-                            .issue_id
-                            .clone()
-                            .unwrap_or_else(|| event.event_id.clone()),
-                    );
-                }
             }
         }
         // Re-alias every newly-seen issue (a created event with no local alias),
@@ -7869,6 +7863,8 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 &[],
             )
             .map_err(sql_err)?;
+        let mut new_alias: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for row in &unaliased {
             let content_id = as_text(&row[0]);
             let bumped = self
@@ -7880,13 +7876,58 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 )
                 .map_err(sql_err)?;
             let next = bumped.first().map_or(0, |row| as_i64(&row[0]));
+            let alias = format!("WS-{next}");
             self.sql
                 .execute(
                     "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
-                    &[text(&content_id), text(&format!("WS-{next}"))],
+                    &[text(&content_id), text(&alias)],
                 )
                 .map_err(sql_err)?;
+            new_alias.insert(content_id, alias);
             report.new_issues += 1;
+        }
+        // Genuine duplicate submission: a newly-seen creation describing the same
+        // work (queue + title) as a DISTINCT issue already in the log — two
+        // independent submissions, distinct content ids. Advisory, never a
+        // silent collapse. (A re-transmit shares one id and is deduped above.)
+        if !unaliased.is_empty() {
+            let created = self
+                .sql
+                .query(
+                    "SELECT issue_id, payload_json FROM tracker_events \
+                     WHERE kind = 'issue.created' AND issue_id IS NOT NULL",
+                    &[],
+                )
+                .map_err(sql_err)?;
+            let keyed: Vec<(String, String)> = created
+                .iter()
+                .map(|row| {
+                    let cid = as_text(&row[0]);
+                    let payload: serde_json::Value =
+                        serde_json::from_str(&as_text(&row[1])).unwrap_or(serde_json::Value::Null);
+                    let queue = payload
+                        .get("queue")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let title = payload
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    (cid, format!("{queue}\u{1e}{title}"))
+                })
+                .collect();
+            let mut by_key: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for (cid, key) in &keyed {
+                by_key.entry(key).or_default().push(cid);
+            }
+            for (content_id, alias) in &new_alias {
+                if let Some((_, key)) = keyed.iter().find(|(c, _)| c == content_id) {
+                    if by_key[key.as_str()].iter().any(|c| *c != content_id) {
+                        report.duplicate_submissions.push(alias.clone());
+                    }
+                }
+            }
         }
         self.rebuild_tracker_projection()?;
         Ok(report)

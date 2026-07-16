@@ -30373,16 +30373,23 @@ fn issue(options: &CliOptions) -> ExitCode {
             };
             match store.sync_dir(std::path::Path::new(dir)) {
                 Ok((written, report)) => {
-                    // Sync is a repeated reconcile — re-transmitting events
-                    // already held is expected, so we do NOT warn per duplicate
-                    // (that would spam every run). A genuine duplicate submission
-                    // is indistinguishable from a re-transmission without
-                    // per-event provenance (a deferred B2 refinement).
+                    // A repeated reconcile re-transmits events already held; those
+                    // dedup silently (idempotent, counted in `skipped`), so sync
+                    // does NOT spam. `duplicate_submissions` now holds only GENUINE
+                    // duplicates — a distinct issue filed independently with the
+                    // same queue+title — so we surface them for a human to
+                    // reconcile (via a `duplicates` relation).
+                    for alias in &report.duplicate_submissions {
+                        eprintln!(
+                            "warning: {alias} duplicates an existing issue (same queue + title)"
+                        );
+                    }
                     if options.json {
                         emit_json(json!({
                             "pushed": written,
                             "imported": report.imported,
                             "new_issues": report.new_issues,
+                            "duplicate_submissions": report.duplicate_submissions,
                         }))
                     } else {
                         println!(
@@ -30446,14 +30453,15 @@ fn issue(options: &CliOptions) -> ExitCode {
     }
 }
 
-/// Render a tracker merge/import result (shared by `import` and `sync`): warn on
-/// every duplicate submission (never silent), then summarize.
+/// Render a tracker merge/import result: warn on every genuine duplicate
+/// submission (a distinct issue filed independently with the same queue + title;
+/// never a silent collapse), then summarize.
 fn emit_import_report(
     report: &whipplescript_store::items::ImportReport,
     json_out: bool,
 ) -> ExitCode {
-    for content_id in &report.duplicate_submissions {
-        eprintln!("warning: duplicate submission collapsed onto existing issue ({content_id})");
+    for alias in &report.duplicate_submissions {
+        eprintln!("warning: {alias} duplicates an existing issue (same queue + title)");
     }
     if json_out {
         emit_json(json!({

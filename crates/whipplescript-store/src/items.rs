@@ -176,9 +176,12 @@ pub struct TrackerEvent {
 }
 
 /// The result of importing another clone's events (ADR-0002 phase B1 slice iii).
-/// `duplicate_submissions` names each byte-identical `issue.created` that
-/// collapsed onto an existing one — surfaced as a WARNING, never silently
-/// dropped, because a silent collapse could corrupt workflow integrity.
+/// `duplicate_submissions` names each newly-seen issue (by local alias) that
+/// describes the same work (queue + title) as a DISTINCT issue already present —
+/// two independent submissions of one issue, surfaced as a WARNING for a human
+/// to reconcile (via a `duplicates` relation), never silently collapsed. A
+/// byte-identical event re-arriving is an idempotent re-transmit, not a
+/// duplicate, and is counted in `skipped`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImportReport {
     pub imported: usize,
@@ -963,9 +966,11 @@ impl WorkItemStore {
     /// clones that edited the SAME issue (same content_id) from a shared parent
     /// FORK its DAG — the conflict engine then surfaces the disagreement. Newly
     /// seen issues are RE-ALIASED locally (this clone's WS-N, independent of the
-    /// origin's). A byte-identical `issue.created` that collapses onto one we
-    /// already hold is reported in `duplicate_submissions` — a warning, never a
-    /// silent collapse. Projections are rebuilt from the unioned log.
+    /// origin's). A re-transmitted event (same content id) is deduped silently as
+    /// an idempotent re-sync; a newly-seen creation that duplicates an existing
+    /// issue (same queue + title, distinct content id) is reported in
+    /// `duplicate_submissions` — a warning, never a silent collapse. Projections
+    /// are rebuilt from the unioned log.
     pub fn import_events(&mut self, events: &[TrackerEvent]) -> StoreResult<ImportReport> {
         let mut report = ImportReport::default();
         {
@@ -991,17 +996,12 @@ impl WorkItemStore {
                 if changes == 1 {
                     report.imported += 1;
                 } else {
-                    // Already present (deduped). A re-submitted creation is a
-                    // duplicate submission — surface it, never collapse silently.
+                    // Byte-identical event already held. Under content-addressing
+                    // this is an IDEMPOTENT re-transmit (the normal cross-machine
+                    // re-sync) — the same event arriving twice, NOT a duplicate
+                    // submission. Count it and stay silent; genuine duplicates are
+                    // caught below by their distinct content ids.
                     report.skipped += 1;
-                    if event.kind == "issue.created" {
-                        report.duplicate_submissions.push(
-                            event
-                                .issue_id
-                                .clone()
-                                .unwrap_or_else(|| event.event_id.clone()),
-                        );
-                    }
                 }
             }
             // Re-alias every newly-seen issue (has a created event, no local
@@ -1015,17 +1015,70 @@ impl WorkItemStore {
                 )?
                 .query_map([], |row| row.get(0))?
                 .collect::<Result<Vec<_>, _>>()?;
+            let mut new_alias: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             for content_id in &unaliased {
                 let next: i64 = tx.query_row(
                     "UPDATE tracker_counter SET next_id = next_id + 1 WHERE singleton = 1 RETURNING next_id - 1",
                     [],
                     |row| row.get(0),
                 )?;
+                let alias = format!("WS-{next}");
                 tx.execute(
                     "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
-                    params![content_id, format!("WS-{next}")],
+                    params![content_id, alias],
                 )?;
+                new_alias.insert(content_id.clone(), alias);
                 report.new_issues += 1;
+            }
+            // Genuine duplicate submission: a newly-seen creation that describes
+            // the SAME issue (same queue + title) as a DISTINCT issue already in
+            // the log. Content-addressing gives every independent submission its
+            // own id, so a real duplicate is two distinct `issue.created` events —
+            // unlike a re-transmit, which shares one id. Advisory only (resolved
+            // by a `duplicates` relation), NEVER a silent collapse.
+            if !unaliased.is_empty() {
+                let created: Vec<(String, String)> = tx
+                    .prepare(
+                        "SELECT issue_id, payload_json FROM tracker_events \
+                         WHERE kind = 'issue.created' AND issue_id IS NOT NULL",
+                    )?
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .map(|row| {
+                        let (cid, payload_json) = row?;
+                        let payload: Value =
+                            serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+                        let queue = payload
+                            .get("queue")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let title = payload
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        Ok((cid, format!("{queue}\u{1e}{title}")))
+                    })
+                    .collect::<StoreResult<Vec<_>>>()?;
+                let mut by_key: std::collections::HashMap<&str, Vec<&str>> =
+                    std::collections::HashMap::new();
+                for (cid, key) in &created {
+                    by_key.entry(key).or_default().push(cid);
+                }
+                for content_id in &unaliased {
+                    if let Some((_, key)) = created.iter().find(|(c, _)| c == content_id) {
+                        // A distinct issue already carries this queue+title.
+                        if by_key[key.as_str()].iter().any(|c| *c != content_id) {
+                            report.duplicate_submissions.push(
+                                new_alias
+                                    .get(content_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| content_id.clone()),
+                            );
+                        }
+                    }
+                }
             }
             tx.commit()?;
         }
@@ -2614,11 +2667,11 @@ mod tests {
         );
     }
 
-    /// Import is idempotent and content-dedups: re-importing the same log adds no
-    /// events, and each re-submitted `issue.created` is reported as a
-    /// duplicate_submission (warned, never silently collapsed).
+    /// Re-importing the same log is idempotent and SILENT: byte-identical events
+    /// are re-transmits (same content id), deduped without a duplicate warning —
+    /// this is the normal cross-machine re-sync, and it must not spam.
     #[test]
-    fn reimport_dedups_and_warns_on_duplicate_submission() {
+    fn reimport_is_a_silent_idempotent_resync() {
         let mut a = open_memory();
         let mut b = open_memory();
         a.file_item("q", "One", "", &[], &json!({}), None)
@@ -2635,13 +2688,49 @@ mod tests {
         let second = b.import_events(&events).unwrap();
         assert_eq!(second.imported, 0, "nothing new on re-import");
         assert_eq!(second.new_issues, 0, "no re-aliasing");
-        assert_eq!(
-            second.duplicate_submissions.len(),
-            2,
-            "both re-submitted creations warned"
+        assert_eq!(second.skipped, 2, "both events deduped as re-transmits");
+        assert!(
+            second.duplicate_submissions.is_empty(),
+            "a re-transmit is NOT a duplicate submission — re-sync stays quiet"
         );
-        // Still exactly two issues — no silent collapse into duplicates.
         assert_eq!(b.list_items(Some("q"), None).unwrap().len(), 2);
+    }
+
+    /// A genuine duplicate submission — two clones independently FILE the same
+    /// issue (same queue + title) — mints two distinct content ids. Merging them
+    /// surfaces the second as a duplicate_submission warning (advisory; a human
+    /// reconciles via a `duplicates` relation), never a silent collapse.
+    #[test]
+    fn independent_same_issue_submissions_warn_as_duplicates() {
+        let mut a = open_memory();
+        let mut b = open_memory();
+        // Two clones each file "Fix login" into queue q — same work, filed twice.
+        a.file_item("q", "Fix login", "", &[], &json!({}), Some("ann"))
+            .expect("files");
+        b.file_item("q", "Fix login", "", &[], &json!({}), Some("bob"))
+            .expect("files");
+        let a_events = a.export_events().unwrap();
+        let b_events = b.export_events().unwrap();
+        // Distinct content ids — independent submissions are not the same event.
+        assert_ne!(a_events[0].event_id, b_events[0].event_id);
+
+        // A pulls in B's independent submission of the same issue.
+        let report = a.import_events(&b_events).unwrap();
+        assert_eq!(report.imported, 1);
+        assert_eq!(report.new_issues, 1);
+        assert_eq!(
+            report.duplicate_submissions.len(),
+            1,
+            "B's independent submission duplicates the one A already had"
+        );
+        // Both issues survive — advisory warning, never a silent collapse.
+        assert_eq!(a.list_items(Some("q"), None).unwrap().len(), 2);
+        // A different title in the same queue is NOT flagged.
+        let mut c = open_memory();
+        c.file_item("q", "Other work", "", &[], &json!({}), None)
+            .expect("files");
+        let clean = c.import_events(&a_events).unwrap();
+        assert!(clean.duplicate_submissions.is_empty());
     }
 
     /// ADR-0002 phase B1 slice v: an optimistic set applies against the current
