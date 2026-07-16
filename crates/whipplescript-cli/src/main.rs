@@ -29610,7 +29610,7 @@ dep add <blocked> [depends-on] <blocker> [--kind K]|\
 link <from> <kind> <to>|unlink <from> <kind> <to>|\
 note <id> <text>|comments <id>|\
 evidence <id> [--kind K --ref R --note N]|\
-export|import <path|->|\
+export [--to DIR]|import <path|->|import --from DIR|sync DIR|\
 rebuild>";
 
 /// Run-identity provenance stamp: anything filed/claimed from inside a turn is
@@ -30330,8 +30330,22 @@ fn issue(options: &CliOptions) -> ExitCode {
             }
         }
         "export" => {
-            // Dump the content-addressed event log as JSON — the unit another
-            // clone unions in (`issue import`). Always JSON (it is data).
+            // `export` dumps the content-addressed event log as JSON to stdout;
+            // `export --to <dir>` writes it as content-addressed files (the
+            // portable cross-machine transport — union by directory).
+            if let Some(dir) = flag_value(args, "--to") {
+                return match store.export_to_dir(std::path::Path::new(&dir)) {
+                    Ok(written) => {
+                        if options.json {
+                            emit_json(json!({"exported_to": dir, "written": written}))
+                        } else {
+                            println!("wrote {written} new event file(s) to {dir}");
+                            ExitCode::SUCCESS
+                        }
+                    }
+                    Err(error) => report_store_error("failed to export events", error),
+                };
+            }
             match store.export_events() {
                 Ok(events) => match serde_json::to_string_pretty(&events) {
                     Ok(text) => {
@@ -30346,10 +30360,47 @@ fn issue(options: &CliOptions) -> ExitCode {
                 Err(error) => report_store_error("failed to export events", error),
             }
         }
+        "sync" => {
+            // `sync <dir>`: bidirectional reconcile against a shared directory —
+            // export local events to it, then import everything it holds. Two
+            // clones that both `sync` the same dir converge.
+            let Some(dir) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.sync_dir(std::path::Path::new(dir)) {
+                Ok((written, report)) => {
+                    // Sync is a repeated reconcile — re-transmitting events
+                    // already held is expected, so we do NOT warn per duplicate
+                    // (that would spam every run). A genuine duplicate submission
+                    // is indistinguishable from a re-transmission without
+                    // per-event provenance (a deferred B2 refinement).
+                    if options.json {
+                        emit_json(json!({
+                            "pushed": written,
+                            "imported": report.imported,
+                            "new_issues": report.new_issues,
+                        }))
+                    } else {
+                        println!(
+                            "synced {dir}: pushed {written}, pulled {} new event(s), {} new issue(s)",
+                            report.imported, report.new_issues
+                        );
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(error) => report_store_error("failed to sync", error),
+            }
+        }
         "import" => {
-            // `import <path>` (or `-` for stdin): union another clone's event log
-            // into this one, deduped by content hash. Reports what merged and
-            // warns on any byte-identical duplicate submission.
+            // `import <path>` (or `-` for stdin) unions a JSON event log;
+            // `import --from <dir>` unions a directory of event files.
+            if let Some(dir) = flag_value(args, "--from") {
+                return match store.import_from_dir(std::path::Path::new(&dir)) {
+                    Ok(report) => emit_import_report(&report, options.json),
+                    Err(error) => report_store_error("failed to import events", error),
+                };
+            }
             let Some(path) = args.get(1) else {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
@@ -30381,25 +30432,7 @@ fn issue(options: &CliOptions) -> ExitCode {
                     }
                 };
             match store.import_events(&events) {
-                Ok(report) => {
-                    for content_id in &report.duplicate_submissions {
-                        eprintln!("warning: duplicate submission collapsed onto existing issue ({content_id})");
-                    }
-                    if options.json {
-                        emit_json(json!({
-                            "imported": report.imported,
-                            "skipped": report.skipped,
-                            "new_issues": report.new_issues,
-                            "duplicate_submissions": report.duplicate_submissions,
-                        }))
-                    } else {
-                        println!(
-                            "imported {} event(s), {} new issue(s), {} already present",
-                            report.imported, report.new_issues, report.skipped
-                        );
-                        ExitCode::SUCCESS
-                    }
-                }
+                Ok(report) => emit_import_report(&report, options.json),
                 Err(error) => report_store_error("failed to import events", error),
             }
         }
@@ -30407,6 +30440,31 @@ fn issue(options: &CliOptions) -> ExitCode {
             eprintln!("{usage}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// Render a tracker merge/import result (shared by `import` and `sync`): warn on
+/// every duplicate submission (never silent), then summarize.
+fn emit_import_report(
+    report: &whipplescript_store::items::ImportReport,
+    json_out: bool,
+) -> ExitCode {
+    for content_id in &report.duplicate_submissions {
+        eprintln!("warning: duplicate submission collapsed onto existing issue ({content_id})");
+    }
+    if json_out {
+        emit_json(json!({
+            "imported": report.imported,
+            "skipped": report.skipped,
+            "new_issues": report.new_issues,
+            "duplicate_submissions": report.duplicate_submissions,
+        }))
+    } else {
+        println!(
+            "imported {} event(s), {} new issue(s), {} already present",
+            report.imported, report.new_issues, report.skipped
+        );
+        ExitCode::SUCCESS
     }
 }
 

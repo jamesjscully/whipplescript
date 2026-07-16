@@ -1034,6 +1034,72 @@ impl WorkItemStore {
         Ok(report)
     }
 
+    /// Export the event log as content-addressed files under `dir` — the
+    /// portable cross-machine transport (ADR-0002 phase B2). Each event is one
+    /// JSON file at `dir/<aa>/<event_id>.json` (git-object-style sharding by
+    /// hash prefix), so a write is idempotent and two clones' directories union
+    /// by the mere set of files (drop-a-folder / rsync / synced-drive sync).
+    /// Returns the number of NEW files written.
+    pub fn export_to_dir(&self, dir: &Path) -> StoreResult<usize> {
+        let events = self.export_events()?;
+        let mut written = 0;
+        for event in &events {
+            if event.event_id.len() < 2 {
+                continue;
+            }
+            let shard = dir.join(&event.event_id[..2]);
+            std::fs::create_dir_all(&shard)?;
+            let path = shard.join(format!("{}.json", event.event_id));
+            if path.exists() {
+                continue; // content-addressed: same id ⇒ same bytes, already present
+            }
+            std::fs::write(&path, serde_json::to_string_pretty(event)?)?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// Import every event file under `dir` (set-union, deduped by content hash).
+    /// Events are applied in a deterministic order (clock, then id) so local
+    /// re-aliasing is stable. Returns the merge report.
+    pub fn import_from_dir(&mut self, dir: &Path) -> StoreResult<ImportReport> {
+        let mut events = Vec::new();
+        if dir.exists() {
+            for shard in std::fs::read_dir(dir)? {
+                let shard = shard?.path();
+                if !shard.is_dir() {
+                    continue;
+                }
+                for entry in std::fs::read_dir(&shard)? {
+                    let path = entry?.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    if let Ok(event) =
+                        serde_json::from_str::<TrackerEvent>(&std::fs::read_to_string(&path)?)
+                    {
+                        events.push(event);
+                    }
+                }
+            }
+        }
+        events.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
+        self.import_events(&events)
+    }
+
+    /// Bidirectional reconcile against a shared directory: export local events
+    /// to it, then import everything it holds. Two clones that both `sync_dir`
+    /// the same directory converge — the cross-machine multi-writer exchange.
+    pub fn sync_dir(&mut self, dir: &Path) -> StoreResult<(usize, ImportReport)> {
+        let written = self.export_to_dir(dir)?;
+        let report = self.import_from_dir(dir)?;
+        Ok((written, report))
+    }
+
     fn active_holder(&self, item_id: &str) -> StoreResult<Option<String>> {
         self.connection
             .query_row(
@@ -2456,6 +2522,50 @@ mod tests {
         assert!(store
             .add_relation(&a.id, &b.id, "related", Some("hard"))
             .is_err());
+    }
+
+    /// ADR-0002 phase B2 cross-machine transport: two clones reconcile by
+    /// sharing a directory of content-addressed event files. After both
+    /// `sync_dir` the same dir, divergent field edits surface as a conflict in
+    /// BOTH — the drop-a-folder multi-writer exchange.
+    #[test]
+    fn dir_sync_reconciles_two_clones() {
+        let dir = std::env::temp_dir().join(format!("whip-tracker-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut a = open_memory();
+        let mut b = open_memory();
+        let issue = a
+            .file_item("q", "Shared", "", &[], &json!({}), None)
+            .expect("files");
+
+        // Seed B with A's issue through the shared directory.
+        a.export_to_dir(&dir).expect("export");
+        let report = b.import_from_dir(&dir).expect("import");
+        assert_eq!(report.new_issues, 1);
+        assert_eq!(b.get_item("WS-1").unwrap().unwrap().title, "Shared");
+
+        // Divergent edits, then both sync against the shared dir.
+        a.set_field(&issue.id, "title", "A version").expect("set A");
+        b.set_field("WS-1", "title", "B version").expect("set B");
+        a.sync_dir(&dir).expect("sync a");
+        b.sync_dir(&dir).expect("sync b"); // b now sees A's edit → forks
+        a.sync_dir(&dir).expect("sync a2"); // a now sees B's edit → forks
+
+        for (name, store) in [("a", &a), ("b", &b)] {
+            let c = store.issue_conflicts("WS-1").unwrap().unwrap();
+            assert!(c.conflicted(), "{name} sees the conflict after sync");
+            assert_eq!(c.field_conflicts[0].values, vec!["A version", "B version"]);
+            // Content-addressed heads: both clones agree on the frontier.
+            assert_eq!(c.heads.len(), 2);
+        }
+        // Both frontiers are byte-identical — true convergence, not just "both
+        // conflicted": the state_token is a content hash of the shared heads.
+        assert_eq!(
+            a.issue_conflicts("WS-1").unwrap().unwrap().state_token,
+            b.issue_conflicts("WS-1").unwrap().unwrap().state_token
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ADR-0002 phase B2: comments and evidence attach to an issue, survive a
