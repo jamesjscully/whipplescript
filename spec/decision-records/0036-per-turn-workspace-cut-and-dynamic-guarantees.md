@@ -59,6 +59,18 @@ the delta (a delegated foreign runtime without workspace mediation) must
 **decline honestly** — `workspace_cut_ref` absent — rather than fabricate;
 consumers treat absence as "unwitnessed", never as "no changes".
 
+> **Update 2026-07-16 — taint producer is dormant.** The original in-resolver
+> taint trigger was "a native OS command ran outside the mediated surface."
+> That channel no longer exists: `bash` moved to the in-isolate Bashkit shell
+> (DR-0039), which witnesses every effect, so `NativeWorkspaceResolver`'s
+> `witness_taint` has no live caller and `take_turn_witness` never reports
+> `Unwitnessed` via taint (the `Unwitnessed` path from persisted non-witnessed
+> segment metadata is unaffected). `witness_taint` is **retained as the reserved
+> honest-decline hook** for a future native-OS command tool, which MUST call it
+> (or fully witness). Tracked in `spec/native-command-tool-tracker.md`. The
+> string-parse OS-command governance seam this DR was drafted alongside was
+> removed in the 2026-07-16 dead-code cleanup (superseded by DR-0039).
+
 ### 2. A dynamic section in the guarantee report
 
 The guarantee report keeps its static admission set and gains a **dynamic

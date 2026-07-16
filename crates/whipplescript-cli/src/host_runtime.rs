@@ -9,7 +9,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -610,78 +609,6 @@ pub trait ResourceResolver {
     }
 }
 
-/// Host realization request for a command that WhippleScript has already
-/// parsed and admitted. The host may further restrict it (for example with an
-/// OS sandbox), but must not widen the command or timeout.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdmittedCommand {
-    pub command: String,
-    pub workspace_root: PathBuf,
-    pub read_only_paths: Vec<PathBuf>,
-    pub timeout: Duration,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommandExecutionOutput {
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: Option<i32>,
-}
-
-pub trait CommandExecutor: Send + Sync {
-    fn execute(&self, command: &AdmittedCommand) -> Result<CommandExecutionOutput, String>;
-}
-
-/// WhippleScript-owned command admission policy. `allowed_prefixes = None` is
-/// an explicit host grant for any simple command; `Some([])` is deny-all.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NativeCommandPolicy {
-    allowed_prefixes: Option<Vec<String>>,
-    max_timeout: Duration,
-}
-
-impl NativeCommandPolicy {
-    pub fn allow_any(max_timeout: Duration) -> Self {
-        Self {
-            allowed_prefixes: None,
-            max_timeout,
-        }
-    }
-
-    pub fn allow_prefixes(
-        prefixes: impl IntoIterator<Item = String>,
-        max_timeout: Duration,
-    ) -> Self {
-        Self {
-            allowed_prefixes: Some(
-                prefixes
-                    .into_iter()
-                    .map(|prefix| prefix.trim().to_owned())
-                    .filter(|prefix| !prefix.is_empty())
-                    .collect(),
-            ),
-            max_timeout,
-        }
-    }
-
-    // Unwired governance helper (commit 229945a "governed native command
-    // execution"): the prefix-allowlist check is not on any current call path.
-    // Preserved for the governance wiring rather than deleted.
-    #[allow(dead_code)]
-    fn admits(&self, command: &str) -> bool {
-        let Some(prefixes) = &self.allowed_prefixes else {
-            return true;
-        };
-        let command = command.trim();
-        prefixes.iter().any(|prefix| {
-            command == prefix
-                || command
-                    .strip_prefix(prefix)
-                    .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-        })
-    }
-}
-
 /// WhippleScript-owned native implementation of the workspace capability used
 /// by embedding desktop hosts. GaugeDesk supplies only the root and any
 /// read-only subtrees; WhippleScript parses tool arguments, confines paths,
@@ -690,10 +617,13 @@ pub struct NativeWorkspaceResolver {
     root: PathBuf,
     read_only: Vec<PathBuf>,
     max_output_bytes: usize,
-    command: Option<(NativeCommandPolicy, Arc<dyn CommandExecutor>)>,
     /// The per-turn workspace witness (DR-0036 §1): every mutation this
-    /// resolver performs is recorded; a native command taints the segment
-    /// because it mutates outside the mediated surface.
+    /// resolver performs is recorded. `taint` marks the segment *unwitnessed*
+    /// so the turn declines the cut honestly if an unmediated channel ever
+    /// mutates the workspace. No channel does today — `bash` runs in the
+    /// in-isolate Bashkit shell and every effect is witnessed — so `witness_taint`
+    /// is a reserved hook for a future native-OS command tool (see
+    /// spec/native-command-tool-tracker.md).
     witness: std::sync::Mutex<WitnessState>,
 }
 
@@ -730,8 +660,13 @@ impl NativeWorkspaceResolver {
         state.reads.push(path.to_owned());
     }
 
-    // Unwired witness helper (commit 7499a66, DR-0036 witnessed cuts): no
-    // current path records taint through it. Preserved for that wiring.
+    /// Marks the current turn segment *unwitnessed* (DR-0036 honest-decline):
+    /// `take_turn_witness` then reports `Unwitnessed` and the receipt omits the
+    /// workspace-cut claim rather than fabricating one. RESERVED HOOK: no
+    /// channel taints today (all mutations go through the mediated tool surface
+    /// / Bashkit), so this has no caller. A future native-OS command tool must
+    /// call it (or bring its own witnessing) — tracked in
+    /// spec/native-command-tool-tracker.md.
     #[allow(dead_code)]
     fn witness_taint(&self, reason: &str) {
         let mut state = self.witness.lock().expect("witness lock");
@@ -754,7 +689,6 @@ impl NativeWorkspaceResolver {
             root,
             read_only: Vec::new(),
             max_output_bytes: 50_000,
-            command: None,
             witness: std::sync::Mutex::new(WitnessState::default()),
         })
     }
@@ -765,15 +699,6 @@ impl NativeWorkspaceResolver {
             .map(|path| normalize_relative(&path))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(self)
-    }
-
-    pub fn command_execution(
-        mut self,
-        policy: NativeCommandPolicy,
-        executor: Arc<dyn CommandExecutor>,
-    ) -> Self {
-        self.command = Some((policy, executor));
-        self
     }
 
     fn resolve(&self, path: &str, write: bool) -> Result<PathBuf, String> {
@@ -1433,139 +1358,6 @@ fn wildcard_matches(pattern: &str, text: &str) -> bool {
         previous = current;
     }
     previous[text.len()]
-}
-
-// Unwired command-safety validator cluster (commit 229945a "governed native
-// command execution"): built for the governed exec path but not on any current
-// call path. Preserved (with its `simple_command_words`/`looks_path_shaped`
-// helpers) for that wiring rather than deleted.
-#[allow(dead_code)]
-fn validate_simple_command(command: &str, read_only: &[PathBuf]) -> Result<(), String> {
-    let words = simple_command_words(command)?;
-    let executable = words
-        .first()
-        .ok_or_else(|| "command must contain an executable".to_owned())?;
-    let executable_name = Path::new(executable)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(executable);
-    const SHELLS: &[&str] = &[
-        "sh",
-        "bash",
-        "dash",
-        "zsh",
-        "fish",
-        "cmd",
-        "cmd.exe",
-        "powershell",
-        "powershell.exe",
-        "pwsh",
-    ];
-    if words.iter().any(|word| SHELLS.contains(&word.as_str())) {
-        return Err("nested shell execution is not permitted".to_owned());
-    }
-    if matches!(
-        executable_name,
-        "python" | "python3" | "node" | "ruby" | "perl"
-    ) && words.iter().any(|word| word == "-c" || word == "-e")
-    {
-        return Err("inline interpreter programs are not permitted".to_owned());
-    }
-
-    for word in words.iter().skip(1) {
-        let candidate = word.split_once('=').map(|(_, value)| value).unwrap_or(word);
-        if candidate.is_empty() || candidate.starts_with('-') || !looks_path_shaped(candidate) {
-            continue;
-        }
-        let relative = normalize_relative(Path::new(candidate))?;
-        if read_only
-            .iter()
-            .any(|protected| relative.starts_with(protected))
-        {
-            return Err(format!(
-                "command path argument `{candidate}` enters a read-only workspace subtree"
-            ));
-        }
-    }
-    Ok(())
-}
-
-#[allow(dead_code)] // helper of the unwired validate_simple_command cluster
-fn looks_path_shaped(word: &str) -> bool {
-    word == "."
-        || word == ".."
-        || word.starts_with("./")
-        || word.starts_with("../")
-        || word.starts_with('/')
-        || word.starts_with('~')
-        || word.contains('/')
-        || word.contains('\\')
-}
-
-#[allow(dead_code)] // helper of the unwired validate_simple_command cluster
-fn simple_command_words(command: &str) -> Result<Vec<String>, String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut chars = command.chars().peekable();
-    let mut quote: Option<char> = None;
-    while let Some(ch) = chars.next() {
-        match quote {
-            Some('\'') => {
-                if ch == '\'' {
-                    quote = None;
-                } else {
-                    current.push(ch);
-                }
-            }
-            Some('"') => match ch {
-                '"' => quote = None,
-                '$' | '`' => {
-                    return Err("shell expansion is not permitted".to_owned());
-                }
-                '\\' => {
-                    let escaped = chars
-                        .next()
-                        .ok_or_else(|| "command has a trailing escape".to_owned())?;
-                    if !matches!(escaped, '"' | '\\') {
-                        return Err("only quote/backslash escapes are permitted".to_owned());
-                    }
-                    current.push(escaped);
-                }
-                '\n' | '\r' => return Err("command separators are not permitted".to_owned()),
-                _ => current.push(ch),
-            },
-            None => match ch {
-                '\'' | '"' => quote = Some(ch),
-                '\\' => {
-                    let escaped = chars
-                        .next()
-                        .ok_or_else(|| "command has a trailing escape".to_owned())?;
-                    current.push(escaped);
-                }
-                '\n' | '\r' => return Err("command separators are not permitted".to_owned()),
-                ch if ch.is_whitespace() => {
-                    if !current.is_empty() {
-                        words.push(std::mem::take(&mut current));
-                    }
-                }
-                '$' | '`' | '*' | '?' | '[' | ']' | '{' | '}' | '~' | ';' | '|' | '&' | '('
-                | ')' | '<' | '>' => {
-                    return Err(format!(
-                        "shell operator or expansion `{ch}` is not permitted"
-                    ));
-                }
-                _ => current.push(ch),
-            },
-            Some(_) => unreachable!(),
-        }
-    }
-    if quote.is_some() {
-        return Err("command has an unterminated quote".to_owned());
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    Ok(words)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4697,20 +4489,6 @@ workflow HumanHostChat {
 
     #[test]
     fn native_command_tool_is_governed_virtual_bash() {
-        struct StubExecutor {
-            calls: std::sync::Mutex<Vec<AdmittedCommand>>,
-        }
-        impl CommandExecutor for StubExecutor {
-            fn execute(&self, command: &AdmittedCommand) -> Result<CommandExecutionOutput, String> {
-                self.calls.lock().expect("calls").push(command.clone());
-                Ok(CommandExecutionOutput {
-                    stdout: "native executor must not run\n".to_owned(),
-                    stderr: String::new(),
-                    exit_code: Some(0),
-                })
-            }
-        }
-
         let root = std::env::temp_dir().join(format!(
             "whip-native-command-{}-{}",
             std::process::id(),
@@ -4720,17 +4498,10 @@ workflow HumanHostChat {
                 .as_nanos()
         ));
         fs::create_dir_all(root.join(".pi")).expect("dirs");
-        let executor = Arc::new(StubExecutor {
-            calls: std::sync::Mutex::new(Vec::new()),
-        });
         let resolver = NativeWorkspaceResolver::new(&root)
             .expect("resolver")
             .read_only([PathBuf::from(".pi")])
-            .expect("read-only")
-            .command_execution(
-                NativeCommandPolicy::allow_any(Duration::from_secs(60)),
-                executor.clone(),
-            );
+            .expect("read-only");
         let project_only = [ResourceRef {
             handle: "project".to_owned(),
             kind: "file_store".to_owned(),
@@ -4772,15 +4543,12 @@ workflow HumanHostChat {
         assert!(resolver
             .execute_tool(&admitted, &call("definitely-not-a-bashkit-command"))
             .is_err());
-        let calls = executor.calls.lock().expect("calls");
-        assert!(
-            calls.is_empty(),
-            "virtual bash never invokes the OS executor"
-        );
+        // `bash` is served entirely by the in-isolate virtual shell (Bashkit):
+        // there is no OS command executor to invoke — the seam was removed once
+        // Bashkit became the only command path (DR-0039).
         assert!(native_workspace_tool_specs_with_command(true, true)
             .iter()
             .any(|tool| tool.name == "bash"));
-        drop(calls);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4869,17 +4637,6 @@ workflow HostChat {
     /// declines the cut instead of fabricating one.
     #[test]
     fn receipt_workspace_cut_and_dynamic_guarantees_from_witnessed_turn() {
-        struct StubExecutor;
-        impl CommandExecutor for StubExecutor {
-            fn execute(&self, _: &AdmittedCommand) -> Result<CommandExecutionOutput, String> {
-                Ok(CommandExecutionOutput {
-                    stdout: "clean\n".to_owned(),
-                    stderr: String::new(),
-                    exit_code: Some(0),
-                })
-            }
-        }
-
         let path = temp_store();
         let workspace = std::env::temp_dir().join(format!(
             "whip-host-cut-{}-{}",
@@ -4912,12 +4669,7 @@ workflow HostChat {
         let instance = runtime
             .open_instance(&open, &CutPackages)
             .expect("instance");
-        let resources = NativeWorkspaceResolver::new(&workspace)
-            .expect("resolver")
-            .command_execution(
-                NativeCommandPolicy::allow_prefixes(["git".to_owned()], Duration::from_secs(60)),
-                Arc::new(StubExecutor),
-            );
+        let resources = NativeWorkspaceResolver::new(&workspace).expect("resolver");
         let secrets = Secrets {
             calls: Cell::new(0),
         };
