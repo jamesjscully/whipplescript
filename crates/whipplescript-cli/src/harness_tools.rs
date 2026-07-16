@@ -1645,13 +1645,18 @@ impl FileToolExecutor {
         }
     }
 
+    // Unwired command-governance cluster (commit 229945a): these allow-list /
+    // boundary-enforcement helpers are not on any current call path. Preserved
+    // for the governed-exec wiring rather than deleted.
     /// A command is allowed if it equals an allow-list prefix or begins with one
     /// followed by whitespace (so `git` permits `git status` but not `gitfoo`).
+    #[allow(dead_code)]
     fn command_allowed(&self, command: &str) -> bool {
         let command = command.trim();
         self.command_prefix_allowed(command)
     }
 
+    #[allow(dead_code)] // unwired command-governance cluster (commit 229945a)
     fn command_prefix_allowed(&self, command: &str) -> bool {
         let command = command.trim();
         self.bash_allow.iter().any(|prefix| {
@@ -1664,6 +1669,7 @@ impl FileToolExecutor {
         })
     }
 
+    #[allow(dead_code)] // unwired command-governance cluster (commit 229945a)
     fn enforce_command_write_boundary(&self, command: &str) -> Result<(), String> {
         for target in command_output_redirection_targets(command)? {
             if is_fd_redirection_target(&target) || target == "/dev/null" {
@@ -1683,6 +1689,7 @@ impl FileToolExecutor {
         Ok(())
     }
 
+    #[allow(dead_code)] // unwired command-governance cluster (commit 229945a)
     fn enforce_command_read_boundary(&self, command: &str) -> Result<(), String> {
         for target in command_input_redirection_targets(command)? {
             if target.contains(['$', '`', '*', '?', '[', ']', '{', '}', '~']) {
@@ -1699,6 +1706,7 @@ impl FileToolExecutor {
         Ok(())
     }
 
+    #[allow(dead_code)] // unwired command-governance cluster (commit 229945a)
     fn enforce_command_path_argument_boundary(&self, command: &str) -> Result<(), String> {
         let words = command_words(command)?;
         for word in &words {
@@ -1985,6 +1993,10 @@ fn bash_allow_from_env() -> Vec<String> {
         .unwrap_or_default()
 }
 
+// Unwired bashkit command-policy draft (pre-ADR, in-isolate-bash-design-note.md):
+// this parsing/validation cluster is not on any current call path. Preserved as
+// a spike rather than deleted; wire it in or remove it as bashkit lands.
+#[allow(dead_code)]
 fn command_argument_policy_violation(command: &str) -> Option<String> {
     let bytes = command.as_bytes();
     let mut index = 0usize;
@@ -2082,6 +2094,7 @@ fn command_argument_policy_violation(command: &str) -> Option<String> {
     None
 }
 
+#[allow(dead_code)] // unwired bashkit command-policy draft (pre-ADR)
 fn is_shell_test_bracket_delimiter(command: &str, index: usize, byte: u8) -> bool {
     let bytes = command.as_bytes();
     match byte {
@@ -2101,6 +2114,7 @@ fn is_shell_test_bracket_delimiter(command: &str, index: usize, byte: u8) -> boo
     }
 }
 
+#[allow(dead_code)] // unwired bashkit command-policy draft (pre-ADR)
 fn command_words(command: &str) -> Result<Vec<String>, String> {
     let bytes = command.as_bytes();
     let mut words = Vec::new();
@@ -2135,6 +2149,7 @@ fn command_words(command: &str) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
+#[allow(dead_code)] // unwired bashkit command-policy draft (pre-ADR)
 fn command_path_argument_policy_violation(word: &str) -> Option<String> {
     if path_argument_escapes_workspace(word) {
         return Some("must stay within the workspace".to_owned());
@@ -2147,6 +2162,7 @@ fn command_path_argument_policy_violation(word: &str) -> Option<String> {
     None
 }
 
+#[allow(dead_code)] // unwired bashkit command-policy draft (pre-ADR)
 fn path_argument_escapes_workspace(value: &str) -> bool {
     if value.is_empty() {
         return false;
@@ -2159,6 +2175,7 @@ fn path_argument_escapes_workspace(value: &str) -> bool {
         .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
+#[allow(dead_code)] // unwired bashkit command-policy draft (pre-ADR)
 fn command_output_redirection_targets(command: &str) -> Result<Vec<String>, String> {
     let bytes = command.as_bytes();
     let mut targets = Vec::new();
@@ -2228,6 +2245,7 @@ fn command_output_redirection_targets(command: &str) -> Result<Vec<String>, Stri
     Ok(targets)
 }
 
+#[allow(dead_code)] // unwired bashkit command-policy draft (pre-ADR)
 fn command_input_redirection_targets(command: &str) -> Result<Vec<String>, String> {
     let bytes = command.as_bytes();
     let mut targets = Vec::new();
@@ -2305,6 +2323,7 @@ fn command_input_redirection_targets(command: &str) -> Result<Vec<String>, Strin
     Ok(targets)
 }
 
+#[allow(dead_code)] // unwired bashkit command-policy draft (pre-ADR)
 fn shell_word_at(command: &str, start: usize) -> Result<(Option<String>, usize), String> {
     let bytes = command.as_bytes();
     let mut index = start;
@@ -2371,12 +2390,14 @@ fn shell_word_at(command: &str, start: usize) -> Result<(Option<String>, usize),
     }
 }
 
+#[allow(dead_code)] // unwired bashkit command-policy draft (pre-ADR)
 fn is_fd_redirection_target(target: &str) -> bool {
     target
         .strip_prefix('&')
         .is_some_and(|rest| rest == "-" || rest.chars().all(|ch| ch.is_ascii_digit()))
 }
 
+#[allow(dead_code)] // unwired bashkit command-policy draft (pre-ADR)
 struct CommandOutput {
     combined: String,
     exit_code: Option<i32>,
@@ -2384,6 +2405,7 @@ struct CommandOutput {
 
 /// Run `command` via `sh -c` with `cwd = root`, killing it if it exceeds
 /// `timeout`. Returns combined stdout+stderr and the exit code.
+#[allow(dead_code)] // unwired bashkit command-policy draft (pre-ADR)
 fn run_bounded_command(
     command: &str,
     root: &Path,

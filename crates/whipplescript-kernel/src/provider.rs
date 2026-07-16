@@ -564,6 +564,11 @@ impl NativeProviderBoundaryError {
     }
 }
 
+// `NativeProviderBoundaryError` is a deliberately rich boundary-error value
+// (provider id, surface, code, message, evidence) crossing the provider seam;
+// boxing every `Result` here would churn every adapter impl for a micro-size
+// win, so allow the large-Err variant on this trait and the validator below.
+#[allow(clippy::result_large_err)]
 pub trait NativeProviderAdapter {
     fn provider_id(&self) -> &str;
     fn capability(&self) -> &ProviderCapability;
@@ -581,6 +586,7 @@ pub trait NativeProviderAdapter {
     ) -> Result<NativeProviderEvent, NativeProviderBoundaryError>;
 }
 
+#[allow(clippy::result_large_err)]
 pub fn validate_native_cancellation_depth(
     config: &ProviderBindingConfig,
     capabilities: &[ProviderCapability],

@@ -2143,7 +2143,7 @@ mod tests {
         let (claim_id, claim_parents, _) = &events[1];
         assert_eq!(claim_id.len(), 64);
         // The claim event chains onto the created event: it is a child.
-        assert_eq!(claim_parents, &[created_id.clone()]);
+        assert_eq!(claim_parents.as_slice(), std::slice::from_ref(created_id));
         assert_ne!(claim_id, created_id);
     }
 

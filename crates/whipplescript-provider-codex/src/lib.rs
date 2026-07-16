@@ -616,6 +616,9 @@ impl<T: CodexAppServerTransport> CodexAppServerAdapter<T> {
         }
     }
 
+    // Returns the shared, deliberately-rich `NativeProviderBoundaryError`; see
+    // the kernel trait for why the large-Err variant is allowed at this seam.
+    #[allow(clippy::result_large_err)]
     fn ensure_codex_request(
         &self,
         request: &NativeProviderTurnRequest,

@@ -1181,7 +1181,7 @@ source clock as wake_once {
         "schedule_name",
     ] {
         assert!(
-            !payload.get(field).map_or(true, serde_json::Value::is_null),
+            !payload.get(field).is_none_or(serde_json::Value::is_null),
             "observation field `{field}` missing from payload: {payload}"
         );
     }

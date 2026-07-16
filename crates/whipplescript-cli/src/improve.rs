@@ -1137,6 +1137,7 @@ fn score_instance(
 
 /// Score one non-builtin gauge whose inputs (if any) are all present in
 /// `readings`.
+#[allow(clippy::too_many_arguments)]
 fn score_one_gauge(
     spec: &GaugeSpec,
     judge_input: &Value,
@@ -6049,7 +6050,7 @@ mod tests {
             ]}"#,
         )
         .expect("write config");
-        let table = PriceTable::load(&[path.clone()]).expect("loads");
+        let table = PriceTable::load(std::slice::from_ref(&path)).expect("loads");
         let usage = TurnUsage {
             provider: "anthropic".to_owned(),
             model: "claude-sonnet-5".to_owned(),

@@ -572,10 +572,11 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                         images: resolved_images.clone(),
                     });
                 }
-                let user_images = resume_from
-                    .is_empty()
-                    .then_some(resolved_images)
-                    .unwrap_or_default();
+                let user_images = if resume_from.is_empty() {
+                    resolved_images
+                } else {
+                    Vec::new()
+                };
                 // Store-backed project instructions (context-assembly Phase 3
                 // item 4): the DO has no filesystem, so AGENTS.md/CLAUDE.md
                 // content registered at deploy resolves from the store — the

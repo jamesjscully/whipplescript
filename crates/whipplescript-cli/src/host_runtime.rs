@@ -664,6 +664,10 @@ impl NativeCommandPolicy {
         }
     }
 
+    // Unwired governance helper (commit 229945a "governed native command
+    // execution"): the prefix-allowlist check is not on any current call path.
+    // Preserved for the governance wiring rather than deleted.
+    #[allow(dead_code)]
     fn admits(&self, command: &str) -> bool {
         let Some(prefixes) = &self.allowed_prefixes else {
             return true;
@@ -726,6 +730,9 @@ impl NativeWorkspaceResolver {
         state.reads.push(path.to_owned());
     }
 
+    // Unwired witness helper (commit 7499a66, DR-0036 witnessed cuts): no
+    // current path records taint through it. Preserved for that wiring.
+    #[allow(dead_code)]
     fn witness_taint(&self, reason: &str) {
         let mut state = self.witness.lock().expect("witness lock");
         if state.taint.is_none() {
@@ -1428,6 +1435,11 @@ fn wildcard_matches(pattern: &str, text: &str) -> bool {
     previous[text.len()]
 }
 
+// Unwired command-safety validator cluster (commit 229945a "governed native
+// command execution"): built for the governed exec path but not on any current
+// call path. Preserved (with its `simple_command_words`/`looks_path_shaped`
+// helpers) for that wiring rather than deleted.
+#[allow(dead_code)]
 fn validate_simple_command(command: &str, read_only: &[PathBuf]) -> Result<(), String> {
     let words = simple_command_words(command)?;
     let executable = words
@@ -1478,6 +1490,7 @@ fn validate_simple_command(command: &str, read_only: &[PathBuf]) -> Result<(), S
     Ok(())
 }
 
+#[allow(dead_code)] // helper of the unwired validate_simple_command cluster
 fn looks_path_shaped(word: &str) -> bool {
     word == "."
         || word == ".."
@@ -1489,6 +1502,7 @@ fn looks_path_shaped(word: &str) -> bool {
         || word.contains('\\')
 }
 
+#[allow(dead_code)] // helper of the unwired validate_simple_command cluster
 fn simple_command_words(command: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut current = String::new();

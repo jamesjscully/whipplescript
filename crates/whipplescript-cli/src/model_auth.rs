@@ -196,11 +196,13 @@ mod tests {
     #[test]
     fn credential_precedence_golden_table() {
         use CoerceProvider::{Anthropic, OpenAi};
-        let table: &[(
+        // (provider, (env, stored, codex) candidates, expected (key, source))
+        type GoldenRow<'a> = (
             CoerceProvider,
-            (Option<&str>, Option<&str>, Option<&str>),
-            Option<(&str, CredentialSource)>,
-        )] = &[
+            (Option<&'a str>, Option<&'a str>, Option<&'a str>),
+            Option<(&'a str, CredentialSource)>,
+        );
+        let table: &[GoldenRow] = &[
             // openai: env beats stored beats codex; codex is a real rung.
             (
                 OpenAi,
@@ -234,7 +236,6 @@ mod tests {
         ];
         for (provider, (env, stored, codex), expected) in table {
             let resolved = resolve_credential_from(*provider, candidates(*env, *stored, *codex));
-            let resolved = resolved.map(|(key, source)| (key, source));
             let expected = expected
                 .as_ref()
                 .map(|(key, source)| ((*key).to_owned(), *source));

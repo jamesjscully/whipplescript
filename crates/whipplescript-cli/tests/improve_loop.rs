@@ -1652,7 +1652,7 @@ fn parallel_evaluation_pairs_scenarios_and_records_judge_spend() {
         &[
             (
                 "WHIPPLESCRIPT_IMPROVE_PROPOSALS",
-                &candidate_path.to_string_lossy().into_owned(),
+                &candidate_path.to_string_lossy(),
             ),
             ("WHIPPLESCRIPT_EVAL_CONCURRENCY", "4"),
             ("WHIPPLESCRIPT_COERCE_PROVIDER", "openai-generic"),

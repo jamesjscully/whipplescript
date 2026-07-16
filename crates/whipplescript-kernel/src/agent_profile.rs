@@ -52,9 +52,7 @@ pub struct AgentProfilePreset {
 
 impl AgentProfilePreset {
     pub fn grants_capability(&self, capability: &str) -> bool {
-        self.capabilities
-            .iter()
-            .any(|granted| *granted == capability)
+        self.capabilities.contains(&capability)
     }
 }
 
