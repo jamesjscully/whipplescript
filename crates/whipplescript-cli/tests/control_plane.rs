@@ -22540,7 +22540,7 @@ rule triage
     };
     for (label, consume_line, expected) in [
         ("off-boundary", "", 1usize),
-        ("at-boundary", "  consume ticket", 0usize),
+        ("at-boundary", "  done ticket", 0usize),
     ] {
         let wf = dir.join(format!("{label}.whip"));
         fs::write(&wf, program(consume_line)).expect("write workflow");
