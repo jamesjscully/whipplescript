@@ -31,13 +31,16 @@ linked sections below.
 Rows 1–9 are complete through review (2026-06-10). Full workspace tests
 (12 suites), clippy, Maude + TLA+ models, rule-coverage CI, smoke scripts,
 and both acceptance fixtures pass. Row 10 is intentionally deferred (one
-deprecation release before removal). Rows 11–17 (Part C, decided 2026-06-10) are complete through review
+deprecation release before removal — **DONE 2026-07-16**, commit 2729e63). Rows
+11–17 (Part C, decided 2026-06-10) are complete through review
 (2026-06-11): full workspace tests, clippy, rule-coverage CI, and the
 live-collector OTel check pass. Noted follow-ups: `acquire ... wait` FIFO
 form, ledger `has entry for` projection sugar, TLA+ formalization of the
 store-tested coordination invariants, exec `with` stdin, time arithmetic.
 Row 18 (C9, decided 2026-06-11) hardens `exec` for hosted deployments:
-design and spec are done, build pending.
+**complete through review** (`--exec-profile`/`--script-manifest`, content-pinned
+capabilities; `soft_middle::hosted_exec_*`). The **sole remaining open item in
+this tracker is the B1a lowering-move** ([B1](#b1-harden-the-soft-middle-priority-1)).
 
 | # | Workstream | Design | Spec | Model | Impl + test | Review |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -50,7 +53,7 @@ design and spec are done, build pending.
 | 7 | Gated `exec` effect ([A5](#a5-capability-gated-exec-effect--decided-2026-06-09)) | **done** | **done** (`spec/language.md` surface revisions) | **done** (`exec_is_gated_by_operator_grants`) | **done** | **done** |
 | 8 | Small cuts: `emit`, `harness`, `pattern` ([A6](#a6-small-cuts--decided-2026-06-09)) | **done** | — | — | **done** (`emit` rejected; `consume` warns) | **done** |
 | 9 | Dynamic rule-coverage CI ([B3](#b3-carry-overs-from-the-previous-plan)) | — | — | — | **done** (`scripts/check-rule-coverage.sh`) | **done** (surfaced + fixed 2 latent example dev failures) |
-| 10 | Remove `consume` after deprecation window ([B3](#b3-carry-overs-from-the-previous-plan)) | — | — | — | deferred (one release) | — |
+| 10 | Remove `consume` after deprecation window ([B3](#b3-carry-overs-from-the-previous-plan)) | — | — | — | **done** (commit 2729e63; `body::consume_done_alias_is_removed`) | **done** |
 | 11 | Sum types: data-carrying variants ([C1](#c1-sum-types-data-carrying-variants--decided-2026-06-10)) | **done** | **done** ([sum-types.md](../sum-types.md)) | **done** (`sum_type_*` e2e in `soft_middle.rs`: tagged dispatch + payload binding per variant, fixture `--variant` knob, reserved-field/bare-binding/exhaustiveness checks) | **done** (brace-body variants lower to `<Enum>.<Variant>` classes with literal `variant` field, visible in `check`; coerce effects embed per-variant fixtures) | **done** (review fixed: case-branch `as` binding in the body parser, runtime variant dispatch, nested-payload splitter capture; full suite + clippy green) |
 | 12 | JSON/JSONL ingestion ([C3](#c3-json-and-jsonl-ingestion--decided-2026-06-10)) | **done** | **done** ([json-ingestion.md](../json-ingestion.md)) | **done** (`exec_parse_*` e2e in `soft_middle.rs`: typed bind, fan-out, all-or-nothing stream, fail-branch routing) | **done** (effects carry a self-contained `parse` contract so workers validate without the IR; escape-aware command extraction fixed en route) | **done** (review fixed: escape-aware command extraction — `\"` inside exec commands previously truncated the command) |
 | 13 | Scheduled time: absolute deadlines ([C4](#c4-scheduled-time-absolute-deadlines--decided-2026-06-10)) | **done** | **done** ([scheduled-time.md](../scheduled-time.md)) | **done** (`timer_until_*` e2e in `soft_middle.rs`: past fires exactly-once, future pends, path resolves at record time) | **done** (fixed 3 bugs en route: body-AST statement gate, lexicographic `strftime` compare, NULL `timeout_seconds` row mapping) | **done** (review fixed: lexicographic strftime compare, NULL timeout row mapping; e2e re-verified after both) |
@@ -58,7 +61,7 @@ design and spec are done, build pending.
 | 15 | Coordination: lease, ledger, counter ([C6](#c6-coordination-resources-lease-ledger-counter--decided-2026-06-10)) | **done** | **done** ([coordination.md](../coordination.md)) | **done** (protocol invariants pinned by store property tests in `coordination.rs` — mutual exclusion, TTL expiry, N-slot, holder release, append order/partitions, cap + lazy reset — and `lease_*`/`counter_*` e2e in `soft_middle.rs`; TLA+ formalization of the same invariants is the noted follow-up) | **done** (try-acquire/release/`until ttl`, append+retain, consume+lazy reset; workspace-scoped `coordination.sqlite`; `whip leases/ledger/counters`; safety checks: one-lease default, exhaustive outcomes, must-release prototype, terminal auto-release; `acquire wait` FIFO form is the noted follow-up) | **done** (review fixed: policy gate blocked coordination kinds as provider-less, `after` line-scan rejected outcome predicates, acquire bindings missing from seen-bindings; discipline checks exercised against leak/missing-arm/multi-lease programs) |
 | 16 | Messaging: durable tuple-space ([C7](#c7-messaging-a-durable-tuple-space--decided-2026-06-10)) | **done** | **done** ([coordination.md](../coordination.md), [event-ingress.md](../event-ingress.md)) | **done** (cross-instance signal injection validates payload against the declared signal shape and lands the typed fact in the peer) | **done** (`emit signal <name> to <instance> { payload }` effect; ledger pub-sub via C6; `has entry for` projection sugar is the noted follow-up) | **done** (review verified payload validation failure fails the signal effect without touching the peer) |
 | 17 | Observability: OpenTelemetry export ([C8](#c8-observability-opentelemetry-export--decided-2026-06-10)) | **done** | **done** ([observability.md](../observability.md)) | **done** (emit-once verified against a live collector: second pass exports nothing; `otel_export_dry_run_emits_structural_spans` pins span naming + structural-only attributes) | **done** (`whip otel-export`: cursor-tracked log tailer → OTLP/HTTP JSON traces; standard OTel env vars; spans named after source constructs; `gen_ai.system` on model spans; plain-HTTP to a local Collector which owns TLS/fan-out; metrics + allowlist are the noted fast-follows) | **done** (review verified emit-once against a live collector and failure isolation: a failed POST marks nothing exported) |
-| 18 | Script capabilities: content-pinned `exec` ([C9](#c9-script-capabilities-content-pinned-exec--decided-2026-06-11)) | **done** | **done** ([script-capabilities.md](../script-capabilities.md)) | todo | todo | todo |
+| 18 | Script capabilities: content-pinned `exec` ([C9](#c9-script-capabilities-content-pinned-exec--decided-2026-06-11)) | **done** | **done** ([script-capabilities.md](../script-capabilities.md)) | — | **done** (`--exec-profile`/`--script-manifest`, `lint_hosted_exec`, sha256 pinning) | **done** (`soft_middle::hosted_exec_runs_content_pinned_capability_with_json_stdin` / `hosted_exec_hash_mismatch_fails_before_spawn` / `tampered_script_capability_fails_with_structured_hash_evidence`) |
 
 Sequencing (as executed): row 1 (body AST + unified evaluator) landed first;
 rows 2–9 built on it. Flow lowering depends on row 1's AST as predicted.
@@ -259,23 +262,30 @@ flow triage
 
 ## Part B — Approved engineering work (no design input needed)
 
-> **RECONCILED 2026-07-01.** The [status board](#status-board) (rows 1–18) and
-> the codebase are authoritative — the Part B features below **shipped** (body
-> AST + unified evaluator in `parser/src/body.rs`+`flow_expand.rs`; single-line
-> record fix; `{{ }}` interpolation; timers/`cancel`; general `when fact` matcher
-> + `manual review requested` removed; work queues + `whip items`; `exec` +
-> `WHIPPLESCRIPT_EXEC_ALLOW`; rule-coverage lint; `--exec-profile`/C9). The
-> checklist below is retained as historical decomposition; its `[ ]` marks are
-> **not** live work except the two genuinely-open carry-overs, which are the
-> only remaining items in this whole tracker:
-> - **B1a (partial):** the body AST shipped, but *moving lowering out of the CLI
->   crate* is still open (`main.rs` ~50k lines) — folds in review-change-plan §4.11.
->   *Ordering note 2026-07-01:* the durable-object sans-IO refactor
->   (`../durable-object-runtime-tracker.md` Phases 1–4) will restructure the
->   executor half of the same file; do the lowering-move first or jointly, not
->   after — avoid refactoring the same ~50k-line file twice.
-> - **B3:** remove `consume` after its deprecation window (it still parses); and
->   the dynamic per-run committed-rule reporting half of rule-coverage CI.
+> **RECONCILED 2026-07-01, updated 2026-07-16.** The [status board](#status-board)
+> (rows 1–18) and the codebase are authoritative — the Part B features below
+> **shipped** (body AST + unified evaluator in `parser/src/body.rs`+`flow_expand.rs`;
+> single-line record fix; `{{ }}` interpolation; timers/`cancel`; general `when
+> fact` matcher + `manual review requested` removed; work queues + `whip items`;
+> `exec` + `WHIPPLESCRIPT_EXEC_ALLOW`; rule-coverage lint; `--exec-profile`/C9).
+>
+> **2026-07-16 closeout.** The two open carry-overs are resolved and B1 was
+> re-verified live: `consume` removed (commit 2729e63); dynamic rule-coverage is
+> `scripts/check-rule-coverage.sh` (row 9); B1b–f verified live + covered by
+> `tests/soft_middle.rs`; and a real bindingless-trigger guard silent-drop found
+> while verifying B1c was fixed (B1c′, commit d5b0586). **The one remaining item
+> in this whole tracker is the B1a lowering-move:**
+> - **B1a (lowering-move):** the body AST shipped, but *moving the rule-body → IR
+>   lowering out of the CLI crate* is still open (`main.rs` ~55k lines) — folds in
+>   review-change-plan §4.11.
+>   *Ordering note:* the durable-object sans-IO refactor
+>   (`../durable-object-runtime-tracker.md`) already moved the *rule pass* into
+>   `whipplescript-kernel` (`rule_pass`/`instance_machine`); what remains in the
+>   CLI file is the *worker effect executor* (`run_*_effect` I/O handlers), which
+>   that tracker separately plans to re-home. The lowering-move targets the
+>   *compile path* (source → IR), a largely separate region of the file, so the
+>   two are unlikely to collide — but stage the lowering-move as its own slices
+>   and rebase around any concurrent executor-re-home work.
 >
 > **B1g closed 2026-07-02:** the pull-forward was kept: the no-silent-no-op
 > sweep now has a deterministic accepted-body matrix in
@@ -289,27 +299,39 @@ flow triage
 The root cause is shared: rule bodies are raw strings re-scanned line by
 line at lowering time, and guards/assertions use two different evaluators.
 
-- [ ] **B1a.** Parse rule bodies into a real AST in the parser crate
+- [~] **B1a.** Parse rule bodies into a real AST in the parser crate
       (absorbs the deferred "move lowering out of the CLI" item from the
-      previous plan). Every statement form is grammar; unknown tokens are
-      parse errors with spans.
-- [ ] **B1b.** One expression evaluator shared by guards, assertions, and
-      payload lowering.
-- [ ] **B1c.** Fix: filtered queries in guards evaluate wrong at runtime —
-      `count(Item where status == "done")` / `exists(Item where ...)` are
-      false despite matching facts, while the identical expression passes
-      as an `assert`. Regression tests pairing guard and assert evaluation
-      of the same expressions.
-- [ ] **B1d.** Fix: single-line record/payload blocks
-      (`complete result { total 2 }`) fail with a misleading
-      "missing required field" error. Either support the form or reject it
-      with a real diagnostic.
-- [ ] **B1e.** Fix: `{{ ... }}` interpolation in record/payload fields
-      produces corrupt values (mangled quoting, unsubstituted templates).
-      Support it properly or reject at check time.
-- [ ] **B1f.** Reject unknown effect modifiers with a spanned diagnostic
-      (`tell w as turn timeout 10m "..."` must say "unknown token
-      `timeout`", not mis-parse downstream).
+      previous plan). **AST SHIPPED** (`parser/src/body.rs` — every statement
+      form is grammar; unknown tokens are spanned parse errors, verified by the
+      B1g accepted-body matrices). REMAINING: *move the rule-body → IR lowering
+      out of the 55k-line `whipplescript-cli/src/main.rs` into the parser/kernel
+      crates* — the last genuinely-open item in this tracker. Own campaign
+      (still-live raw-text scanners in the lowering are the reason B1c/the
+      bindingless-guard bug hid there). Sequencing note below re: the DO refactor.
+- [x] **B1b.** One expression evaluator shared by guards, assertions, and
+      payload lowering — shipped; guards and asserts evaluate identical
+      filtered-query expressions identically (test
+      `soft_middle::filtered_query_guards_match_assertions_over_single_line_rows`).
+- [x] **B1c.** Filtered queries in guards evaluate correctly at runtime —
+      `count(Item where ...)` / `exists(Item where ...)` in a guard match the
+      same expression as an `assert` (positive and negative). Verified live
+      2026-07-16 and pinned by
+      `soft_middle::filtered_query_guards_match_assertions_over_single_line_rows`.
+- [x] **B1c′.** (found verifying B1c, 2026-07-16, commit d5b0586) `where`
+      guards on **bindingless** triggers (`when started`, `is available`,
+      `completed turn`, `has ready issue`) were parsed + shown in the IR but
+      silently dropped at runtime, so a false guard still fired.
+      `filter_bindingless_guard` now applies the same `eval_guard` to those
+      trigger branches. Test `soft_middle::started_trigger_guard_is_enforced`.
+- [x] **B1d.** Single-line record/payload blocks (`complete result { total 2 }`)
+      are accepted and lower correctly (verified 2026-07-16; single-line rows
+      also exercised by the B1c test's `table`).
+- [x] **B1e.** `{{ ... }}` interpolation in record/payload fields renders
+      against bindings (verified 2026-07-16: `msg "hello {{ item.name }}"` →
+      `"hello Ann"`; test `soft_middle::templates_in_payload_fields_render`).
+- [x] **B1f.** Unknown effect modifiers are rejected with a spanned diagnostic
+      rather than mis-parsed downstream (verified 2026-07-16: an unknown token
+      after `tell w as turn` is a spanned parse error, not a silent accept).
 - [x] **B1g.** Sweep: fuzz/property tests that any body accepted by `check`
       either executes faithfully or produces a runtime diagnostic — no
       silent no-ops. Closed 2026-07-02 with deterministic parser/CLI accepted-body
@@ -320,45 +342,56 @@ line at lowering time, and guards/assertions use two different evaluators.
 Stage status lives in the [status board](#status-board) — do not duplicate
 it here. This section holds the per-feature work breakdown.
 
+> **SHIPPED** (status board rows 3/4/5, reconciled 2026-07-01; corroborated by
+> the green kernel + `whip` bin suites and the timer/queue/signal examples).
+> The `[x]` marks below record the decomposition.
+
 Time (A2):
-- [ ] `timeout <dur>` clause parsed on all effect statements; stored on the
+- [x] `timeout <dur>` clause parsed on all effect statements; stored on the
       effect; enforced on worker passes (creation-anchored deadline).
-- [ ] Expiry path: mark `timed_out`, fire dependency branches, record
+- [x] Expiry path: mark `timed_out`, fire dependency branches, record
       cancellation request + evidence.
-- [ ] `timer <dur> as x` -> `timer.wait` effect kind; completed by
+- [x] `timer <dur> as x` -> `timer.wait` effect kind; completed by
       worker/dev passes when due.
-- [ ] `cancel <binding>` rule-body operation (v1): terminal-cancels a
+- [x] `cancel <binding>` rule-body operation (v1): terminal-cancels a
       pending effect, requests cancellation of a running one; no-op with
       evidence on already-terminal effects.
-- [ ] `dev --until idle`: pending timers do not count as runnable work;
+- [x] `dev --until idle`: pending timers do not count as runnable work;
       `status` lists pending timers with due times.
-- [ ] Duration literals (`s/m/h/d`) in the expression layer.
+- [x] Duration literals (`s/m/h/d`) in the expression layer.
 
 Event matching (A3a–c):
-- [ ] `when fact <dotted.name> as x [where ...]` general matcher.
-- [ ] Re-implement surviving sugar as documented lowerings to the general
+- [x] `when fact <dotted.name> as x [where ...]` general matcher.
+- [x] Re-implement surviving sugar as documented lowerings to the general
       form; delete the magic-prefix table in `normalize_pattern_name` /
       `binding_from_when`.
-- [ ] Remove `manual review requested`.
+- [x] Remove `manual review requested`.
 
 Work queues (A3d–e), per [`work-queues.md`](../work-queues.md):
-- [ ] `queue { tracker ... }` declaration; binding config resolution.
-- [ ] `queue.file/claim/release/finish` effect kinds + verbs; claim lease
+- [x] `queue { tracker ... }` declaration; binding config resolution.
+- [x] `queue.file/claim/release/finish` effect kinds + verbs; claim lease
       semantics; branchable already-claimed outcome.
-- [ ] Builtin tracker: workspace-scoped store, sequential `WS-n` ids,
-      transactional claim.
-- [ ] Projection on worker passes; `(queue, id)`-keyed item facts;
+- [x] Builtin tracker: workspace-scoped store, sequential `WS-n` ids,
+      transactional claim. (Now the phase-B content-addressed tracker — see
+      [`../tracker-phase-b-tracker.md`](../tracker-phase-b-tracker.md).)
+- [x] Projection on worker passes; `(queue, id)`-keyed item facts;
       `<queue> has ready item` sugar.
-- [ ] CLI: `whip items [add|show|list]`; run-identity env injection into
+- [x] CLI: `whip items [add|show|list]`; run-identity env injection into
       turns; provenance stamping.
-- [ ] Drop `AgentTurn.issue`/`changedFiles`; keep the curated queue
+- [x] Drop `AgentTurn.issue`/`changedFiles`; keep the curated queue
       examples as the authoring surface.
 
 ### B3. Carry-overs from the previous plan
 
-- [ ] Dynamic rule-coverage CI: every rule in every shipped example commits
-      at least once in some fixture run.
-- [ ] Remove `consume` after its deprecation window.
+- [x] Dynamic rule-coverage CI: every rule in every shipped example commits
+      at least once in some fixture run — `scripts/check-rule-coverage.sh`
+      drives each example through a fixture run and diffs declared rules
+      against `rule.committed` events (status board row 9).
+- [x] Remove `consume` after its deprecation window (2026-07-16, commit
+      2729e63): the bare `consume` done-alias is removed across the body parser
+      + both raw-text fact-consumption scanners; the live counter verb
+      `consume <c> for ...` is unaffected. Tests
+      `body::consume_done_alias_is_removed` / `counter_consume_verb_still_parses`.
 
 ---
 
