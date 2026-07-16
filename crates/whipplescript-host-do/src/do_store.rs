@@ -6991,28 +6991,133 @@ fn do_now(sql: &impl DoSql) -> StoreResult<String> {
         .map_or_else(String::new, |row| as_text(&row[0])))
 }
 
-/// Append one immutable tracker event (INSERT only — never updated or deleted).
-fn do_tracker_append(
+/// Resolve a human `WS-N` alias to its opaque `content_id` merge identity
+/// (ADR-0002 phase B1: the DO event log is keyed by content_id, like native).
+fn do_content_id(sql: &impl DoSql, alias: &str) -> StoreResult<Option<String>> {
+    let rows = sql
+        .query(
+            "SELECT content_id FROM tracker_aliases WHERE alias = ?1",
+            &[text(alias)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows.first().map(|row| as_text(&row[0])))
+}
+
+/// The issue's current head event ids — events nothing lists as a parent.
+fn do_issue_heads(sql: &impl DoSql, content_id: &str) -> StoreResult<Vec<String>> {
+    let rows = sql
+        .query(
+            "SELECT e.event_id FROM tracker_events e \
+             WHERE e.issue_id = ?1 AND e.event_id IS NOT NULL \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM tracker_events c \
+                 WHERE c.issue_id = ?1 \
+                   AND instr(c.parents_json, '\"' || e.event_id || '\"') > 0)",
+            &[text(content_id)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows.iter().map(|row| as_text(&row[0])).collect())
+}
+
+/// Append one immutable content-addressed tracker event (INSERT only), keyed by
+/// the issue's opaque content_id. `event_id_override` is used only for the
+/// `issue.created` root (whose id IS the content_id). Deduped by `event_id`.
+fn do_tracker_append_raw(
     sql: &impl DoSql,
-    issue_id: Option<&str>,
+    content_id: Option<&str>,
+    event_id_override: Option<&str>,
     kind: &str,
-    payload: &serde_json::Value,
+    payload_json: &str,
     actor: Option<&str>,
     now: &str,
-) -> StoreResult<()> {
+) -> StoreResult<String> {
+    let parents = match content_id {
+        Some(id) => do_issue_heads(sql, id)?,
+        None => Vec::new(),
+    };
+    let event_id = match event_id_override {
+        Some(id) => id.to_owned(),
+        None => whipplescript_store::items::event_content_id(
+            kind,
+            content_id,
+            payload_json,
+            actor,
+            &parents,
+            now,
+        ),
+    };
+    let parents_json =
+        serde_json::to_string(&parents).map_err(|error| sql_err(error.to_string()))?;
     sql.execute(
-        "INSERT INTO tracker_events (issue_id, kind, payload_json, actor, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT OR IGNORE INTO tracker_events \
+         (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         &[
-            opt_text(issue_id),
+            text(&event_id),
+            text(&parents_json),
+            opt_text(content_id),
             text(kind),
-            text(&payload.to_string()),
+            text(payload_json),
             opt_text(actor),
             text(now),
         ],
     )
     .map_err(sql_err)?;
+    Ok(event_id)
+}
+
+/// Append one event for an issue given by its `WS-N` alias — resolves the alias
+/// to the opaque content_id the event log is keyed by (merge-stable).
+fn do_tracker_append(
+    sql: &impl DoSql,
+    alias: Option<&str>,
+    kind: &str,
+    payload: &serde_json::Value,
+    actor: Option<&str>,
+    now: &str,
+) -> StoreResult<()> {
+    let content_id = match alias {
+        Some(a) => Some(
+            do_content_id(sql, a)?
+                .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {a}")))?,
+        ),
+        None => None,
+    };
+    do_tracker_append_raw(
+        sql,
+        content_id.as_deref(),
+        None,
+        kind,
+        &payload.to_string(),
+        actor,
+        now,
+    )?;
     Ok(())
+}
+
+/// Load one issue's events (by content_id) into the shared `IssueEvent` shape
+/// for `analyze_issue_dag` — the DO store shares the native conflict analysis.
+fn do_load_issue_events(
+    sql: &impl DoSql,
+    content_id: &str,
+) -> StoreResult<Vec<whipplescript_store::items::IssueEvent>> {
+    let rows = sql
+        .query(
+            "SELECT event_id, parents_json, kind, payload_json FROM tracker_events \
+             WHERE issue_id = ?1 ORDER BY event_seq",
+            &[text(content_id)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows
+        .iter()
+        .map(|row| whipplescript_store::items::IssueEvent {
+            event_id: as_opt_text(&row[0]).unwrap_or_default(),
+            parents: serde_json::from_str(&as_text(&row[1])).unwrap_or_default(),
+            kind: as_text(&row[2]),
+            payload: serde_json::from_str(&as_text(&row[3]))
+                .unwrap_or_else(|_| serde_json::json!({})),
+        })
+        .collect())
 }
 
 /// The holder of the active lease on an issue, if any.
@@ -7186,11 +7291,29 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
             "metadata": metadata,
             "filed_by": filed_by,
         });
-        do_tracker_append(
-            &self.sql,
-            Some(&item_id),
+        // Opaque merge identity = the content-hash of the creation event; WS-N
+        // is only a local alias for it. The event log is keyed by content_id.
+        let payload_json = payload.to_string();
+        let content_id = whipplescript_store::items::event_content_id(
             "issue.created",
-            &payload,
+            None,
+            &payload_json,
+            filed_by,
+            &[],
+            &now,
+        );
+        self.sql
+            .execute(
+                "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
+                &[text(&content_id), text(&item_id)],
+            )
+            .map_err(sql_err)?;
+        do_tracker_append_raw(
+            &self.sql,
+            Some(&content_id),
+            Some(&content_id),
+            "issue.created",
+            &payload_json,
             filed_by,
             &now,
         )?;
@@ -7280,8 +7403,25 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
                 &[text(queue)],
             )
             .map_err(sql_err)?;
+        // A conflicted issue is not ready (ADR-0002 phase B1 slice ii): its
+        // field values are in dispute. Not expressible in the SQL predicate, so
+        // filter here via the shared DAG conflict analysis.
+        let mut ready = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let item = do_issue_row(row);
+            let conflicted = match do_content_id(&self.sql, &item.id)? {
+                Some(content_id) => whipplescript_store::items::analyze_issue_dag(
+                    &do_load_issue_events(&self.sql, &content_id)?,
+                )
+                .conflicted(),
+                None => false,
+            };
+            if !conflicted {
+                ready.push(item);
+            }
+        }
         // Ready rows have no active lease by construction; the overlay is a no-op.
-        Ok(rows.iter().map(|row| do_issue_row(row)).collect())
+        Ok(ready)
     }
 
     fn claim_item(
@@ -7308,11 +7448,14 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         if let Some(holder) = do_active_holder(&self.sql, item_id)? {
             return Ok(ClaimOutcome::AlreadyClaimed { holder });
         }
+        // The acquire count is over the event log, which is keyed by content_id.
+        let content_id = do_content_id(&self.sql, item_id)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {item_id}")))?;
         let n = self
             .sql
             .query(
                 "SELECT COUNT(*) FROM tracker_events WHERE issue_id = ?1 AND kind = 'claim.acquired'",
-                &[text(item_id)],
+                &[text(&content_id)],
             )
             .map_err(sql_err)?
             .first()
@@ -7471,20 +7614,560 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
     }
 
     fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()> {
-        // `from` blocks `to`: append `relation.added` and fold into
-        // `tracker_relations` (mirror of the native `add_blocks` door).
+        self.add_relation(from, to, "blocks", None)
+    }
+}
+
+// -- Phase-B tracker surface over DoSql (ADR-0002 B1/B2) --------------------
+//
+// The additive surface native `WorkItemStore` exposes as inherent methods,
+// ported so the edge host is at parity: relation taxonomy, field sets +
+// conflict view, comments/evidence, and merge (export/import). The DAG/hash
+// core is shared from `whipplescript_store::items` — the DO only supplies the
+// `DoSql` glue, so both backends mint identical event ids and detect conflicts
+// identically.
+impl<Sql: DoSql> DoSqliteStore<Sql> {
+    /// Records a directed relation `kind(from -> to)`; only `blocks` gates
+    /// readiness. `dep_kind` is valid only on `blocks`. Event payload carries
+    /// content_ids (merge-stable); the projection keeps aliases.
+    pub fn add_relation(
+        &mut self,
+        from: &str,
+        to: &str,
+        kind: &str,
+        dep_kind: Option<&str>,
+    ) -> StoreResult<()> {
+        use whipplescript_store::items::{DEPENDENCY_KINDS, RELATION_KINDS};
+        if !RELATION_KINDS.contains(&kind) {
+            return Err(StoreError::Conflict(format!(
+                "unknown relation kind `{kind}`"
+            )));
+        }
+        if let Some(dk) = dep_kind {
+            if kind != "blocks" {
+                return Err(StoreError::Conflict(
+                    "dep_kind only applies to `blocks` relations".to_owned(),
+                ));
+            }
+            if !DEPENDENCY_KINDS.contains(&dk) {
+                return Err(StoreError::Conflict(format!(
+                    "unknown dependency kind `{dk}`"
+                )));
+            }
+        }
         let now = do_now(&self.sql)?;
-        let payload = serde_json::json!({"from": from, "to": to, "kind": "blocks"});
+        let from_cid = do_content_id(&self.sql, from)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {from}")))?;
+        let to_cid = do_content_id(&self.sql, to)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {to}")))?;
+        let payload =
+            serde_json::json!({"from": from_cid, "to": to_cid, "kind": kind, "dep_kind": dep_kind});
         do_tracker_append(&self.sql, Some(to), "relation.added", &payload, None, &now)?;
         self.sql
             .execute(
                 "INSERT OR IGNORE INTO tracker_relations (from_issue, to_issue, kind, dep_kind) \
-                 VALUES (?1, ?2, 'blocks', NULL)",
-                &[text(from), text(to)],
+                 VALUES (?1, ?2, ?3, ?4)",
+                &[text(from), text(to), text(kind), opt_text(dep_kind)],
             )
             .map_err(sql_err)?;
         Ok(())
     }
+
+    /// Sets one field of an issue (`issue.field_set`) — the mutation the conflict
+    /// engine folds. Returns `false` if the issue is unknown.
+    pub fn set_field(&mut self, item_id: &str, field: &str, value: &str) -> StoreResult<bool> {
+        let now = do_now(&self.sql)?;
+        let Some(content_id) = do_content_id(&self.sql, item_id)? else {
+            return Ok(false);
+        };
+        let payload = serde_json::json!({"field": field, "value": value});
+        do_tracker_append_raw(
+            &self.sql,
+            Some(&content_id),
+            None,
+            "issue.field_set",
+            &payload.to_string(),
+            None,
+            &now,
+        )?;
+        if let Some(column) = whipplescript_store::items::projection_column(field) {
+            self.sql
+                .execute(
+                    &format!(
+                        "UPDATE tracker_issues SET {column} = ?2, updated_at = ?3 WHERE issue_id = ?1"
+                    ),
+                    &[text(item_id), text(value), text(&now)],
+                )
+                .map_err(sql_err)?;
+        }
+        Ok(true)
+    }
+
+    /// The DAG conflict view of one issue (`heads` / `state_token` /
+    /// `field_conflicts`) — shares the native analysis. `None` if unknown.
+    pub fn issue_conflicts(
+        &self,
+        item_id: &str,
+    ) -> StoreResult<Option<whipplescript_store::items::IssueConflicts>> {
+        let Some(content_id) = do_content_id(&self.sql, item_id)? else {
+            return Ok(None);
+        };
+        let events = do_load_issue_events(&self.sql, &content_id)?;
+        Ok(Some(whipplescript_store::items::analyze_issue_dag(&events)))
+    }
+
+    /// Adds a comment (`comment.added`); returns its content-hash id or `None`.
+    pub fn add_comment(
+        &mut self,
+        item_id: &str,
+        author: Option<&str>,
+        body: &str,
+    ) -> StoreResult<Option<String>> {
+        let now = do_now(&self.sql)?;
+        let Some(content_id) = do_content_id(&self.sql, item_id)? else {
+            return Ok(None);
+        };
+        let payload = serde_json::json!({"author": author, "body": body});
+        let comment_id = do_tracker_append_raw(
+            &self.sql,
+            Some(&content_id),
+            None,
+            "comment.added",
+            &payload.to_string(),
+            author,
+            &now,
+        )?;
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO tracker_comments (comment_id, issue_id, author, body, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[text(&comment_id), text(item_id), opt_text(author), text(body), text(&now)],
+            )
+            .map_err(sql_err)?;
+        Ok(Some(comment_id))
+    }
+
+    /// Attaches evidence (`evidence.added`); returns its content-hash id.
+    pub fn add_evidence(
+        &mut self,
+        item_id: &str,
+        kind: Option<&str>,
+        reference: Option<&str>,
+        note: Option<&str>,
+        added_by: Option<&str>,
+    ) -> StoreResult<Option<String>> {
+        let now = do_now(&self.sql)?;
+        let Some(content_id) = do_content_id(&self.sql, item_id)? else {
+            return Ok(None);
+        };
+        let payload = serde_json::json!({
+            "kind": kind, "reference": reference, "note": note, "added_by": added_by,
+        });
+        let evidence_id = do_tracker_append_raw(
+            &self.sql,
+            Some(&content_id),
+            None,
+            "evidence.added",
+            &payload.to_string(),
+            added_by,
+            &now,
+        )?;
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO tracker_evidence \
+                 (evidence_id, issue_id, kind, reference, note, added_by, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                &[
+                    text(&evidence_id),
+                    text(item_id),
+                    opt_text(kind),
+                    opt_text(reference),
+                    opt_text(note),
+                    opt_text(added_by),
+                    text(&now),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(Some(evidence_id))
+    }
+
+    /// Export every event in transport form (the unit another clone unions in).
+    pub fn export_events(&self) -> StoreResult<Vec<whipplescript_store::items::TrackerEvent>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT event_id, parents_json, issue_id, kind, payload_json, actor, created_at \
+                 FROM tracker_events ORDER BY event_seq",
+                &[],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| whipplescript_store::items::TrackerEvent {
+                event_id: as_opt_text(&row[0]).unwrap_or_default(),
+                parents: serde_json::from_str(&as_text(&row[1])).unwrap_or_default(),
+                issue_id: as_opt_text(&row[2]),
+                kind: as_text(&row[3]),
+                payload_json: as_text(&row[4]),
+                actor: as_opt_text(&row[5]),
+                created_at: as_text(&row[6]),
+            })
+            .collect())
+    }
+
+    /// Merge another clone's events (set-union deduped by event_id), re-aliasing
+    /// newly seen issues locally and warning on duplicate submissions. The DO
+    /// tracker writes projections directly, so imported events are folded here.
+    pub fn import_events(
+        &mut self,
+        events: &[whipplescript_store::items::TrackerEvent],
+    ) -> StoreResult<whipplescript_store::items::ImportReport> {
+        let mut report = whipplescript_store::items::ImportReport::default();
+        for event in events {
+            let parents_json =
+                serde_json::to_string(&event.parents).map_err(|e| sql_err(e.to_string()))?;
+            let changes = self
+                .sql
+                .execute(
+                    "INSERT OR IGNORE INTO tracker_events \
+                     (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    &[
+                        text(&event.event_id),
+                        text(&parents_json),
+                        opt_text(event.issue_id.as_deref()),
+                        text(&event.kind),
+                        text(&event.payload_json),
+                        opt_text(event.actor.as_deref()),
+                        text(&event.created_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            if changes == 1 {
+                report.imported += 1;
+            } else {
+                report.skipped += 1;
+                if event.kind == "issue.created" {
+                    report.duplicate_submissions.push(
+                        event
+                            .issue_id
+                            .clone()
+                            .unwrap_or_else(|| event.event_id.clone()),
+                    );
+                }
+            }
+        }
+        // Re-alias every newly-seen issue (a created event with no local alias),
+        // in append order, minting this clone's own WS-N.
+        let unaliased = self
+            .sql
+            .query(
+                "SELECT issue_id FROM tracker_events \
+                 WHERE kind = 'issue.created' AND issue_id IS NOT NULL \
+                   AND issue_id NOT IN (SELECT content_id FROM tracker_aliases) \
+                 GROUP BY issue_id ORDER BY MIN(event_seq)",
+                &[],
+            )
+            .map_err(sql_err)?;
+        for row in &unaliased {
+            let content_id = as_text(&row[0]);
+            let bumped = self
+                .sql
+                .query(
+                    "UPDATE tracker_counter SET next_id = next_id + 1 WHERE singleton = 1 \
+                     RETURNING next_id - 1",
+                    &[],
+                )
+                .map_err(sql_err)?;
+            let next = bumped.first().map_or(0, |row| as_i64(&row[0]));
+            self.sql
+                .execute(
+                    "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
+                    &[text(&content_id), text(&format!("WS-{next}"))],
+                )
+                .map_err(sql_err)?;
+            report.new_issues += 1;
+        }
+        self.rebuild_tracker_projection()?;
+        Ok(report)
+    }
+
+    /// Rebuild the tracker projections (issues/relations/leases/comments/
+    /// evidence) by folding the content_id-keyed event log through the alias
+    /// bridge — the DO counterpart of the native `rebuild_projection`.
+    pub fn rebuild_tracker_projection(&mut self) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "DELETE FROM tracker_issues; DELETE FROM tracker_relations; \
+                 DELETE FROM tracker_leases; DELETE FROM tracker_comments; \
+                 DELETE FROM tracker_evidence;",
+                &[],
+            )
+            .map_err(sql_err)?;
+        let alias_rows = self
+            .sql
+            .query("SELECT content_id, alias FROM tracker_aliases", &[])
+            .map_err(sql_err)?;
+        let alias_of: std::collections::HashMap<String, String> = alias_rows
+            .iter()
+            .map(|row| (as_text(&row[0]), as_text(&row[1])))
+            .collect();
+        let events = self
+            .sql
+            .query(
+                "SELECT event_id, issue_id, kind, payload_json, created_at \
+                 FROM tracker_events ORDER BY event_seq",
+                &[],
+            )
+            .map_err(sql_err)?;
+        for row in &events {
+            let event_id = as_opt_text(&row[0]);
+            let content_id = as_opt_text(&row[1]);
+            let kind = as_text(&row[2]);
+            let payload: serde_json::Value =
+                serde_json::from_str(&as_text(&row[3])).unwrap_or_else(|_| serde_json::json!({}));
+            let created_at = as_text(&row[4]);
+            let issue_alias = content_id.as_deref().and_then(|c| alias_of.get(c).cloned());
+            do_fold_tracker_event(
+                &self.sql,
+                event_id.as_deref(),
+                issue_alias.as_deref(),
+                &kind,
+                &payload,
+                &created_at,
+                &alias_of,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// An issue's comments in chronological order.
+    pub fn comments(&self, item_id: &str) -> StoreResult<Vec<whipplescript_store::items::Comment>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT comment_id, author, body, created_at FROM tracker_comments \
+                 WHERE issue_id = ?1 ORDER BY created_at, comment_id",
+                &[text(item_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| whipplescript_store::items::Comment {
+                id: as_text(&row[0]),
+                author: as_opt_text(&row[1]),
+                body: as_text(&row[2]),
+                created_at: as_text(&row[3]),
+            })
+            .collect())
+    }
+
+    /// An issue's attached evidence in chronological order.
+    pub fn evidence(
+        &self,
+        item_id: &str,
+    ) -> StoreResult<Vec<whipplescript_store::items::Evidence>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT evidence_id, kind, reference, note, added_by, created_at \
+                 FROM tracker_evidence WHERE issue_id = ?1 ORDER BY created_at, evidence_id",
+                &[text(item_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| whipplescript_store::items::Evidence {
+                id: as_text(&row[0]),
+                kind: as_opt_text(&row[1]),
+                reference: as_opt_text(&row[2]),
+                note: as_opt_text(&row[3]),
+                added_by: as_opt_text(&row[4]),
+                created_at: as_text(&row[5]),
+            })
+            .collect())
+    }
+}
+
+/// Fold one tracker event into the DO projections during a rebuild (the DO
+/// counterpart of the native `fold_event`). `issue_id` is the alias (resolved
+/// from the event's content_id); relation payloads carry content_ids that map
+/// back to aliases via `alias_of`.
+fn do_fold_tracker_event(
+    sql: &impl DoSql,
+    event_id: Option<&str>,
+    issue_id: Option<&str>,
+    kind: &str,
+    payload: &serde_json::Value,
+    created_at: &str,
+    alias_of: &std::collections::HashMap<String, String>,
+) -> StoreResult<()> {
+    let str_of = |key: &str| {
+        payload
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let alias_for = |cid: Option<String>| cid.and_then(|c| alias_of.get(&c).cloned());
+    match kind {
+        "issue.created" => {
+            if let Some(issue) = issue_id {
+                let labels_json = payload
+                    .get("labels")
+                    .map_or_else(|| "[]".to_owned(), std::string::ToString::to_string);
+                let metadata_json = payload
+                    .get("metadata")
+                    .map_or_else(|| "{}".to_owned(), std::string::ToString::to_string);
+                sql.execute(
+                    "INSERT INTO tracker_issues \
+                     (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?8)",
+                    &[
+                        text(issue),
+                        text(&str_of("queue").unwrap_or_default()),
+                        text(&str_of("title").unwrap_or_default()),
+                        text(&str_of("body").unwrap_or_default()),
+                        text(&labels_json),
+                        text(&metadata_json),
+                        opt_text(str_of("filed_by").as_deref()),
+                        text(created_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "issue.field_set" => {
+            if let (Some(issue), Some(field), Some(value)) =
+                (issue_id, str_of("field"), str_of("value"))
+            {
+                if let Some(column) = whipplescript_store::items::projection_column(&field) {
+                    sql.execute(
+                        &format!(
+                            "UPDATE tracker_issues SET {column} = ?2, updated_at = ?3 WHERE issue_id = ?1"
+                        ),
+                        &[text(issue), text(&value), text(created_at)],
+                    )
+                    .map_err(sql_err)?;
+                }
+            }
+        }
+        "issue.closed" | "issue.canceled" | "issue.reopened" => {
+            if let Some(issue) = issue_id {
+                let status = match kind {
+                    "issue.closed" => "closed",
+                    "issue.canceled" => "canceled",
+                    _ => "open",
+                };
+                sql.execute(
+                    "UPDATE tracker_issues SET status = ?2, \
+                     claim_summary = COALESCE(?3, claim_summary), updated_at = ?4 WHERE issue_id = ?1",
+                    &[text(issue), text(status), opt_text(str_of("summary").as_deref()), text(created_at)],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "relation.added" => {
+            if let (Some(from), Some(to)) = (alias_for(str_of("from")), alias_for(str_of("to"))) {
+                sql.execute(
+                    "INSERT OR IGNORE INTO tracker_relations (from_issue, to_issue, kind, dep_kind) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    &[
+                        text(&from),
+                        text(&to),
+                        text(&str_of("kind").unwrap_or_else(|| "blocks".to_owned())),
+                        opt_text(str_of("dep_kind").as_deref()),
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "relation.removed" => {
+            if let (Some(from), Some(to)) = (alias_for(str_of("from")), alias_for(str_of("to"))) {
+                sql.execute(
+                    "DELETE FROM tracker_relations WHERE from_issue = ?1 AND to_issue = ?2 AND kind = ?3",
+                    &[text(&from), text(&to), text(&str_of("kind").unwrap_or_else(|| "blocks".to_owned()))],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "comment.added" => {
+            if let (Some(comment_id), Some(issue)) = (event_id, issue_id) {
+                sql.execute(
+                    "INSERT OR IGNORE INTO tracker_comments (comment_id, issue_id, author, body, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    &[
+                        text(comment_id),
+                        text(issue),
+                        opt_text(str_of("author").as_deref()),
+                        text(&str_of("body").unwrap_or_default()),
+                        text(created_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "evidence.added" => {
+            if let (Some(evidence_id), Some(issue)) = (event_id, issue_id) {
+                sql.execute(
+                    "INSERT OR IGNORE INTO tracker_evidence \
+                     (evidence_id, issue_id, kind, reference, note, added_by, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    &[
+                        text(evidence_id),
+                        text(issue),
+                        opt_text(str_of("kind").as_deref()),
+                        opt_text(str_of("reference").as_deref()),
+                        opt_text(str_of("note").as_deref()),
+                        opt_text(str_of("added_by").as_deref()),
+                        text(created_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "claim.acquired" => {
+            if let Some(issue) = issue_id {
+                sql.execute(
+                    "INSERT OR IGNORE INTO tracker_leases (lease_id, issue_id, actor, acquired_at, expires_at, released_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                    &[
+                        opt_text(str_of("lease_id").as_deref()),
+                        text(issue),
+                        opt_text(str_of("actor").as_deref()),
+                        text(created_at),
+                        opt_text(payload.get("expires_at").and_then(serde_json::Value::as_str)),
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "claim.renewed" => {
+            sql.execute(
+                "UPDATE tracker_leases SET expires_at = ?2 WHERE lease_id = ?1",
+                &[
+                    opt_text(str_of("lease_id").as_deref()),
+                    opt_text(
+                        payload
+                            .get("expires_at")
+                            .and_then(serde_json::Value::as_str),
+                    ),
+                ],
+            )
+            .map_err(sql_err)?;
+        }
+        "claim.released" | "claim.expired" => {
+            sql.execute(
+                "UPDATE tracker_leases SET released_at = ?2 WHERE lease_id = ?1",
+                &[
+                    opt_text(str_of("lease_id").as_deref()),
+                    text(&str_of("released_at").unwrap_or_else(|| created_at.to_owned())),
+                ],
+            )
+            .map_err(sql_err)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 // -- Coordination over DoSql (DR-0033 chunk 5a) -----------------------------
@@ -8069,7 +8752,9 @@ pub(crate) mod test_support {
                 effect_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL
             );
             CREATE TABLE tracker_events (
-                event_seq INTEGER PRIMARY KEY AUTOINCREMENT, issue_id TEXT, kind TEXT NOT NULL,
+                event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT, parents_json TEXT NOT NULL DEFAULT '[]',
+                issue_id TEXT, kind TEXT NOT NULL,
                 payload_json TEXT NOT NULL DEFAULT '{}', actor TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -8094,9 +8779,21 @@ pub(crate) mod test_support {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1), next_id INTEGER NOT NULL
             );
             INSERT INTO tracker_counter (singleton, next_id) VALUES (1, 1);
+            CREATE TABLE tracker_aliases (
+                content_id TEXT PRIMARY KEY, alias TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE tracker_comments (
+                comment_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, author TEXT,
+                body TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE tracker_evidence (
+                evidence_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, kind TEXT, reference TEXT,
+                note TEXT, added_by TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE INDEX idx_tracker_issues_queue ON tracker_issues(queue, status);
             CREATE INDEX idx_tracker_leases_issue ON tracker_leases(issue_id, released_at);
             CREATE INDEX idx_tracker_events_issue ON tracker_events(issue_id, kind);
+            CREATE UNIQUE INDEX idx_tracker_events_id ON tracker_events(event_id);
             CREATE TABLE coord_leases (
                 owner TEXT NOT NULL, resource TEXT NOT NULL, key TEXT NOT NULL, holder TEXT NOT NULL,
                 acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, expires_at TEXT NOT NULL,
@@ -8304,6 +9001,64 @@ mod tests {
                 .status,
             "closed"
         );
+    }
+
+    /// DO parity (ADR-0002 phase B): the edge-host tracker is content-addressed
+    /// (events keyed by opaque content_id, not WS-N), shares the native conflict
+    /// analysis, and merges via export/import — two DO clones editing one issue
+    /// converge to a surfaced conflict, exactly like native.
+    #[test]
+    fn do_tracker_is_content_addressed_and_merges_to_a_conflict() {
+        let mut a = store();
+        let issue =
+            WorkItems::file_item(&mut a, "q", "Shared", "", &[], &serde_json::json!({}), None)
+                .expect("file");
+        assert_eq!(issue.id, "WS-1");
+
+        // Identity = content hash; no event is keyed by the WS-N alias.
+        let cid = do_content_id(&a.sql, "WS-1")
+            .unwrap()
+            .expect("alias resolves");
+        assert_eq!(cid.len(), 64, "content_id is a SHA-256");
+        let by_alias = a
+            .sql
+            .query(
+                "SELECT COUNT(*) FROM tracker_events WHERE issue_id = 'WS-1'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(as_i64(&by_alias[0][0]), 0, "no event keyed by the alias");
+
+        // A second DO clone imports A's issue and re-aliases it locally.
+        let mut b = store();
+        let report = b.import_events(&a.export_events().unwrap()).unwrap();
+        assert_eq!(report.new_issues, 1);
+        assert_eq!(b.get_item("WS-1").unwrap().unwrap().title, "Shared");
+
+        // Independent divergent edits from the shared created event → a fork.
+        a.set_field(&issue.id, "title", "from-A").unwrap();
+        b.set_field("WS-1", "title", "from-B").unwrap();
+        b.import_events(&a.export_events().unwrap()).unwrap();
+
+        let conflicts = b.issue_conflicts("WS-1").unwrap().unwrap();
+        assert!(conflicts.conflicted(), "the two writers disagree on title");
+        assert_eq!(conflicts.field_conflicts[0].field, "title");
+        assert_eq!(
+            conflicts.field_conflicts[0].values,
+            vec!["from-A", "from-B"]
+        );
+        assert!(
+            WorkItems::ready_items(&b, "q").unwrap().is_empty(),
+            "a conflicted issue is not ready on the edge host"
+        );
+
+        // Comments/evidence also merge and survive the rebuild the import runs.
+        a.add_comment(&issue.id, Some("worker"), "note").unwrap();
+        a.add_evidence(&issue.id, Some("log"), Some("s3://x"), None, None)
+            .unwrap();
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        assert_eq!(b.comments("WS-1").unwrap().len(), 1);
+        assert_eq!(b.evidence("WS-1").unwrap().len(), 1);
     }
 
     #[test]
