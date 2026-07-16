@@ -65,6 +65,40 @@ pub struct WorkItem {
     pub updated_at: String,
 }
 
+/// The relation kinds the builtin provider supports (ADR-0002 "Relations And
+/// Dependencies"). Only `blocks` gates readiness; the rest are graph metadata.
+pub const RELATION_KINDS: &[&str] = &[
+    "blocks",
+    "parent-of",
+    "related",
+    "duplicates",
+    "supersedes",
+    "discovered-from",
+];
+
+/// The dependency-kind taxonomy a `blocks` relation may carry (small and
+/// operational). Recorded metadata; every `blocks` edge gates readiness
+/// regardless of `dep_kind` (providers may later refine).
+pub const DEPENDENCY_KINDS: &[&str] = &[
+    "hard",
+    "soft",
+    "order",
+    "resource",
+    "review",
+    "contract",
+    "discovered",
+];
+
+/// A directed relation edge between two issues (by alias). `dep_kind` is the
+/// dependency flavor, only present on `blocks` edges.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Relation {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+    pub dep_kind: Option<String>,
+}
+
 /// One field whose value is disputed: its `bef`-maximal setters in the event
 /// DAG disagree (ADR-0002 phase B1 slice ii; `tracker-merge.maude` `conflict`).
 /// `values` are the distinct maximal-setter values, sorted for stable output.
@@ -515,26 +549,103 @@ impl WorkItemStore {
     /// transaction; idempotent via `INSERT OR IGNORE`. The `whip issue dep add`
     /// door (blocked depends-on blocker => `add_blocks(blocker, blocked)`).
     pub fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()> {
+        self.add_relation(from, to, "blocks", None)
+    }
+
+    /// Records a directed relation `kind(from -> to)` (ADR-0002 "Relations And
+    /// Dependencies"). `blocks` gates readiness (`from` blocks `to`); the other
+    /// kinds are graph metadata. `dep_kind` (the dependency flavor) is only
+    /// valid on a `blocks` edge. A pair may carry several kinds at once
+    /// (the projection PK is `(from, to, kind)`). Merge-stable: the event
+    /// payload references issues by opaque content_id; the projection keeps
+    /// aliases (the readiness join is alias-keyed and clone-local).
+    pub fn add_relation(
+        &mut self,
+        from: &str,
+        to: &str,
+        kind: &str,
+        dep_kind: Option<&str>,
+    ) -> StoreResult<()> {
+        if !RELATION_KINDS.contains(&kind) {
+            return Err(StoreError::Conflict(format!(
+                "unknown relation kind `{kind}`"
+            )));
+        }
+        if let Some(dk) = dep_kind {
+            if kind != "blocks" {
+                return Err(StoreError::Conflict(
+                    "dep_kind only applies to `blocks` relations".to_owned(),
+                ));
+            }
+            if !DEPENDENCY_KINDS.contains(&dk) {
+                return Err(StoreError::Conflict(format!(
+                    "unknown dependency kind `{dk}`"
+                )));
+            }
+        }
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = tx_now(&tx)?;
-        // The event payload references issues by opaque content_id (merge-stable
-        // across clones); the projection keeps aliases (the readiness join is
-        // alias-keyed and clone-local).
         let from_cid = content_id_of(&tx, from)?
             .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {from}")))?;
         let to_cid = content_id_of(&tx, to)?
             .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {to}")))?;
-        let payload = json!({"from": from_cid, "to": to_cid, "kind": "blocks"});
+        let payload = json!({"from": from_cid, "to": to_cid, "kind": kind, "dep_kind": dep_kind});
         tx_append_event(&tx, Some(to), "relation.added", &payload, None, &now)?;
         tx.execute(
             "INSERT OR IGNORE INTO tracker_relations (from_issue, to_issue, kind, dep_kind) \
-             VALUES (?1, ?2, 'blocks', NULL)",
-            params![from, to],
+             VALUES (?1, ?2, ?3, ?4)",
+            params![from, to, kind, dep_kind],
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Removes a relation edge (`relation.removed`). Returns whether an edge was
+    /// present. The event is appended even if the edge was already absent, so
+    /// the removal is durable across a rebuild and a merge.
+    pub fn remove_relation(&mut self, from: &str, to: &str, kind: &str) -> StoreResult<bool> {
+        if !RELATION_KINDS.contains(&kind) {
+            return Err(StoreError::Conflict(format!(
+                "unknown relation kind `{kind}`"
+            )));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let from_cid = content_id_of(&tx, from)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {from}")))?;
+        let to_cid = content_id_of(&tx, to)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {to}")))?;
+        let payload = json!({"from": from_cid, "to": to_cid, "kind": kind});
+        tx_append_event(&tx, Some(to), "relation.removed", &payload, None, &now)?;
+        let removed = tx.execute(
+            "DELETE FROM tracker_relations WHERE from_issue = ?1 AND to_issue = ?2 AND kind = ?3",
+            params![from, to, kind],
+        )?;
+        tx.commit()?;
+        Ok(removed > 0)
+    }
+
+    /// Every relation edge touching an issue (as `from` or `to`), by alias.
+    pub fn relations(&self, item_id: &str) -> StoreResult<Vec<Relation>> {
+        let mut statement = self.connection.prepare(
+            "SELECT from_issue, to_issue, kind, dep_kind FROM tracker_relations \
+             WHERE from_issue = ?1 OR to_issue = ?1 ORDER BY kind, from_issue, to_issue",
+        )?;
+        let rows = statement
+            .query_map([item_id], |row| {
+                Ok(Relation {
+                    from: row.get(0)?,
+                    to: row.get(1)?,
+                    kind: row.get(2)?,
+                    dep_kind: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Sets one field of an issue (`issue.field_set`) — the mutation whose
@@ -1369,6 +1480,23 @@ fn fold_event(
                 ],
             )?;
         }
+        "relation.removed" => {
+            let (Some(from), Some(to)) = (
+                str_of("from").and_then(|c| alias_of.get(&c).cloned()),
+                str_of("to").and_then(|c| alias_of.get(&c).cloned()),
+            ) else {
+                return Ok(());
+            };
+            tx.execute(
+                "DELETE FROM tracker_relations \
+                 WHERE from_issue = ?1 AND to_issue = ?2 AND kind = ?3",
+                params![
+                    from,
+                    to,
+                    str_of("kind").unwrap_or_else(|| "blocks".to_owned())
+                ],
+            )?;
+        }
         "claim.acquired" => {
             tx.execute(
                 "INSERT OR IGNORE INTO tracker_leases (lease_id, issue_id, actor, acquired_at, expires_at, released_at) \
@@ -2048,6 +2176,75 @@ mod tests {
         b.import_events(&a.export_events().unwrap()).unwrap();
         let conflicts = b.issue_conflicts("WS-1").unwrap().unwrap();
         assert!(!conflicts.conflicted(), "same value → convergence");
+    }
+
+    /// ADR-0002 phase B2 (richer model): only `blocks` gates readiness; other
+    /// relation kinds are graph metadata. `blocks` carries a dependency kind,
+    /// and removal frees the blocked issue. Relations survive rebuild.
+    #[test]
+    fn relation_kinds_gate_readiness_only_for_blocks() {
+        let mut store = open_memory();
+        let a = store
+            .file_item("q", "A", "", &[], &json!({}), None)
+            .expect("files");
+        let b = store
+            .file_item("q", "B", "", &[], &json!({}), None)
+            .expect("files");
+
+        // A non-blocking relation does not affect readiness.
+        store
+            .add_relation(&a.id, &b.id, "related", None)
+            .expect("related");
+        assert_eq!(
+            store.ready_items("q").unwrap().len(),
+            2,
+            "related does not block"
+        );
+
+        // A dependency (blocks, with a kind) gates the blocked issue.
+        store
+            .add_relation(&b.id, &a.id, "blocks", Some("resource"))
+            .expect("blocks");
+        let ready: Vec<String> = store
+            .ready_items("q")
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(ready, vec![b.id.clone()], "a is blocked by b, b is ready");
+
+        // The dep_kind is recorded on the edge.
+        let rels = store.relations(&a.id).unwrap();
+        let blocks = rels.iter().find(|r| r.kind == "blocks").unwrap();
+        assert_eq!(blocks.dep_kind.as_deref(), Some("resource"));
+
+        // Removing the blocks edge frees a; the related edge is untouched.
+        assert!(store.remove_relation(&b.id, &a.id, "blocks").unwrap());
+        assert_eq!(
+            store.ready_items("q").unwrap().len(),
+            2,
+            "unblocked after removal"
+        );
+        assert!(
+            store
+                .relations(&a.id)
+                .unwrap()
+                .iter()
+                .any(|r| r.kind == "related"),
+            "the metadata relation survives"
+        );
+
+        // Rebuild reproduces the surviving relation set (added then removed nets out).
+        store.rebuild_projection().unwrap();
+        let after = store.relations(&a.id).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].kind, "related");
+
+        // Validation: unknown kinds and misplaced dep_kind are rejected.
+        assert!(store.add_relation(&a.id, &b.id, "bogus", None).is_err());
+        assert!(store
+            .add_relation(&a.id, &b.id, "related", Some("hard"))
+            .is_err());
     }
 
     /// Import is idempotent and content-dedups: re-importing the same log adds no

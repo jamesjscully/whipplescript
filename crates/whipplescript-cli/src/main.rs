@@ -29606,7 +29606,8 @@ finish <id> [--summary S]|complete <id> [--summary S]|\
 fail <id> [--actor A]|\
 set <id> <field> <value> [--expect-state-token T]|\
 conflicts <id>|conflicts --tracker TR|\
-dep add <blocked> [depends-on] <blocker>|\
+dep add <blocked> [depends-on] <blocker> [--kind K]|\
+link <from> <kind> <to>|unlink <from> <kind> <to>|\
 export|import <path|->|\
 rebuild>";
 
@@ -29806,6 +29807,22 @@ fn issue(options: &CliOptions) -> ExitCode {
                                 issue_conflicts_to_json(id, view)["field_conflicts"].clone(),
                             );
                         }
+                        if let (Some(map), Ok(rels)) = (value.as_object_mut(), store.relations(id))
+                        {
+                            map.insert(
+                                "relations".to_owned(),
+                                Value::Array(
+                                    rels.iter()
+                                        .map(|r| {
+                                            json!({
+                                                "from": r.from, "kind": r.kind,
+                                                "to": r.to, "dep_kind": r.dep_kind,
+                                            })
+                                        })
+                                        .collect(),
+                                ),
+                            );
+                        }
                         emit_json(value)
                     } else {
                         println!("{} [{}] tracker={}", item.id, item.status, item.queue);
@@ -29828,6 +29845,16 @@ fn issue(options: &CliOptions) -> ExitCode {
                                 for fc in &view.field_conflicts {
                                     println!("  {}: {}", fc.field, fc.values.join(" | "));
                                 }
+                            }
+                        }
+                        if let Ok(rels) = store.relations(id) {
+                            for r in &rels {
+                                let dep = r
+                                    .dep_kind
+                                    .as_deref()
+                                    .map(|d| format!(" ({d})"))
+                                    .unwrap_or_default();
+                                println!("relation: {} {} {}{dep}", r.from, r.kind, r.to);
                             }
                         }
                         ExitCode::SUCCESS
@@ -29970,23 +29997,62 @@ fn issue(options: &CliOptions) -> ExitCode {
             }
         }
         "dep" => {
-            // `dep add <blocked> [depends-on] <blocker>`: blocker blocks blocked.
+            // `dep add <blocked> [depends-on] <blocker> [--kind <dep_kind>]`:
+            // blocker blocks blocked (a `blocks` relation carrying the dep kind).
             if args.get(1).map(String::as_str) != Some("add") {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             }
-            let rest = args
-                .iter()
-                .skip(2)
-                .filter(|token| token.as_str() != "depends-on")
-                .collect::<Vec<_>>();
-            let (Some(blocked), Some(blocker)) = (rest.first(), rest.get(1)) else {
+            let dep_kind = flag_value(args, "--kind");
+            let mut positional = Vec::new();
+            let mut iter = args.iter().skip(2);
+            while let Some(token) = iter.next() {
+                match token.as_str() {
+                    "depends-on" => {}
+                    "--kind" => {
+                        iter.next(); // its value is consumed by flag_value above
+                    }
+                    _ => positional.push(token),
+                }
+            }
+            let (Some(blocked), Some(blocker)) = (positional.first(), positional.get(1)) else {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             };
-            match store.add_blocks(blocker, blocked) {
+            match store.add_relation(blocker, blocked, "blocks", dep_kind.as_deref()) {
                 Ok(()) => emit_issue_row(&store, blocked, "gated by dependency", options.json),
                 Err(error) => report_store_error("failed to add dependency", error),
+            }
+        }
+        "link" => {
+            // `link <from> <kind> <to>`: add a directed relation edge.
+            let (Some(from), Some(kind), Some(to)) = (args.get(1), args.get(2), args.get(3)) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.add_relation(from, to, kind, None) {
+                Ok(()) => emit_issue_row(&store, from, &format!("{kind} -> {to}"), options.json),
+                Err(error) => report_store_error("failed to link relation", error),
+            }
+        }
+        "unlink" => {
+            // `unlink <from> <kind> <to>`: remove a directed relation edge.
+            let (Some(from), Some(kind), Some(to)) = (args.get(1), args.get(2), args.get(3)) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.remove_relation(from, to, kind) {
+                Ok(true) => emit_issue_row(
+                    &store,
+                    from,
+                    &format!("unlinked {kind} -> {to}"),
+                    options.json,
+                ),
+                Ok(false) => {
+                    eprintln!("no `{kind}` relation from `{from}` to `{to}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to unlink relation", error),
             }
         }
         "set" => {
