@@ -46,10 +46,10 @@ use whipplescript_kernel::{
     program_analysis_summary_json,
     provider::{
         builtin_provider_capabilities, validate_provider_binding, validate_provider_binding_json,
-        AdapterSurface, CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
+        CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
         NativeProviderBoundaryError, NativeProviderCancellation, NativeProviderEvent,
         NativeProviderEventKind, NativeProviderTurnRequest, ProviderBindingConfig,
-        ProviderCapability, ProviderKind, ProviderValidationResult, ProviderValidationStatus,
+        ProviderCapability, ProviderValidationResult, ProviderValidationStatus,
     },
     // The pure rule-lowering closure (`lower_rule`/`ready_contexts` + helpers +
     // their support types), lifted into the wasm-clean kernel (DR-0033 chunk 1b).
@@ -1176,7 +1176,7 @@ fn validate_doctor_provider_config_json_with_bindings(
 fn validate_provider_runtime_config(
     config: &ProviderBindingConfig,
 ) -> Vec<ProviderValidationResult> {
-    if config.provider_kind != ProviderKind::Command || config.surface != AdapterSurface::Command {
+    if config.provider_kind != "command" || config.surface != "command" {
         return Vec::new();
     }
     match command_launch_plan_from_config(config) {
@@ -21334,7 +21334,7 @@ fn provider_binding_for_harness(
 fn command_launch_plan_from_config(
     config: &ProviderBindingConfig,
 ) -> Result<CommandLaunchPlan, StoreError> {
-    if config.provider_kind != ProviderKind::Command || config.surface != AdapterSurface::Command {
+    if config.provider_kind != "command" || config.surface != "command" {
         return Err(StoreError::Conflict(format!(
             "provider config `{}` must use provider_kind `command` and surface `command` for a command harness",
             config.provider_id
@@ -21609,8 +21609,8 @@ fn codex_app_server_adapter(
     let capability = builtin_provider_capabilities()
         .into_iter()
         .find(|capability| {
-            capability.provider_kind == ProviderKind::Codex
-                && capability.surface == AdapterSurface::CodexAppServer
+            capability.provider_kind == "codex"
+                && capability.surface == "codex_app_server"
         })
         .ok_or_else(|| StoreError::Conflict("missing built-in Codex capability".to_owned()))?;
     Ok(
@@ -21641,8 +21641,8 @@ fn codex_native_turn_request(
     apply_provider_config_options(&mut provider_options, config);
     Ok(NativeProviderTurnRequest {
         provider_id: execution.provider.to_owned(),
-        provider_kind: ProviderKind::Codex,
-        surface: AdapterSurface::CodexAppServer,
+        provider_kind: "codex".to_owned(),
+        surface: "codex_app_server".to_owned(),
         run_id: execution.run_id.to_owned(),
         effect_id: execution.effect_id.to_owned(),
         agent: execution.agent.to_owned(),
@@ -21710,8 +21710,8 @@ fn claude_agent_sdk_adapter(
     let capability = builtin_provider_capabilities()
         .into_iter()
         .find(|capability| {
-            capability.provider_kind == ProviderKind::Claude
-                && capability.surface == AdapterSurface::ClaudeAgentSdk
+            capability.provider_kind == "claude"
+                && capability.surface == "claude_agent_sdk"
         })
         .ok_or_else(|| StoreError::Conflict("missing built-in Claude capability".to_owned()))?;
     let mut client = ClaudeAgentSdkClient::new(transport);
@@ -21766,8 +21766,8 @@ fn claude_native_turn_request(
     }
     Ok(NativeProviderTurnRequest {
         provider_id: execution.provider.to_owned(),
-        provider_kind: ProviderKind::Claude,
-        surface: AdapterSurface::ClaudeAgentSdk,
+        provider_kind: "claude".to_owned(),
+        surface: "claude_agent_sdk".to_owned(),
         run_id: execution.run_id.to_owned(),
         effect_id: execution.effect_id.to_owned(),
         agent: execution.agent.to_owned(),
@@ -21933,8 +21933,8 @@ impl NativeFixtureAdapter {
             terminal,
             next_index: 0,
             capability: ProviderCapability {
-                provider_kind: ProviderKind::Fixture,
-                surface: AdapterSurface::Fixture,
+                provider_kind: "fixture".to_owned(),
+                surface: "fixture".to_owned(),
                 protocol_version: Some("native-fixture.v1".to_owned()),
                 session_identity_fields: vec!["session_id".to_owned(), "turn_id".to_owned()],
                 stream_event_kinds: vec![
@@ -22068,8 +22068,8 @@ fn native_fixture_turn_request(
 ) -> NativeProviderTurnRequest {
     NativeProviderTurnRequest {
         provider_id: execution.provider.to_owned(),
-        provider_kind: ProviderKind::Fixture,
-        surface: AdapterSurface::Fixture,
+        provider_kind: "fixture".to_owned(),
+        surface: "fixture".to_owned(),
         run_id: execution.run_id.to_owned(),
         effect_id: execution.effect_id.to_owned(),
         agent: execution.agent.to_owned(),
@@ -54899,8 +54899,8 @@ rule finish_batch
             .provider_config
             .as_ref()
             .expect("provider config selected");
-        assert_eq!(config.provider_kind, ProviderKind::Codex);
-        assert_eq!(config.surface, AdapterSurface::CodexAppServer);
+        assert_eq!(config.provider_kind, "codex".to_owned());
+        assert_eq!(config.surface, "codex_app_server".to_owned());
         assert_eq!(config.workspace_policy, "read_only");
         assert_eq!(
             config.credentials_ref.as_deref(),
@@ -55011,7 +55011,7 @@ rule finish_batch
             .provider_config
             .as_ref()
             .expect("provider config selected");
-        assert_eq!(config.provider_kind, ProviderKind::Command);
+        assert_eq!(config.provider_kind, "command".to_owned());
         assert_eq!(config.timeout_ms, Some(2500));
         let _ = fs::remove_file(config_path);
     }

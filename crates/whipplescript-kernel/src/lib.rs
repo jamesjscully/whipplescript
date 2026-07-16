@@ -4337,8 +4337,8 @@ mod tests {
     use harness::{ClaudeCodeAgentHarness, CodexAgentHarness, CommandLaunchPlan, MockAgentHarness};
     use native_lifecycle::AgentTurnLifecycleKind;
     use provider::{
-        builtin_provider_capabilities, AdapterSurface, CancellationDepth,
-        NativeProviderBoundaryError, NativeProviderCancellation, ProviderCapability, ProviderKind,
+        builtin_provider_capabilities, CancellationDepth, NativeProviderBoundaryError,
+        NativeProviderCancellation, ProviderCapability,
     };
     use std::{fs, path::PathBuf, process::Command};
     use trace::check_trace;
@@ -5334,8 +5334,8 @@ rule wait
             .expect("rule commits");
 
         let capability = provider::ProviderCapability {
-            provider_kind: provider::ProviderKind::Fixture,
-            surface: provider::AdapterSurface::Fixture,
+            provider_kind: "fixture".to_owned(),
+            surface: "fixture".to_owned(),
             protocol_version: Some("fixture.v1".to_owned()),
             session_identity_fields: vec!["session".to_owned()],
             stream_event_kinds: vec!["fixture.turn.started".to_owned()],
@@ -5404,8 +5404,8 @@ rule wait
 
         let request = NativeProviderTurnRequest {
             provider_id: "native-fixture".to_owned(),
-            provider_kind: provider::ProviderKind::Fixture,
-            surface: provider::AdapterSurface::Fixture,
+            provider_kind: "fixture".to_owned(),
+            surface: "fixture".to_owned(),
             run_id: "run-tell".to_owned(),
             effect_id: "tell".to_owned(),
             agent: "worker".to_owned(),
@@ -7023,7 +7023,7 @@ rule wait
             Self {
                 capability: builtin_provider_capabilities()
                     .into_iter()
-                    .find(|capability| capability.provider_kind == ProviderKind::Fixture)
+                    .find(|capability| capability.provider_kind == "fixture")
                     .expect("fixture capability"),
                 script: script.into(),
                 on_start: None,
@@ -7136,8 +7136,8 @@ rule wait
         ]);
         let request = NativeProviderTurnRequest {
             provider_id: "scripted".to_owned(),
-            provider_kind: ProviderKind::Fixture,
-            surface: AdapterSurface::Fixture,
+            provider_kind: "fixture".to_owned(),
+            surface: "fixture".to_owned(),
             run_id: "run-tell".to_owned(),
             effect_id: "tell".to_owned(),
             agent: "worker".to_owned(),
@@ -7229,13 +7229,13 @@ rule wait
         let mut adapter = NeverLaunchAdapter {
             capability: builtin_provider_capabilities()
                 .into_iter()
-                .find(|capability| capability.provider_kind == ProviderKind::Fixture)
+                .find(|capability| capability.provider_kind == "fixture")
                 .expect("fixture capability"),
         };
         let request = NativeProviderTurnRequest {
             provider_id: "scripted".to_owned(),
-            provider_kind: ProviderKind::Fixture,
-            surface: AdapterSurface::Fixture,
+            provider_kind: "fixture".to_owned(),
+            surface: "fixture".to_owned(),
             run_id: "run-tell".to_owned(),
             effect_id: "tell".to_owned(),
             agent: "worker".to_owned(),
@@ -7314,8 +7314,8 @@ rule wait
         );
         let request = NativeProviderTurnRequest {
             provider_id: "scripted".to_owned(),
-            provider_kind: ProviderKind::Fixture,
-            surface: AdapterSurface::Fixture,
+            provider_kind: "fixture".to_owned(),
+            surface: "fixture".to_owned(),
             run_id: "run-tell".to_owned(),
             effect_id: "tell".to_owned(),
             agent: "worker".to_owned(),

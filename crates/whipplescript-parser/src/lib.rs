@@ -3848,8 +3848,8 @@ fn effect_contract_for_kind(
             // Capability id == effect kind (spec/std-coercion.md "Static
             // checks" 1: the never-enforced `model.invoke` died with the S2
             // rename), and the provider kind is the kernel's
-            // `ProviderKind::SchemaCoerce` string — a schema coercer, not a
-            // generic model row.
+            // `provider::PROVIDER_SCHEMA_COERCE` ("schema_coercer") string — a
+            // schema coercer, not a generic model row.
             strings(&["schema.coerce"]),
             strings(&["schema_coercer"]),
             strings(&["effect.output"]),

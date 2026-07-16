@@ -10,9 +10,9 @@ use serde_json::{json, Value};
 use crate::{
     native_lifecycle::{normalize_claude_agent_sdk_event, AgentTurnLifecycleKind},
     provider::{
-        AdapterSurface, CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
+        CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
         NativeProviderBoundaryError, NativeProviderCancellation, NativeProviderEvent,
-        NativeProviderEventKind, NativeProviderTurnRequest, ProviderCapability, ProviderKind,
+        NativeProviderEventKind, NativeProviderTurnRequest, ProviderCapability,
     },
 };
 
@@ -578,7 +578,7 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkAdapter<T> {
     ) -> NativeProviderBoundaryError {
         NativeProviderBoundaryError {
             provider_id: self.provider_id.clone(),
-            surface: AdapterSurface::ClaudeAgentSdk,
+            surface: "claude_agent_sdk".to_owned(),
             code: code.into(),
             message: message.into(),
             recoverable,
@@ -625,8 +625,8 @@ impl<T: ClaudeAgentSdkTransport> ClaudeAgentSdkAdapter<T> {
                 request.to_json_redacted(),
             ));
         }
-        if request.provider_kind != ProviderKind::Claude
-            || request.surface != AdapterSurface::ClaudeAgentSdk
+        if request.provider_kind != "claude"
+            || request.surface != "claude_agent_sdk"
         {
             return Err(self.boundary_error(
                 "surface_mismatch",
@@ -1074,8 +1074,8 @@ mod tests {
         builtin_provider_capabilities()
             .into_iter()
             .find(|capability| {
-                capability.provider_kind == ProviderKind::Claude
-                    && capability.surface == AdapterSurface::ClaudeAgentSdk
+                capability.provider_kind == "claude"
+                    && capability.surface == "claude_agent_sdk"
             })
             .expect("claude capability")
     }
@@ -1083,8 +1083,8 @@ mod tests {
     fn native_claude_request() -> NativeProviderTurnRequest {
         NativeProviderTurnRequest {
             provider_id: "claude-main".to_owned(),
-            provider_kind: ProviderKind::Claude,
-            surface: AdapterSurface::ClaudeAgentSdk,
+            provider_kind: "claude".to_owned(),
+            surface: "claude_agent_sdk".to_owned(),
             run_id: "run-1".to_owned(),
             effect_id: "effect-1".to_owned(),
             agent: "claude".to_owned(),

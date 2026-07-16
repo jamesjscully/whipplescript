@@ -4,69 +4,21 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProviderKind {
-    Codex,
-    Claude,
-    Fixture,
-    Command,
-    SchemaCoerce,
-}
+// Provider-kind and adapter-surface identifiers. The registry is OPEN
+// (DR-0024, provider-crate split): the kernel names only its own builtins as
+// string constants here; external providers (codex, claude, and any third
+// party) live in their own crates, own their identifier strings, and register a
+// `ProviderCapability` into the effective catalog at the composition root. The
+// kernel therefore has zero compile-time knowledge of any external provider —
+// `provider_kind` / `surface` are opaque strings validated against whatever
+// capability set the host assembles, not a closed enum.
+pub const PROVIDER_FIXTURE: &str = "fixture";
+pub const PROVIDER_COMMAND: &str = "command";
+pub const PROVIDER_SCHEMA_COERCE: &str = "schema_coercer";
 
-impl ProviderKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Claude => "claude",
-            Self::Fixture => "fixture",
-            Self::Command => "command",
-            Self::SchemaCoerce => "schema_coercer",
-        }
-    }
-
-    fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "codex" => Some(Self::Codex),
-            "claude" => Some(Self::Claude),
-            "fixture" => Some(Self::Fixture),
-            "command" => Some(Self::Command),
-            "schema_coercer" => Some(Self::SchemaCoerce),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AdapterSurface {
-    CodexAppServer,
-    ClaudeAgentSdk,
-    Fixture,
-    Command,
-    CoerceHttp,
-}
-
-impl AdapterSurface {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::CodexAppServer => "codex_app_server",
-            Self::ClaudeAgentSdk => "claude_agent_sdk",
-            Self::Fixture => "fixture",
-            Self::Command => "command",
-            Self::CoerceHttp => "coerce_http",
-        }
-    }
-
-    fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "codex_app_server" => Some(Self::CodexAppServer),
-            "claude_agent_sdk" => Some(Self::ClaudeAgentSdk),
-            "fixture" => Some(Self::Fixture),
-            "command" => Some(Self::Command),
-            "coerce_http" => Some(Self::CoerceHttp),
-            _ => None,
-        }
-    }
-}
+pub const SURFACE_FIXTURE: &str = "fixture";
+pub const SURFACE_COMMAND: &str = "command";
+pub const SURFACE_COERCE_HTTP: &str = "coerce_http";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CancellationDepth {
@@ -133,8 +85,8 @@ impl ProviderValidationStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderCapability {
-    pub provider_kind: ProviderKind,
-    pub surface: AdapterSurface,
+    pub provider_kind: String,
+    pub surface: String,
     pub protocol_version: Option<String>,
     pub session_identity_fields: Vec<String>,
     pub stream_event_kinds: Vec<String>,
@@ -173,8 +125,8 @@ impl ProviderCapability {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderBindingConfig {
     pub provider_id: String,
-    pub provider_kind: ProviderKind,
-    pub surface: AdapterSurface,
+    pub provider_kind: String,
+    pub surface: String,
     pub credentials_ref: Option<String>,
     pub profile_ids: Vec<String>,
     pub default_model: Option<String>,
@@ -217,8 +169,11 @@ impl ProviderBindingConfig {
             }
         };
         let provider_id = required_string(object, "provider_id");
-        let provider_kind = enum_string(object, "provider_kind", ProviderKind::from_str);
-        let surface = enum_string(object, "surface", AdapterSurface::from_str);
+        // Open registry: provider_kind / surface are free identifiers; an
+        // unrecognized pair is rejected later by `validate_provider_binding`
+        // against the assembled capability catalog, not here.
+        let provider_kind = required_string(object, "provider_kind");
+        let surface = required_string(object, "surface");
         let workspace_policy = optional_workspace_policy(object, "workspace_policy")
             .unwrap_or_else(|| Ok("shared".to_owned()));
         let artifact_policy =
@@ -242,14 +197,14 @@ impl ProviderBindingConfig {
             Ok(provider_kind) => provider_kind,
             Err(error) => {
                 errors.push(*error);
-                ProviderKind::Command
+                String::new()
             }
         };
         let surface = match surface {
             Ok(surface) => surface,
             Err(error) => {
                 errors.push(*error);
-                AdapterSurface::Command
+                String::new()
             }
         };
         let timeout_ms = match timeout_ms {
@@ -419,8 +374,8 @@ impl ProviderValidationResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeProviderTurnRequest {
     pub provider_id: String,
-    pub provider_kind: ProviderKind,
-    pub surface: AdapterSurface,
+    pub provider_kind: String,
+    pub surface: String,
     pub run_id: String,
     pub effect_id: String,
     pub agent: String,
@@ -589,7 +544,7 @@ pub struct NativeProviderCancellation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeProviderBoundaryError {
     pub provider_id: String,
-    pub surface: AdapterSurface,
+    pub surface: String,
     pub code: String,
     pub message: String,
     pub recoverable: bool,
@@ -689,7 +644,7 @@ fn native_boundary_error(
 ) -> NativeProviderBoundaryError {
     NativeProviderBoundaryError {
         provider_id: config.provider_id.clone(),
-        surface: config.surface,
+        surface: config.surface.clone(),
         code: code.into(),
         message: message.into(),
         recoverable,
@@ -704,8 +659,8 @@ pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
     let mut caps: Vec<ProviderCapability> = Vec::new();
     #[cfg(feature = "codex")]
     caps.push(ProviderCapability {
-        provider_kind: ProviderKind::Codex,
-        surface: AdapterSurface::CodexAppServer,
+        provider_kind: "codex".to_owned(),
+        surface: "codex_app_server".to_owned(),
         protocol_version: Some("codex-app-server-local-schema".to_owned()),
         session_identity_fields: strings(&["thread_id", "turn_id", "item_id"]),
         stream_event_kinds: strings(&[
@@ -722,8 +677,8 @@ pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
     });
     #[cfg(feature = "claude")]
     caps.push(ProviderCapability {
-        provider_kind: ProviderKind::Claude,
-        surface: AdapterSurface::ClaudeAgentSdk,
+        provider_kind: "claude".to_owned(),
+        surface: "claude_agent_sdk".to_owned(),
         protocol_version: Some("anthropic-agent-sdk".to_owned()),
         session_identity_fields: strings(&["session_id"]),
         stream_event_kinds: strings(&["message", "tool_event", "hook_event", "result"]),
@@ -740,8 +695,8 @@ pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
     });
     caps.extend([
         ProviderCapability {
-            provider_kind: ProviderKind::Fixture,
-            surface: AdapterSurface::Fixture,
+            provider_kind: "fixture".to_owned(),
+            surface: "fixture".to_owned(),
             protocol_version: Some("fixture".to_owned()),
             session_identity_fields: Vec::new(),
             stream_event_kinds: strings(&["completed", "failed", "timed_out", "cancelled"]),
@@ -752,8 +707,8 @@ pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
             auth_requirements: Vec::new(),
         },
         ProviderCapability {
-            provider_kind: ProviderKind::Command,
-            surface: AdapterSurface::Command,
+            provider_kind: "command".to_owned(),
+            surface: "command".to_owned(),
             protocol_version: Some("command-agent-harness".to_owned()),
             session_identity_fields: Vec::new(),
             stream_event_kinds: strings(&["completed", "failed", "timed_out"]),
@@ -926,23 +881,6 @@ fn optional_workspace_policy(
     })
 }
 
-fn enum_string<T>(
-    object: &serde_json::Map<String, Value>,
-    key: &str,
-    parse: impl FnOnce(&str) -> Option<T>,
-) -> Result<T, Box<ProviderValidationResult>> {
-    let value = required_string(object, key)?;
-    parse(&value).ok_or_else(|| {
-        Box::new(ProviderValidationResult::fail(
-            "",
-            "",
-            "provider.config.invalid",
-            "unknown_enum_value",
-            format!("provider config `{key}` has unknown value `{value}`"),
-        ))
-    })
-}
-
 fn optional_enum_string<T>(
     object: &serde_json::Map<String, Value>,
     key: &str,
@@ -1020,20 +958,20 @@ mod tests {
         let capabilities = builtin_provider_capabilities();
 
         assert!(capabilities.iter().any(|capability| {
-            capability.provider_kind == ProviderKind::Codex
-                && capability.surface == AdapterSurface::CodexAppServer
+            capability.provider_kind == "codex"
+                && capability.surface == "codex_app_server"
                 && capability
                     .stream_event_kinds
                     .contains(&"turn/diff/updated".to_owned())
         }));
         assert!(capabilities.iter().any(|capability| {
-            capability.provider_kind == ProviderKind::Claude
-                && capability.surface == AdapterSurface::ClaudeAgentSdk
+            capability.provider_kind == "claude"
+                && capability.surface == "claude_agent_sdk"
                 && capability.tool_policy == "claude_tools_permissions_hooks"
         }));
         assert!(capabilities.iter().any(|capability| {
-            capability.provider_kind == ProviderKind::Command
-                && capability.surface == AdapterSurface::Command
+            capability.provider_kind == "command"
+                && capability.surface == "command"
                 && capability.cancellation_depths == vec![CancellationDepth::None]
         }));
     }
@@ -1059,8 +997,8 @@ mod tests {
         .expect("config parses");
 
         assert_eq!(config.provider_id, "codex-main");
-        assert_eq!(config.provider_kind, ProviderKind::Codex);
-        assert_eq!(config.surface, AdapterSurface::CodexAppServer);
+        assert_eq!(config.provider_kind, "codex".to_owned());
+        assert_eq!(config.surface, "codex_app_server".to_owned());
         assert_eq!(config.cancellation_depth, CancellationDepth::NativeStop);
         assert_eq!(
             config.to_json_redacted()["extra_keys"],
@@ -1128,18 +1066,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_required_enum_values() {
-        let results = ProviderBindingConfig::from_json_str(
+    fn rejects_unrecognized_provider_surface_at_validation() {
+        // Open registry (DR-0024): provider_kind / surface are free strings, so
+        // an unrecognized surface now PARSES cleanly and is rejected by
+        // `validate_provider_binding` against the assembled capability catalog —
+        // no more parse-time `unknown_enum_value`.
+        let config = ProviderBindingConfig::from_json_str(
             r#"{
               "provider_id": "codex-main",
               "provider_kind": "codex",
               "surface": "plain_command"
             }"#,
         )
-        .expect_err("unknown surface fails");
+        .expect("free-string surface parses under the open registry");
 
+        let results = validate_provider_binding(&config, &builtin_provider_capabilities());
         assert!(results.iter().any(|result| {
-            result.status == ProviderValidationStatus::Fail && result.code == "unknown_enum_value"
+            result.status == ProviderValidationStatus::Fail && result.code == "unsupported_surface"
         }));
     }
 
@@ -1149,8 +1092,8 @@ mod tests {
         provider_options.insert("api_token".to_owned(), json!("sk-never-print"));
         let request = NativeProviderTurnRequest {
             provider_id: "codex-main".to_owned(),
-            provider_kind: ProviderKind::Codex,
-            surface: AdapterSurface::CodexAppServer,
+            provider_kind: "codex".to_owned(),
+            surface: "codex_app_server".to_owned(),
             run_id: "run-1".to_owned(),
             effect_id: "tell".to_owned(),
             agent: "worker".to_owned(),
@@ -1235,7 +1178,7 @@ mod tests {
     fn native_provider_boundary_error_redacts_message_and_evidence() {
         let error = NativeProviderBoundaryError {
             provider_id: "claude-main".to_owned(),
-            surface: AdapterSurface::ClaudeAgentSdk,
+            surface: "claude_agent_sdk".to_owned(),
             code: "auth_failed".to_owned(),
             message: "ANTHROPIC_API_KEY sk-never-print failed".to_owned(),
             recoverable: true,
@@ -1329,7 +1272,7 @@ mod tests {
 
         let capability = builtin_provider_capabilities()
             .into_iter()
-            .find(|capability| capability.provider_kind == ProviderKind::Codex)
+            .find(|capability| capability.provider_kind == "codex")
             .expect("codex capability exists");
         let mut adapter = FakeNativeAdapter {
             capability,
@@ -1337,8 +1280,8 @@ mod tests {
         };
         let request = NativeProviderTurnRequest {
             provider_id: "fake-codex".to_owned(),
-            provider_kind: ProviderKind::Codex,
-            surface: AdapterSurface::CodexAppServer,
+            provider_kind: "codex".to_owned(),
+            surface: "codex_app_server".to_owned(),
             run_id: "run-1".to_owned(),
             effect_id: "tell".to_owned(),
             agent: "worker".to_owned(),
@@ -1368,7 +1311,7 @@ mod tests {
             .expect("cancel event");
 
         assert_eq!(adapter.provider_id(), "fake-codex");
-        assert_eq!(adapter.capability().surface, AdapterSurface::CodexAppServer);
+        assert_eq!(adapter.capability().surface, "codex_app_server".to_owned());
         assert_eq!(started.event_kind, NativeProviderEventKind::Started);
         assert_eq!(streamed.provider_event_type, "message_end");
         assert_eq!(cancelled.event_kind, NativeProviderEventKind::Cancelled);
@@ -1447,8 +1390,8 @@ mod tests {
         let claude = capabilities
             .iter()
             .find(|capability| {
-                capability.provider_kind == ProviderKind::Claude
-                    && capability.surface == AdapterSurface::ClaudeAgentSdk
+                capability.provider_kind == "claude"
+                    && capability.surface == "claude_agent_sdk"
             })
             .expect("claude capability registered");
         assert_eq!(claude.cancellation_depths, vec![CancellationDepth::None]);

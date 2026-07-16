@@ -11,9 +11,9 @@ use serde_json::{json, Value};
 use crate::{
     native_lifecycle::{normalize_codex_app_server_event, AgentTurnLifecycleKind},
     provider::{
-        AdapterSurface, CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
+        CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
         NativeProviderBoundaryError, NativeProviderCancellation, NativeProviderEvent,
-        NativeProviderEventKind, NativeProviderTurnRequest, ProviderCapability, ProviderKind,
+        NativeProviderEventKind, NativeProviderTurnRequest, ProviderCapability,
     },
 };
 
@@ -522,8 +522,8 @@ impl<T: CodexAppServerTransport> CodexAppServerAdapter<T> {
                 }),
             ));
         }
-        if request.provider_kind != ProviderKind::Codex
-            || request.surface != AdapterSurface::CodexAppServer
+        if request.provider_kind != "codex"
+            || request.surface != "codex_app_server"
         {
             return Err(self.boundary_error(
                 "surface_mismatch",
@@ -549,7 +549,7 @@ impl<T: CodexAppServerTransport> CodexAppServerAdapter<T> {
     ) -> NativeProviderBoundaryError {
         NativeProviderBoundaryError {
             provider_id: self.provider_id.clone(),
-            surface: AdapterSurface::CodexAppServer,
+            surface: "codex_app_server".to_owned(),
             code: code.into(),
             message: message.into(),
             recoverable,
@@ -1187,8 +1187,8 @@ mod tests {
         builtin_provider_capabilities()
             .into_iter()
             .find(|capability| {
-                capability.provider_kind == ProviderKind::Codex
-                    && capability.surface == AdapterSurface::CodexAppServer
+                capability.provider_kind == "codex"
+                    && capability.surface == "codex_app_server"
             })
             .expect("codex capability")
     }
@@ -1196,8 +1196,8 @@ mod tests {
     fn native_codex_request() -> NativeProviderTurnRequest {
         NativeProviderTurnRequest {
             provider_id: "codex-main".to_owned(),
-            provider_kind: ProviderKind::Codex,
-            surface: AdapterSurface::CodexAppServer,
+            provider_kind: "codex".to_owned(),
+            surface: "codex_app_server".to_owned(),
             run_id: "run-1".to_owned(),
             effect_id: "effect-1".to_owned(),
             agent: "codex".to_owned(),
