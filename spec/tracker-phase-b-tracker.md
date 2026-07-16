@@ -85,13 +85,35 @@ identity change (one-way; the opaque id is new primary identity).
 
 ## B2 — additive (after B1)
 
-- [~] Full relation-kind set (`parent-of`/`related`/`duplicates`/`supersedes`/
-      `discovered-from` + the `hard/soft/order/resource/review/contract/
-      discovered` dependency taxonomy compiling to `blocks`).
-- [~] Comments / evidence (`comment.added`/`evidence.added` events + projections).
-- [~] External providers with claim-strength (GitHub/Linear/Jira adapters
-      normalizing into tracker events; weak/advisory claims surface as such).
-- [~] DO `rebuild_projection` parity.
+The **richer model** (relations + comments/evidence) SHIPPED 2026-07-15 (Jack's
+first B2 pick):
+
+- [x] Full relation-kind set (2026-07-15, commit 6d0a63c; store test
+      `relation_kinds_gate_readiness_only_for_blocks`): `blocks`/`parent-of`/
+      `related`/`duplicates`/`supersedes`/`discovered-from` (only `blocks` gates
+      readiness); `blocks` carries a `hard/soft/order/resource/review/contract/
+      discovered` dep_kind. `add_relation`/`remove_relation`/`relations`;
+      `relation.removed` event; CLI `dep add --kind`, `link`/`unlink`, `show`.
+      Merge-stable + rebuild-stable.
+- [x] Comments / evidence (2026-07-15, commit a8829b1; store test
+      `comments_and_evidence_attach_and_merge_once`): `comment.added` /
+      `evidence.added` events + `tracker_comments`/`tracker_evidence`
+      projections, keyed by content-hash event_id (fold-once through merge).
+      `add_comment`/`comments`, `add_evidence`/`evidence`; CLI `note`,
+      `comments`, `evidence [--kind/--ref/--note]`, `show`.
+
+Remaining B2 (in the order I'd take them):
+
+- [~] DO `rebuild_projection` parity — the durable-object tracker (`do_store.rs`)
+      is still on the pre-phase-B schema (WS-N-keyed, no event_id/parents/DAG);
+      port the B1+B2 model so the edge host matches native. Correctness/parity.
 - [~] Cross-machine transport: portable `.whip/tracker/tx/**/*.json` and/or the
       WorkspaceVcs integration (the gaugedesk multi-writer exchange). Trigger:
-      the first real cross-machine / cross-clone sync.
+      the first real cross-machine / cross-clone sync. (export/import already
+      give the event-level primitive; this is the on-disk/sync format.)
+- [~] External providers with claim-strength (GitHub/Linear/Jira adapters
+      normalizing into tracker events; weak/advisory claims surface as such).
+      DEMAND-GATED — build against a concrete integration target, not
+      speculatively.
+- [~] provenance-based `duplicate_submission` suppression (quiet incremental
+      re-sync) — needs per-event origin; natural rider on transport.
