@@ -2,9 +2,6 @@
 
 use serde_json::{json, Value};
 
-#[cfg(feature = "claude")]
-use crate::claude_agent_sdk::ClaudeSidecarEvent;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentTurnLifecycleKind {
     Started,
@@ -140,51 +137,13 @@ impl NativeAgentTurnObservation {
     }
 }
 
-// `normalize_codex_app_server_event` and its `codex_terminal_*` helpers moved to
-// the whipplescript-provider-codex crate (DR-0024 split): event-shape knowledge
-// belongs with the adapter that speaks the protocol, not the kernel.
-
-#[cfg(feature = "claude")]
-pub fn normalize_claude_agent_sdk_event(
-    event: &ClaudeSidecarEvent,
-) -> Option<NativeAgentTurnObservation> {
-    let kind = match event.event_type.as_str() {
-        "claude.session.started" => AgentTurnLifecycleKind::Started,
-        "claude.stream.message" => AgentTurnLifecycleKind::Streamed,
-        "claude.tool.requested" | "claude.hook.event" => AgentTurnLifecycleKind::ToolRequested,
-        "claude.artifact.captured" => AgentTurnLifecycleKind::ArtifactCaptured,
-        "claude.turn.completed" => AgentTurnLifecycleKind::Completed,
-        "claude.turn.failed" => AgentTurnLifecycleKind::Failed,
-        "claude.turn.cancelled" => AgentTurnLifecycleKind::Cancelled,
-        _ => return None,
-    };
-    Some(
-        NativeAgentTurnObservation::new(kind, &event.event_type)
-            .session_id(
-                event
-                    .payload
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            )
-            .turn_id(Some(event.run_id.clone()))
-            .payload_shape(&event.payload)
-            .provider_error(
-                event
-                    .payload
-                    .pointer("/error/message")
-                    .or_else(|| event.payload.get("error").filter(|e| e.is_string()))
-                    .or_else(|| {
-                        event
-                            .payload
-                            .get("message")
-                            .filter(|_| event.event_type == "claude.turn.failed")
-                    })
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            ),
-    )
-}
+// Provider event normalizers moved to their provider crates (DR-0024 split):
+// `normalize_codex_app_server_event` (+ `codex_terminal_*`) to
+// whipplescript-provider-codex, and `normalize_claude_agent_sdk_event` (+
+// `ClaudeSidecarEvent`) to whipplescript-provider-claude. Event-shape knowledge
+// belongs with the adapter that speaks the protocol; the kernel keeps only the
+// provider-agnostic `AgentTurnLifecycleKind` / `NativeAgentTurnObservation`
+// vocabulary and its shape-only redaction boundary (`payload_shape`).
 
 fn json_shape(value: &Value) -> Value {
     match value {
@@ -197,41 +156,6 @@ fn json_shape(value: &Value) -> Value {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalizes_claude_terminal_events() {
-        let event = ClaudeSidecarEvent {
-            event_type: "claude.turn.failed".to_owned(),
-            run_id: "run-1".to_owned(),
-            payload: json!({"session_id": "session-1", "error": "secret"}),
-        };
-
-        let observation = normalize_claude_agent_sdk_event(&event).expect("event normalizes");
-
-        assert_eq!(observation.kind, AgentTurnLifecycleKind::Failed);
-        assert_eq!(
-            observation.provider_session_id.as_deref(),
-            Some("session-1")
-        );
-        assert_eq!(observation.provider_turn_id.as_deref(), Some("run-1"));
-        assert!(!observation
-            .provider_payload_shape
-            .to_string()
-            .contains("secret"));
-    }
-
-    #[test]
-    fn normalizes_claude_artifact_events() {
-        let claude = normalize_claude_agent_sdk_event(&ClaudeSidecarEvent {
-            event_type: "claude.artifact.captured".to_owned(),
-            run_id: "run-1".to_owned(),
-            payload: json!({"session_id": "session-1", "content": "secret"}),
-        })
-        .expect("claude artifact normalizes");
-        assert_eq!(claude.kind, AgentTurnLifecycleKind::ArtifactCaptured);
-        assert!(!claude.provider_payload_shape.to_string().contains("secret"));
-    }
-}
+// The codex/claude normalizer tests live with their crates now (DR-0024). The
+// provider-agnostic kernel record path is covered by
+// `native_provider_lifecycle_observation_records_event_and_fact` in lib.rs.

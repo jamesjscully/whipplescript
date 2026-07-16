@@ -2,8 +2,6 @@
 
 pub mod agent_profile;
 pub mod artifact_manifest;
-#[cfg(feature = "claude")]
-pub mod claude_agent_sdk;
 pub mod coerce;
 pub mod coerce_native;
 pub mod context_assembly;

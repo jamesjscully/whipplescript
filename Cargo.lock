@@ -2030,6 +2030,7 @@ dependencies = [
  "whipplescript-core",
  "whipplescript-kernel",
  "whipplescript-parser",
+ "whipplescript-provider-claude",
  "whipplescript-provider-codex",
  "whipplescript-store",
 ]
@@ -2080,6 +2081,14 @@ version = "0.4.0"
 dependencies = [
  "serde_json",
  "whipplescript-core",
+]
+
+[[package]]
+name = "whipplescript-provider-claude"
+version = "0.4.0"
+dependencies = [
+ "serde_json",
+ "whipplescript-kernel",
 ]
 
 [[package]]

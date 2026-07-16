@@ -654,30 +654,11 @@ fn native_boundary_error(
 
 pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
     // Open registry (DR-0024): this returns only the kernel's OWN builtins
-    // (fixture, command, schema-coercer). External providers — codex lives in
+    // (the fixture and command surfaces). External providers — codex lives in
     // `whipplescript-provider-codex`, claude in `whipplescript-provider-claude`,
     // and any third party in its own crate — own their `ProviderCapability` and
     // the host extends this catalog with `capability()` from each crate it built.
-    let mut caps: Vec<ProviderCapability> = Vec::new();
-    #[cfg(feature = "claude")]
-    caps.push(ProviderCapability {
-        provider_kind: "claude".to_owned(),
-        surface: "claude_agent_sdk".to_owned(),
-        protocol_version: Some("anthropic-agent-sdk".to_owned()),
-        session_identity_fields: strings(&["session_id"]),
-        stream_event_kinds: strings(&["message", "tool_event", "hook_event", "result"]),
-        tool_policy: "claude_tools_permissions_hooks".to_owned(),
-        // DR-0017 ("Cancellation should remain conservative"): Claude interrupt
-        // has never been live-validated, so the catalog advertises NO depth —
-        // a binding requesting `cooperative_request` fails validation instead
-        // of pretending. The feature-report vocabulary (`turn.cancel: unknown`)
-        // is the report plane's half (std-agent slices 5/7).
-        cancellation_depths: vec![CancellationDepth::None],
-        artifact_manifest: true,
-        health_checks: strings(&["claude_sdk", "api_key", "tool_policy"]),
-        auth_requirements: strings(&["anthropic_api_key_or_provider_config_ref"]),
-    });
-    caps.extend([
+    let caps: Vec<ProviderCapability> = vec![
         ProviderCapability {
             provider_kind: "fixture".to_owned(),
             surface: "fixture".to_owned(),
@@ -702,7 +683,7 @@ pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
             health_checks: strings(&["executable"]),
             auth_requirements: Vec::new(),
         },
-    ]);
+    ];
     caps
 }
 
@@ -939,19 +920,17 @@ mod tests {
 
     #[test]
     fn builtin_capabilities_capture_distinct_native_surfaces() {
-        // Open registry (DR-0024): the kernel builtin catalog no longer includes
-        // codex (moved to whipplescript-provider-codex; the host appends its
-        // `capability()`). It still carries claude (pending extraction) and the
-        // always-present command surface.
+        // Open registry (DR-0024): the kernel builtin catalog holds ONLY the
+        // kernel's own surfaces (fixture, command). Codex and claude moved to
+        // their own crates; the host appends their `capability()`.
         let capabilities = builtin_provider_capabilities();
 
         assert!(capabilities
             .iter()
-            .all(|capability| capability.provider_kind != "codex"));
+            .all(|capability| capability.provider_kind != "codex"
+                && capability.provider_kind != "claude"));
         assert!(capabilities.iter().any(|capability| {
-            capability.provider_kind == "claude"
-                && capability.surface == "claude_agent_sdk"
-                && capability.tool_policy == "claude_tools_permissions_hooks"
+            capability.provider_kind == "fixture" && capability.surface == "fixture"
         }));
         assert!(capabilities.iter().any(|capability| {
             capability.provider_kind == "command"
@@ -1033,14 +1012,31 @@ mod tests {
 
     #[test]
     fn reports_missing_credentials_without_secret_values() {
-        let results = validate_provider_binding_json(
+        // No kernel builtin requires credentials, so validate against a
+        // synthetic auth-requiring capability (open registry): the guard must
+        // report the missing reference without echoing any secret value.
+        let config = ProviderBindingConfig::from_json_str(
             r#"{
               "provider_id": "claude-main",
               "provider_kind": "claude",
               "surface": "claude_agent_sdk"
             }"#,
-        );
+        )
+        .expect("config parses");
+        let capabilities = vec![ProviderCapability {
+            provider_kind: "claude".to_owned(),
+            surface: "claude_agent_sdk".to_owned(),
+            protocol_version: None,
+            session_identity_fields: Vec::new(),
+            stream_event_kinds: Vec::new(),
+            tool_policy: "none".to_owned(),
+            cancellation_depths: vec![CancellationDepth::None],
+            artifact_manifest: true,
+            health_checks: Vec::new(),
+            auth_requirements: vec!["anthropic_api_key_or_provider_config_ref".to_owned()],
+        }];
 
+        let results = validate_provider_binding(&config, &capabilities);
         let missing = results
             .iter()
             .find(|result| result.code == "missing_credentials_ref")
@@ -1387,21 +1383,26 @@ mod tests {
         );
     }
 
-    /// DR-0017 conformance (std-agent slice 2): Claude interrupt was never
-    /// live-validated, so the catalog must not advertise any cancellation
-    /// depth, and both validation planes must refuse a binding that claims
-    /// `cooperative_request` for Claude.
-    #[cfg(feature = "claude")]
+    /// DR-0017 conformance (std-agent slice 2), validation-plane half: when a
+    /// capability advertises NO cancellation depth, both validation planes must
+    /// refuse a binding that claims `cooperative_request`. (The claude
+    /// capability's own `None` advertisement is asserted in
+    /// whipplescript-provider-claude.) Uses a synthetic no-depth capability so
+    /// the kernel test is provider-agnostic.
     #[test]
-    fn claude_advertises_no_cancellation_depth_per_dr0017() {
-        let capabilities = builtin_provider_capabilities();
-        let claude = capabilities
-            .iter()
-            .find(|capability| {
-                capability.provider_kind == "claude" && capability.surface == "claude_agent_sdk"
-            })
-            .expect("claude capability registered");
-        assert_eq!(claude.cancellation_depths, vec![CancellationDepth::None]);
+    fn no_depth_capability_refuses_cooperative_request_per_dr0017() {
+        let capabilities = vec![ProviderCapability {
+            provider_kind: "claude".to_owned(),
+            surface: "claude_agent_sdk".to_owned(),
+            protocol_version: None,
+            session_identity_fields: Vec::new(),
+            stream_event_kinds: Vec::new(),
+            tool_policy: "none".to_owned(),
+            cancellation_depths: vec![CancellationDepth::None],
+            artifact_manifest: true,
+            health_checks: Vec::new(),
+            auth_requirements: Vec::new(),
+        }];
 
         let config = ProviderBindingConfig::from_json_str(
             r#"{
@@ -1425,7 +1426,7 @@ mod tests {
             &capabilities,
             CancellationDepth::CooperativeRequest,
         )
-        .expect_err("configured cooperative_request is not capability-supported for claude");
+        .expect_err("configured cooperative_request is not capability-supported");
         assert_eq!(error.code, "unsupported_configured_cancellation_depth");
     }
 

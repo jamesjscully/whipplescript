@@ -425,7 +425,8 @@ const CODEX_REPORT: &[FeatureReportEntry] = &[
 /// conservative" — the report half of the slice-2 honesty fix: never state
 /// support for cancellation that has not been live-validated. Tool policy and
 /// model selection ARE live-wired SDK options.
-#[cfg(feature = "claude")]
+// Un-gated after the claude adapter moved to whipplescript-provider-claude
+// (DR-0024): static feature-report vocabulary, like CODEX_REPORT above.
 const CLAUDE_REPORT: &[FeatureReportEntry] = &[
     unsupported("context.compact"),
     unsupported("context.auto_compact"),
@@ -493,7 +494,6 @@ pub const AGENT_FEATURE_REPORTS: &[AgentFeatureReport] = &[
         provider_kind: "codex",
         entries: CODEX_REPORT,
     },
-    #[cfg(feature = "claude")]
     AgentFeatureReport {
         provider_kind: "claude",
         entries: CLAUDE_REPORT,
@@ -690,7 +690,6 @@ mod tests {
 
     /// DR-0017 conformance (the report half of slice 2): the Claude report
     /// states `turn.cancel: unknown` — never a validated support level.
-    #[cfg(feature = "claude")]
     #[test]
     fn claude_report_states_turn_cancel_unknown() {
         let report = agent_feature_report("claude").expect("claude report");

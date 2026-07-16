@@ -14,6 +14,7 @@ categories = ["command-line-utilities", "development-tools"]
 whipplescript-core = { version = "0.4.0", path = "../whipplescript-core" }
 whipplescript-kernel = { version = "0.4.0", path = "../whipplescript-kernel", default-features = false, features = ["native"] }
 whipplescript-parser = { version = "0.4.0", path = "../whipplescript-parser" }
+whipplescript-provider-claude = { version = "0.4.0", path = "../whipplescript-provider-claude", optional = true }
 whipplescript-provider-codex = { version = "0.4.0", path = "../whipplescript-provider-codex", optional = true }
 whipplescript-store = { version = "0.4.0", path = "../whipplescript-store" }
 regex = "1"
@@ -35,7 +36,7 @@ htmd = "0.5"
 # pending its own extraction. `--no-default-features` builds a whip without them.
 default = ["codex", "claude"]
 codex = ["dep:whipplescript-provider-codex"]
-claude = ["whipplescript-kernel/claude"]
+claude = ["dep:whipplescript-provider-claude"]
 
 [dev-dependencies]
 # Enables the private legacy-envelope fixture constructor only while compiling

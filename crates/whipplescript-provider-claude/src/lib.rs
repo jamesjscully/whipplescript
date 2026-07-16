@@ -1,4 +1,11 @@
-//! Minimal Claude Agent SDK sidecar JSONL client.
+//! Claude Agent SDK sidecar provider adapter for WhippleScript.
+//!
+//! An external, opt-in provider crate (DR-0024 provider-crate split): the kernel
+//! has no compile-time knowledge of Claude. This crate owns the Claude sidecar
+//! protocol (JSONL transport, event normalization, `ClaudeSidecarEvent`, policy
+//! mapping) and registers a [`ProviderCapability`] into whatever catalog the host
+//! assembles via [`capability`]. It depends on `whipplescript-kernel` for the
+//! shared provider vocabulary and the kernel-side redaction boundary.
 
 use std::{
     io::{BufRead, BufReader, Write},
@@ -7,14 +14,91 @@ use std::{
 
 use serde_json::{json, Value};
 
-use crate::{
-    native_lifecycle::{normalize_claude_agent_sdk_event, AgentTurnLifecycleKind},
+use whipplescript_kernel::{
+    native_lifecycle::{AgentTurnLifecycleKind, NativeAgentTurnObservation},
     provider::{
         CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
         NativeProviderBoundaryError, NativeProviderCancellation, NativeProviderEvent,
         NativeProviderEventKind, NativeProviderTurnRequest, ProviderCapability,
     },
 };
+
+/// The provider-kind identifier this crate registers under. Opaque to the kernel.
+pub const PROVIDER_KIND: &str = "claude";
+/// The adapter-surface identifier this crate speaks.
+pub const SURFACE: &str = "claude_agent_sdk";
+
+/// The Claude capability entry. The host assembles this into the effective
+/// provider catalog it passes to `validate_provider_binding` — the kernel does
+/// not carry it (open registry).
+pub fn capability() -> ProviderCapability {
+    ProviderCapability {
+        provider_kind: PROVIDER_KIND.to_owned(),
+        surface: SURFACE.to_owned(),
+        protocol_version: Some("anthropic-agent-sdk".to_owned()),
+        session_identity_fields: vec!["session_id".to_owned()],
+        stream_event_kinds: ["message", "tool_event", "hook_event", "result"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        tool_policy: "claude_tools_permissions_hooks".to_owned(),
+        // DR-0017 ("Cancellation should remain conservative"): Claude interrupt
+        // has never been live-validated, so the catalog advertises NO depth — a
+        // binding requesting `cooperative_request` fails validation instead of
+        // pretending.
+        cancellation_depths: vec![CancellationDepth::None],
+        artifact_manifest: true,
+        health_checks: ["claude_sdk", "api_key", "tool_policy"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        auth_requirements: vec!["anthropic_api_key_or_provider_config_ref".to_owned()],
+    }
+}
+
+/// Normalize a raw Claude sidecar event into the kernel's provider-agnostic
+/// lifecycle observation (shape-only payload via the kernel's `payload_shape`
+/// redaction). Moved out of the kernel with the adapter it belongs to (DR-0024).
+pub fn normalize_claude_agent_sdk_event(
+    event: &ClaudeSidecarEvent,
+) -> Option<NativeAgentTurnObservation> {
+    let kind = match event.event_type.as_str() {
+        "claude.session.started" => AgentTurnLifecycleKind::Started,
+        "claude.stream.message" => AgentTurnLifecycleKind::Streamed,
+        "claude.tool.requested" | "claude.hook.event" => AgentTurnLifecycleKind::ToolRequested,
+        "claude.artifact.captured" => AgentTurnLifecycleKind::ArtifactCaptured,
+        "claude.turn.completed" => AgentTurnLifecycleKind::Completed,
+        "claude.turn.failed" => AgentTurnLifecycleKind::Failed,
+        "claude.turn.cancelled" => AgentTurnLifecycleKind::Cancelled,
+        _ => return None,
+    };
+    Some(
+        NativeAgentTurnObservation::new(kind, &event.event_type)
+            .session_id(
+                event
+                    .payload
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            )
+            .turn_id(Some(event.run_id.clone()))
+            .payload_shape(&event.payload)
+            .provider_error(
+                event
+                    .payload
+                    .pointer("/error/message")
+                    .or_else(|| event.payload.get("error").filter(|e| e.is_string()))
+                    .or_else(|| {
+                        event
+                            .payload
+                            .get("message")
+                            .filter(|_| event.event_type == "claude.turn.failed")
+                    })
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            ),
+    )
+}
 
 #[derive(Debug)]
 pub enum ClaudeAgentSdkError {
@@ -97,7 +181,7 @@ pub fn build_claude_agent_tool_policy(
     // carries the base Claude tool set and the capability grants the preset
     // can truthfully expand to. A preset without a Claude translation — or a
     // name that is no preset at all — fails closed.
-    let preset = crate::agent_profile::agent_profile_preset(profile);
+    let preset = whipplescript_kernel::agent_profile::agent_profile_preset(profile);
     let base_tools = preset.and_then(|preset| preset.claude_allowed_tools);
     let (Some(preset), Some(base_tools)) = (preset, base_tools) else {
         return Err(policy_error(
@@ -955,9 +1039,12 @@ impl StdioClaudeAgentSdkTransport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        crate::harness::strip_control_plane_secrets(&mut builder);
+        whipplescript_kernel::harness::strip_control_plane_secrets(&mut builder);
         // The Claude sidecar is the Anthropic-family backend; strip OpenAI keys.
-        crate::harness::strip_env_vars(&mut builder, crate::harness::OPENAI_CREDENTIAL_ENV);
+        whipplescript_kernel::harness::strip_env_vars(
+            &mut builder,
+            whipplescript_kernel::harness::OPENAI_CREDENTIAL_ENV,
+        );
         let mut child = builder.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| {
             ClaudeAgentSdkError::Protocol("Claude sidecar did not expose stdin".to_owned())
@@ -1036,7 +1123,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
-    use crate::provider::{builtin_provider_capabilities, NativeProviderAdapter};
+    use whipplescript_kernel::provider::NativeProviderAdapter;
 
     #[derive(Default)]
     struct FakeTransport {
@@ -1069,12 +1156,59 @@ mod tests {
     }
 
     fn claude_capability() -> ProviderCapability {
-        builtin_provider_capabilities()
-            .into_iter()
-            .find(|capability| {
-                capability.provider_kind == "claude" && capability.surface == "claude_agent_sdk"
-            })
-            .expect("claude capability")
+        super::capability()
+    }
+
+    #[test]
+    fn capability_matches_the_registered_surface() {
+        let capability = super::capability();
+        assert_eq!(capability.provider_kind, super::PROVIDER_KIND);
+        assert_eq!(capability.surface, super::SURFACE);
+    }
+
+    #[test]
+    fn capability_advertises_no_cancellation_depth_per_dr0017() {
+        // DR-0017: Claude interrupt was never live-validated, so the capability
+        // must advertise NO cancellation depth (the validation-plane refusal is
+        // covered kernel-side).
+        assert_eq!(
+            super::capability().cancellation_depths,
+            vec![CancellationDepth::None]
+        );
+    }
+
+    #[test]
+    fn normalizes_claude_terminal_events() {
+        let event = ClaudeSidecarEvent {
+            event_type: "claude.turn.failed".to_owned(),
+            run_id: "run-1".to_owned(),
+            payload: json!({"session_id": "session-1", "error": "secret"}),
+        };
+
+        let observation = normalize_claude_agent_sdk_event(&event).expect("event normalizes");
+
+        assert_eq!(observation.kind, AgentTurnLifecycleKind::Failed);
+        assert_eq!(
+            observation.provider_session_id.as_deref(),
+            Some("session-1")
+        );
+        assert_eq!(observation.provider_turn_id.as_deref(), Some("run-1"));
+        assert!(!observation
+            .provider_payload_shape
+            .to_string()
+            .contains("secret"));
+    }
+
+    #[test]
+    fn normalizes_claude_artifact_events() {
+        let claude = normalize_claude_agent_sdk_event(&ClaudeSidecarEvent {
+            event_type: "claude.artifact.captured".to_owned(),
+            run_id: "run-1".to_owned(),
+            payload: json!({"session_id": "session-1", "content": "secret"}),
+        })
+        .expect("claude artifact normalizes");
+        assert_eq!(claude.kind, AgentTurnLifecycleKind::ArtifactCaptured);
+        assert!(!claude.provider_payload_shape.to_string().contains("secret"));
     }
 
     fn native_claude_request() -> NativeProviderTurnRequest {

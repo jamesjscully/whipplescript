@@ -5,6 +5,7 @@ members = [
     "crates/whipplescript-host-do",
     "crates/whipplescript-kernel",
     "crates/whipplescript-parser",
+    "crates/whipplescript-provider-claude",
     "crates/whipplescript-provider-codex",
     "crates/whipplescript-store",
 ]

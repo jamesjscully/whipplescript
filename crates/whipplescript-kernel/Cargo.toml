@@ -33,12 +33,11 @@ tokio = { version = "1", features = ["rt", "time"] }
 # kernel itself is store-backend-agnostic (RuntimeKernel<S: RuntimeStore>), so a
 # wasm consumer builds with `--no-default-features` to drop rusqlite (DR-0033
 # Phase 5). Provider adapters are optional and EXTERNAL (DR-0024 provider-crate
-# split): the owned brokered harness is the built-in path; Codex now lives in the
-# `whipplescript-provider-codex` crate (kernel-independent), and Claude's `claude`
-# feature is the last in-kernel adapter pending its own extraction.
-default = ["native", "claude"]
+# split): the owned brokered harness is the built-in path; Codex and Claude now
+# live in the whipplescript-provider-codex / -claude crates (kernel-independent).
+# The kernel has zero compile-time knowledge of any external provider.
+default = ["native"]
 native = ["whipplescript-store/native"]
-claude = []
 # Exposes deterministic legacy-envelope construction only to downstream test
 # targets. Production embeddings must use an external governance signature.
 test-support = []

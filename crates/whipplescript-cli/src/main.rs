@@ -24,11 +24,6 @@ use whipplescript_core::json::{require_json_array_field, required_json_string};
 // The pure, wasm-kernel-hostable package-registry parse + validation core, lifted
 // out of this binary (S7 Step 3). The filesystem-coupled DR-0025 `@tool`
 // attestation and the embedded std manifest bytes stay in the CLI below.
-#[cfg(feature = "claude")]
-use whipplescript_kernel::claude_agent_sdk::{
-    ClaudeAgentSdkAdapter, ClaudeAgentSdkClient, StdioClaudeAgentSdkTransport,
-    WHIP_SIDECAR_PROTOCOL,
-};
 use whipplescript_kernel::exec_http::{ingest_exec_stdout, ExecIngest};
 use whipplescript_kernel::package_registry::*;
 use whipplescript_kernel::{
@@ -71,6 +66,11 @@ use whipplescript_parser::{
     IrEffectNode, IrExecTarget, IrInclude, IrProgram, IrProjectionRead, IrRule, IrSchema, IrTest,
     IrType, IrWorkflowContract, IrWorkflowContractKind, Item, ProjQueryKind, QueryKind, RuleStatus,
     RunKind, SourceSpan, StubPayload, TestClause, TestField, UnaryOp,
+};
+#[cfg(feature = "claude")]
+use whipplescript_provider_claude::{
+    ClaudeAgentSdkAdapter, ClaudeAgentSdkClient, StdioClaudeAgentSdkTransport,
+    WHIP_SIDECAR_PROTOCOL,
 };
 #[cfg(feature = "codex")]
 use whipplescript_provider_codex::{
@@ -21591,6 +21591,8 @@ fn effective_provider_capabilities() -> Vec<whipplescript_kernel::provider::Prov
     let mut caps = builtin_provider_capabilities();
     #[cfg(feature = "codex")]
     caps.push(whipplescript_provider_codex::capability());
+    #[cfg(feature = "claude")]
+    caps.push(whipplescript_provider_claude::capability());
     caps
 }
 
@@ -21714,12 +21716,7 @@ fn claude_agent_sdk_adapter(
                 "failed to launch Claude Agent SDK sidecar: {error:?}"
             ))
         })?;
-    let capability = builtin_provider_capabilities()
-        .into_iter()
-        .find(|capability| {
-            capability.provider_kind == "claude" && capability.surface == "claude_agent_sdk"
-        })
-        .ok_or_else(|| StoreError::Conflict("missing built-in Claude capability".to_owned()))?;
+    let capability = whipplescript_provider_claude::capability();
     let mut client = ClaudeAgentSdkClient::new(transport);
     // Version exchange (DR-0035 Decision 7): a sidecar that ANSWERS with a
     // mismatched protocol blocks the binding here (provider_health,
