@@ -462,18 +462,24 @@ impl CoordinationStore {
             params![owner, counter, key],
             |row| row.get(0),
         )?;
-        let outcome = if consumed + amount <= cap {
-            tx.execute(
-                "UPDATE counters SET consumed = consumed + ?4 WHERE owner = ?1 AND counter = ?2 AND key = ?3",
-                params![owner, counter, key, amount],
-            )?;
-            ConsumeOutcome::Ok {
-                remaining: cap - consumed - amount,
+        // `amount` is workflow-authored, so guard the cap check against i64
+        // overflow: a near-MAX amount would wrap `consumed + amount` negative,
+        // passing the check and driving `consumed` negative — an unbounded
+        // counter (silent cap bypass in release, panic in debug). checked_add
+        // fails closed to `Over` (denied), never charging.
+        let outcome = match consumed.checked_add(amount) {
+            Some(total) if amount >= 0 && total <= cap => {
+                tx.execute(
+                    "UPDATE counters SET consumed = consumed + ?4 WHERE owner = ?1 AND counter = ?2 AND key = ?3",
+                    params![owner, counter, key, amount],
+                )?;
+                ConsumeOutcome::Ok {
+                    remaining: cap - total,
+                }
             }
-        } else {
-            ConsumeOutcome::Over {
-                remaining: cap - consumed,
-            }
+            _ => ConsumeOutcome::Over {
+                remaining: (cap - consumed).max(0),
+            },
         };
         if let Some(effect_id) = effect_id {
             tx.execute(
@@ -1326,6 +1332,23 @@ mod tests {
             second,
             ConsumeOutcome::Ok { remaining: 4 },
             "distinct effect debits from 7, not from a double-charged 4"
+        );
+    }
+
+    /// An adversarial near-i64::MAX amount must not overflow the cap check:
+    /// it fails closed to `Over` (denied), never wrapping `consumed` negative
+    /// into an unbounded counter (and never panicking in debug).
+    #[test]
+    fn consume_rejects_an_overflowing_amount() {
+        let mut store = store();
+        let outcome = store
+            .consume("budget", "k", i64::MAX, 10, "2026-07")
+            .expect("consume");
+        assert_eq!(outcome, ConsumeOutcome::Over { remaining: 10 });
+        // The counter was not charged, so a legitimate consume still succeeds.
+        assert_eq!(
+            store.consume("budget", "k", 4, 10, "2026-07").expect("ok"),
+            ConsumeOutcome::Ok { remaining: 6 }
         );
     }
 

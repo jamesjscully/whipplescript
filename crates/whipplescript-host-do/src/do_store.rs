@@ -8514,19 +8514,25 @@ impl<Sql: DoSql> Coordination for DoSqliteStore<Sql> {
             )
             .map_err(sql_err)?;
         let consumed = current.first().map(|row| as_i64(&row[0])).unwrap_or(0);
-        if consumed + amount <= cap {
-            self.sql
-                .execute(
-                    "UPDATE coord_counters SET consumed = consumed + ?4 WHERE owner = ?1 AND counter = ?2 AND key = ?3",
-                    &[text(owner), text(counter), text(key), int(amount)],
-                )
-                .map_err(sql_err)?;
-            return Ok(ConsumeOutcome::Ok {
-                remaining: cap - consumed - amount,
-            });
+        // Guard the workflow-authored `amount` against i64 overflow (mirrors the
+        // native store): a near-MAX amount would wrap the check and drive the
+        // counter negative (silent cap bypass). checked_add fails closed to
+        // `Over`, never charging.
+        if let Some(total) = consumed.checked_add(amount) {
+            if amount >= 0 && total <= cap {
+                self.sql
+                    .execute(
+                        "UPDATE coord_counters SET consumed = consumed + ?4 WHERE owner = ?1 AND counter = ?2 AND key = ?3",
+                        &[text(owner), text(counter), text(key), int(amount)],
+                    )
+                    .map_err(sql_err)?;
+                return Ok(ConsumeOutcome::Ok {
+                    remaining: cap - total,
+                });
+            }
         }
         Ok(ConsumeOutcome::Over {
-            remaining: cap - consumed,
+            remaining: (cap - consumed).max(0),
         })
     }
 
@@ -10276,7 +10282,13 @@ mod tests {
         e(
             "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            &[text("ask"), text("i1"), text("human.ask"), text("queued"), text("{}")],
+            &[
+                text("ask"),
+                text("i1"),
+                text("human.ask"),
+                text("queued"),
+                text("{}"),
+            ],
         );
         // A timer.wait created at t0 with a 30s timeout, blocked on the ask.
         e(
