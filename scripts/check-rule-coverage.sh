@@ -14,19 +14,23 @@ run_whip() {
   $WHIP "$@"
 }
 
-# Examples that need real providers, multiple roots, or explicit inputs are
-# exercised elsewhere; everything else must reach full rule coverage here.
-#   - tested-agent-turn: requires `given input` (no `--input` here); covered by `whip test`.
-#   - coerce-enum: requires `given input` (a WorkItem); its coerce->enum variant
-#     dispatch is covered by the example's own `whip test` blocks.
-#   - subworkflow-tool-consumer: requires `given input` (a ConsumerRequest); the
-#     no-`--input` fixture run here cannot start it.
-#   - package-memory: imports the non-`std.` `memory` package, so it needs a
-#     `whip.lock`; covered by the `dev_capability_call_*` / `check_discovers_*` tests.
-#   - event-bridge: an `@service` workflow whose only rule fires on an external
-#     `deploy.finished` signal (injected with `whip signal`); a no-signal fixture
-#     run records nothing, so its `assert count(...) == 1` cannot hold here.
-SKIP="revision-parent-child revision-validation-approval revision-repair-planner revision-running-cancel revision-ticket-v1 revision-ticket-v2 revision-validation-approval tested-agent-turn coerce-enum subworkflow-tool-consumer package-memory event-bridge"
+# Examples that a no-`--input`, no-`--root`, single-workflow fixture run cannot
+# drive are exercised elsewhere; everything else must reach full rule coverage
+# here. Categories:
+#   - multiple workflows (need `--root`): the docs-examples gate checks these with
+#     the right root. (coord-acquire-wait, coordination-partition-shared,
+#     least-privilege-subagent, parent-child-outcomes, private-workflow-wrapper,
+#     typed-invoke-result, revision-*).
+#   - `given input` (need `--input`): covered by `whip test` blocks.
+#     (tested-agent-turn, coerce-enum, subworkflow-tool-consumer, compact-contract,
+#     echo-text-tool, improve-triage, include-audit, include-triage,
+#     pattern-consumer-audit, pattern-consumer-triage, redact-projection,
+#     scalar-terminal).
+#   - non-`std.` package import (need a `whip.lock`): package-memory, package-notes;
+#     covered by the `dev_capability_call_*` / `check_discovers_*` tests.
+#   - event-bridge: an `@service` workflow whose only rule fires on an injected
+#     external signal; a no-signal fixture run records nothing.
+SKIP="revision-parent-child revision-validation-approval revision-repair-planner revision-running-cancel revision-ticket-v1 revision-ticket-v2 tested-agent-turn coerce-enum subworkflow-tool-consumer package-memory package-notes event-bridge coord-acquire-wait coordination-partition-shared least-privilege-subagent parent-child-outcomes private-workflow-wrapper typed-invoke-result compact-contract echo-text-tool improve-triage include-audit include-triage pattern-consumer-audit pattern-consumer-triage redact-projection scalar-terminal"
 
 # Script hard-off Layer 2 (spec/std-script.md): raw `exec` seeds `script.raw`
 # only under dev profile + a non-empty WHIPPLESCRIPT_EXEC_ALLOW, and ungranted
@@ -46,9 +50,12 @@ for workflow in "$ROOT"/examples/*.whip; do
   rm -f "$store" "$items"
   export WHIPPLESCRIPT_ITEMS_STORE="$items"
 
-  # Queue-backed examples need at least one ready item.
-  if grep -q "tracker builtin" "$workflow"; then
-    run_whip items add --queue backlog --title "Coverage item" --body "seeded" >/dev/null
+  # Tracker-backed examples need at least one ready issue. Detect the declared
+  # `tracker <name> { provider builtin }` and seed that queue via `whip issue new`
+  # (renamed from the old `whip items add`).
+  tracker_queue="$(grep -oE '^tracker [A-Za-z_][A-Za-z0-9_]*' "$workflow" | head -1 | awk '{print $2}' || true)"
+  if [ -n "$tracker_queue" ]; then
+    run_whip issue new --tracker "$tracker_queue" --title "Coverage item" --body "seeded" >/dev/null
   fi
 
   report="$WORK_DIR/$name.json"
@@ -58,7 +65,14 @@ for workflow in "$ROOT"/examples/*.whip; do
     failures=1
     continue
   fi
-  instance="$(jq -r '.instance_id' "$report")"
+  # Some effects (e.g. messaging.stdio) print to stdout ahead of the --json
+  # payload; extract the JSON object so a stray line does not break the parse.
+  instance="$(sed -n '/^{/,$p' "$report" | jq -r '.instance_id // empty' 2>/dev/null || true)"
+  if [ -z "$instance" ]; then
+    echo "FAIL (no instance_id): $name"
+    failures=1
+    continue
+  fi
 
   # Drive pending human asks generically, then step until quiet.
   for _ in 1 2 3; do
