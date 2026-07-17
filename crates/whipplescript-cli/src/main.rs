@@ -20501,7 +20501,27 @@ fn private_or_local_ipv4(ip: Ipv4Addr) -> bool {
 }
 
 fn private_or_local_ipv6(ip: Ipv6Addr) -> bool {
+    // An IPv4-mapped (::ffff:a.b.c.d) or IPv4-compatible (::a.b.c.d) address is
+    // dialed over IPv4, so screen it with the (comprehensive) IPv4 classifier —
+    // otherwise `[::ffff:169.254.169.254]` (IMDS) / `[::ffff:127.0.0.1]` slip
+    // through as "public". `to_ipv4_mapped` covers the mapped form; the compat
+    // form is caught below.
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return private_or_local_ipv4(v4);
+    }
     let octets = ip.octets();
+    // IPv4-compatible ::a.b.c.d (first 96 bits zero, not ::/`::1`).
+    if octets[..12] == [0u8; 12] && !ip.is_loopback() && !ip.is_unspecified() {
+        return private_or_local_ipv4(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    // NAT64 well-known prefix 64:ff9b::/96 embeds an IPv4 destination.
+    if octets[..12] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0] {
+        return private_or_local_ipv4(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
     ip.is_loopback()
         || ip.is_unspecified()
         || (octets[0] & 0xfe) == 0xfc
@@ -40874,6 +40894,12 @@ mod tests {
             "http://10.0.0.5/x",
             "http://192.168.1.1/x",
             "https://[::1]/x",
+            // IPv4-mapped / -compatible IPv6 must screen as their IPv4:
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+            "http://[::ffff:127.0.0.1]/x",
+            "http://[::ffff:10.0.0.5]/x",
+            "http://100.64.0.1/x",
+            "http://0.0.0.0/x",
         ] {
             assert!(
                 http_source_url_policy_error(url).is_some(),
