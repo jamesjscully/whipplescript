@@ -1806,34 +1806,53 @@ pub fn parse_case_block(lines: &[&str], start: usize) -> Option<(CaseBlock, usiz
     let mut case_depth = brace_delta(header).max(1);
     while index < lines.len() && case_depth > 0 {
         let trimmed = lines[index].trim();
-        if let Some((pattern, guard, before_body)) = case_branch_header(trimmed) {
-            // `before_body` is the `=>` right-hand side, always starting with
-            // `{`. A SINGLE-LINE branch (`pat => { complete ... }`) carries its
-            // whole body here and its braces balance on this line; a multi-line
-            // branch has just `{` with the body on the following lines. The old
-            // logic forced depth to >= 1 and only collected following lines, so
-            // a single-line branch's inline body was silently dropped and the
-            // branch never materialized at runtime (a check/runtime divergence
-            // that `whip fmt` did not fix, since fmt leaves branches single-line).
+        if let Some((pattern, guard, rhs)) = split_case_head(trimmed) {
+            // A branch header is `pattern [where guard] => ...`. The body's
+            // opening `{` may sit on THIS line (`=> { ... }`) or on the NEXT
+            // line (`=>` then `{`). The token parser is whitespace-insensitive
+            // and accepts both, so the line scanner must too — otherwise a whole
+            // branch is silently dropped at runtime (a check/runtime divergence,
+            // same class as the single-line-branch bug). `header_lines` counts
+            // the header line plus a separate `{` line if the brace is not inline.
+            let (inline, header_lines) = if let Some(rest) = rhs.strip_prefix('{') {
+                (rest.to_owned(), 1usize)
+            } else if rhs.is_empty() {
+                let mut j = index + 1;
+                while j < lines.len() && lines[j].trim().is_empty() {
+                    j += 1;
+                }
+                match lines.get(j).map(|line| line.trim()) {
+                    Some(next) if next.starts_with('{') => (next[1..].to_owned(), j - index + 1),
+                    _ => {
+                        case_depth += brace_delta(trimmed);
+                        index += 1;
+                        continue;
+                    }
+                }
+            } else {
+                // `=>` present but the RHS is not a `{ ... }` body.
+                case_depth += brace_delta(trimmed);
+                index += 1;
+                continue;
+            };
             let mut body = Vec::new();
-            let inline = before_body.strip_prefix('{').unwrap_or(before_body);
-            let mut branch_depth = 1 + brace_delta(inline);
+            let mut branch_depth = 1 + brace_delta(&inline);
             if branch_depth <= 0 {
-                // Single-line branch: the body is the inline text minus its
-                // closing `}`.
-                let inline_body = inline.trim().strip_suffix('}').unwrap_or(inline).trim();
+                // Single-line branch: body is the inline text minus its `}`.
+                let inline_trim = inline.trim();
+                let inline_body = inline_trim.strip_suffix('}').unwrap_or(inline_trim).trim();
                 if !inline_body.is_empty() {
                     body.push(inline_body.to_owned());
                 }
-                index += 1;
+                index += header_lines;
             } else {
-                // Multi-line branch: keep any inline lead, then collect the
-                // following lines until the branch's braces close.
+                // Multi-line branch: keep any inline lead, then collect following
+                // lines until the branch's braces close.
                 let inline_body = inline.trim();
                 if !inline_body.is_empty() {
                     body.push(inline_body.to_owned());
                 }
-                index += 1;
+                index += header_lines;
                 while index < lines.len() && branch_depth > 0 {
                     let line = lines[index];
                     let next_depth = branch_depth + brace_delta(line);
@@ -1863,18 +1882,20 @@ pub fn parse_case_block(lines: &[&str], start: usize) -> Option<(CaseBlock, usiz
     ))
 }
 
-pub fn case_branch_header(line: &str) -> Option<(String, Option<String>, &str)> {
-    let (head, body_start) = line.split_once("=>")?;
-    let body_start = body_start.trim();
-    if !body_start.starts_with('{') {
+/// Split a case-branch header line into (pattern, optional guard, `=>` RHS).
+/// The RHS is returned trimmed and may be `{ ... }`, a bare `{`, or "" (when the
+/// opening brace is on the next line) — the caller resolves where the body opens.
+pub fn split_case_head(line: &str) -> Option<(String, Option<String>, String)> {
+    let (head, rhs) = line.split_once("=>")?;
+    let head = head.trim();
+    if head.is_empty() {
         return None;
     }
-    let head = head.trim();
     let (pattern, guard) = match head.split_once(" where ") {
-        Some((pattern, guard)) => (pattern.trim(), Some(guard.trim().to_owned())),
-        None => (head, None),
+        Some((pattern, guard)) => (pattern.trim().to_owned(), Some(guard.trim().to_owned())),
+        None => (head.to_owned(), None),
     };
-    Some((pattern.to_owned(), guard, body_start))
+    Some((pattern, guard, rhs.trim().to_owned()))
 }
 
 pub fn select_case_branch(case: &CaseBlock, context: &mut RuleContext) -> CaseSelection {
@@ -4693,6 +4714,16 @@ pub fn top_level_record_blocks(body: &str) -> Vec<RecordBlock> {
                 continue;
             }
             let mut record_lines = Vec::new();
+            // Capture any field text after the opening `{` on this same line
+            // (e.g. `record Note { a "AAA"`). The token parser accepts this
+            // (structure comes from tokens, not line breaks), so `check` passes;
+            // dropping it here was a silent check/runtime divergence.
+            if let Some(open) = trimmed.find('{') {
+                let lead = trimmed[open + 1..].trim();
+                if !lead.is_empty() && lead != "}" {
+                    record_lines.push(lead.to_owned());
+                }
+            }
             let mut depth = brace_delta(trimmed);
             index += 1;
             while index < lines.len() && depth > 0 {
@@ -4778,6 +4809,15 @@ pub fn milestone_blocks(body: &str) -> Vec<MilestoneBlock> {
             continue;
         }
         let mut milestone_lines = Vec::new();
+        // Capture any field text after the opening `{` on this line (parity with
+        // top_level_record_blocks — the token parser accepts a field on the
+        // brace line, so dropping it was a silent check/runtime divergence).
+        if let Some(open) = trimmed.find('{') {
+            let lead = trimmed[open + 1..].trim();
+            if !lead.is_empty() && lead != "}" {
+                milestone_lines.push(lead.to_owned());
+            }
+        }
         let mut depth = brace_delta(trimmed);
         index += 1;
         while index < lines.len() && depth > 0 {
@@ -5690,5 +5730,48 @@ renew slot until 300s as r
                 ),
             }
         }
+    }
+
+    /// A record field placed on the opening `{` line is captured by the runtime
+    /// line-scanner, matching the token parser (`check`). Regression for a silent
+    /// check/runtime divergence that dropped the field.
+    #[test]
+    fn record_field_on_the_brace_line_is_captured() {
+        let body = "record Note { a \"AAA\"\n  b \"BBB\"\n}";
+        let blocks = top_level_record_blocks(body);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            blocks[0].body.contains("a \"AAA\"") && blocks[0].body.contains("b \"BBB\""),
+            "both fields captured, got: {:?}",
+            blocks[0].body
+        );
+        // Same for milestone blocks.
+        let m = milestone_blocks("emit milestone \"m\" of Note { a \"AAA\"\n  b \"BBB\"\n}");
+        assert_eq!(m.len(), 1);
+        assert!(m[0].body.contains("a \"AAA\"") && m[0].body.contains("b \"BBB\""));
+    }
+
+    /// A case branch whose `=>` and opening `{` sit on separate lines is parsed
+    /// as a real branch (the token parser is whitespace-insensitive). Regression
+    /// for a divergence that dropped the whole branch at runtime.
+    #[test]
+    fn case_branch_with_brace_on_the_next_line_is_parsed() {
+        let lines: Vec<&str> = vec![
+            "case item.status {",
+            "  \"ready\" =>",
+            "  {",
+            "    complete result { ok 1 }",
+            "  }",
+            "  \"done\" => { fail fail { reason \"d\" } }",
+            "}",
+        ];
+        let (case, _) = parse_case_block(&lines, 0).expect("case parses");
+        assert_eq!(case.branches.len(), 2, "both branches materialize");
+        assert_eq!(case.branches[0].pattern, "\"ready\"");
+        assert!(
+            case.branches[0].body.iter().any(|l| l.contains("complete")),
+            "the non-adjacent-brace branch keeps its body: {:?}",
+            case.branches[0].body
+        );
     }
 }
