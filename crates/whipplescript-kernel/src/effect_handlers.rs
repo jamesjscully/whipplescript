@@ -1615,13 +1615,14 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
             let partition = field("partition");
             let entry = input.get("entry").cloned().unwrap_or(Value::Null);
             let retain_seconds = require_i64!(input, "retain_seconds");
-            let seq = kernel.store_mut().append_for_owner(
+            let seq = kernel.store_mut().append_for_owner_idempotent(
                 &owner,
                 &ledger,
                 &partition,
                 &entry.to_string(),
                 instance_id,
                 retain_seconds,
+                &effect.effect_id,
             )?;
             json!({
                 "variant": "Appended",
@@ -1657,9 +1658,15 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
                     ),
                 );
             };
-            let outcome = kernel
-                .store_mut()
-                .consume_for_owner(&owner, &counter, &key, amount, cap, &period)?;
+            let outcome = kernel.store_mut().consume_for_owner_idempotent(
+                &owner,
+                &counter,
+                &key,
+                amount,
+                cap,
+                &period,
+                &effect.effect_id,
+            )?;
             match outcome {
                 ConsumeOutcome::Ok { remaining } => json!({
                     "variant": "Ok",

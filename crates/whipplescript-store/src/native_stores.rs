@@ -665,6 +665,41 @@ impl Coordination for NativeStores {
             .consume_for_owner(owner, counter, key, amount, cap, period)
     }
 
+    fn append_for_owner_idempotent(
+        &mut self,
+        owner: &str,
+        ledger: &str,
+        partition: &str,
+        payload_json: &str,
+        appended_by: &str,
+        retain_seconds: i64,
+        effect_id: &str,
+    ) -> StoreResult<i64> {
+        self.coord.append_for_owner_idempotent(
+            owner,
+            ledger,
+            partition,
+            payload_json,
+            appended_by,
+            retain_seconds,
+            effect_id,
+        )
+    }
+
+    fn consume_for_owner_idempotent(
+        &mut self,
+        owner: &str,
+        counter: &str,
+        key: &str,
+        amount: i64,
+        cap: i64,
+        period: &str,
+        effect_id: &str,
+    ) -> StoreResult<ConsumeOutcome> {
+        self.coord
+            .consume_for_owner_idempotent(owner, counter, key, amount, cap, period, effect_id)
+    }
+
     fn list_leases_for_owner(
         &self,
         owner: Option<&str>,
