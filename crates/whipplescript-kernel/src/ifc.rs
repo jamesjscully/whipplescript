@@ -1824,6 +1824,46 @@ pub fn check_with_envelope_imports(
                 }
             }
         }
+        // Provider egress via coerce/decide/prompt (SchemaCoerce): these ship
+        // the interpolated prompt — which carries the rule's read data — to the
+        // `schema.coerce` model backend, an external LLM (principal `model`).
+        // Exactly like `agent.tell` (DR-0027 provider-as-principal): a
+        // read-confidential rule whose model principal is not cleared for a read
+        // leaks to the model. AgentTell is checked per-effect above via its own
+        // grants; a coerce carries no grants, so — fail-closed — its egress is
+        // the rule's reads. Without this, coerce was an UNMODELED door: governed
+        // data left to the model with `violations: 0` (information-flow-surface.md §56).
+        if let Some(coerce_span) = rule
+            .metadata
+            .effects
+            .iter()
+            .find(|effect| effect.kind == IrEffectKind::SchemaCoerce)
+            .map(|effect| effect.span)
+        {
+            for &resource in &reads {
+                if envelope.leaks(resource, "model") {
+                    diagnostics.push(Diagnostic {
+                        span: coerce_span,
+                        message: format!(
+                            "provider-egress violation in rule `{rule}`: a `coerce`/`decide`/\
+                             `prompt` reads `{resource}` (readable by {rr}) but the schema.coerce \
+                             model provider `model` (clearance {pr}) is not cleared, so the prompt \
+                             egresses to an uncleared model",
+                            rule = rule.name,
+                            rr = envelope.reader_label(resource),
+                            pr = envelope.reader_label("model"),
+                        ),
+                        suggestion: Some(
+                            "clear the model provider for this resource (`grant provider model -> \
+                             … readable by <role>`), or declassify before the coerce"
+                                .to_owned(),
+                        ),
+                        related: Vec::new(),
+                    });
+                    break;
+                }
+            }
+        }
         // `record <Fact>` writes the durable fact-base, which other rules and the
         // DR-0026 session-event stream observe — a governed egress sink (the
         // recordSink of infoflow-composition, H2). Sink id `fact:<schema>`;
@@ -2792,6 +2832,98 @@ rule work
                     && d.message.contains("ledger")
                     && d.message.contains("outbox")),
             "rule-body read->write should be flagged, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn coerce_over_a_confidential_read_is_a_provider_egress() {
+        // schema.coerce ships the interpolated prompt to an external LLM (principal
+        // `model`). A rule that reads the confidential ledger and coerces in the same
+        // rule leaks to an uncleared model — DR-0027 provider-as-principal, fail-closed
+        // on the rule's reads because a coerce carries no access grants of its own.
+        let program = r#"@service
+workflow CoerceEgress
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+class Verdict { label string }
+
+file store ledger { root "./ledger"  allow read ["**"] }
+
+coerce classify(text string) -> Verdict {
+  prompt """markdown
+  Classify: {{ text }}
+  """
+}
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from ledger at "data.txt" as loaded
+  coerce classify(ticket.id) as verdict
+  after verdict succeeds as v {
+    complete result { ok true }
+  }
+}
+"#;
+        let ir = compile_program(program).ir.expect("compiles");
+        let envelope = Envelope::from_json(ENVELOPE).expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("provider-egress violation")
+                    && d.message.contains("coerce")
+                    && d.message.contains("ledger")),
+            "coerce in a rule that reads the confidential ledger should be flagged, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn coerce_over_a_public_read_does_not_leak() {
+        // The same shape over a public store must NOT be flagged — no confidential
+        // read reaches the model, so the coerce egress is clean (no false positive).
+        let program = r#"@service
+workflow CoerceClean
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+class Verdict { label string }
+
+file store outbox { root "./outbox"  allow read ["**"] }
+
+coerce classify(text string) -> Verdict {
+  prompt """markdown
+  Classify: {{ text }}
+  """
+}
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from outbox at "data.txt" as loaded
+  coerce classify(ticket.id) as verdict
+  after verdict succeeds as v {
+    complete result { ok true }
+  }
+}
+"#;
+        let ir = compile_program(program).ir.expect("compiles");
+        let envelope = Envelope::from_json(ENVELOPE).expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("provider-egress")),
+            "coerce over a public read must not be flagged, got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
