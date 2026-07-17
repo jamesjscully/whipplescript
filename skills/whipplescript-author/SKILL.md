@@ -115,7 +115,7 @@ effect requests. Workers execute effects later and record evidence.
 | Agent turn | `tell` | `tell worker as turn "..."` | [`manual.md#request-agent-work`](../../docs/manual.md#request-agent-work) |
 | Typed model decision | `coerce` or `decide` | `coerce classify(...) as result` | [`language-reference.md#coerce`](../../docs/language-reference.md#coerce) |
 | Human gate | `askHuman`, `human answered` | `askHuman as review choices [...]` | [`manual.md#gate-on-humans`](../../docs/manual.md#gate-on-humans) |
-| Backlog ownership | `queue`, `claim`, `finish`, `release` | `when backlog has ready item as item` | [`language-reference.md#work-queues`](../../docs/language-reference.md#work-queues) |
+| Backlog ownership | `use std.tracker`, `tracker`, `claim`, `finish`, `release` | `when backlog has ready issue as issue` | [`language-reference.md#work-queues`](../../docs/language-reference.md#work-queues) |
 | Deadlines | `timeout`, `timer`, `cancel` | `tell worker as turn timeout 10m` | [`language-reference.md#time-and-deadlines`](../../docs/language-reference.md#time-and-deadlines) |
 | Retry policy | facts and guarded rules | `where job.attempts < 3` | [`manual.md#express-retries-as-facts`](../../docs/manual.md#express-retries-as-facts) |
 | Script capability | `exec` | `exec backup with request -> Report as x` | [`language-reference.md#exec`](../../docs/language-reference.md#exec) |
@@ -144,13 +144,13 @@ and effects.
    - default to `rule`s for independent reactions, fan-out, retries, and
      event-driven policy;
    - use `flow` only for one fixed sequence with shared bindings;
-   - use `queue` only when external work items need claim/finish/release
-     ownership;
+   - use `std.tracker` (a `tracker` backlog) only when external work items need
+     claim/finish/release ownership;
    - use `invoke` only when a subtask needs its own lifecycle.
 5. Declare agents with the narrowest useful `profile`, `capacity`, and
    `capabilities`.
 6. Put every external action behind an effect: `tell`, `coerce`, `askHuman`,
-   `call`, `exec`, `timer`, `queue.*`, or `invoke`.
+   `call`, `exec`, `timer`, `tracker.*`, or `invoke`.
 7. Sequence effect outputs only with `after` blocks or flow step order.
 8. Add terminal rules: `complete output { ... }` or `fail failure { ... }`.
    Tag truly perpetual workflows `@service`.
@@ -321,29 +321,31 @@ flow triage_ticket
 }
 ```
 
-Queue work:
+Track work (the `std.tracker` backlog):
 
 ```whip
-queue backlog {
-  tracker builtin
+use std.tracker
+
+tracker backlog {
+  provider builtin
 }
 
-rule work_ready_item
-  when backlog has ready item as item
+rule work_ready_issue
+  when backlog has ready issue as issue
   when worker is available
 => {
-  claim item as lease
+  claim issue as active_claim
 
-  after lease succeeds {
-    tell worker as turn "Resolve {{ item.title }}."
+  after active_claim succeeds {
+    tell worker as turn "Resolve {{ issue.title }}."
   }
 
   after turn succeeds as outcome {
-    finish item { summary outcome.summary }
+    finish issue { summary outcome.summary }
   }
 
   after turn fails {
-    release item
+    release issue
   }
 }
 ```
@@ -368,7 +370,7 @@ Typed dynamic agent routing:
 
 ```whip
 class ReviewTask {
-  reviewer AgentRef<codex | claude | pi>
+  reviewer AgentRef<codex | claude>
   title string
   trackerPath string
   status "queued"
