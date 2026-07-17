@@ -289,6 +289,7 @@ impl CoordinationStore {
     /// (the effect was applied but its cross-database terminal did not commit
     /// before a crash) the recorded seq is returned and no second entry is
     /// written. See `coord_applied`. `None` is the un-guarded append.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_for_owner_idempotent(
         &mut self,
         owner: &str,
@@ -406,6 +407,7 @@ impl CoordinationStore {
     /// the recorded outcome (`Ok`/`Over` + remaining) is returned and the
     /// counter is NOT charged a second time, so a crash between the coordination
     /// commit and the instance-store terminal cannot double-charge the budget.
+    #[allow(clippy::too_many_arguments)]
     pub fn consume_for_owner_idempotent(
         &mut self,
         owner: &str,
