@@ -185,8 +185,9 @@ fn source_delivery_key(source: &IrSource, observation: &Value, ordinal_key: Stri
 /// Admits durable signal facts from `file` sources through the admission core.
 ///
 /// LINE MODE (`path`): each non-empty line at ordinal `i` is one delivery,
-/// keyed `H(source, i)` (or the `dedup` field) — append-only log semantics, so
-/// re-reads are absorbed and a growing file only adds its new tail.
+/// keyed `H(source, i, line)` (or the `dedup` field) — re-reads and unchanged
+/// lines are absorbed, a growing file adds only its new tail, and a changed
+/// line at an existing index re-admits (its content is part of the key).
 /// Observation record: `{ line, line_index, path }`.
 ///
 /// OCCURRENCE MODE (`watch`, spec/std-ingress.md I2a/I3): each glob-matched
@@ -231,7 +232,15 @@ pub fn resolve_due_file_sources<S: RuntimeStore>(
                     "line_index": index,
                     "path": path,
                 });
-                let ordinal_key = idempotency_key(&[&source.name, &index.to_string()]);
+                // Fold the line CONTENT into the delivery key, not just the
+                // ordinal: keying on (source, index) alone silently drops a
+                // changed line at an existing index (its key already exists ->
+                // Duplicate -> absorbed). With content in the key, an unchanged
+                // line still absorbs (same key), a growing file still adds only
+                // its new tail, but a mutated line at an existing index
+                // re-admits. A declared `dedup` field still overrides this in
+                // source_delivery_key.
+                let ordinal_key = idempotency_key(&[&source.name, &index.to_string(), line]);
                 admit_source_observation(
                     kernel,
                     instance_id,
@@ -701,5 +710,77 @@ class Seen {
         let third =
             resolve_due_file_sources(&mut kernel, &instance_id, &ir, &mut io).expect("pass runs");
         assert_eq!(third.admitted, 1, "content change re-admits: {third:?}");
+    }
+
+    /// Line-mode file sources fold the line CONTENT into the delivery key: an
+    /// unchanged line at an existing index re-reads as a duplicate (absorbed),
+    /// a growing file admits only its new tail, but a CHANGED line at an
+    /// existing index re-admits instead of being silently dropped.
+    #[test]
+    fn file_line_mode_readmits_a_changed_line_at_an_existing_index() {
+        const LINE_PROGRAM: &str = r#"
+@service
+workflow IngressLines
+
+signal status.line {
+  value string
+}
+
+source file as status {
+  path "./status.txt"
+  observe as obs
+  emit status.line {
+    value obs.line
+  }
+}
+
+rule react
+  when status.line as f
+=> {
+  record Seen { value f.value }
+}
+
+class Seen {
+  value string
+}
+"#;
+        struct FakeIo(String);
+        impl IngressFileIo for FakeIo {
+            fn read_file(&mut self, path: &str) -> Result<Option<String>, String> {
+                Ok((path == "./status.txt").then(|| self.0.clone()))
+            }
+            fn glob_files(&mut self, _pattern: &str) -> Result<Vec<String>, String> {
+                Ok(Vec::new())
+            }
+        }
+
+        let ir = compile_program(LINE_PROGRAM).ir.expect("program compiles");
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let instance_id = instance_on(&mut store, "IngressLines");
+        let mut kernel = RuntimeKernel::new(store);
+
+        // One line at index 0.
+        let mut io = FakeIo("pending".to_owned());
+        let first =
+            resolve_due_file_sources(&mut kernel, &instance_id, &ir, &mut io).expect("pass runs");
+        assert_eq!(first.admitted, 1, "the first line admits: {first:?}");
+
+        // Same content re-read: absorbed (append-log semantics preserved).
+        let second =
+            resolve_due_file_sources(&mut kernel, &instance_id, &ir, &mut io).expect("pass runs");
+        assert_eq!(
+            second.admitted, 0,
+            "an unchanged line re-reads once: {second:?}"
+        );
+
+        // The line at index 0 is rewritten in place: it must RE-ADMIT, not be
+        // silently dropped as a positional duplicate.
+        let mut io = FakeIo("done".to_owned());
+        let third =
+            resolve_due_file_sources(&mut kernel, &instance_id, &ir, &mut io).expect("pass runs");
+        assert_eq!(
+            third.admitted, 1,
+            "a changed line at an existing index re-admits: {third:?}"
+        );
     }
 }
