@@ -439,7 +439,7 @@ fact), `given fact <Type> { … }` (a pre-existing fact), `given clock at
 "<timestamp>"` (inject a virtual evaluation clock so `timer until`/`timeout`
 deadlines fire — or stay pending — deterministically and without a real sleep),
 `given tracker <name> issue { … }` (seed an existing issue into the builtin tracker,
-isolated per scenario, surfaced through the real `queue.item.ready` projection),
+isolated per scenario, surfaced through the real `tracker.issue.ready` projection),
 `given file <store> at "<path>" "<content>"` (seed a deterministic fixture file
 into a declared `file store`, isolated per scenario in a temp dir the store root
 is redirected to, so a `read` runs through the real worker against the fixture);
@@ -1511,7 +1511,7 @@ This section is a compact index of source constructs.
 | --- | --- |
 | `record Class { ... }` | New fact. |
 | `record Class from binding { ... }` | New fact with copied fields. |
-| `done binding` | Mark matched fact consumed. `consume binding` is a deprecated alias; the checker now emits a warning for it. |
+| `done binding` | Mark matched fact consumed. (The old `consume binding` alias was removed — it is now a check error; use `done`. `consume <counter> for <key> amount <n>` is a separate, live counter verb.) |
 | `done binding -> record ...` | Consume and create replacement fact atomically. |
 | `tell agent ... [timeout <dur>] as turn` | `agent.tell` effect. |
 | `prompt "..." [using provider] as result` | Provider-backed free-text prompt effect returning a string-shaped result. |

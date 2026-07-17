@@ -164,7 +164,7 @@ each construct follow in the rest of this page.
 ```text
 program       ::= include* use* item*
 item          ::= workflow | contract | harness | agent | class | enum | event
-                | table | queue | lease | ledger | counter | coerce | rule
+                | table | tracker | lease | ledger | counter | coerce | rule
                 | flow | pattern | apply | action | assert
 workflow      ::= tag* "workflow" Ident block?   # header form if block omitted
 contract      ::= ("input" | "output" | "failure") Ident Type
@@ -799,9 +799,9 @@ becomes an effect, and a later rule branches on its completion.
 | `decide "..." -> { ... } as x` | Enqueue an inline typed model decision (see [Inline `decide`](#inline-decide)). |
 | `askHuman [as x] [choices [...]] "..."` | Enqueue a human review request. |
 | `file issue into <tracker> { ... }` | File a new issue into a [tracker](#trackers). |
-| `claim <item> [as x]` | Claim a queue item; already-claimed is a branchable failure. |
-| `release <item>` | Return a claimed item to the queue. |
-| `finish <item> [{ summary ... }]` | Mark a queue item done. |
+| `claim <issue> [as x]` | Claim a tracker issue; already-claimed is a branchable failure. |
+| `release <issue>` | Return a claimed issue to the tracker. |
+| `finish <issue> [{ summary ... }]` | Mark a tracker issue done. |
 | `timer <dur> as x` | Create a [timer effect](#time-and-deadlines) that fires when due. |
 | `timer until <time> as x` | Create an absolute [timer effect](#time-and-deadlines) that fires at or after a typed instant. |
 | `cancel <binding>` | Cancel a pending or running effect bound earlier. |

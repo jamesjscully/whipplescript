@@ -1,15 +1,14 @@
 # Current state
 
 WhippleScript is pre-1.0. It is good for durable agent orchestration — both
-locally and, in 0.3, deployed to the edge — but it is not yet a stable
-production dependency.
+locally and deployed to the edge — but it is not yet a stable production
+dependency.
 
-These docs track the latest released line (`0.3.x`); the repository itself is
-currently on the in-progress `v0.4` branch (versioned-workspace work,
-unreleased), not `main`. Published release artifacts are versioned as `0.3.x`;
-use docs from the matching Git tag when pinning exact CLI flags, JSON fields, or
-provider configuration behavior. The `stage-*` label printed by `whip --help` is
-an internal implementation-stage marker.
+These docs track the `0.1.0` release (the first public release; it collapses the
+earlier internal 0.2/0.3/0.4 development lines into one feature-complete cut).
+Use docs from the matching Git tag when pinning exact CLI flags, JSON fields, or
+provider configuration behavior. `whip --help` prints the version plus a single
+`release` implementation-stage label (not a separate compatibility version).
 
 ## Stable enough to rely on
 
@@ -77,8 +76,9 @@ follow-on configuration step — it is not on by default. See
   boundary and a live model client (OpenAI/Anthropic, `WHIPPLESCRIPT_HARNESS_*`,
   with a credential-free fixture fallback for CI), the enforced envelope (a
   configurable per-turn step budget and a durable workspace lease), and a
-  default-deny `bash` tool (allow-list of command prefixes, workspace cwd,
-  timeout), and capability-gated tracker tools (`list/add/update_todo` over the
+  sandboxed `bash` tool (the in-isolate Bashkit virtual shell over the workspace
+  file surface — no OS/network reach; gated by `with access to command { run }`),
+  and capability-gated tracker tools (`list/add/update_todo` over the
   durable work tracker; mutating calls use `with access to tracker { ... }`),
   context
   compaction on long turns (projection only; the durable stream is complete), and

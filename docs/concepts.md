@@ -84,14 +84,15 @@ event) and `emit signal ... to` (a signal to another instance), `send via`
 what was requested, which provider ran it, whether it finished, and what
 evidence was captured.
 
-## Work queue
+## Work tracker
 
-A durable backlog of work items, declared in source and vendor-neutral. Where
-a fact is workflow state, a queue item is a unit of pending work to be
-claimed, worked, and finished — the `builtin` tracker persists it outside the
-event log so a backlog survives across instances. Rules pull from a queue with
-`claim`; a lost claim is an ordinary branchable failure, so contention needs no
-locks in source.
+A durable backlog of work, declared in source and vendor-neutral: `use
+std.tracker` and a `tracker <name> { provider builtin }` declaration. Where a
+fact is workflow state, a tracker *issue* is a unit of pending work to be
+claimed, worked, and finished — the `builtin` provider persists it outside the
+event log so a backlog survives across instances. Rules react with `when <name>
+has ready issue as issue` and pull work with `claim`; a lost claim is an
+ordinary branchable failure, so contention needs no locks in source.
 
 ## Agent
 

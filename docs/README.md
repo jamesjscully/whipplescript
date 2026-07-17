@@ -10,7 +10,7 @@ humans using the website and coding agents reading Markdown directly.
 **Version scope:** the Markdown in this repository tracks the latest released
 line of the CLI. Release users should read the docs from the matching Git
 tag when exact CLI flags or JSON fields matter. The current published CLI
-version is `0.3.x`; the implementation-stage label printed by `whip --help`
+version is `0.1.0`; the implementation-stage label printed by `whip --help`
 is an internal progress marker, not a separate compatibility version.
 In-progress work on the next release line lands on a separate branch and is
 not reflected here unless a page says otherwise.

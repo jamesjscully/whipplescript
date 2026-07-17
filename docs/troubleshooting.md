@@ -179,7 +179,8 @@ WHIPPLESCRIPT_REAL_PROVIDER_DISPOSABLE_ACK=I_UNDERSTAND_THIS_PROVIDER_TARGET_IS_
 scripts/check-real-providers-report.sh
 ```
 
-Provider-specific variants exist (for example `WHIPPLESCRIPT_PI_DESTRUCTIVE_TESTS`).
+Provider-specific variants exist (for example `WHIPPLESCRIPT_CODEX_DESTRUCTIVE_TESTS`
+or `WHIPPLESCRIPT_CLAUDE_DESTRUCTIVE_TESTS`).
 Reports record only whether the markers are set, never their values.
 
 ## Cloud deploy, checkpoint, restore, or executor trouble

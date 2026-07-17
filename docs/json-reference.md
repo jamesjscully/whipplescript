@@ -3,7 +3,7 @@
 This page is the public machine-readable contract surface for the CLI. Field
 sets may grow within the same schema version; consumers should ignore unknown
 fields. Required fields listed here are safe to depend on for the current
-documentation set and released `0.3.x` CLI unless a schema version
+documentation set and released `0.1.0` CLI unless a schema version
 changes.
 
 For command usage, see [CLI reference](api-reference.md).
