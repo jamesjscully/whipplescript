@@ -1263,6 +1263,122 @@ rule record_deploy
     let _ = fs::remove_file(source_path);
 }
 
+/// Ingress admission must validate the payload against the instance's COMMITTED
+/// program, not an arbitrary `--program` the caller supplies: otherwise
+/// `whip signal <inst> --program attacker.whip` admits a signal against a schema
+/// the instance never ran. A tampered program (different source hash) is
+/// rejected; the genuine committed program still admits (ultracode #7).
+#[test]
+fn signal_rejects_a_program_that_is_not_the_instances_committed_version() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let committed = temp_workflow_path("signal-committed");
+    let tampered = temp_workflow_path("signal-tampered");
+    let committed_src = r#"
+@service
+workflow SigGuard
+
+signal deploy.finished {
+  service string
+}
+
+class DeploySeen {
+  service string
+}
+
+rule record_deploy
+  when deploy.finished as f
+=> {
+  record DeploySeen {
+    service f.service
+  }
+}
+"#;
+    // Same declared signal, but an extra signal changes the source hash — a
+    // stand-in for any caller-supplied program that is not the committed one.
+    let tampered_src = committed_src.replace(
+        "signal deploy.finished {",
+        "signal secret.backdoor {\n  service string\n}\n\nsignal deploy.finished {",
+    );
+    fs::write(&committed, committed_src).expect("write committed");
+    fs::write(&tampered, &tampered_src).expect("write tampered");
+
+    let store = store_path.to_str().expect("utf-8 store path");
+    let committed_path = committed.to_str().expect("utf-8 path");
+    let tampered_path = tampered.to_str().expect("utf-8 path");
+
+    let run = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "run",
+            committed_path,
+            "--input",
+            "{}",
+        ],
+    );
+    let instance_id = run
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // The tampered program is refused before any admission.
+    let refused = Command::new(bin)
+        .args([
+            "--store",
+            store,
+            "signal",
+            &instance_id,
+            "--name",
+            "deploy.finished",
+            "--data",
+            r#"{"service":"evil"}"#,
+            "--program",
+            tampered_path,
+        ])
+        .output()
+        .expect("signal runs");
+    assert!(
+        !refused.status.success(),
+        "a tampered --program must be rejected: {refused:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("does not match"),
+        "the refusal names the mismatch: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // The genuine committed program still admits.
+    let admitted = Command::new(bin)
+        .args([
+            "--store",
+            store,
+            "signal",
+            &instance_id,
+            "--name",
+            "deploy.finished",
+            "--data",
+            r#"{"service":"api"}"#,
+            "--program",
+            committed_path,
+        ])
+        .output()
+        .expect("signal runs");
+    assert!(
+        admitted.status.success(),
+        "the committed program admits: stdout={} stderr={}",
+        String::from_utf8_lossy(&admitted.stdout),
+        String::from_utf8_lossy(&admitted.stderr)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(committed);
+    let _ = fs::remove_file(tampered);
+}
+
 /// std.files `write` (spec/std-library/files.md): `write text to <store> at
 /// <path> { body <expr> mode <mode> }` renders a body to disk through the real
 /// worker, settling `file.write.completed`. The mode is enforced ("no silent

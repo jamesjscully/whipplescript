@@ -30756,6 +30756,45 @@ fn inbox_answer(options: &CliOptions) -> ExitCode {
     }
 }
 
+/// Cross-check a caller-supplied `--program` against the instance's committed
+/// program version before ingress admission. The payload MUST be validated
+/// against the schema the instance actually runs, not an arbitrary program the
+/// caller compiled: otherwise `whip signal <inst> --program attacker.whip` (or
+/// `ingress serve --program …`) admits a signal the committed program never
+/// declared, or coerces the payload to a shape the committed schema forbids.
+/// Returns Err(message) on a source-hash mismatch; Ok when they match or the
+/// instance has no committed version to check against (fail-open only where
+/// there is nothing to compare, never on a mismatch).
+fn verify_program_matches_committed_version(
+    store: &SqliteStore,
+    instance_id: &str,
+    source: &str,
+) -> Result<(), String> {
+    let Some(instance) = store.get_instance(instance_id).ok().flatten() else {
+        return Ok(()); // unknown instance: admission itself reports it
+    };
+    if instance.version_id.is_empty() {
+        return Ok(()); // unversioned instance: nothing to cross-check
+    }
+    let Some(version) = store
+        .get_program_version(&instance.version_id)
+        .ok()
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let compiled = stable_hash_hex(source);
+    if compiled != version.source_hash {
+        return Err(format!(
+            "the supplied `--program` (source hash {compiled}) does not match instance \
+             `{instance_id}`'s committed program version `{}` (source hash {}); ingress is \
+             validated against the committed program, not a caller-supplied one",
+            instance.version_id, version.source_hash
+        ));
+    }
+    Ok(())
+}
+
 /// `whip signal <instance> --name <name> --data <json> --program <path>`:
 /// lands a typed external signal as a durable fact (spec/event-ingress.md).
 /// The payload is validated against the declared `signal` schema at this
@@ -30815,7 +30854,7 @@ fn signal(options: &CliOptions) -> ExitCode {
         eprintln!("{usage}");
         return ExitCode::from(2);
     };
-    let (_source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
+    let (source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
         Ok(compiled) => compiled,
         Err(error) => return report_compile_failure(&program_path, error),
     };
@@ -30830,6 +30869,12 @@ fn signal(options: &CliOptions) -> ExitCode {
         Ok(store) => store,
         Err(code) => return code,
     };
+    // The supplied `--program` must be the instance's committed program, or a
+    // caller could admit a signal against a schema the instance never ran.
+    if let Err(message) = verify_program_matches_committed_version(&store, &instance_id, &source) {
+        eprintln!("{message}");
+        return ExitCode::from(2);
+    }
     // The ONE shared admission core (spec/std-ingress.md I3): declared-signal
     // check, H8 internal-channel gate, payload validation, idempotent append,
     // fact derivation — the same door every ingress driver goes through.
@@ -30983,7 +31028,7 @@ fn ingress_command(options: &CliOptions) -> ExitCode {
         eprintln!("{usage}");
         return ExitCode::from(2);
     };
-    let (_source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
+    let (source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
         Ok(compiled) => compiled,
         Err(error) => return report_compile_failure(&program_path, error),
     };
@@ -31037,6 +31082,15 @@ fn ingress_command(options: &CliOptions) -> ExitCode {
             println!("{}", reject("envelope has no `payload`".to_owned()));
             continue;
         };
+        // Each delivery names its target instance: the served `--program` must
+        // be that instance's committed program, or a caller could admit signals
+        // against a schema the instance never ran.
+        if let Err(message) =
+            verify_program_matches_committed_version(kernel.store(), instance_id, &source)
+        {
+            println!("{}", reject(message));
+            continue;
+        }
         let delivery_id = envelope.get("delivery_id").and_then(Value::as_str);
         let payload_json = payload.to_string();
         let delivery_key =
@@ -31161,7 +31215,7 @@ fn message_command(options: &CliOptions) -> ExitCode {
         eprintln!("{usage}");
         return ExitCode::from(2);
     }
-    let (_source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
+    let (source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
         Ok(compiled) => compiled,
         Err(error) => return report_compile_failure(&program_path, error),
     };
@@ -31195,6 +31249,12 @@ fn message_command(options: &CliOptions) -> ExitCode {
             return ExitCode::from(2);
         }
         Err(error) => return report_store_error("failed to load instance", error),
+    }
+    // The supplied `--program` must be the instance's committed program, or a
+    // caller could admit a message against a schema the instance never ran.
+    if let Err(message) = verify_program_matches_committed_version(&store, &instance_id, &source) {
+        eprintln!("{message}");
+        return ExitCode::from(2);
     }
     // Mint a UNIQUE message id per DELIVERY (spec/std-messaging.md local
     // provider notes): the id is keyed by the channel's delivery ordinal —
