@@ -240,7 +240,19 @@ pub fn ready_contexts(
             for context in contexts {
                 for fact in &matching {
                     let mut context = context.clone();
-                    context.identity = Some(format!("{binding}:{}", fact.key));
+                    // Accumulate identity across EVERY `as` binding, not just the
+                    // last: a multi-when join (`when A as aa` + `when B as bb`)
+                    // otherwise gives (a1,b1) and (a2,b1) the same identity
+                    // (`bb:<b1>`), so their effect ids — derived from the
+                    // identity — collide and one join firing's fan-out effects
+                    // are silently dropped. Compose the per-binding fragments so
+                    // distinct combinations stay distinct. Single-binding rules
+                    // are unchanged (no prior fragment to prepend).
+                    let fragment = format!("{binding}:{}", fact.key);
+                    context.identity = Some(match context.identity.take() {
+                        Some(prev) => format!("{prev}|{fragment}"),
+                        None => fragment,
+                    });
                     context.bindings.push((binding.to_owned(), fact.clone()));
                     match &when.guard {
                         Some(guard) => {
@@ -5548,6 +5560,78 @@ pub fn split_args(args: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fact(name: &str, key: &str, value_json: &str) -> FactView {
+        FactView {
+            fact_id: format!("f_{key}"),
+            program_version_id: None,
+            revision_epoch: 0,
+            name: name.to_owned(),
+            key: key.to_owned(),
+            value_json: value_json.to_owned(),
+            provenance_class: "table".to_owned(),
+            source_span_json: None,
+        }
+    }
+
+    /// A multi-`when` join must yield a DISTINCT context identity per binding
+    /// combination. The identity feeds the effect-id derivation, so if two
+    /// firings — (a1,b1) and (a2,b1) — shared an identity, their fan-out effects
+    /// would collide and one firing would be silently dropped (ultracode #1).
+    #[test]
+    fn join_contexts_have_distinct_identities_per_combination() {
+        let src = r#"@service
+workflow Join
+
+output result R
+class R { n int }
+class A { id string }
+class B { id string }
+class Pair { a string  b string }
+
+rule pair
+  when A as a
+  when B as b
+=> {
+  record Pair { a a.id  b b.id }
+}
+"#;
+        let ir = whipplescript_parser::compile_program(src)
+            .ir
+            .expect("compiles");
+        let rule = ir
+            .rules
+            .iter()
+            .find(|rule| rule.name == "pair")
+            .expect("pair rule");
+        let facts = vec![
+            fact("A", "A:a1", r#"{"id":"a1"}"#),
+            fact("A", "A:a2", r#"{"id":"a2"}"#),
+            fact("B", "B:b1", r#"{"id":"b1"}"#),
+        ];
+        let ready = ready_contexts(&ir, rule, &facts, &[], None);
+        let identities: Vec<&str> = ready
+            .contexts
+            .iter()
+            .filter_map(|context| context.identity.as_deref())
+            .collect();
+        assert_eq!(
+            identities.len(),
+            2,
+            "two A facts join one B fact into two contexts: {identities:?}"
+        );
+        assert_ne!(
+            identities[0], identities[1],
+            "each join combination must carry a distinct identity: {identities:?}"
+        );
+        // Both bindings' keys participate in the identity.
+        for identity in &identities {
+            assert!(
+                identity.contains("a:") && identity.contains("b:"),
+                "identity composes both bindings: {identity}"
+            );
+        }
+    }
 
     /// std.coord slice 5 regression: release disambiguation is binding-typed
     /// over the PARSED effects. An `acquire … as <b>` line inside prompt text
