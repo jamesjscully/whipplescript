@@ -907,24 +907,35 @@ impl WorkItemStore {
             .prepare("SELECT content_id, alias FROM tracker_aliases")?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<_, _>>()?;
-        // (event_id, issue_id/content_id, kind, payload_json, created_at)
-        type ProjectionEventRow = (Option<String>, Option<String>, String, String, String);
+        // (event_id, issue_id/content_id, kind, payload_json, created_at, parents)
+        type ProjectionEventRow = (String, Option<String>, String, String, String, Vec<String>);
         let events: Vec<ProjectionEventRow> = tx
             .prepare(
-                "SELECT event_id, issue_id, kind, payload_json, created_at \
+                "SELECT event_id, issue_id, kind, payload_json, created_at, parents_json \
                  FROM tracker_events ORDER BY event_seq",
             )?
             .query_map([], |row| {
+                let parents: Vec<String> =
+                    serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default();
                 Ok((
-                    row.get(0)?,
+                    row.get::<_, Option<String>>(0)?.unwrap_or_default(),
                     row.get(1)?,
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    parents,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        for (event_id, content_id, kind, payload_json, created_at) in &events {
+        // Fold in a deterministic TOPOLOGICAL order (parents strictly before
+        // children; concurrent events by event_id). `event_seq` is insertion
+        // order, which is NOT causal after a merge — folding by it can apply a
+        // field_set before its own `issue.created` (lost UPDATE) or a superseded
+        // value last, so two clones holding the same event set would project
+        // different columns. Topological order is content-derived and identical
+        // on every clone.
+        for id in topological_event_order(&events, |e| e.0.as_str(), |e| e.5.as_slice()) {
+            let (event_id, content_id, kind, payload_json, created_at, _parents) = &events[id];
             let payload: Value = serde_json::from_str(payload_json).unwrap_or_else(|_| json!({}));
             let issue_alias = content_id
                 .as_deref()
@@ -932,7 +943,7 @@ impl WorkItemStore {
                 .map(String::as_str);
             fold_event(
                 &tx,
-                event_id.as_deref(),
+                Some(event_id.as_str()),
                 issue_alias,
                 kind,
                 &payload,
@@ -1734,6 +1745,62 @@ pub fn analyze_issue_dag(events: &[IssueEvent]) -> IssueConflicts {
 /// Fold one event into the projection tables — the shared step of both live
 /// application and `rebuild_projection`, so a rebuild is bit-identical. `issue_id`
 /// is the alias of the event's subject issue (already resolved from the event's
+/// Deterministic topological order over a content-addressed event DAG: every
+/// event's in-set parents come strictly before it; concurrent events are broken
+/// by `event_id`. Returns indices into `events`. Because both the parent edges
+/// and the tiebreak are content-derived, the order is IDENTICAL on every clone,
+/// independent of insertion / import order — so folding in this order makes the
+/// projected columns converge. Cycle-safe: a Merkle DAG has no cycles, but any
+/// leftover (e.g. a dangling parent from a partial import) is appended by
+/// `event_id`. Shared by the native rebuild and (via the DO's own copy) the DO.
+pub fn topological_event_order<T>(
+    events: &[T],
+    id_of: impl Fn(&T) -> &str,
+    parents_of: impl Fn(&T) -> &[String],
+) -> Vec<usize> {
+    use std::collections::{BTreeSet, HashMap};
+    let index: HashMap<&str, usize> = events
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (id_of(e), i))
+        .collect();
+    let mut indeg = vec![0usize; events.len()];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); events.len()];
+    for (i, e) in events.iter().enumerate() {
+        for parent in parents_of(e) {
+            if let Some(&pi) = index.get(parent.as_str()) {
+                children[pi].push(i);
+                indeg[i] += 1;
+            }
+        }
+    }
+    let mut ready: BTreeSet<(&str, usize)> = (0..events.len())
+        .filter(|&i| indeg[i] == 0)
+        .map(|i| (id_of(&events[i]), i))
+        .collect();
+    let mut order = Vec::with_capacity(events.len());
+    while let Some(&(_, i)) = ready.iter().next() {
+        ready.remove(&(id_of(&events[i]), i));
+        order.push(i);
+        for &child in &children[i] {
+            indeg[child] -= 1;
+            if indeg[child] == 0 {
+                ready.insert((id_of(&events[child]), child));
+            }
+        }
+    }
+    if order.len() < events.len() {
+        let mut seen = vec![false; events.len()];
+        for &i in &order {
+            seen[i] = true;
+        }
+        let mut rest: Vec<usize> = (0..events.len()).filter(|&i| !seen[i]).collect();
+        rest.sort_by(|&a, &b| id_of(&events[a]).cmp(id_of(&events[b])));
+        order.extend(rest);
+    }
+    order
+}
+
 /// opaque `content_id`). `alias_of` maps content_id → alias so `relation.added`
 /// payloads (which reference issues by opaque id) fold into the alias-keyed
 /// projection.
@@ -2735,6 +2802,36 @@ mod tests {
             "a re-transmit is NOT a duplicate submission — re-sync stays quiet"
         );
         assert_eq!(b.list_items(Some("q"), None).unwrap().len(), 2);
+    }
+
+    /// Two clones holding the byte-identical event set must project the SAME
+    /// field value regardless of import order. A linear title history
+    /// orig→A→B is folded TOPOLOGICALLY, so a non-causal import order can no
+    /// longer drop edits or leave clones disagreeing. (Pre-fix bug: folding by
+    /// insertion order projected "orig" in one order and "B" in another.)
+    #[test]
+    fn projection_converges_across_import_orders() {
+        let mut source = open_memory();
+        let it = source
+            .file_item("q", "orig", "", &[], &json!({}), None)
+            .expect("file");
+        source.set_field(&it.id, "title", "A").expect("set A");
+        source.set_field(&it.id, "title", "B").expect("set B");
+        let events = source.export_events().unwrap();
+        assert_eq!(source.get_item(&it.id).unwrap().unwrap().title, "B");
+
+        let title_after = |order: &[TrackerEvent]| {
+            let mut clone = open_memory();
+            clone.import_events(order).unwrap();
+            let alias = clone.list_items(Some("q"), None).unwrap()[0].id.clone();
+            clone.get_item(&alias).unwrap().unwrap().title
+        };
+        let mut asc = events.clone();
+        asc.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+        let mut desc = events.clone();
+        desc.sort_by(|a, b| b.event_id.cmp(&a.event_id));
+        assert_eq!(title_after(&asc), "B", "ascending import must project B");
+        assert_eq!(title_after(&desc), "B", "descending import must project B");
     }
 
     /// A genuine duplicate submission — two clones independently FILE the same

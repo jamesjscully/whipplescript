@@ -7985,26 +7985,48 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         let events = self
             .sql
             .query(
-                "SELECT event_id, issue_id, kind, payload_json, created_at \
+                "SELECT event_id, issue_id, kind, payload_json, created_at, parents_json \
                  FROM tracker_events ORDER BY event_seq",
                 &[],
             )
             .map_err(sql_err)?;
-        for row in &events {
-            let event_id = as_opt_text(&row[0]);
-            let content_id = as_opt_text(&row[1]);
-            let kind = as_text(&row[2]);
+        // (event_id, content_id, kind, payload_json, created_at, parents)
+        type Row = (String, Option<String>, String, String, String, Vec<String>);
+        let rows: Vec<Row> = events
+            .iter()
+            .map(|row| {
+                let parents: Vec<String> =
+                    serde_json::from_str(&as_text(&row[5])).unwrap_or_default();
+                (
+                    as_opt_text(&row[0]).unwrap_or_default(),
+                    as_opt_text(&row[1]),
+                    as_text(&row[2]),
+                    as_text(&row[3]),
+                    as_text(&row[4]),
+                    parents,
+                )
+            })
+            .collect();
+        // Fold in the same deterministic TOPOLOGICAL order as the native store
+        // (parents before children; concurrent events by event_id) so a DO log
+        // and a native log project identical columns and don't diverge on a
+        // non-causal import order.
+        for i in whipplescript_store::items::topological_event_order(
+            &rows,
+            |e| e.0.as_str(),
+            |e| e.5.as_slice(),
+        ) {
+            let (event_id, content_id, kind, payload_str, created_at, _parents) = &rows[i];
             let payload: serde_json::Value =
-                serde_json::from_str(&as_text(&row[3])).unwrap_or_else(|_| serde_json::json!({}));
-            let created_at = as_text(&row[4]);
+                serde_json::from_str(payload_str).unwrap_or_else(|_| serde_json::json!({}));
             let issue_alias = content_id.as_deref().and_then(|c| alias_of.get(c).cloned());
             do_fold_tracker_event(
                 &self.sql,
-                event_id.as_deref(),
+                Some(event_id.as_str()),
                 issue_alias.as_deref(),
-                &kind,
+                kind,
                 &payload,
-                &created_at,
+                created_at,
                 &alias_of,
             )?;
         }
