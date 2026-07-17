@@ -14,7 +14,9 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
-use crate::{StoreError, StoreResult};
+#[cfg(feature = "native")]
+use crate::StoreError;
+use crate::StoreResult;
 
 pub const DEFAULT_COORDINATION_OWNER: &str = "shared";
 

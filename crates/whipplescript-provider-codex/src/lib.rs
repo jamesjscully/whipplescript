@@ -968,16 +968,27 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
                     json!({"run_id": cancellation.run_id}),
                 )
             })?;
-        let interrupt = self
-            .client
-            .request(
-                "turn/interrupt",
-                json!({
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                }),
-            )
-            .map_err(|error| self.map_error("codex_interrupt_failed", error))?;
+        // Bound the interrupt RPC by the inactivity budget (DR-0035 Decision 4),
+        // exactly like the turn-start RPCs: a wedged-but-alive app-server that
+        // never answers `turn/interrupt` must not pin the worker thread forever
+        // and defeat cancellation. On timeout, synthesize a refused-cancel
+        // diagnostic (acknowledged=false) so the driver records it and keeps
+        // draining toward the inactivity backstop instead of blocking.
+        let interrupt = self.client.request_timeout(
+            "turn/interrupt",
+            json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+            }),
+            self.inactivity_budget,
+        );
+        let (acknowledged, interrupt_result_shape) = match interrupt {
+            Ok(result) => (true, json_shape(&result)),
+            Err(CodexAppServerError::Timeout(message)) => {
+                (false, json_shape(&json!({ "timeout": message })))
+            }
+            Err(error) => return Err(self.map_error("codex_interrupt_failed", error)),
+        };
 
         Ok(NativeProviderEvent {
             provider_id: self.provider_id.clone(),
@@ -988,10 +999,10 @@ impl<T: CodexAppServerTransport> NativeProviderAdapter for CodexAppServerAdapter
             provider_turn_id: Some(turn_id),
             sequence: Some(self.next_sequence()),
             evidence: json!({
-                "acknowledged": true,
+                "acknowledged": acknowledged,
                 "requested_depth": cancellation.requested_depth.as_str(),
                 "reason_shape": json_shape(&Value::String(cancellation.reason)),
-                "interrupt_result_shape": json_shape(&interrupt),
+                "interrupt_result_shape": interrupt_result_shape,
             }),
             artifacts: vec![],
         })
@@ -2000,6 +2011,44 @@ mod tests {
                 .pointer("/params/threadId")
                 .and_then(Value::as_str),
             Some("thread-1")
+        );
+    }
+
+    #[test]
+    fn native_adapter_interrupt_that_never_answers_is_a_refused_cancel_not_a_hang() {
+        // Only the three start RPCs answer; `turn/interrupt` gets no reply, so
+        // the bounded read times out. cancel_turn must return a refused-cancel
+        // diagnostic (acknowledged=false), NOT block forever or hard-error —
+        // otherwise a wedged-but-alive app-server pins the worker thread and
+        // defeats cancellation (ultracode #15).
+        let transport = FakeTransport::with_reads(&[
+            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-1"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}"#,
+        ]);
+        let client = CodexAppServerClient::new(transport);
+        let mut adapter = CodexAppServerAdapter::new("codex-main", codex_capability(), client)
+            .with_inactivity_budget(std::time::Duration::from_millis(1));
+        adapter
+            .start_turn(native_codex_request())
+            .expect("turn starts");
+
+        let ack = adapter
+            .cancel_turn(NativeProviderCancellation {
+                run_id: "run-1".to_owned(),
+                provider_session_id: None,
+                provider_turn_id: None,
+                requested_depth: CancellationDepth::NativeStop,
+                reason: "revision changed".to_owned(),
+            })
+            .expect("a timed-out interrupt is still an Ok diagnostic, not an error");
+        assert_eq!(ack.event_kind, NativeProviderEventKind::Diagnostic);
+        assert!(!ack.event_kind.is_terminal());
+        assert_eq!(
+            ack.evidence.get("acknowledged").and_then(Value::as_bool),
+            Some(false),
+            "an unanswered interrupt is recorded as a refused cancel: {}",
+            ack.evidence
         );
     }
 }
