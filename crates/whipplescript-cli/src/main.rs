@@ -639,12 +639,25 @@ fn print_usage() {
         whipplescript_core::IMPLEMENTATION_STAGE
     );
     println!("usage: whip [--store path] [--json] <command> [args]");
-    println!("commands: package, check, compile, verify-report, run, revise, step, worker, dev, accept, instances, status, log, facts, effects, runs");
+    println!();
+    println!("authoring:    check  compile  verify-report  fmt  lint  lsp  test  package");
+    println!("run:          run  revise  step  worker  dev  accept  ingress");
     println!(
-        "          artifacts, inbox, signal, ingress, issue, leases, ledger, counters, evidence, diagnostics, trace"
+        "inspect:      instances  status  log  facts  effects  runs  artifacts  evidence  diagnostics  trace"
     );
-    println!("          otel-export, pause, resume, cancel, checkpoint, restore, fork, retry, recover, doctor, deploy");
-    println!("          improve, campaigns, campaign, adopt, answer, pin, suppose, settle, gauges");
+    println!("inbox/msg:    inbox  signal  message  mailbox");
+    println!("coordinate:   leases  ledger  counters");
+    println!("lifecycle:    pause  resume  cancel  retry  recover");
+    println!("context:      checkpoint  restore  handles  fork");
+    println!("version ctl:  branch  stream");
+    println!("tracker:      issue");
+    println!(
+        "improve:      improve  campaigns  campaign  adopt  answer  pin  suppose  settle  gauges  evidence"
+    );
+    println!("ops/deploy:   doctor  deploy  executor  otel-export  telemetry");
+    println!("config:       auth  coercion  memory  script  agents  providers  skills  skill");
+    println!("governance:   gov  infoflow");
+    println!();
     println!("run `whip <command> --help` or `whip help <command>` for command usage");
 }
 
@@ -707,6 +720,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "retry" => "usage: whip retry <instance> <effect>",
         "recover" => "usage: whip recover <instance>",
         "doctor" => "usage: whip doctor [--providers] [--provider-config <path>] [--record-provider-evidence <instance>]",
+        "gov" => "usage: whip gov <sign | verify | escalate | escalations | agent> [args]",
         "infoflow" => "usage: whip infoflow   (interactive information-flow REPL: check <file> | escalate <request> | quit; renamed from `whip agent`)",
         "agents" => "usage: whip [--json] agents [--root <workflow>] <workflow.whip>",
         "providers" => "usage: whip [--json] providers [--root <workflow>] <workflow.whip>",

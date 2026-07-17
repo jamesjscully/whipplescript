@@ -22939,7 +22939,7 @@ mod tests {
 
     #[test]
     fn parser_scaffold_links_to_core() {
-        assert_eq!(parser_stage(), "stage-0-skeleton");
+        assert_eq!(parser_stage(), "release");
     }
 
     #[test]

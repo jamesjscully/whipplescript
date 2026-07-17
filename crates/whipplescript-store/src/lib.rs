@@ -10738,7 +10738,7 @@ mod tests {
 
     #[test]
     fn store_scaffold_links_to_core() {
-        assert_eq!(store_stage(), "stage-0-skeleton");
+        assert_eq!(store_stage(), "release");
     }
 
     /// Drive the store through the `RuntimeStore` trait as a `&dyn` object:

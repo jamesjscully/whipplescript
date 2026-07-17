@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub mod json;
 
-/// Current implementation stage for the active redesign.
-pub const IMPLEMENTATION_STAGE: &str = "stage-0-skeleton";
+/// Implementation-stage label shown alongside the version (for project tracking;
+/// does not replace the semantic version).
+pub const IMPLEMENTATION_STAGE: &str = "release";
 
 /// Returns the workspace package version.
 pub fn version() -> &'static str {
@@ -1482,7 +1483,7 @@ mod tests {
 
     #[test]
     fn exposes_stage_marker() {
-        assert_eq!(IMPLEMENTATION_STAGE, "stage-0-skeleton");
+        assert_eq!(IMPLEMENTATION_STAGE, "release");
     }
 
     #[test]
