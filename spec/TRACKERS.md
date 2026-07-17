@@ -62,7 +62,8 @@ closed/archived (shipped or historical).
 
 | Tracker | Status | Scope (one line, non-overlapping) | Last triaged | Release |
 |---------|--------|-----------------------------------|--------------|---------|
-| `spec/distribution-tracker.md` | active | Packaging, versioning, and distribution of whipplescript artifacts | 2026-06-30 | v0.2 |
+| `spec/v0.1-release-tracker.md` | active | The single public release: collapse the 0.2/0.3/0.4 ceremony into a feature-complete, reviewed, docs-polished, ready-to-use v0.1.0 | 2026-07-16 | v0.1 |
+| `spec/distribution-tracker.md` | active | Packaging, versioning, and distribution of whipplescript artifacts | 2026-06-30 | v0.1 |
 | `spec/expression-kernel-tracker.md` | active | The expression/evaluation kernel implementation | 2026-06-30 | v0.2 |
 | `spec/native-provider-implementation-tracker.md` | active | Building usable native Codex/Claude providers (prose tracker) | 2026-06-30 | v0.2 |
 | `spec/workflow-composition-transition-tracker.md` | active | Migrating to the workflow-composition model (invoke/subworkflows) | 2026-06-30 | v0.2 |

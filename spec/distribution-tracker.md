@@ -169,15 +169,18 @@ Result: passed on 2026-06-02. The run built and uploaded
 - Which release channels are needed after v0.1: stable only, or stable plus
   nightly/pre-release?
 
-## crates.io — self-contained crates (0.3.1, open)
+## crates.io — self-contained crates (open, follow-on to v0.1.0)
 
-crates.io publish is DEFERRED from 0.3 (Jack 2026-07-09). `whipplescript-core
-0.3.0` is published; the other four are blocked because the crates are not
-self-contained for a published tarball: `whipplescript-parser`'s `build.rs`
-reads `../../std/{manifests,grammars}/*.json`, and `whipplescript` /
-`whipplescript-store` `include_str!("../../../std/manifests/…")` — workspace-root
-paths absent from a published crate, so the verify build fails (`--no-verify`
-would ship unbuildable crates). Fix for 0.3.1: vendor the shared std manifests +
-grammars into each crate that reads them (root `std/` stays the SSOT; a gate
-check diffs the vendored copies against it), re-verify all five, then publish
-`core→parser→store→kernel→whipplescript`. See `spec/release-checklist.md` §v0.3.0.
+crates.io publish is a DEFERRED follow-on (not cut-blocking; Jack 2026-07-09).
+An early `whipplescript-core 0.3.0` was published under the old version ladder;
+the whole line is now collapsed to **0.1.0** (2026-07-16 — see
+[`v0.1-release-tracker.md`](v0.1-release-tracker.md)). The publish is blocked
+because the crates are not self-contained for a published tarball:
+`whipplescript-parser`'s `build.rs` reads `../../std/{manifests,grammars}/*.json`,
+and `whipplescript` / `whipplescript-store` `include_str!("../../../std/manifests/…")`
+— workspace-root paths absent from a published crate, so the verify build fails
+(`--no-verify` would ship unbuildable crates). Fix: vendor the shared std
+manifests + grammars into each crate that reads them (root `std/` stays the SSOT;
+a gate check diffs the vendored copies against it), re-verify all five, then
+publish `core→parser→store→kernel→whipplescript`. See
+`spec/release-checklist.md` §v0.1.0.

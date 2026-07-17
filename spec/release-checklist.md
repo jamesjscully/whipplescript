@@ -32,143 +32,34 @@ Before declaring v0 complete:
 
 Known v0 deferrals must include owner, rationale, and follow-up location.
 
-## v0.2.0 Cut Runbook
+## v0.1.0 Cut Runbook
 
-The 0.2 baseline is verified green (full readiness gate, 0 required failures) and
-the version is staged at 0.2.0. Below is the ordered sequence to cut and publish.
-Every step requires a maintainer decision or maintainer credentials and is not
-automatable from inside the build.
+The one and only public release. Decision (Jack, 2026-07-16): the earlier
+v0.2/v0.3/v0.4 tags were ceremony to establish a cadence; with no users, they
+are collapsed into a single feature-complete, ready-to-use **v0.1.0**. Campaign
+phases + open items live in [`v0.1-release-tracker.md`](v0.1-release-tracker.md);
+this is the mechanical cut.
 
-1. **Std-package renames — DONE.** S3 `queue.*`→`tracker.*` (e57be7d), S2
-   `coerce`→`schema.coerce` (bd940e4), and the S2b model-id effect-key fold
-   (8abc7aa) are built, runtime-verified, and gate-green. DR-0014 can move
-   `proposed`→`accepted`. No scope decision remains here.
-
-2. **Live provider validation (G-008) — Codex + Claude.** Endpoint-health is
-   codex+claude-only.
-   With Codex logged in (`codex`) and Claude authed (`claude` — claude.ai login or
-   `ANTHROPIC_API_KEY`), and a provider config for config-validation:
-   `WHIPPLESCRIPT_RELEASE_STRICT_EXTERNAL=1 WHIPPLESCRIPT_PROVIDER_CONFIGS=examples/provider-configs/native/native.example.json scripts/check-release-readiness.sh`
-   Codex + Claude were validated live 2026-07-05 (app-server + Agent SDK + both
-   native source-workflow smokes; surface probe uses grep, not rg). Required to
-   advertise production native support.
-
-3. **Final green + version.** Working tree clean; `whip --version` →
-   `whipplescript 0.2.0`; `dist plan` reports 0.2.0; set the CHANGELOG date.
-
-4. **Tag → GitHub Release (CI-built artifacts).** A tag push is the only path that
-   creates a GitHub Release; the cargo-dist workflow builds/uploads the five
-   platform archives, shell/PowerShell installers, and checksums:
-   `git tag v0.2.0 && git push origin v0.2.0`
-   Watch `.github/workflows/release.yml`: confirm all platform archives + the
-   packaged-binary smoke job pass and the release body is correct.
-
-5. **Publish to crates.io in dependency order** (each must be live before the next
-   resolves; path deps already pin `version = "0.2.0"`):
-   `cargo publish -p whipplescript-core`
-   `cargo publish -p whipplescript-parser`
-   `cargo publish -p whipplescript-store`
-   `cargo publish -p whipplescript-kernel`
-   `cargo publish -p whipplescript`
-   (`whipplescript-host-do` is the Durable-Object host on the 0.3 track — not
-   published for 0.2.)
-
-6. **Homebrew formula.** From the tagged release assets take the macOS/Linux
-   tarball URLs + SHA256s and update `Formula/` in `jamesjscully/homebrew-tap`;
-   smoke with `brew install jamesjscully/tap/whip`.
-
-7. **Post-publish smoke.**
-   `cargo install --git https://github.com/jamesjscully/whipplescript --tag v0.2.0 --locked -p whipplescript`
-   then `whip --version` (0.2.0) · `whip doctor --json` ·
-   `whip check examples/minimal-noop.whip`.
-
-Deferred past 0.2 (not blockers): macOS Developer ID signing + notarization,
-Windows Authenticode, WinGet/Scoop/Chocolatey, release provenance attestations.
-
-## v0.3.0 Cut Runbook
-
-0.3 = cloud (Durable Object runtime) + owned harness. Scope decisions (Jack,
-2026-07-09): **publish via the public mirror + crates.io**; **skip Homebrew**;
-ship **containers-disabled** (the Class-A/B compute plane is built + locally
-live-proven — enabling it in production is a follow-on once Cloudflare Containers
-billing + image push are done, and is tracked as v0.4 in the DO runtime tracker).
-Web search/fetch tools and the deferred DO `[~]` residuals were moved to v0.4.
-
-1. **Version + gate.** Workspace bumped `0.2.0 → 0.3.0` (all crates + path-dep
-   pins + `Cargo.lock`); IR goldens unchanged. Full readiness gate
-   (`WHIPPLESCRIPT_RELEASE_READINESS_FULL=1`) green — note the toolchain bump to
-   rustc/clippy 1.95.0 newly flagged one pre-existing `let-else` under
-   `-D warnings` (fixed, 8f80248). Set the CHANGELOG date.
-
-2. **Tag → `main` → GitHub Release.** As with 0.2, a tag push is the only path
-   that builds the platform archives. If `-src` GitHub Actions billing is still
-   broken, publish via the **public mirror** (free CI) exactly as 0.2 did — and
-   the mirror publish **MUST preserve the grafted infra files** (the 5
-   release-infra files + the ~9 curated-tree files enumerated in the release-plan
-   memory), or mirror CI/releases break.
-
-3. **crates.io — DEFERRED to 0.3.1 (Jack, 2026-07-09).** `whipplescript-core
-   0.3.0` published successfully; the other four are blocked because the crates
-   are **not self-contained for a published tarball**: `whipplescript-parser`'s
-   `build.rs` reads `../../std/{manifests,grammars}/*.json`, and
-   `whipplescript`/`whipplescript-store` `include_str!("../../../std/manifests/…")`
-   — those workspace-root paths don't exist in a published crate, so the verify
-   build fails (and `--no-verify` would ship crates nobody can build). Fix
-   (0.3.1): vendor the shared std manifests + grammars into each crate that reads
-   them, with a gate check keeping the vendored copies in sync with the root SSOT,
-   then re-verify all five and publish `core→parser→store→kernel→whipplescript`
-   (host-do is the DO host, not a CLI dep — skipped). Prereqs (done):
-   verified crates.io email + a `publish-new`-scoped token (`cargo login`).
-
-4. **Post-publish smoke.**
-   `cargo install --git https://github.com/jamesjscully/whipplescript --tag v0.3.0 --locked -p whipplescript`
-   then `whip --version` (0.3.0) · `whip doctor --json` ·
-   `whip check examples/minimal-noop.whip`.
-
-## v0.4.0 Cut Runbook (draft — engineering complete 2026-07-10, decisions pending)
-
-0.4 = **version control (the versioned workspace + untie substrate
-capabilities) + improve/evals**, plus the items moved here at the 0.3 cut
-(web search/fetch tools; deferred DO `[~]` residuals).
-
-**Engineering state (2026-07-10).** The version-control half is COMPLETE:
-untie-substrate readiness tracker Phases 0–5 all shipped on branch `v0.4`
-(formal models; the versioned-workspace floor; the 13-op workspace API with
-diff/bundles/erasure/chunk transfer/selective verbs/conflict
-surface/archaeology/op-undo; the chat fork; policy-epoch consumption with
-DR-0036 witnessed workspace cuts + dynamic guarantee reports; auth
-simplification via host-resolved provider profiles; the store-seam handles
-surface, position-pair cut, and seam-contract draft). The web search + fetch
-tools are built per their accepted notes (native owned harness).
-
-**Blocking the cut — maintainer decisions/input:**
-
-1. **Improve/evals scope (Jack).** The second half of 0.4's banner is now
-   formally tracked (`experimentation-improve-tracker.md`, registered
-   2026-07-10) with the settled design ground, the four open Jack-held
-   design questions, and the scope analysis. **Lean recorded there: re-cut
-   0.4 as the version-control release; improve/evals becomes 0.5's banner.**
-   The tree is staged at 0.4.0 with an Unreleased CHANGELOG entry either
-   way; only the scope sentence and the date change at cut.
-2. **Sequencing fork** (untie tracker, ⚑): git-backed workspace API in
-   gaugedesk first? Analysis written 2026-07-10; whip-build-order
-   independent — this gates gaugedesk sequencing, not the whip cut.
-3. **Production container enable** (DO tracker; Cloudflare Containers
-   billing + image push) — also gates the Phase 2 presigned-transfer
-   residual and the web tools' DO build boxes (`NeedsHttp` executor,
-   TS-shell guard/egress entries).
-4. **Workspace-DO broker, egress deny, P7 object tier** (DO tracker
-   decisions).
-5. **Seam-contract ratification** rides the un-tie side's co-authoring
-   (`store-seam-contract-draft.md` open items: Quint twin, admitted-erasure
-   command, handoff format).
-6. **crates.io publishing** remains on the 0.3.1 vendoring track (above),
-   independent of the 0.4 tree.
-
-**Mechanical steps once scope is decided** (mirror the 0.3 runbook): version
-bump + CHANGELOG date; full readiness gate
-(`WHIPPLESCRIPT_RELEASE_READINESS_FULL=1`) green; tag → mirror publish
-(preserve the grafted infra files); post-publish smoke.
+1. **Version.** Workspace + crates staged at `0.1.0` (done 2026-07-16); `whip
+   --version` → `whipplescript 0.1.0`. The prior 0.2/0.3/0.4 CHANGELOG sections
+   are collapsed into a single `[0.1.0]` entry.
+2. **Feature completeness + reviews.** Tracker Phases 2–4 done: every built
+   capability wired/surfaced/documented, code + security review passes applied,
+   docs + companion skill validated from a clean checkout.
+3. **Final green.** Working tree clean; full readiness gate
+   (`WHIPPLESCRIPT_RELEASE_READINESS_FULL=1`) green; the pre-cut checklist above
+   re-verified for this cut.
+4. **Tag → GitHub Release (CI-built artifacts).** A tag push is the only path
+   that builds the platform archives, installers, and checksums:
+   `git tag v0.1.0 && git push origin v0.1.0`. Watch
+   `.github/workflows/release.yml` for all platform archives + the packaged-binary
+   smoke job. (Jack pushes.)
+5. **Post-publish smoke.** From the tagged assets:
+   `cargo install --git https://github.com/jamesjscully/whipplescript --tag v0.1.0 --locked -p whipplescript`,
+   then `whip --version` (0.1.0) · `whip doctor --json` · a quickstart example.
+6. **Follow-ons (not cut-blocking):** crates.io publish (dependency-order
+   `core→parser→store→kernel→whipplescript`), Homebrew formula from the tagged
+   assets, and retiring the old `v0.2.0` git tags.
 
 ## Native Provider Release Gate
 
