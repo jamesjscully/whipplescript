@@ -72,6 +72,17 @@ impl ChunkTree {
 /// 64-bit FNV-1a over raw bytes — the byte-level twin of the store's
 /// `stable_hash_hex` (identical constants, identical result for UTF-8
 /// input), so chunk ids and blob ids share one id space.
+///
+/// SECURITY (v0.1 trust assumption — not forgery-resistant): this is a
+/// 64-bit NON-CRYPTOGRAPHIC hash, so collisions and preimages are cheap to
+/// construct. Content ids are the integrity anchor for `import_bundle` (which
+/// admits external bytes only if `content_hash_hex(body) == blob.id`), for
+/// dedup, and for erasure identity — so bundle import is only forgery-safe
+/// from a MUTUALLY-TRUSTED sender. A hardened deployment that accepts bundles
+/// across a trust boundary must re-key this primitive to a cryptographic hash
+/// (SHA-256, matching the tracker DAG) — an explicit identity migration,
+/// tracked as an open decision, deliberately deferred for v0.1. Do NOT treat
+/// a matching content id as authentication of untrusted bytes.
 pub fn content_hash_hex(bytes: &[u8]) -> String {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in bytes {

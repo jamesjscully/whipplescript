@@ -2489,7 +2489,13 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 }
                 // `put` stores under the true content hash of `body`;
                 // assert the bundle's claimed id equals it so a mismatched
-                // (forged) id is refused rather than silently ignored.
+                // (forged) id is refused rather than silently ignored. NOTE
+                // (v0.1 trust assumption): the id is a 64-bit non-cryptographic
+                // hash (see chunking::content_hash_hex), so this check proves
+                // body↔id CONSISTENCY, not authenticity — a determined attacker
+                // can craft colliding bytes. Bundle import is only forgery-safe
+                // from a mutually-trusted sender until the id primitive is
+                // re-keyed to SHA-256 (tracked, deferred).
                 let stored = self.content.put(body)?;
                 if stored != blob.id {
                     return Err(StoreError::Conflict(format!(
