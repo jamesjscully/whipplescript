@@ -1404,9 +1404,9 @@ one entry from a multi-entry report; `--emit` prints a chosen embedded artifact
 whip [--json] branch <create|list|show|write|read|ls|remove|merge|discard|bind> ...
 ```
 
-`branch` backs the in-progress v0.4 versioned workspace (whip-native VCS) and is
-**not** part of the released 0.3 surface. It is present in the dispatch but should
-be treated as experimental and subject to change.
+`branch` (and its companion `stream`) back the versioned workspace (whip-native
+VCS). The surface is present and functional but should be treated as
+experimental and subject to change.
 
 ## Language reference index
 

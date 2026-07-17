@@ -184,7 +184,7 @@ Reports record only whether the markers are set, never their values.
 
 ## Cloud deploy, checkpoint, restore, or executor trouble
 
-The sections above cover local/native runs. For the v0.3 edge runtime — a
+The sections above cover local/native runs. For the edge runtime — a
 workflow running unchanged inside a Cloudflare Durable Object — the full
 operator surface lives in the [Runtime & operations](runtime-operations.md)
 guide. A few common snags:
