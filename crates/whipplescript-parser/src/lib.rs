@@ -16956,7 +16956,15 @@ struct ExprParser<'a> {
     source: &'a str,
     tokens: Vec<ExprToken>,
     pos: usize,
+    depth: usize,
 }
+
+/// Recursion-depth ceiling for the guard-expression grammar. Every level of
+/// `(`/`[`/`{` nesting and every prefix `!`/`not` descends through
+/// `parse_unary`, so bounding it there stops a deeply-nested expression in a
+/// workflow file from overflowing the stack and aborting the process — a
+/// normal `Err` diagnostic is returned instead. Far above any real expression.
+const MAX_EXPR_DEPTH: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExprToken {
@@ -16978,6 +16986,7 @@ impl<'a> ExprParser<'a> {
             source,
             tokens: lex_expr(source),
             pos: 0,
+            depth: 0,
         }
     }
 
@@ -17100,6 +17109,22 @@ impl<'a> ExprParser<'a> {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, String> {
+        // Depth guard (every nesting level descends through here): return a
+        // diagnostic rather than recurse the native stack to a crash.
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            self.depth -= 1;
+            return Err(format!(
+                "expression in `{}` is nested too deeply (limit {MAX_EXPR_DEPTH})",
+                self.source.trim()
+            ));
+        }
+        let result = self.parse_unary_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_unary_inner(&mut self) -> Result<Expr, String> {
         if self.consume_symbol('!') {
             return Ok(Expr::Unary {
                 op: UnaryOp::Not,
@@ -26056,6 +26081,33 @@ rule safe_not_null
     /// Every expression form in the spec's grammar (expression-kernel.md
     /// "Expression Forms") parses and renders to a pinned snapshot, so parser
     /// precedence and snapshot parenthesization are locked for each form.
+    #[test]
+    fn deeply_nested_expression_errors_instead_of_overflowing_the_stack() {
+        // Run on a production-sized stack (compile happens on the 8 MB main
+        // thread, not a 2 MB test thread): a pathologically nested guard
+        // expression must return a normal Err diagnostic, not abort the
+        // process with a stack overflow.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let deep = format!("{}task.done{}", "(".repeat(8000), ")".repeat(8000));
+                let result = parse_expression(&deep);
+                assert!(
+                    result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|message| message.contains("nested too deeply")),
+                    "expected a depth-limit diagnostic, got {result:?}"
+                );
+                // A reasonably nested expression still parses (guard is generous).
+                let ok = format!("{}task.done{}", "(".repeat(64), ")".repeat(64));
+                assert!(parse_expression(&ok).is_ok(), "64-deep nesting must parse");
+            })
+            .expect("spawn")
+            .join()
+            .expect("nested-expression parse must not crash");
+    }
+
     #[test]
     fn parses_every_expression_form_with_pinned_precedence() {
         let cases = [
