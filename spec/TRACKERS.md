@@ -55,30 +55,31 @@ radio-style choice lists are excluded from checkbox counting.
 
 ## Registry
 
-**Release** targets (tagged 2026-07-05; plan = [[project-release-plan]] memory):
-**v0.2** language + std packages + native runtime (polished) · **v0.3** cloud
-deployment + owned harness · **v0.4** improve/evals + version control. Blank =
-closed/archived (shipped or historical).
+**Release** target: the v0.2/v0.3/v0.4 ladder was collapsed 2026-07-16 (Jack —
+no users; it was cadence ceremony) into a single feature-complete **v0.1.0**
+(everything built ships; SSOT `spec/v0.1-release-tracker.md`). The Release column
+reads `v0.1` for anything that ships in it, `later` for a preserved-but-deferred
+option, blank for closed/historical trackers.
 
 | Tracker | Status | Scope (one line, non-overlapping) | Last triaged | Release |
 |---------|--------|-----------------------------------|--------------|---------|
 | `spec/v0.1-release-tracker.md` | active | The single public release: collapse the 0.2/0.3/0.4 ceremony into a feature-complete, reviewed, docs-polished, ready-to-use v0.1.0 | 2026-07-16 | v0.1 |
 | `spec/distribution-tracker.md` | active | Packaging, versioning, and distribution of whipplescript artifacts | 2026-06-30 | v0.1 |
-| `spec/expression-kernel-tracker.md` | active | The expression/evaluation kernel implementation | 2026-06-30 | v0.2 |
-| `spec/native-provider-implementation-tracker.md` | active | Building usable native Codex/Claude providers (prose tracker) | 2026-06-30 | v0.2 |
-| `spec/workflow-composition-transition-tracker.md` | active | Migrating to the workflow-composition model (invoke/subworkflows) | 2026-06-30 | v0.2 |
+| `spec/expression-kernel-tracker.md` | active | The expression/evaluation kernel implementation — **gate-complete for v0.1** (all 9 Acceptance Gates green; remaining matrix cells = deferred polish) | 2026-07-16 | v0.1 |
+| `spec/native-provider-implementation-tracker.md` | closed | Native Codex/Claude providers — all NP milestones shipped 2026-07-16; residue = arbitrary-attachment fixtures + owner-gated live G-008 | 2026-07-16 | v0.1 |
+| `spec/workflow-composition-transition-tracker.md` | closed | Workflow-composition model (invoke/subworkflows) — keystones + all 15 gates shipped; closed 2026-07-16 | 2026-07-16 | v0.1 |
 | `spec/workflow-encapsulation-implementation-tracker.md` | closed | v1 workflow-encapsulation + invocation-authorization theorem — all phases shipped 2026-07-02; open remnants re-homed to owned-harness-tool-surface.md | 2026-07-02 |
-| `spec/durable-object-runtime-tracker.md` | active | Sans-IO async refactor + Cloudflare Durable Object host binding (run whip in a wasm isolate) | 2026-07-01 | v0.3 |
-| `spec/context-assembly-tracker.md` | closed | Owned-harness context assembly (mirror pi): system-prompt seam, skills registry/catalogue, project-instructions, and pluggable cache-aware compaction | 2026-07-04 | v0.3 |
-| `spec/experimentation-improve-tracker.md` | active | Experimentation/improve subsystem (the v0.4 banner's second half): release-scope decision + the four open design passes + the gauge/mark/campaign build — registered 2026-07-10, previously pre-ADR notes | 2026-07-10 | v0.4 (lean: re-cut → v0.5) |
-| `spec/decision-records/language-ergonomics-tracker.md` | closed | v2 language-surface ergonomics decisions + build-out — **CLOSED 2026-07-16**, all rows shipped: Part B reconciled 2026-07-01; B1g closed 07-02; `consume` removed + B1b–f re-verified + bindingless-guard fix + C9/row 10/18 closed 07-16; B1a lowering-move completed by the DO sans-IO refactor (DR-0033 chunk 1b) | 2026-07-16 | v0.2 |
+| `spec/durable-object-runtime-tracker.md` | active | Sans-IO async refactor + Cloudflare Durable Object host binding (run whip in a wasm isolate) | 2026-07-01 | v0.1 |
+| `spec/context-assembly-tracker.md` | closed | Owned-harness context assembly (mirror pi): system-prompt seam, skills registry/catalogue, project-instructions, and pluggable cache-aware compaction | 2026-07-04 | v0.1 |
+| `spec/experimentation-improve-tracker.md` | active | Experimentation/improve subsystem — the gauge/mark/campaign/improve system is BUILT + reachable + tested (ships in v0.1); the 6 open items are design residuals, all demand-gated/deferred-with-cause | 2026-07-16 | v0.1 |
+| `spec/decision-records/language-ergonomics-tracker.md` | closed | v2 language-surface ergonomics decisions + build-out — **CLOSED 2026-07-16**, all rows shipped: Part B reconciled 2026-07-01; B1g closed 07-02; `consume` removed + B1b–f re-verified + bindingless-guard fix + C9/row 10/18 closed 07-16; B1a lowering-move completed by the DO sans-IO refactor (DR-0033 chunk 1b) | 2026-07-16 | v0.1 |
 | `spec/decision-records/standard-package-design-tracker.md` | closed | Standard-package design campaign — all 13 rows v1 BUILT, Current Rule satisfied 2026-07-15 (171a9e0); open tails re-homed to the post-campaign tracker | 2026-07-15 | |
-| `spec/std-package-post-campaign-tracker.md` | active | Sequenced post-campaign std-package tails: Waves 0-3 buildable, demand-gated triggers, design-heavy items awaiting rulings | 2026-07-15 | v0.4+ |
-| `spec/tracker-phase-b-tracker.md` | active | std.tracker phase B — the DAG/conflict campaign (ADR-0002 phase B, hard-core-first): content-hash event DAG, per-field merge conflicts, resolution, state-tokens | 2026-07-15 | v0.4+ |
+| `spec/std-package-post-campaign-tracker.md` | active | Sequenced post-campaign std-package tails: Waves 0-3 buildable, demand-gated triggers, design-heavy items awaiting rulings | 2026-07-15 | v0.1 |
+| `spec/tracker-phase-b-tracker.md` | closed | std.tracker phase B — the DAG/conflict campaign: content-hash event DAG, per-field merge conflicts, cross-machine transport, DO parity. B1+B2 COMPLETE; closed 2026-07-16 (sole open = demand-gated external providers) | 2026-07-16 | v0.1 |
 | `spec/native-command-tool-tracker.md` | active | Native (real-OS) command `bash` tool — a preserved OPTION (not started): build as a whipplescript tool first, DR-0036-witnessed, capability-gated; the old host OS-executor seam was removed 2026-07-16 (superseded by DR-0039 Bashkit) | 2026-07-16 | later |
 | `spec/decision-records/discriminated-families-design.md` | closed | Discriminated-families — all four families (A/B/C) + selector capstone + §5.4 observer-only check SHIPPED & gated; closed 2026-07-03. Sole non-`[x]`: the Stage 1a internal pass-collapse refactor, a deferred-with-cause `[~]` (dropped Rev 2026-06-28e, no capability lost). §9 = demand-gated / v2 design questions, not open build intent. | 2026-07-03 |
 | `spec/review-change-plan.md` | closed | 2026-06-09 review pass — shipped; remaining follow-ups folded into language-ergonomics (dedup) | 2026-07-01 |
-| `spec/final-audit.md` | active | Running v0 audit log for release readiness | 2026-06-30 | v0.2 |
+| `spec/final-audit.md` | active | Running v0 audit log for release readiness | 2026-06-30 | v0.1 |
 | `spec/real-provider-validation-tracker.md` | closed | Real (live) provider validation — all v0 items shipped | 2026-06-30 |
 | `spec/workflow-revision-transition-tracker.md` | closed | Workflow-revision transition — post-audit hardening complete | 2026-06-30 |
 | `spec/decision-records/information-flow-implementation-tracker.md` | closed | IFC build tracker — reconciled + closed (6 deferrals-with-cause) | 2026-06-30 |

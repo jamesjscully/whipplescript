@@ -1,6 +1,10 @@
 # Workflow Composition Transition Tracker
 
-Status: active tracker
+Status: **closed 2026-07-16** — both keystones + all 15 Acceptance Gates shipped;
+the coerce-import decision is resolved (defer via `include`), the docs BAML→coerce
+sweep is done (0 `baml` in docs). Remaining `[~]` items are correct deferrals
+(decl-kind restrictions, invoke authorization, showcase polish) needing a policy
+decision, not v0.1 work. Re-surface on demand.
 
 This tracker covers the transition from the current single-source workflow
 implementation to the explicit composition model:
@@ -93,11 +97,11 @@ The target behavior is specified in [language.md](language.md),
 ## Phase 1: Source Bundles And Imports
 
 - [x] Define concrete grammar for `include "path.whip"` and allowed path forms.
-- [ ] Decide whether coerce imports use `include "types.coerce"`, a separate coerce
-  declaration, or generated source bundle members. **Open decision** (duplicated in
-  Open Decisions below — that is the canonical entry). `include` currently accepts
-  only `.whip`; coerce definitions live inline in `.whip` today, so no coerce-import
-  mechanism is forced yet.
+- [x] Decide whether coerce imports use `include "types.coerce"`, a separate coerce
+  declaration, or generated source bundle members. **RESOLVED (Jack): defer** — share
+  coerces via `include` of the `.whip`; no `.coerce` import built (see the canonical
+  entry in Open Decisions below). `include` accepts only `.whip`; coerce definitions
+  live inline, so no coerce-import mechanism is forced.
 - [x] Implement include resolution with cycle detection and stable ordering.
   (`SourceBundleResolver` main.rs:37432 — active-stack cycle detection, visited
   dedup, deterministic pre-order concat.)
@@ -425,16 +429,11 @@ The target behavior is specified in [language.md](language.md),
   declared failure, timeout, and cancellation. (`examples/parent-child-outcomes.whip`
   — one parent rule with `after child succeeds/fails/times out/cancelled` branches;
   in the docs-examples gate with `--root Parent`.)
-- [~] Update quickstart, language sketch, examples spec, companion skill, and
-  troubleshooting docs to use the canonical model. **Mostly done (2026-07-01 sweep,
-  Work Item 5).** The `include`/`pattern`/`invoke`/`complete`/`fail`/`workflow`
-  spellings were swept across the companion skill (`skills/whipplescript-author/SKILL.md`)
-  and both troubleshooting docs and found ALREADY canonical; the one obsolete
-  phrasing (BAML terminology) was corrected in SKILL.md. **Remaining as its own
-  work item:** a `docs/*.md` BAML→coerce sweep (stale `baml.coerce` effect-kind
-  prose in language-reference.md/api-reference.md/manual.md/providers.md/troubleshooting.md
-  — caution: confirm whether the runtime provider registration name is still
-  literally `baml` before rewriting env examples).
+- [x] Update quickstart, language sketch, examples spec, companion skill, and
+  troubleshooting docs to use the canonical model. Done: the
+  `include`/`pattern`/`invoke`/`complete`/`fail`/`workflow` spellings were swept
+  and found canonical; the BAML→coerce sweep is complete — **`grep -rin baml
+  docs/` → zero** (docs use `schema.coerce` throughout; verified 2026-07-16).
 - [~] Document the canonical explicit-workflow shape in examples and quickstart.
   **Partial:** the explicit `workflow` shape is present in quickstart; the new
   `include`/`pattern`/parent-child examples (above) document those shapes. Full

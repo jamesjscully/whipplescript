@@ -1,6 +1,11 @@
 # Expression Kernel Tracker
 
-Status: active implementation tracker
+Status: active — **GATE-COMPLETE for v0.1** (all 9 Acceptance Gates `[x]`,
+reconciled 2026-07-16). The remaining `[ ]` feature-matrix cells are
+"stage-not-reached for a deferred feature" (full-generality typed path
+resolution, expression-level exhaustiveness, precedence Maude, deep
+destructuring) — deferred polish, not v0.1 blockers. Kept active as the
+finer-grained feature matrix; no build work is required to ship.
 
 This tracker breaks the expression-kernel spec into concrete implementation
 work. The source of truth for semantics is
@@ -137,7 +142,7 @@ as complete:
 | Missing vs null distinction | [x] | [x] | [~] | [x] | [~] | [x] | Expression evaluator preserves internal Missing separately from JSON null for guards/assertions/query filters. |
 | Type-directed interpolation paths | [x] | [~] | [ ] | [~] | [ ] | [x] | Existing interpolation is path-oriented but not fully expression-kernel typed. |
 | Dynamic `AgentRef<...>` | [x] | [~] | [~] | [~] | [~] | [~] | Source/IR support typed agent domains for record values and dynamic `tell`; still needs shared expression evaluator coverage. |
-| Deterministic validation capability | [~] | [ ] | [ ] | [ ] | [ ] | [ ] | Still design-level; should handle checks that do not need coerce/model judgment. |
+| Deterministic validation capability | [x] | [x] | [x] | [x] | [x] | [x] | SHIPPED as `exec "<validator>" -> Schema as v` (parser lib.rs; golden `examples/deterministic-validation.{whip,ir}`; gated in `scripts/check-docs-examples.sh`). |
 
 ## Implementation Work Queue
 
@@ -266,9 +271,10 @@ as complete:
 - [x] Model finite-domain branch match/non-match in Maude.
 - [x] Model exhaustive finite-domain miss diagnostics in Maude.
 - [x] Model optional Some/None branch readiness and present binding in Maude.
-- [ ] Defer deep object destructuring, array destructuring, user-defined
+- [~] Defer deep object destructuring, array destructuring, user-defined
   extractors, and provider-text pattern matching until a concrete workflow
-  requires them.
+  requires them. (Deferred-with-cause: no shipping workflow needs them; not a
+  v0.1 item.)
 
 Tagged terminal-output union branch matching implementation checklist:
 

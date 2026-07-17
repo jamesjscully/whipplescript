@@ -1,9 +1,10 @@
 # std.tracker phase B — the DAG / conflict campaign
 
-Status: **B1 + B2 COMPLETE 2026-07-15/16** (B1 eac8baf→6463fe3; B2 richer
-model, DO parity, cross-machine transport, genuine duplicate detection). The
-sole open item is external-provider adapters, which are demand-gated (build
-against a concrete integration target, not speculatively). Scope is ADR-0002's
+Status: **closed 2026-07-16 — B1 + B2 COMPLETE 2026-07-15/16** (B1
+eac8baf→6463fe3; B2 richer model, DO parity, cross-machine transport, genuine
+duplicate detection). The sole open item is external-provider adapters, which are
+demand-gated (build against a concrete integration target, not speculatively) —
+re-surface on demand. Scope is ADR-0002's
 deferred phase B
 (spec/decision-records/0002-work-tracker-package.md "Phase B1"), taken on
 hard-core-first per Jack: the merge-friendly / distributed tracker that

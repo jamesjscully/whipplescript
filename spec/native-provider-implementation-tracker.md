@@ -1,7 +1,10 @@
 # Native Provider Implementation Tracker
 
-Status: active execution tracker for usable Codex and Claude provider
-support.
+Status: **closed 2026-07-16** — all NP-000…NP-100 milestones shipped; native
+Codex + Claude are complete and deterministic-adapter-tested. The remaining
+`[~]` are correct deferrals (arbitrary provider-generated attachments beyond the
+fixed file/diff fixtures) and the owner-gated live strict-external validation
+(G-008), which runs at cut with both providers logged in — not code work.
 
 Date: May 31, 2026.
 
