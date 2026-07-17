@@ -23638,7 +23638,7 @@ fn run_script_capability_exec(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let _ = fs::remove_file(&verified_path);
+            let _ = fs::remove_dir_all(verified_path.parent().unwrap_or(&verified_path));
             return Err((None, format!("exec command failed to start: {error}")));
         }
     };
@@ -23649,7 +23649,7 @@ fn run_script_capability_exec(
             // the child's own output and exit code decide the outcome.
             if error.kind() != io::ErrorKind::BrokenPipe {
                 let _ = child.kill();
-                let _ = fs::remove_file(&verified_path);
+                let _ = fs::remove_dir_all(verified_path.parent().unwrap_or(&verified_path));
                 return Err((None, format!("exec command failed to write stdin: {error}")));
             }
         }
@@ -23657,11 +23657,11 @@ fn run_script_capability_exec(
     let output = match child.wait_with_output() {
         Ok(output) => output,
         Err(error) => {
-            let _ = fs::remove_file(&verified_path);
+            let _ = fs::remove_dir_all(verified_path.parent().unwrap_or(&verified_path));
             return Err((None, format!("exec command failed: {error}")));
         }
     };
-    let _ = fs::remove_file(&verified_path);
+    let _ = fs::remove_dir_all(verified_path.parent().unwrap_or(&verified_path));
     exec_output_to_outcome(output, parse_contract)
 }
 
@@ -23709,14 +23709,47 @@ fn write_verified_script_copy(
         .and_then(|extension| extension.to_str())
         .map(|extension| format!(".{extension}"))
         .unwrap_or_default();
-    let path = env::temp_dir().join(format!(
-        "whipplescript-script-{sanitized}-{sha256}{extension}"
-    ));
+    // Stage the verified bytes inside a FRESH PRIVATE directory (0700, owned by
+    // us, created atomically so a pre-existing path/symlink is rejected) rather
+    // than a predictable shared-temp file. A predictable path let a local
+    // co-tenant pre-create it as a symlink (`fs::write` then clobbers a victim
+    // file) or swap the content between write and exec — defeating the content
+    // pin. Inside a 0700 dir we own, neither is possible.
+    let dir = private_staging_dir("whipplescript-script")?;
+    let path = dir.join(format!("{sanitized}-{sha256}{extension}"));
     fs::write(&path, bytes)?;
     if let Ok(metadata) = fs::metadata(original_path) {
         let _ = fs::set_permissions(&path, metadata.permissions());
     }
     Ok(path)
+}
+
+/// Create a fresh, private (0700) staging directory in the temp dir. The name
+/// is unpredictable enough to avoid collisions, and the directory is created
+/// with `mkdir` semantics that FAIL if the path already exists — so an attacker
+/// cannot pre-seed it as a symlink, and once created only we (its owner) can
+/// write inside it.
+fn private_staging_dir(prefix: &str) -> io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = env::temp_dir().join(format!("{prefix}-{}-{nanos}-{n}", std::process::id()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // `create` (non-recursive) fails with EEXIST if the path exists.
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(&dir)?;
+    }
+    Ok(dir)
 }
 
 /// Resolve a script capability's declared `env:` references against the host
