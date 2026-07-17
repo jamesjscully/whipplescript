@@ -7824,6 +7824,35 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
     ) -> StoreResult<whipplescript_store::items::ImportReport> {
         let mut report = whipplescript_store::items::ImportReport::default();
         for event in events {
+            // Re-verify the content-addressed id before admitting an event from
+            // an untrusted transport (kept in lockstep with the native store):
+            // reject a tampered event whose id != SHA-256 of its own content, or
+            // a created event whose id != its issue identity.
+            let expected_id = if event.kind == "issue.created" {
+                whipplescript_store::items::event_content_id(
+                    &event.kind,
+                    None,
+                    &event.payload_json,
+                    event.actor.as_deref(),
+                    &[],
+                    &event.created_at,
+                )
+            } else {
+                whipplescript_store::items::event_content_id(
+                    &event.kind,
+                    event.issue_id.as_deref(),
+                    &event.payload_json,
+                    event.actor.as_deref(),
+                    &event.parents,
+                    &event.created_at,
+                )
+            };
+            let created_identity_ok = event.kind != "issue.created"
+                || event.issue_id.as_deref() == Some(event.event_id.as_str());
+            if expected_id != event.event_id || !created_identity_ok {
+                report.rejected += 1;
+                continue;
+            }
             let parents_json =
                 serde_json::to_string(&event.parents).map_err(|e| sql_err(e.to_string()))?;
             let changes = self

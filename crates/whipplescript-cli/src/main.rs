@@ -30418,11 +30418,18 @@ fn issue(options: &CliOptions) -> ExitCode {
                             "warning: {alias} duplicates an existing issue (same queue + title)"
                         );
                     }
+                    if report.rejected > 0 {
+                        eprintln!(
+                            "warning: rejected {} event(s) whose content hash did not verify (tampered or corrupt)",
+                            report.rejected
+                        );
+                    }
                     if options.json {
                         emit_json(json!({
                             "pushed": written,
                             "imported": report.imported,
                             "new_issues": report.new_issues,
+                            "rejected": report.rejected,
                             "duplicate_submissions": report.duplicate_submissions,
                         }))
                     } else {
@@ -30497,17 +30504,24 @@ fn emit_import_report(
     for alias in &report.duplicate_submissions {
         eprintln!("warning: {alias} duplicates an existing issue (same queue + title)");
     }
+    if report.rejected > 0 {
+        eprintln!(
+            "warning: rejected {} event(s) whose content hash did not verify (tampered or corrupt)",
+            report.rejected
+        );
+    }
     if json_out {
         emit_json(json!({
             "imported": report.imported,
             "skipped": report.skipped,
             "new_issues": report.new_issues,
+            "rejected": report.rejected,
             "duplicate_submissions": report.duplicate_submissions,
         }))
     } else {
         println!(
-            "imported {} event(s), {} new issue(s), {} already present",
-            report.imported, report.new_issues, report.skipped
+            "imported {} event(s), {} new issue(s), {} already present, {} rejected",
+            report.imported, report.new_issues, report.skipped, report.rejected
         );
         ExitCode::SUCCESS
     }

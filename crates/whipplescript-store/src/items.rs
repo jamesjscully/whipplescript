@@ -188,6 +188,12 @@ pub struct ImportReport {
     pub skipped: usize,
     pub new_issues: usize,
     pub duplicate_submissions: Vec<String>,
+    /// Events refused because their `event_id` did not equal the SHA-256 of
+    /// their own content (tamper / corruption), or a created event whose id did
+    /// not match its issue identity. The content-addressed integrity check that
+    /// makes tamper-evidence and suppression-resistance real on the (untrusted)
+    /// shared-folder transport.
+    pub rejected: usize,
 }
 
 #[cfg(feature = "native")]
@@ -980,6 +986,39 @@ impl WorkItemStore {
                 .connection
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             for event in events {
+                // Re-verify the content-addressed id before admitting an event
+                // from an untrusted transport (shared folder / rsync / synced
+                // drive). Without this, a tampered `<hash>.json` whose payload
+                // does not match its `event_id` would be folded verbatim, and an
+                // event carrying an honest event's id but different content would
+                // SUPPRESS the honest one via `INSERT OR IGNORE`. A created
+                // event is hashed with no issue_id and no parents, and its id IS
+                // the issue identity.
+                let expected_id = if event.kind == "issue.created" {
+                    event_content_id(
+                        &event.kind,
+                        None,
+                        &event.payload_json,
+                        event.actor.as_deref(),
+                        &[],
+                        &event.created_at,
+                    )
+                } else {
+                    event_content_id(
+                        &event.kind,
+                        event.issue_id.as_deref(),
+                        &event.payload_json,
+                        event.actor.as_deref(),
+                        &event.parents,
+                        &event.created_at,
+                    )
+                };
+                let created_identity_ok = event.kind != "issue.created"
+                    || event.issue_id.as_deref() == Some(event.event_id.as_str());
+                if expected_id != event.event_id || !created_identity_ok {
+                    report.rejected += 1;
+                    continue;
+                }
                 let parents_json = serde_json::to_string(&event.parents)?;
                 let changes = tx.execute(
                     "INSERT OR IGNORE INTO tracker_events \
@@ -2702,6 +2741,48 @@ mod tests {
     /// issue (same queue + title) — mints two distinct content ids. Merging them
     /// surfaces the second as a duplicate_submission warning (advisory; a human
     /// reconciles via a `duplicates` relation), never a silent collapse.
+    /// A tampered event (payload mutated but the id kept, or an id that collides
+    /// with an honest event) is REJECTED on import, not folded — the content-
+    /// addressed integrity the shared-folder transport claims. Also proves an
+    /// id-collision cannot SUPPRESS the honest event.
+    #[test]
+    fn import_rejects_events_whose_id_does_not_match_their_content() {
+        let mut a = open_memory();
+        let it = a
+            .file_item("q", "Original", "", &[], &json!({}), Some("ann"))
+            .expect("files");
+        a.set_field(&it.id, "title", "Legit").expect("set");
+        let events = a.export_events().unwrap();
+
+        // Tamper: keep a field_set event's id + parents, mutate its payload to a
+        // hostile value (a forger rewriting the title under a valid-looking id).
+        let mut tampered = events.clone();
+        let victim = tampered
+            .iter_mut()
+            .find(|e| e.kind == "issue.field_set")
+            .expect("a field_set event");
+        victim.payload_json = victim.payload_json.replace("Legit", "Hijacked");
+
+        let mut b = open_memory();
+        let report = b.import_events(&tampered).unwrap();
+        assert!(report.rejected >= 1, "the tampered event must be rejected");
+        // The honest events still import; the hijacked value never lands.
+        let alias = b.list_items(Some("q"), None).unwrap()[0].id.clone();
+        assert_eq!(b.get_item(&alias).unwrap().unwrap().title, "Original");
+
+        // A created event whose id does not equal its issue identity is rejected.
+        let mut forged = a.export_events().unwrap();
+        let created = forged
+            .iter_mut()
+            .find(|e| e.kind == "issue.created")
+            .expect("created");
+        created.issue_id = Some("WS-forged-identity".to_owned());
+        let mut c = open_memory();
+        let report = c.import_events(std::slice::from_ref(created)).unwrap();
+        assert_eq!(report.rejected, 1);
+        assert_eq!(report.imported, 0);
+    }
+
     #[test]
     fn independent_same_issue_submissions_warn_as_duplicates() {
         let mut a = open_memory();
