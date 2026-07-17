@@ -205,23 +205,46 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
     /// DO shell sets its single wake-up alarm from this when the instance
     /// parks; `None` means nothing is scheduled.
     pub fn next_effect_due_epoch_ms(&self, instance_id: &str) -> StoreResult<Option<i64>> {
+        // A due instant is only honest for an effect `advance_time` will actually
+        // fire. A `timer.wait` whose upstream dependency is unsatisfied is NOT
+        // fired by `due_time_effects` (its dep guard), so it must not be reported
+        // here either — otherwise the shell schedules an alarm for a creation-
+        // anchored deadline already in the past, Cloudflare runs it immediately,
+        // the re-drive re-parks with the same past due, and the alarm busy-loops
+        // (billed, zero progress) until the dependency resolves. This is the same
+        // guard `due_time_effects` applies (do_store.rs:6613); keep them in step.
+        let dependency_guard = "( e.kind != 'timer.wait' OR NOT EXISTS ( \
+             SELECT 1 FROM effect_dependencies AS dependency \
+             JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
+              AND upstream.instance_id = dependency.instance_id \
+             WHERE dependency.instance_id = e.instance_id \
+               AND dependency.downstream_effect_id = e.effect_id AND NOT ( \
+                 (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
+                 OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out')) \
+                 OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
+                 OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
+                 OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
+               ) \
+           ) )";
+        let query = format!(
+            "SELECT MIN(due_epoch) FROM ( \
+               SELECT (CAST(strftime('%s', e.created_at) AS INTEGER) + e.timeout_seconds) \
+                 AS due_epoch FROM effects AS e \
+                WHERE e.instance_id = ?1 AND e.timeout_seconds IS NOT NULL \
+                  AND e.status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
+                  AND {dependency_guard} \
+               UNION ALL \
+               SELECT CAST(strftime('%s', json_extract(e.input_json, '$.deadline_at')) \
+                 AS INTEGER) FROM effects AS e \
+                WHERE e.instance_id = ?1 \
+                  AND json_extract(e.input_json, '$.deadline_at') IS NOT NULL \
+                  AND e.status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
+                  AND {dependency_guard} \
+             )"
+        );
         let rows = self
             .sql
-            .query(
-                "SELECT MIN(due_epoch) FROM ( \
-                   SELECT (CAST(strftime('%s', created_at) AS INTEGER) + timeout_seconds) \
-                     AS due_epoch FROM effects \
-                    WHERE instance_id = ?1 AND timeout_seconds IS NOT NULL \
-                      AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
-                   UNION ALL \
-                   SELECT CAST(strftime('%s', json_extract(input_json, '$.deadline_at')) \
-                     AS INTEGER) FROM effects \
-                    WHERE instance_id = ?1 \
-                      AND json_extract(input_json, '$.deadline_at') IS NOT NULL \
-                      AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
-                 )",
-                &[text(instance_id)],
-            )
+            .query(&query, &[text(instance_id)])
             .map_err(sql_err)?;
         Ok(rows
             .first()
@@ -10237,6 +10260,66 @@ mod tests {
             )
             .expect("read");
         assert_eq!(as_text(&down_status[0][0]), "queued");
+    }
+
+    /// The DO alarm scheduler (`next_effect_due_epoch_ms`) must report a due
+    /// instant ONLY for a timer.wait `advance_time` can actually fire — i.e.
+    /// not one still blocked on an unsatisfied upstream dependency. Otherwise
+    /// the shell schedules an alarm for a creation-anchored deadline already in
+    /// the past, Cloudflare runs it instantly, and the re-drive/re-park cycle
+    /// busy-loops. This mirrors the `due_time_effects` dep guard.
+    #[test]
+    fn next_due_omits_a_dependency_blocked_timer() {
+        let store = store();
+        let e = |sql: &str, params: &[SqlValue]| store.sql.execute(sql, params).expect(sql);
+        // An upstream human.ask with no answer yet (still queued).
+        e(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[text("ask"), text("i1"), text("human.ask"), text("queued"), text("{}")],
+        );
+        // A timer.wait created at t0 with a 30s timeout, blocked on the ask.
+        e(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json, \
+             timeout_seconds, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                text("wait"),
+                text("i1"),
+                text("timer.wait"),
+                text("blocked_by_dependency"),
+                text("{}"),
+                int(30),
+                text("2026-01-01T00:00:00Z"),
+            ],
+        );
+        e(
+            "INSERT INTO effect_dependencies (instance_id, downstream_effect_id, \
+             upstream_effect_id, predicate) VALUES (?1, ?2, ?3, ?4)",
+            &[text("i1"), text("wait"), text("ask"), text("succeeds")],
+        );
+        // While the ask is unsatisfied the blocked timer contributes no due
+        // instant — no alarm to busy-loop on.
+        assert_eq!(
+            store.next_effect_due_epoch_ms("i1").expect("next due"),
+            None,
+            "a dependency-blocked timer.wait must not be reported as due"
+        );
+        // Once the upstream succeeds the timer is fireable, so its creation-
+        // anchored deadline (t0 + 30s) is reported.
+        store
+            .sql
+            .execute(
+                "UPDATE effects SET status = 'completed' WHERE effect_id = ?1",
+                &[text("ask")],
+            )
+            .expect("complete ask");
+        // 2026-01-01T00:00:00Z = 1767225600s; + 30s timeout, in milliseconds.
+        let expected = (1_767_225_600_i64 + 30) * 1000;
+        assert_eq!(
+            store.next_effect_due_epoch_ms("i1").expect("next due"),
+            Some(expected),
+            "an unblocked timer.wait reports its deadline"
+        );
     }
 
     /// The event-plus-update lifecycle methods (transition_instance,

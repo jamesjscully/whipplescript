@@ -1648,8 +1648,17 @@ export class WorkflowInstance implements DurableObject {
       }
       if (outcome.kind === "parked" && outcome.next_due_unix_ms != null) {
         // The instance holds pending timers/deadlines: schedule the DO's
-        // single alarm at the earliest one (the Alarms seam, live).
-        await this.ctx.storage.setAlarm(outcome.next_due_unix_ms);
+        // single alarm at the earliest one (the Alarms seam, live). Clamp to
+        // strictly-future so a due already in the past cannot make Cloudflare
+        // run the alarm instantly and re-drive in a tight loop — defense in
+        // depth atop the kernel dep guard that keeps reported dues fireable.
+        const at = Math.max(outcome.next_due_unix_ms, Date.now() + 1);
+        await this.ctx.storage.setAlarm(at);
+      } else {
+        // Parked with nothing due, or terminal: clear any alarm a prior park
+        // scheduled, so a settled or now-unblocked instance is not woken into
+        // a pointless re-drive (deleteAlarm is a no-op when none is set).
+        await this.ctx.storage.deleteAlarm();
       }
       return { status: instance.status(), outcome: outcome.kind };
     }
