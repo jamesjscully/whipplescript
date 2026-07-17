@@ -1699,22 +1699,35 @@ pub fn analyze_issue_dag(events: &[IssueEvent]) -> IssueConflicts {
         false
     };
 
-    // Group the field-setting events by field.
+    // Group the field-setting events by field. The lifecycle events
+    // (`issue.closed`/`issue.canceled`/`issue.reopened`) are ALSO status
+    // setters — including them means a `finish` (close) concurrent with a
+    // `set status open` on another clone is detected as a conflict, instead of
+    // silently folding to an order-dependent status and being handed to a worker.
     let mut setters: BTreeMap<String, Vec<(&str, String)>> = BTreeMap::new();
     for e in events {
-        if e.kind != "issue.field_set" || e.event_id.is_empty() {
+        if e.event_id.is_empty() {
             continue;
         }
-        let (Some(field), Some(value)) = (
-            e.payload.get("field").and_then(Value::as_str),
-            e.payload.get("value").and_then(Value::as_str),
-        ) else {
-            continue;
+        let (field, value) = match e.kind.as_str() {
+            "issue.field_set" => {
+                let (Some(field), Some(value)) = (
+                    e.payload.get("field").and_then(Value::as_str),
+                    e.payload.get("value").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                (field.to_owned(), value.to_owned())
+            }
+            "issue.closed" => ("status".to_owned(), "closed".to_owned()),
+            "issue.canceled" => ("status".to_owned(), "canceled".to_owned()),
+            "issue.reopened" => ("status".to_owned(), "open".to_owned()),
+            _ => continue,
         };
         setters
-            .entry(field.to_owned())
+            .entry(field)
             .or_default()
-            .push((e.event_id.as_str(), value.to_owned()));
+            .push((e.event_id.as_str(), value));
     }
 
     let mut field_conflicts = Vec::new();
@@ -2597,6 +2610,36 @@ mod tests {
         assert!(
             b.ready_items("q").unwrap().is_empty(),
             "a conflicted issue is not handed to a worker"
+        );
+    }
+
+    /// A lifecycle close on one clone concurrent with a `status` set on another
+    /// is a real status conflict — `issue.closed` is a status setter, so the
+    /// fork is flagged (and kept off the ready queue) rather than folding to an
+    /// order-dependent status.
+    #[test]
+    fn close_vs_concurrent_status_set_is_a_conflict() {
+        let mut a = open_memory();
+        let mut b = open_memory();
+        let issue = a
+            .file_item("q", "Shared", "", &[], &json!({}), None)
+            .expect("files");
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        let b_alias = "WS-1";
+
+        // A finishes (issue.closed → status "closed"); B sets status "open" —
+        // both chaining off the shared created event.
+        a.finish_item(&issue.id, Some("done")).expect("finish");
+        b.set_field(b_alias, "status", "open").expect("set");
+
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        let conflicts = b.issue_conflicts(b_alias).unwrap().unwrap();
+        assert!(conflicts.conflicted(), "close vs status-open must conflict");
+        assert_eq!(conflicts.field_conflicts[0].field, "status");
+        assert_eq!(conflicts.field_conflicts[0].values, vec!["closed", "open"]);
+        assert!(
+            b.ready_items("q").unwrap().is_empty(),
+            "a status-conflicted issue is not handed to a worker"
         );
     }
 
