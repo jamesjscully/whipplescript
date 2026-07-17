@@ -3490,6 +3490,40 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 *spent += cost;
                 Ok(())
             };
+            // The candidate/baseline programs' OWN provider effects (agent turns,
+            // coerce/decide) executed by drive_to_idle are the dominant campaign
+            // cost — and, unlike judge turns, count toward the spend cap only if
+            // folded here. `std.spend` already prices them per observation (the
+            // same reading run_settle folds into its own cap); mirror that so the
+            // `--spend-cap` guardrail actually bounds the whole run, not just the
+            // judge + proposer turns.
+            let workflow_spend = |store: &mut ImproveStore,
+                                  observations: &[RunObservation],
+                                  what: &str,
+                                  spent: &mut i64|
+             -> Result<(), String> {
+                let cost: i64 = observations
+                    .iter()
+                    .filter_map(|observation| observation.readings.get("std.spend"))
+                    .map(|reading| (reading.score * 1_000_000.0).round() as i64)
+                    .sum();
+                if cost == 0 {
+                    return Ok(());
+                }
+                store
+                    .append_campaign_event(
+                        &campaign_id,
+                        "campaign.spend",
+                        &json!({
+                            "cost_micros": cost,
+                            "priced": true,
+                            "what": what,
+                        }),
+                    )
+                    .map_err(|error| format!("failed to record workflow spend: {error:?}"))?;
+                *spent += cost;
+                Ok(())
+            };
             let mut spent_micros: i64 = 0;
             let baseline_open = evaluate_all(&program_path, &ir, &open, &mut seq)?;
             let baseline_sealed = evaluate_all(&program_path, &ir, &sealed, &mut seq)?;
@@ -3503,6 +3537,18 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 store,
                 &baseline_sealed,
                 "judge turns (baseline, sealed)",
+                &mut spent_micros,
+            )?;
+            workflow_spend(
+                store,
+                &baseline_open,
+                "workflow turns (baseline)",
+                &mut spent_micros,
+            )?;
+            workflow_spend(
+                store,
+                &baseline_sealed,
+                "workflow turns (baseline, sealed)",
                 &mut spent_micros,
             )?;
             let mut baseline_tags = campaign_tags.clone();
@@ -3717,6 +3763,12 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                     &format!("judge turns ({candidate_id})"),
                     &mut spent_micros,
                 )?;
+                workflow_spend(
+                    store,
+                    &candidate_open,
+                    &format!("workflow turns ({candidate_id})"),
+                    &mut spent_micros,
+                )?;
                 let candidate_hash = program_hash(&proposal.source);
                 record_observations(
                     store,
@@ -3776,6 +3828,12 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                         store,
                         &candidate_sealed,
                         &format!("judge turns ({candidate_id}, sealed)"),
+                        &mut spent_micros,
+                    )?;
+                    workflow_spend(
+                        store,
+                        &candidate_sealed,
+                        &format!("workflow turns ({candidate_id}, sealed)"),
                         &mut spent_micros,
                     )?;
                     record_observations(

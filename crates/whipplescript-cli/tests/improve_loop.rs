@@ -1575,6 +1575,158 @@ fn judge_turns_are_priced_spend_and_bind_the_settle_cap() {
     );
 }
 
+/// The improve `--spend-cap` must bound the candidate/baseline programs' OWN
+/// provider spend (their body `coerce`/agent effects), not only judge +
+/// proposer turns. Regression for the guardrail silently failing to bind when
+/// the dominant cost is the workflow itself (a free exec gauge + a zero-usage
+/// fixture proposer leave workflow spend the ONLY thing that can cross the cap).
+#[test]
+fn improve_spend_cap_binds_on_the_workflows_own_coerce_spend() {
+    let env = Env::new("workflow-spend-cap");
+    write_judges(&env.dir);
+    let priority_judge = env.dir.join("judge_priority.py");
+    // A program whose RULE BODY runs a coerce (priced provider spend), scored
+    // by a FREE exec gauge — so nothing but the body coerce can bind the cap.
+    let program_src = format!(
+        r#"workflow Triage
+
+input ticket Ticket
+
+class Ticket {{
+  id string
+  title string
+}}
+
+class Verdict {{
+  ok bool
+}}
+
+class Assessment {{
+  ticket string
+  priority string
+}}
+
+coerce Classify(title string) -> Verdict {{
+  prompt """markdown
+  Is "{{{{ title }}}}" ok?
+
+  {{{{ ctx.output_format }}}}
+  """
+}}
+
+gauge priority_correct {{
+  judge via exec "python3 {priority_judge}"
+  expect P(ok) at least 0.5
+}}
+
+rule triage
+  when Ticket as ticket
+=> {{
+  coerce Classify(ticket.title) as verdict
+  after verdict succeeds as v {{
+    record Assessment {{
+      ticket ticket.id
+      priority "low"
+    }}
+  }}
+}}
+"#,
+        priority_judge = priority_judge.display(),
+    );
+    let program_path = env.dir.join("triage.whip");
+    fs::write(&program_path, &program_src).expect("write program");
+    let program_str = program_path.to_string_lossy().into_owned();
+
+    // $1 per token: the mock coerce returns 3 in + 2 out = $5 per body call.
+    // The coerce RUN records the worker's agent provider (`fixture`) and leaves
+    // the model unrecorded, so std.spend prices it under (fixture, "").
+    let prices_path = env.dir.join("providers.json");
+    fs::write(
+        &prices_path,
+        r#"{"providers": [], "prices": [
+            {"provider": "fixture", "model": "",
+             "input_per_mtok_usd": 1000000.0, "output_per_mtok_usd": 1000000.0}
+        ]}"#,
+    )
+    .expect("write prices");
+    let prices_str = prices_path.to_string_lossy().into_owned();
+
+    let (base_url, _bodies) = mock_coerce_endpoint(r#"{"ok": true}"#);
+    let coerce_env: [(&str, &str); 4] = [
+        ("WHIPPLESCRIPT_COERCE_PROVIDER", "openai-generic"),
+        ("OPENAI_API_KEY", "test-key"),
+        ("WHIPPLESCRIPT_COERCE_BASE_URL", &base_url),
+        ("WHIPPLESCRIPT_COERCE_MODEL", "test-model"),
+    ];
+
+    // Pin a scenario (the body coerce runs via the mock endpoint here too).
+    let dev = env.run_json(
+        &[
+            "--store",
+            &env.store,
+            "--input",
+            r#"{"ticket":{"id":"T-1","title":"Fix login"}}"#,
+            "--json",
+            "dev",
+            &program_str,
+            "--provider",
+            "fixture",
+        ],
+        &coerce_env,
+    );
+    let instance = dev["instance_id"].as_str().expect("instance id").to_owned();
+    env.run_json(
+        &[
+            "--store", &env.store, "--json", "pin", &instance, "--as", "case-1",
+        ],
+        &[],
+    );
+
+    // A fixture proposer with NO usage env => zero proposer spend. The exec
+    // gauge is free => zero judge spend. Only the baseline body coerce ($5)
+    // accrues, and it must cross the $4 cap and park BEFORE any proposal.
+    let report = env.run_json(
+        &[
+            "--json",
+            "improve",
+            "priority_correct",
+            "--program",
+            &program_str,
+            "--proposer",
+            "fixture",
+            "--spend-cap",
+            "$4",
+            "--provider-config",
+            &prices_str,
+        ],
+        &coerce_env,
+    );
+    assert_eq!(
+        report["parked"].as_bool(),
+        Some(true),
+        "the workflow's own coerce spend must bind the cap: {report}"
+    );
+    assert_eq!(
+        report["proposed"].as_bool(),
+        Some(false),
+        "parked before proposing anything: {report}"
+    );
+    // The campaign record shows the recorded workflow spend crossed the $4 cap.
+    let campaign_id = report["campaign"].as_str().expect("campaign id").to_owned();
+    let campaigns = env.run_json(&["--json", "campaigns"], &[]);
+    let row = campaigns["campaigns"]
+        .as_array()
+        .expect("campaigns")
+        .iter()
+        .find(|row| row["campaign"].as_str() == Some(campaign_id.as_str()))
+        .expect("campaign row");
+    assert_eq!(row["status"].as_str(), Some("parked"), "{campaigns}");
+    assert!(
+        row["spent_micros"].as_i64().unwrap_or(0) >= 4_000_000,
+        "workflow coerce spend recorded against the cap: {campaigns}"
+    );
+}
+
 #[test]
 fn parallel_evaluation_pairs_scenarios_and_records_judge_spend() {
     let env = Env::new("parallel-eval");
