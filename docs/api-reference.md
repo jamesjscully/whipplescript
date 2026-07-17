@@ -32,9 +32,9 @@ pause, resume, cancel, checkpoint, restore, fork, retry, recover, auth, deploy,
 executor, doctor
 ```
 
-`branch` also dispatches, but it backs the unreleased v0.4 versioned workspace and
-is documented below as experimental. The top-level `whip --help` banner lists a
-subset of these commands; the dispatch above is authoritative.
+`branch` and `stream` also dispatch, backing the versioned workspace (whip-native
+VCS); both are documented below as experimental. The top-level `whip --help`
+banner groups all commands; the dispatch above is authoritative.
 
 Run `whip <command> --help` or `whip help <command>` to print the usage line
 for any command.
@@ -1385,6 +1385,39 @@ has no path to signing governance; a `sign` is refused. Renamed one-way from
 `whip agent` (no alias; spec/std-agent.md "Operator CLI") — the old spelling
 errors with a pointer here.
 
+### `coercion status`
+
+```sh
+whip [--json] coercion status
+```
+
+Shows the resolved `schema.coerce` provider configuration: provider, backend,
+model, credential source, the selecting rung, and the fingerprint. The go-to
+command for debugging why a `coerce`/`decide`/`prompt` resolves to the fixture
+provider versus a real model.
+
+### `memory`
+
+```sh
+whip memory pools                       # list the workspace memory pools
+whip memory entries <pool> [--limit <n>]  # show a pool's entries
+```
+
+Read-only views of the workspace memory store (the `std.memory` `learn`/`recall`
+backing). `WHIPPLESCRIPT_MEMORY_STORE` overrides the store path.
+
+### `script`
+
+```sh
+whip script list [--script-manifest <path>]     # the pinned script capabilities
+whip script verify [--script-manifest <path>]   # re-hash each pin; exit 1 on mismatch
+```
+
+Read-only views over the pinned script-capability manifest (`std.script` / the
+hosted `exec <name> with ...` surface). `verify` re-hashes each pinned script and
+exits non-zero on any content mismatch — a security check that the on-disk
+scripts still match their manifest sha256 pins.
+
 ### `verify-report`
 
 ```sh
@@ -1407,6 +1440,21 @@ whip [--json] branch <create|list|show|write|read|ls|remove|merge|discard|bind> 
 `branch` (and its companion `stream`) back the versioned workspace (whip-native
 VCS). The surface is present and functional but should be treated as
 experimental and subject to change.
+
+### `stream` (experimental, unreleased)
+
+```sh
+whip [--json] stream <create|join|leave|archive|promote|list|show> ...
+whip stream create <stream> [--name <label>]   # group review branches into a stream
+whip stream join <stream> <branch>             # add a branch to the stream
+whip stream leave <branch>                      # remove a branch from its stream
+whip stream promote <stream>                    # promote the stream's work
+whip stream archive <stream>                    # archive a finished stream
+whip stream list | whip stream show <stream>    # inspect
+```
+
+Streams group versioned-workspace `branch`es for review. Same experimental
+status as `branch`.
 
 ## Language reference index
 
