@@ -84,22 +84,19 @@ Current scope is **experimental**:
   tool surface for known harness capabilities (`repo.read`, `repo.write`,
   `command.run`, `tracker.*`, and `workflow.invoke`); the scheduler already
   requires those values to be declared by the target agent. `bash` is offered
-  only with `with access to command { run }`, and a command runs only if ALL of:
-  the profile and required-capability set permit `command.run`; it matches an
-  allow-list prefix in `WHIPPLESCRIPT_HARNESS_BASH_ALLOW` (e.g. `git,cargo,ls`
-  — with no allow-list, every `bash` command is refused); it is a single simple
-  command — shell control operators, pipes, command substitution, backticks,
-  and variable/glob/brace/tilde expansion are refused before execution; its
-  literal redirection targets pass the same turn globs as file tools (`<` uses
-  read globs, `>`/`>>` use write globs; dynamic redirection targets are
-  refused); and its path-shaped arguments stay inside the workspace (absolute,
-  `~`, and `..` paths are rejected). When an IFC governance envelope is active,
-  the `command` resource must also be governed. Commands run with the workspace
-  as cwd and are killed past a timeout. Command-specific side-effect
-  classification (per-tool argv operand policies) is deliberately **not** part
-  of this surface: the simple-command policy plus the operator allow-list is
-  the whole enforcement boundary, and anything subtler is the operator's
-  allow-list judgment.
+  only with `with access to command { run }`, and runs only when the
+  profile/required-capability set permits `command.run` AND the turn carries
+  that grant. It then executes in the **in-isolate Bashkit virtual shell**
+  (DR-0039) over the governed workspace file surface — **not** a real OS shell:
+  no `fork`/`exec`, no ambient filesystem, no ambient network. Ordinary shell
+  features (pipes, substitution, redirection to workspace files, a fixed set of
+  builtins) work, but they cannot reach outside the workspace. Every file the
+  command reads, writes, or deletes crosses the **same labeled-store policy
+  boundary as the file tools** (read/write globs of the granted stores), and a
+  path outside the workspace simply does not exist to it. When an IFC governance
+  envelope is active, the `command` resource must also be governed. Because the
+  interpreter has no OS reach, there is no command allow-list to configure — the
+  sandbox plus the workspace policy IS the enforcement boundary.
 - Tracker tools (`list_todos`/`add_todo`/`update_todo`), offered only when
   `WHIPPLESCRIPT_HARNESS_TRACKER=<tracker>` is set: the agent participates in the
   durable work tracker (files/updates items the workflow's rules observe).

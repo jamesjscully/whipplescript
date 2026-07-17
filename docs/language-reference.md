@@ -962,21 +962,19 @@ intersects the tool surface with those known harness capabilities; the store
 blocks the turn before provider launch if the target agent did not declare them.
 When an IFC governance envelope is active, every
 file-store resource named by a turn grant must also be governed by that envelope
-before the owned turn is admitted. Bash is offered and executed only when ALL of
-the following hold: the profile/registry/required-capability set permits
-`command.run`; the turn carries `with access to command { run }`; the command
-matches the operator allow-list (`WHIPPLESCRIPT_HARNESS_BASH_ALLOW` — with no
-allow-list, every command is refused); the command is a single simple command
-(shell control operators, pipes, command substitution, backticks, and
-variable/glob/brace/tilde expansion are refused before execution); literal
-shell file redirection targets pass the same turn globs as file tools (`<` uses
-read globs, `>`/`>>` use write globs; dynamic redirection targets are refused);
-path-shaped arguments stay inside the workspace (absolute, `~`, and `..` paths
-are rejected); and, when an IFC governance envelope is active, the `command`
-resource is governed by that envelope. Command-specific side-effect
-classification (per-tool argv operand policies) is deliberately not part of
-this surface — the simple-command policy plus the operator allow-list is the
-whole enforcement boundary.
+before the owned turn is admitted. Bash is offered and executed only when the
+profile/registry/required-capability set permits `command.run` AND the turn
+carries `with access to command { run }`. It then runs in the **in-isolate
+Bashkit virtual shell** (DR-0039) over the governed workspace file surface —
+not a real OS shell: no `fork`/`exec`, no ambient filesystem, and no ambient
+network. Ordinary shell features (pipes, command substitution, redirection to
+workspace files, a fixed builtin set) work, but cannot reach outside the
+workspace: every file the command reads/writes/deletes crosses the **same
+labeled-store policy boundary as the file tools** (the granted stores' read/
+write globs), and paths outside the workspace do not exist to it. When an IFC
+governance envelope is active, the `command` resource must be governed by that
+envelope. Because the interpreter has no OS reach, there is no command
+allow-list — the sandbox plus the workspace policy is the enforcement boundary.
 Tracker `list_todos` is read-only;
 `add_todo` requires
 `with access to tracker { file }`, and `update_todo` requires the matching

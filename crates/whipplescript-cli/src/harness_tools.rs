@@ -1091,7 +1091,12 @@ impl FileToolExecutor {
         files.path_policy_error(&self.root, Path::new(path), store_name, op)
     }
 
-    /// Override the bash allow-list (test/programmatic use).
+    /// VESTIGIAL: sets `bash_allow`, which no longer gates anything. Under the
+    /// Bashkit virtual shell (DR-0039) bash is gated by the harness profile +
+    /// `command { run }` grant and confined by the workspace policy — there is
+    /// no command allow-list. Retained only so existing test builders compile;
+    /// the field + `WHIPPLESCRIPT_HARNESS_BASH_ALLOW` are dead and slated for
+    /// removal (a mechanical cleanup of the 14 call-sites).
     #[allow(dead_code)]
     pub fn with_bash_allow(mut self, allow: Vec<String>) -> Self {
         self.bash_allow = allow;
