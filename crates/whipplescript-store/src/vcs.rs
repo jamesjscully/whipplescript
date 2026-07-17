@@ -2178,42 +2178,63 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         if selected.is_empty() {
             return Ok(TransportOutcome::NothingSelected);
         }
-        // Net effect per path = the NEWEST selected unit; its BEFORE is
-        // the certified precondition on the target.
-        let mut net: BTreeMap<String, &crate::selection::ChangeUnit> = BTreeMap::new();
+        // Net effect per path folds the OLDEST and NEWEST selected writes to
+        // that path: the certified precondition on the target is the oldest's
+        // `before` (the state before this branch first touched the path), and
+        // the result is the newest's `after`. Using the newest write's `before`
+        // (an intermediate state the target never held) would falsely conflict a
+        // valid multi-write cherry-pick — e.g. create p2 (before=None) then edit
+        // p2 (before="v1"): the target lacks p2, so `current(None) !=
+        // before("v1")` reports a phantom conflict.
+        struct NetUnit<'a> {
+            oldest: &'a crate::selection::ChangeUnit,
+            newest: &'a crate::selection::ChangeUnit,
+        }
+        let mut net: BTreeMap<String, NetUnit> = BTreeMap::new();
         for &index in &selected {
             let unit = &universe[index];
-            let entry = net.entry(unit.path.clone()).or_insert(unit);
-            if unit.seq > entry.seq {
-                *entry = unit;
-            }
+            net.entry(unit.path.clone())
+                .and_modify(|net_unit| {
+                    if unit.seq < net_unit.oldest.seq {
+                        net_unit.oldest = unit;
+                    }
+                    if unit.seq > net_unit.newest.seq {
+                        net_unit.newest = unit;
+                    }
+                })
+                .or_insert(NetUnit {
+                    oldest: unit,
+                    newest: unit,
+                });
         }
         let mut manifest = self.load_manifest(target.head_manifest_hash.as_deref())?;
         let mut conflicts = Vec::new();
         let mut moved = Vec::new();
-        for (path, unit) in &net {
+        for (path, net_unit) in &net {
+            let precondition = net_unit.oldest.before.as_ref();
+            let result = net_unit.newest.after.as_ref();
             let current = manifest.get(path);
-            if current == unit.after.as_ref() {
+            if current == result {
                 continue; // already there: the idempotent skip
             }
-            if current != unit.before.as_ref() {
+            if current != precondition {
                 conflicts.push(PathConflict {
                     path: path.clone(),
-                    base: unit.before.clone(),
+                    base: net_unit.oldest.before.clone(),
                     ours: current.cloned(),
-                    theirs: unit.after.clone(),
+                    theirs: net_unit.newest.after.clone(),
                     ours_side: MergeSide {
                         label: onto.to_owned(),
                         cut_id: target.head_cut_id.clone(),
                     },
                     theirs_side: MergeSide {
                         label: branch_id.to_owned(),
-                        cut_id: Some(unit.cut_id.clone()),
+                        cut_id: Some(net_unit.newest.cut_id.clone()),
                     },
                 });
                 continue;
             }
-            moved.push((path.clone(), unit.after.clone()));
+            moved.push((path.clone(), net_unit.newest.after.clone()));
         }
         if !conflicts.is_empty() {
             return Ok(TransportOutcome::Conflicted { conflicts });
@@ -4535,6 +4556,46 @@ mod tests {
             vcs.get_branch("draft_a").expect("get").expect("row").status,
             BranchStatus::Active,
             "partial adoption never closes the branch"
+        );
+    }
+
+    /// A multi-write cherry-pick onto a target that never held the intermediate
+    /// state must transport cleanly, not phantom-conflict (ultracode #10): the
+    /// precondition is the OLDEST selected write's `before`, not the newest's.
+    #[test]
+    fn transport_of_a_multi_write_path_uses_the_oldest_precondition() {
+        use crate::selection::parse;
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("create");
+        // Create p2 (before=None), then edit it (before="v1"). mainline has no p2.
+        vcs.write("draft_a", "p2.md", Some("v1"), "e2", "t2")
+            .expect("create");
+        vcs.write("draft_a", "p2.md", Some("v2"), "e3", "t3")
+            .expect("edit");
+        // Transport the whole path — both writes are selected. The oldest
+        // (e2) before=None matches mainline's absent p2, so it transports the
+        // net result (v2) rather than conflicting on the intermediate "v1".
+        let outcome = vcs
+            .transport_selection(
+                "draft_a",
+                &parse("path(p2.md)").expect("parse"),
+                MAINLINE_BRANCH_ID,
+                "tp1",
+                "t4",
+            )
+            .expect("transport");
+        assert!(
+            matches!(outcome, TransportOutcome::Transported { .. }),
+            "a valid multi-write cherry-pick must not phantom-conflict: {outcome:?}"
+        );
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "p2.md")
+                .expect("read")
+                .as_deref(),
+            Some("v2"),
+            "the net result (newest after) lands on the target"
         );
     }
 
