@@ -3818,7 +3818,19 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                 if dropped_pairs > 0 {
                     gate_tags.push(format!("pairs-dropped:{dropped_pairs}"));
                 }
-                if verdict.proposable && sealing_engaged {
+                // A tradeoff a precedent would AUTO-ACCEPT on the OPEN evidence
+                // must still clear the holdout gate before the precedent is
+                // honored: otherwise an open-only tradeoff is promoted without
+                // ever evaluating the sealed scenarios, bypassing the seal.
+                // Evaluate sealed and re-derive the verdict over combined
+                // evidence here too, so the precedent decision below (computed
+                // from verdict.lines) is judged on holdout-inclusive data.
+                let open_precedent_auto_accepts = verdict.tradeoff
+                    && matches!(
+                        precedent_resolution(&precedents, &verdict.lines),
+                        Some(PrecedentResolution::AutoAccept(_))
+                    );
+                if (verdict.proposable || open_precedent_auto_accepts) && sealing_engaged {
                     // Promotion gate: score the sealed holdout on BOTH arms and
                     // re-check dominance over the combined evidence. Every gate
                     // exposure wears the seal (cumulative, k=3).
@@ -3866,7 +3878,13 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                         .collect();
                     verdict =
                         dominance_verdict(&specs, &spec_active, &combined_base, &combined_cand);
-                    if !verdict.proposable {
+                    // A candidate that was DOMINANT on the open evidence but is
+                    // no longer proposable on the combined evidence failed the
+                    // gate. A tradeoff (never proposable) evaluated here only to
+                    // judge the precedent on holdout-inclusive data is not
+                    // "refused" — the precedent decision below stands on the
+                    // combined verdict.
+                    if open_verdict.proposable && !verdict.proposable {
                         verdict
                             .reasons
                             .push("failed the sealed promotion gate".to_owned());
