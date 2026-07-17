@@ -3,14 +3,29 @@
 //! The **governance agent** is the only path that may SIGN a governance envelope,
 //! and it is gated by admin/sudo privilege (G1, G4). The **whip agent** — the rest
 //! of the CLI — is unprivileged and may only *verify* a signed envelope, never
-//! produce one. The single-signer rule and untrusted-input isolation hold
-//! structurally: `SignedEnvelope::sign` is the sole producer of a valid
-//! attestation and refuses without governance privilege, and no unprivileged path
-//! reaches it.
+//! produce one via `SignedEnvelope::sign` (which refuses without governance
+//! privilege).
 //!
-//! Trust root: option C attestation (DR-0028) — the signature is a SHA-256 of the
-//! canonical envelope content bound to the signer identity. Tampering with the
-//! content breaks the hash, so the whip agent rejects it.
+//! ## Trust model (be honest about which path is cryptographic)
+//!
+//! The legacy attestation here is a **keyless SHA-256 integrity checksum of the
+//! canonical envelope content**, NOT a cryptographic signature. It detects
+//! *tampering* (mutating the content breaks the hash), but it authenticates no
+//! author: anyone who can WRITE the envelope file can recompute the same hash and
+//! produce a byte-valid attestation, and the `signer` field is outside the hashed
+//! bytes. So on the native path the "single-signer" guarantee rests on **OS file
+//! permissions of `WHIPPLESCRIPT_IFC_ENVELOPE`** (only the privileged operator can
+//! write it) — a documented local-trust assumption, not a keyed proof. The policy
+//! epoch is likewise not covered by this checksum.
+//!
+//! The **authenticated** path — the one that resists a compromised host / an
+//! untrusted envelope — is the external **P-256** signature verified in
+//! `whipplescript-host-do::governance`, which binds signer + key + algorithm +
+//! content hash cryptographically (and the epoch, on that path). Any consumer
+//! crossing a real trust boundary must use that verifier, not the checksum.
+//! (v0.1 documents this posture; folding signer+epoch into the native hashed
+//! bytes and persisting an epoch floor are deferred hardening — see
+//! spec/information-flow-governance.md.)
 
 use std::path::Path;
 

@@ -183,6 +183,31 @@ cross-machine custody or a stronger trust root. **(B) is rejected as the trust
 root** (too easy to misconfigure into a silent bypass), though "no envelope =
 ungoverned dev" is fine because dev makes no safety claim.
 
+### v0.1 realization + trust assumptions (be precise about which path is keyed)
+
+As shipped, the two enforcement planes realize this decision differently, and the
+release documents the gap honestly rather than overclaiming:
+
+- **Native path (`whip`, `WHIPPLESCRIPT_IFC_ENVELOPE`)** — the attestation is a
+  *keyless* SHA-256 checksum of the canonical envelope content. It is
+  **tamper-evident** (mutating the content breaks the hash) but authenticates no
+  author: anyone who can write the envelope file can recompute a byte-valid
+  attestation, and `signer` is outside the hashed bytes. So the native single-
+  signer guarantee effectively rests on **OS file permissions of the envelope**
+  (option (B)'s trust model) — a documented **local-operator trust assumption**,
+  acceptable for a single-box deployment. The policy epoch is not covered by this
+  checksum either (an existing instance pins its policy at open, so this bites
+  only at new-instance admission of a stale-but-checksum-valid envelope).
+- **DO / external path (`whipplescript-host-do::governance`)** — a real **P-256**
+  signature binding signer + key + algorithm + content hash (and the epoch). This
+  is option (A), the authenticated trust root that resists a compromised host or
+  an untrusted envelope; any consumer crossing a real trust boundary must use it.
+
+**Deferred hardening** (would upgrade the native path toward (A)): fold `signer`
+and the policy `epoch` into the native hashed bytes; require the keyed verifier
+on cross-trust consumers; persist a monotonic epoch high-water mark so a rolled-
+back-but-valid envelope is refused. Not required for a local-operator v0.1.
+
 ## Out of scope: which LLM provider you trust
 
 WhippleScript enforces *declared* provider clearances (DR-0027 provider egress: a
