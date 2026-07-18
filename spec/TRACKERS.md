@@ -64,6 +64,7 @@ option, blank for closed/historical trackers.
 | Tracker | Status | Scope (one line, non-overlapping) | Last triaged | Release |
 |---------|--------|-----------------------------------|--------------|---------|
 | `spec/v0.1-release-tracker.md` | active | The single public release: collapse the 0.2/0.3/0.4 ceremony into a feature-complete, reviewed, docs-polished, ready-to-use v0.1.0 | 2026-07-16 | v0.1 |
+| `spec/v0.2-milestone-tracker.md` | active | First post-release feature-additive milestone: candidate slate (generic OpenAI provider, multimodal I/O, native bash, MCP, tokenizer/cache/language-eval quality cluster, self-distillation fine-tuning) + sequencing; deep design graduates to per-feature notes | 2026-07-17 | v0.2 |
 | `spec/distribution-tracker.md` | active | Packaging, versioning, and distribution of whipplescript artifacts | 2026-06-30 | v0.1 |
 | `spec/expression-kernel-tracker.md` | active | The expression/evaluation kernel implementation — **gate-complete for v0.1** (all 9 Acceptance Gates green; remaining matrix cells = deferred polish) | 2026-07-16 | v0.1 |
 | `spec/native-provider-implementation-tracker.md` | closed | Native Codex/Claude providers — all NP milestones shipped 2026-07-16; residue = arbitrary-attachment fixtures + owner-gated live G-008 | 2026-07-16 | v0.1 |
