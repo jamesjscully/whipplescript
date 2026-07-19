@@ -36,8 +36,15 @@ impl CoerceProvider {
     /// Default API base URL (overridable for the Codex backend or a mock).
     pub fn default_base_url(self) -> &'static str {
         match self {
-            CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat => "https://api.openai.com",
+            // The OpenAi (Responses) and Anthropic builders append the full
+            // `/v1/...` path themselves, so their default base is the bare host.
+            CoerceProvider::OpenAi => "https://api.openai.com",
             CoerceProvider::Anthropic => "https://api.anthropic.com",
+            // The OpenAiCompat builder appends only `/chat/completions` (the
+            // OpenAI-SDK `base_url` convention: the `/v1` version segment lives
+            // in base_url), so the default MUST carry `/v1` — otherwise the
+            // request 404s at `.../chat/completions`. Live-confirmed 2026-07-19.
+            CoerceProvider::OpenAiCompat => "https://api.openai.com/v1",
         }
     }
 }
@@ -1205,6 +1212,43 @@ mod tests {
             .headers
             .iter()
             .any(|(k, v)| k == "authorization" && v == "Bearer sk-test"));
+    }
+
+    #[test]
+    fn openai_compat_default_base_url_carries_v1_so_the_default_is_usable() {
+        // Regression (live-confirmed 2026-07-19 against Ollama): the OpenAiCompat
+        // builder appends only `/chat/completions`, so its default base MUST
+        // already include the `/v1` version segment — otherwise a caller relying
+        // on the default (or pointing at real OpenAI without a manual `/v1`) 404s
+        // at `.../chat/completions`. OpenAi/Anthropic keep the bare-host default
+        // because their builders add `/v1/...` themselves.
+        assert_eq!(
+            CoerceProvider::OpenAiCompat.default_base_url(),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            CoerceProvider::OpenAi.default_base_url(),
+            "https://api.openai.com"
+        );
+        // Building with the default base must yield a valid `/v1/chat/completions`
+        // URL, not the broken `.../chat/completions`.
+        let schema = json!({ "type": "object" });
+        let call = CoerceCall {
+            provider: CoerceProvider::OpenAiCompat,
+            base_url: CoerceProvider::OpenAiCompat.default_base_url(),
+            api_key: "sk-test",
+            model: "gpt-4o-mini",
+            prompt: "Classify this",
+            output_schema: &schema,
+            schema_name: "WorkReview",
+            max_tokens: 1024,
+            codex: None,
+            idempotency_key: "",
+        };
+        assert_eq!(
+            build_request(&call).url,
+            "https://api.openai.com/v1/chat/completions"
+        );
     }
 
     #[test]

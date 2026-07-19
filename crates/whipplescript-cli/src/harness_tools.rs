@@ -3068,10 +3068,12 @@ fn profile_config_from_value(
     };
     let provider = match entry.get("provider").and_then(Value::as_str) {
         Some("openai") => CoerceProvider::OpenAi,
+        Some("openai-generic") => CoerceProvider::OpenAiCompat,
         Some("anthropic") => CoerceProvider::Anthropic,
         Some(other) => {
             return Err(format!(
-                "provider profile `{name}` names unknown provider `{other}` (expected `openai` or `anthropic`)"
+                "provider profile `{name}` names unknown provider `{other}` \
+                 (expected `openai`, `openai-generic`, or `anthropic`)"
             ));
         }
         None => {
@@ -3132,10 +3134,11 @@ fn resolve_harness_model_config() -> Result<Option<HarnessModelConfig>, String> 
     };
     let provider = match provider_name.as_str() {
         "openai" => CoerceProvider::OpenAi,
+        "openai-generic" => CoerceProvider::OpenAiCompat,
         "anthropic" => CoerceProvider::Anthropic,
         other => {
             return Err(format!(
-            "unknown WHIPPLESCRIPT_HARNESS_PROVIDER `{other}` (expected `openai` or `anthropic`)"
+            "unknown WHIPPLESCRIPT_HARNESS_PROVIDER `{other}` (expected `openai`, `openai-generic`, or `anthropic`)"
         ))
         }
     };
@@ -3561,6 +3564,35 @@ mod tests {
             .expect("entry");
         assert_eq!(resolved.api_key, "env-carried-key");
         std::env::remove_var("WHIP_TEST_PROFILE_KEY_4B");
+    }
+
+    #[test]
+    fn provider_profile_accepts_openai_generic_for_the_owned_harness() {
+        // Regression (live-confirmed 2026-07-19 against Ollama): the owned-harness
+        // profile parser must accept `openai-generic` → `OpenAiCompat`, else the
+        // agent-turn path for any OpenAI-compatible endpoint (Ollama/vLLM/OpenRouter)
+        // is code-complete in the kernel but unreachable through config.
+        let document = serde_json::json!({
+            "default": {
+                "provider": "openai-generic",
+                "model": "tinyllama:latest",
+                "api_key": "k",
+                "base_url": "http://localhost:11434/v1",
+            }
+        });
+        let config = profile_config_from_value(&document, None)
+            .expect("valid entry")
+            .expect("profile entry");
+        assert!(matches!(config.provider, CoerceProvider::OpenAiCompat));
+        assert_eq!(config.base_url, "http://localhost:11434/v1");
+        // With base_url omitted, the (fixed) OpenAiCompat default carries `/v1`.
+        let defaulted = serde_json::json!({
+            "default": { "provider": "openai-generic", "model": "m", "api_key": "k" }
+        });
+        let config = profile_config_from_value(&defaulted, None)
+            .expect("valid")
+            .expect("entry");
+        assert_eq!(config.base_url, "https://api.openai.com/v1");
     }
 
     fn temp_root() -> PathBuf {

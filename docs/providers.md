@@ -321,6 +321,69 @@ Credentials:
 If the provider is set but no credential resolves, the coerce effect fails with
 a clear message instead of silently using a fixture.
 
+## OpenAI-compatible & local models (Ollama, vLLM, OpenRouter, Groq, …)
+
+Anything that speaks the OpenAI Chat Completions wire format
+(`/v1/chat/completions`) works through the **`openai-generic`** provider — local
+runtimes (Ollama, LM Studio, vLLM, llama.cpp) and hosted gateways (OpenRouter,
+Together, Groq, Fireworks, DeepSeek, Azure OpenAI). One provider, selected by
+`base_url`.
+
+> **`base_url` must include the API version segment** (usually `/v1`). Unlike the
+> `openai`/`anthropic` providers — whose base is the bare host and whip appends
+> `/v1/...` — `openai-generic` appends only `/chat/completions`, following the
+> OpenAI-SDK convention that the version lives in `base_url`. So use
+> `http://localhost:11434/v1`, **not** `http://localhost:11434`.
+
+### Coerce / decide (structured output)
+
+```sh
+# A local Ollama model making a typed `coerce` decision:
+WHIPPLESCRIPT_COERCE_PROVIDER=openai-generic \
+WHIPPLESCRIPT_COERCE_BASE_URL=http://localhost:11434/v1 \
+WHIPPLESCRIPT_COERCE_MODEL=llama3.1:8b \
+OPENAI_API_KEY=ollama \
+  whip dev workflow.whip --provider fixture --until idle
+```
+
+`OPENAI_API_KEY` carries the bearer token; endpoints that don't check it (Ollama)
+accept any non-empty value. Confirm the resolved config with
+`whip --json coercion status`. The declared `coerce` output type is sent as a
+`response_format: json_schema` constraint; endpoints that support it (Ollama,
+vLLM, OpenAI) return schema-conforming JSON parsed straight into the typed value.
+
+### Agent turns (owned harness)
+
+Point the [owned harness](#owned-harness-provider-owned) at the same endpoint
+through a **provider-profiles** file (`WHIPPLESCRIPT_PROVIDER_PROFILES`), keyed by
+the agent's declared `profile` (with `default` as the catch-all):
+
+```json
+{
+  "default": {
+    "provider": "openai-generic",
+    "model": "llama3.1:8b",
+    "base_url": "http://localhost:11434/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "max_tokens": 1024
+  }
+}
+```
+
+```sh
+WHIPPLESCRIPT_PROVIDER_PROFILES=./profiles.json OPENAI_API_KEY=ollama \
+  whip dev workflow.whip --provider owned --until idle
+```
+
+whip drives the tool-use loop itself (tools are sent as
+`{type:"function", ...}`, results fed back as `role:"tool"`), so tool quality
+tracks the model — small local models will tool-call poorly, but the wire path is
+identical to any hosted OpenAI-compatible model.
+
+> **On the Durable Object host**, outbound model calls must be HTTPS except for
+> loopback. A hosted compatible endpoint (OpenRouter/Together/…) works as-is; a
+> non-loopback plain-HTTP local endpoint is refused.
+
 ## `whip auth`
 
 whip does not run its own login — your environment is already authenticated
