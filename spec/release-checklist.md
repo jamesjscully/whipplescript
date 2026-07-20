@@ -61,6 +61,25 @@ this is the mechanical cut.
    `core→parser→store→kernel→whipplescript`), Homebrew formula from the tagged
    assets, and retiring the old `v0.2.0` git tags.
 
+## v0.1.1 Patch Cut Runbook
+
+Scope (Jack, 2026-07-20): the openai-generic provider reachability fixes +
+spend/cache-economics correctness (G2). Same mechanics as the v0.1.0 cut,
+abbreviated:
+
+1. **Version.** Workspace + path-dep pins `0.1.0` → `0.1.1`; `Cargo.lock`
+   regenerated; `whip --version` → `whipplescript 0.1.1`; CHANGELOG `[0.1.1]`
+   dated (and `[0.1.0]` retro-dated 2026-07-17).
+2. **Final green.** Working tree clean; full readiness gate
+   (`WHIPPLESCRIPT_RELEASE_READINESS_FULL=1`) green.
+3. **Tag → Release.** `git tag -a v0.1.1 && git push origin v0.1.1 && git push
+   mirror v0.1.1`. ⚠ Until the GitHub account billing block is cleared, the
+   mirror CI builds artifacts but its `gh release create` step 403s — publish
+   manually from the CI artifacts with an owner-scoped `gh` token (the v0.1.0
+   procedure).
+4. **Post-publish smoke.** `cargo install --git … --tag v0.1.1 --locked -p
+   whipplescript`; `whip --version` → 0.1.1.
+
 ## Native Provider Release Gate
 
 For a release that advertises usable native Codex and Claude providers,

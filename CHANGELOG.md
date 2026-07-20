@@ -3,7 +3,42 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
-## [0.1.0] — Unreleased (date set at cut)
+## [0.1.1] — 2026-07-20
+
+A correctness patch for the generic OpenAI-compatible provider path and spend
+accounting, from live validation against a real local endpoint (Ollama).
+
+### Fixed
+- `openai-generic` default base URL now carries the `/v1` segment the Chat
+  Completions builder expects; relying on the default (or pointing at
+  api.openai.com without a hand-added `/v1`) previously 404'd.
+- The owned-harness provider-profile parser and `WHIPPLESCRIPT_HARNESS_PROVIDER`
+  now accept `openai-generic` — the agent-turn path for OpenAI-compatible
+  endpoints (Ollama, vLLM, OpenRouter, …) was implemented but unreachable
+  through configuration.
+- OpenAI-chat-shaped usage (`prompt_tokens` / `completion_tokens`) is now
+  priced; it previously parsed as zero tokens and recorded as unpriced.
+- Anthropic prompt-cache traffic (`cache_read_input_tokens` /
+  `cache_creation_input_tokens`) now counts toward `std.tokens` and prices into
+  spend; it was previously invisible ($0) to the spend cap.
+- A campaign that spends under a `--spend-cap` while any usage is unpriced now
+  ends with an operator warning and a `campaign.spend_cap_unpriced` record
+  event instead of letting the cap silently under-count.
+
+### Added
+- Provider usage is normalized into disjoint uncached / cache-read /
+  cache-write buckets by wire shape (Anthropic-style and OpenAI-style usage
+  objects both supported, including future engines that mimic either).
+- Optional `cache_read_per_mtok_usd` / `cache_write_per_mtok_usd` price-table
+  rates; absent rates price cache traffic at the input rate (a conservative
+  overestimate, so an underspecified table can only over-count toward a cap).
+- New builtin gauge `std.cache_hit` (ascending): provider prompt-cache hit
+  rate, present only when the provider reports cache usage.
+- docs: "OpenAI-compatible & local models" guide (coerce + agent-turn recipes,
+  the `/v1` base-URL convention, DO HTTPS-except-loopback caveat) and expanded
+  spend-price documentation.
+
+## [0.1.0] — 2026-07-17
 
 The first public release of WhippleScript — a small scripting language for AI to
 orchestrate AI, built on a durable, replayable rule/effect kernel with a
