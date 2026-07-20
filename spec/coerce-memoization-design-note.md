@@ -36,7 +36,7 @@ re-sampled ("propose a fresh idea").
 
 ```whip
 coerce classify(title string, body string) -> Classification {
-  memo                     # ← opt-in: "this decision is a function of its inputs"
+  memoize                  # ← opt-in: "this decision is a function of its inputs"
   prompt """..."""
 }
 ```
@@ -59,7 +59,7 @@ The stored value's label situation is clean because the memo key contains the
 full rendered input: identical key ⇒ identical inputs ⇒ the label derivation
 at the use site is the same as if computed. The one rule to enforce: the memo
 store is inside the workspace trust boundary (same posture as facts), so no new
-flow is introduced. The IFC checker should still treat a `memo` coerce as an
+flow is introduced. The IFC checker should still treat a `memoize` coerce as an
 egress point statically (it *may* miss), i.e. no static-check relaxation.
 
 **Evidence & improve.** Two options when a campaign evaluates candidates:
@@ -74,7 +74,7 @@ would quietly narrow it. Normal runs use memo; regeneration measures fresh.
 **Staleness.** Nothing expires by content: model id + template + schema are in
 the key. Residual staleness is provider-behavior drift *behind the same model
 id* (e.g. a hosted alias silently updated). Options: a declaration-level TTL
-(`memo 7d`), a `whip coercion memo clear` operator command, or both. TTL adds
+(`memoize 7d`), a `whip coercion memo clear` (name TBD) operator command, or both. TTL adds
 a time dependency to something declared input-pure — my lean: **no TTL in v1**,
 just the operator clear command; add TTL only on demonstrated need.
 
@@ -95,11 +95,12 @@ value; it never enters the store.
 
 ## 6. Open questions for Jack
 
-1. **Surface:** `memo` keyword on the coerce declaration (strawman above) vs. a
-   store-level/config knob vs. both. The declaration feels right (it is a
+1. **Surface:** `memoize` clause on the coerce declaration (strawman above) vs.
+   a store-level/config knob vs. both. The declaration feels right (it is a
    semantic property of the decision, not deployment config).
-2. **Keyword name:** `memo` / `cached` / `pure`? (`pure` overclaims — the model
-   isn't pure; the *policy* is reuse.)
+2. **Keyword name: RESOLVED (Jack 2026-07-20) — `memoize`.** The verb names the
+   policy applied to the declaration; `pure`/`deterministic` would overclaim a
+   property of the model.
 3. **Improve interplay:** confirm bypass-during-regeneration (lean (b) above).
 4. **Scope granularity:** workspace-wide store, or per-workflow namespacing
    within it? (Workspace-wide maximizes reuse; the key already contains the
