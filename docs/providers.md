@@ -227,6 +227,16 @@ history is never repriced. The maintained example lives at
 `examples/provider-configs/native/native.example.json` — verify its rates
 against your provider's current price sheet before relying on the cap.
 
+> **Unpriced models under a `--spend-cap`.** Because the cap binds only
+> *priced* cost, a paid model with no `prices` entry would let the cap
+> silently never bind. A campaign that spends under a cap while any usage is
+> unpriced now ends with a **warning** (and a `campaign.spend_cap_unpriced`
+> record event) naming the gap. This matters most for arbitrary
+> `openai-generic` endpoints: add a `prices` entry for the model to make the
+> cap enforceable — or, for a genuinely-free local model (Ollama, local
+> vLLM), add an entry with `input_per_mtok_usd: 0` / `output_per_mtok_usd: 0`
+> to declare it free and silence the warning.
+
 ## Native providers
 
 Native adapters for Codex and Claude are experimental: setup,

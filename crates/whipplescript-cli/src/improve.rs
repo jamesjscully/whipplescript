@@ -389,6 +389,67 @@ impl PriceTable {
     }
 }
 
+/// A spend cap binds only PRICED cost (the deliberate no-default-prices posture,
+/// DR-0037): an unpriced model records $0 and never advances the cap. Keep the
+/// posture — whip invents no price — but make it LOUD rather than passive: at
+/// campaign end, if a cap was set and any spend went unpriced, tell the operator
+/// their cap could not account for it and how to fix it. This matters now that any
+/// OpenAI-compatible model is trivially wireable: a paid-but-unpriced model would
+/// otherwise silently disable the cap. Also records a `campaign.spend_cap_unpriced`
+/// event so the gap is in the record, not just on stderr.
+fn warn_on_unpriced_spend_under_cap(
+    store: &mut ImproveStore,
+    campaign_id: &str,
+    spend_cap_micros: Option<i64>,
+) {
+    let Some(cap) = spend_cap_micros else {
+        return;
+    };
+    let Ok(events) = store.list_campaign_events(campaign_id) else {
+        return;
+    };
+    let mut unpriced_events = 0i64;
+    let mut sources: BTreeSet<String> = BTreeSet::new();
+    for event in &events {
+        if event.event_type != "campaign.spend" {
+            continue;
+        }
+        // Absent `priced` defaults to true (a real priced event always sets it);
+        // only an explicit `priced: false` is an unpriced turn.
+        if event
+            .payload
+            .get("priced")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        unpriced_events += 1;
+        if let Some(what) = event.payload.get("what").and_then(Value::as_str) {
+            sources.insert(what.to_owned());
+        }
+    }
+    if unpriced_events == 0 {
+        return;
+    }
+    let cap_usd = cap as f64 / 1_000_000.0;
+    let sources = sources.into_iter().collect::<Vec<_>>().join(", ");
+    eprintln!(
+        "warning: --spend-cap ${cap_usd:.2} could not account for {unpriced_events} unpriced \
+         spend event(s) ({sources}): the model has no `prices` entry, so its cost recorded as $0 \
+         and did not bind the cap. Add a `prices` block entry (use 0 for a genuinely-free local \
+         model) to make the cap enforceable."
+    );
+    let _ = store.append_campaign_event(
+        campaign_id,
+        "campaign.spend_cap_unpriced",
+        &json!({
+            "unpriced_spend_events": unpriced_events,
+            "spend_cap_micros": cap,
+        }),
+    );
+}
+
 /// The standalone coerce request shell for judge/proposer turns: the
 /// NativeCoerceClient carries the real prompt/schema; these identity fields
 /// exist for effect-shaped callers and are unused on this path.
@@ -3507,21 +3568,57 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                     .filter_map(|observation| observation.readings.get("std.spend"))
                     .map(|reading| (reading.score * 1_000_000.0).round() as i64)
                     .sum();
-                if cost == 0 {
+                // Workflow turns whose model has no `prices` entry make `std.spend`
+                // error `unpriced` -> a SKIPPED gauge, not a priced reading, so
+                // their real cost is invisible to the cap (the most silent case:
+                // no spend event at all). Record an honest unpriced spend event
+                // (tokens from std.tokens when scored) so it is never silent and
+                // the end-of-campaign cap check can flag it.
+                let is_unpriced = |observation: &&RunObservation| {
+                    observation
+                        .skipped
+                        .iter()
+                        .any(|(gauge, reason)| gauge == "std.spend" && reason.contains("unpriced"))
+                };
+                let unpriced_turns = observations.iter().filter(is_unpriced).count();
+                if cost == 0 && unpriced_turns == 0 {
                     return Ok(());
                 }
-                store
-                    .append_campaign_event(
-                        &campaign_id,
-                        "campaign.spend",
-                        &json!({
-                            "cost_micros": cost,
-                            "priced": true,
-                            "what": what,
-                        }),
-                    )
-                    .map_err(|error| format!("failed to record workflow spend: {error:?}"))?;
-                *spent += cost;
+                if cost > 0 {
+                    store
+                        .append_campaign_event(
+                            &campaign_id,
+                            "campaign.spend",
+                            &json!({
+                                "cost_micros": cost,
+                                "priced": true,
+                                "what": what,
+                            }),
+                        )
+                        .map_err(|error| format!("failed to record workflow spend: {error:?}"))?;
+                    *spent += cost;
+                }
+                if unpriced_turns > 0 {
+                    let unpriced_tokens: i64 = observations
+                        .iter()
+                        .filter(is_unpriced)
+                        .filter_map(|observation| observation.readings.get("std.tokens"))
+                        .map(|reading| reading.score.round() as i64)
+                        .sum();
+                    store
+                        .append_campaign_event(
+                            &campaign_id,
+                            "campaign.spend",
+                            &json!({
+                                "cost_micros": 0,
+                                "priced": false,
+                                "tokens": unpriced_tokens,
+                                "unpriced_turns": unpriced_turns,
+                                "what": what,
+                            }),
+                        )
+                        .map_err(|error| format!("failed to record workflow spend: {error:?}"))?;
+                }
                 Ok(())
             };
             let mut spent_micros: i64 = 0;
@@ -3985,6 +4082,10 @@ fn run_improve(options: &CliOptions) -> Result<ExitCode, String> {
                     )
                     .map_err(|error| format!("failed to close campaign: {error:?}"))?;
             }
+            // The cap only binds priced cost; if any spend went unpriced under a
+            // set cap, surface it (loud, non-blocking) rather than let the cap
+            // silently under-count.
+            warn_on_unpriced_spend_under_cap(store, &campaign_id, spec_active.spend_cap_micros);
             Ok((cards, proposed_any, candidate_seq, stages_advanced, parked))
         })(&mut store);
     let (cards, proposed_any, candidate_seq, stages_advanced, parked) = match outcome {
@@ -6355,5 +6456,76 @@ mod tests {
         let value = bar_stat(&aggregate, &bar).expect("p90 computes");
         assert!((value - 90.0).abs() <= 1.0);
         assert_eq!(bar_met(&aggregate, &bar), Some(true));
+    }
+
+    #[test]
+    fn unpriced_spend_under_a_cap_is_surfaced_not_silent() {
+        // A `--spend-cap` binds only priced cost; with arbitrary OpenAI-compatible
+        // models now easy to wire, a paid-but-unpriced model records $0 and the cap
+        // silently never binds. The campaign must flag that in the record.
+        let mut store = ImproveStore::open_in_memory().expect("open");
+        let flagged = |store: &ImproveStore, campaign: &str| {
+            store
+                .list_campaign_events(campaign)
+                .expect("events")
+                .iter()
+                .any(|event| event.event_type == "campaign.spend_cap_unpriced")
+        };
+
+        // A priced proposer turn + an UNPRICED workflow turn, under a cap.
+        let with_unpriced = store
+            .open_campaign(&json!({ "goal": "cap-unpriced" }))
+            .expect("open campaign");
+        store
+            .append_campaign_event(
+                &with_unpriced,
+                "campaign.spend",
+                &json!({ "cost_micros": 1000, "priced": true, "what": "proposer turn" }),
+            )
+            .expect("priced event");
+        store
+            .append_campaign_event(
+                &with_unpriced,
+                "campaign.spend",
+                &json!({ "cost_micros": 0, "priced": false, "tokens": 5000,
+                         "unpriced_turns": 1, "what": "workflow turns (baseline)" }),
+            )
+            .expect("unpriced event");
+        warn_on_unpriced_spend_under_cap(&mut store, &with_unpriced, Some(5_000_000));
+        assert!(
+            flagged(&store, &with_unpriced),
+            "unpriced spend under a cap must record a spend_cap_unpriced event"
+        );
+
+        // No cap -> nothing to enforce, no flag even with unpriced usage.
+        let no_cap = store
+            .open_campaign(&json!({ "goal": "no-cap" }))
+            .expect("open");
+        store
+            .append_campaign_event(
+                &no_cap,
+                "campaign.spend",
+                &json!({ "cost_micros": 0, "priced": false, "what": "workflow turns" }),
+            )
+            .expect("event");
+        warn_on_unpriced_spend_under_cap(&mut store, &no_cap, None);
+        assert!(!flagged(&store, &no_cap), "no cap -> no unpriced flag");
+
+        // All priced under a cap -> no flag.
+        let all_priced = store
+            .open_campaign(&json!({ "goal": "priced" }))
+            .expect("open");
+        store
+            .append_campaign_event(
+                &all_priced,
+                "campaign.spend",
+                &json!({ "cost_micros": 42, "priced": true, "what": "proposer turn" }),
+            )
+            .expect("event");
+        warn_on_unpriced_spend_under_cap(&mut store, &all_priced, Some(1_000_000));
+        assert!(
+            !flagged(&store, &all_priced),
+            "all priced -> no unpriced flag"
+        );
     }
 }
