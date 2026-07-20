@@ -213,10 +213,21 @@ price table the improve subsystem consumes (`--spend-cap`, `std.spend`):
   "providers": [...],
   "prices": [
     {"provider": "anthropic", "model": "claude-sonnet-5",
-     "input_per_mtok_usd": 3.0, "output_per_mtok_usd": 15.0}
+     "input_per_mtok_usd": 3.0, "output_per_mtok_usd": 15.0,
+     "cache_read_per_mtok_usd": 0.3, "cache_write_per_mtok_usd": 3.75}
   ]
 }
 ```
+
+The two cache rates are optional. Providers bill prompt-cache traffic at
+different rates from fresh input (Anthropic discounts cache *reads* heavily and
+surcharges cache *writes*; OpenAI discounts cached input, writes are unbilled);
+usage is normalized into disjoint uncached / cache-read / cache-write buckets
+per turn. An entry without cache rates prices cache traffic at the **input**
+rate — a conservative overestimate for reads, so an underspecified table can
+only over-count toward a spend cap, never under-count. The built-in
+`std.cache_hit` gauge reads out the cache hit rate (cache-read tokens over all
+input-side tokens) whenever the provider reports cache usage.
 
 Rates are USD per million tokens, per (provider, model), input and output
 separately. Pricing is **config-only**: whip ships no built-in rates (a

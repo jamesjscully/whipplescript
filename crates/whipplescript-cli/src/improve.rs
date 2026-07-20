@@ -88,39 +88,85 @@ fn program_hash(source: &str) -> String {
 // Priced spend: the provider-config `prices` block (record-time, config-only)
 // ---------------------------------------------------------------------------
 
-/// One provider turn's token usage, carried to the spend ledger. The split
-/// is what pricing needs; `total_tokens` is the provider's own total when
-/// reported, else input+output — never an overlapping sum.
+/// One provider turn's token usage, carried to the spend ledger, normalized
+/// into DISJOINT buckets (spec/inference-cache-note.md G2):
+/// `input_tokens` = UNCACHED input, `cache_read_tokens` / `cache_write_tokens`
+/// = provider prompt-cache traffic, `output_tokens` = completion. The cache
+/// fields are `None` when the provider reported no cache usage at all —
+/// distinct from an honest 0 — so observability can tell "no caching
+/// happening" from "engine doesn't report caching". `total_tokens` is the
+/// provider's own total when reported, else the disjoint sum — never an
+/// overlapping sum.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct TurnUsage {
     provider: String,
     model: String,
     input_tokens: i64,
     output_tokens: i64,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
     total_tokens: i64,
 }
 
 impl TurnUsage {
+    /// Normalize a provider `usage` object by FIELD SHAPE, not provider name,
+    /// so future OpenAI-compatible / self-hosted engines that mimic either
+    /// wire family work without a whip change:
+    /// - Anthropic shape: `input_tokens` EXCLUDES cache traffic;
+    ///   `cache_read_input_tokens` / `cache_creation_input_tokens` are separate.
+    /// - OpenAI shape: `prompt_tokens` (chat) / `input_tokens` (responses)
+    ///   INCLUDES cached tokens; `prompt_tokens_details.cached_tokens` /
+    ///   `input_tokens_details.cached_tokens` is the cached subset (no
+    ///   write-side field — OpenAI cache writes are automatic and unbilled).
     fn from_usage_json(provider: &str, model: &str, usage: &Value) -> Self {
-        let input_tokens = usage
+        let raw_input = usage
             .get("input_tokens")
+            .or_else(|| usage.get("prompt_tokens"))
             .and_then(Value::as_i64)
             .unwrap_or(0);
         let output_tokens = usage
             .get("output_tokens")
+            .or_else(|| usage.get("completion_tokens"))
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        let total_tokens = usage
-            .get("total_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(input_tokens + output_tokens);
+        // Anthropic-shape cache fields: input is already exclusive of these.
+        let anthropic_read = usage.get("cache_read_input_tokens").and_then(Value::as_i64);
+        let cache_write_tokens = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_i64);
+        // OpenAI-shape cached subset: input INCLUDES it, so subtract below.
+        let openai_cached = usage
+            .get("prompt_tokens_details")
+            .or_else(|| usage.get("input_tokens_details"))
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_i64);
+        let (input_tokens, cache_read_tokens) = match (anthropic_read, openai_cached) {
+            (Some(read), _) => (raw_input, Some(read)),
+            (None, Some(cached)) => ((raw_input - cached).max(0), Some(cached)),
+            (None, None) => (raw_input, None),
+        };
+        let total_tokens = usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(
+            input_tokens
+                + cache_read_tokens.unwrap_or(0)
+                + cache_write_tokens.unwrap_or(0)
+                + output_tokens,
+        );
         Self {
             provider: provider.to_owned(),
             model: model.to_owned(),
             input_tokens,
             output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
             total_tokens,
         }
+    }
+
+    /// Input-side tokens the provider processed: uncached + cache traffic.
+    fn input_side_tokens(&self) -> i64 {
+        self.input_tokens
+            + self.cache_read_tokens.unwrap_or(0)
+            + self.cache_write_tokens.unwrap_or(0)
     }
 }
 
@@ -323,8 +369,22 @@ fn p_mean_worse(scores: &[f64], reference: f64, direction_up: bool) -> Option<f6
 /// spend event stores the computed cost and history is never repriced.
 #[derive(Clone, Debug, Default)]
 struct PriceTable {
-    /// (provider, model) → (input USD/Mtok, output USD/Mtok).
-    rates: BTreeMap<(String, String), (f64, f64)>,
+    /// (provider, model) → per-Mtok USD rates.
+    rates: BTreeMap<(String, String), PriceRate>,
+}
+
+/// Per-(provider, model) USD-per-Mtok rates. The cache rates are optional:
+/// providers bill cache reads/writes differently (Anthropic ~0.1× input for
+/// reads, 1.25× for writes; OpenAI ~0.5× for cached input, writes unbilled) —
+/// whip ships NO multipliers (same no-invented-prices posture), so an entry
+/// without cache rates prices cache traffic at the input rate, a conservative
+/// overestimate for reads.
+#[derive(Clone, Copy, Debug)]
+struct PriceRate {
+    input: f64,
+    output: f64,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
 }
 
 impl PriceTable {
@@ -349,6 +409,26 @@ impl PriceTable {
                 let model = entry.get("model").and_then(Value::as_str);
                 let input = entry.get("input_per_mtok_usd").and_then(Value::as_f64);
                 let output = entry.get("output_per_mtok_usd").and_then(Value::as_f64);
+                // Optional cache rates (spec/inference-cache-note.md G2): a
+                // present-but-invalid value is a hard error like any other
+                // malformed entry; an absent one falls back to the input rate
+                // at cost time (conservative for cache reads — providers
+                // discount them — so the cap binds sooner, never later).
+                let cache_rate = |key: &str| -> Result<Option<f64>, String> {
+                    match entry.get(key) {
+                        None => Ok(None),
+                        Some(value) => match value.as_f64() {
+                            Some(rate) if rate >= 0.0 && rate.is_finite() => Ok(Some(rate)),
+                            _ => Err(format!(
+                                "invalid `{key}` in price entry in {} (need a non-negative \
+                                 number): {entry}",
+                                path.display()
+                            )),
+                        },
+                    }
+                };
+                let cache_read = cache_rate("cache_read_per_mtok_usd")?;
+                let cache_write = cache_rate("cache_write_per_mtok_usd")?;
                 match (provider, model, input, output) {
                     (Some(provider), Some(model), Some(input), Some(output))
                         if input >= 0.0
@@ -356,9 +436,15 @@ impl PriceTable {
                             && input.is_finite()
                             && output.is_finite() =>
                     {
-                        table
-                            .rates
-                            .insert((provider.to_owned(), model.to_owned()), (input, output));
+                        table.rates.insert(
+                            (provider.to_owned(), model.to_owned()),
+                            PriceRate {
+                                input,
+                                output,
+                                cache_read,
+                                cache_write,
+                            },
+                        );
                     }
                     _ => {
                         return Err(format!(
@@ -374,16 +460,26 @@ impl PriceTable {
     }
 
     /// Record-time cost in USD micros; `None` = unpriced (no table entry
-    /// for this provider/model, or no input/output split to price).
+    /// for this provider/model, or no tokens to price). Cache traffic prices
+    /// at its own rate when the entry declares one, else at the input rate
+    /// (a conservative overestimate for reads — every provider discounts
+    /// them — so an underspecified table can only over-count toward a cap).
     fn cost_micros(&self, usage: &TurnUsage) -> Option<i64> {
-        if usage.input_tokens == 0 && usage.output_tokens == 0 {
+        if usage.input_tokens == 0
+            && usage.output_tokens == 0
+            && usage.cache_read_tokens.unwrap_or(0) == 0
+            && usage.cache_write_tokens.unwrap_or(0) == 0
+        {
             return None;
         }
-        let (input_rate, output_rate) = self
+        let rate = self
             .rates
             .get(&(usage.provider.clone(), usage.model.clone()))?;
-        let usd = (usage.input_tokens as f64 * input_rate
-            + usage.output_tokens as f64 * output_rate)
+        let usd = (usage.input_tokens as f64 * rate.input
+            + usage.output_tokens as f64 * rate.output
+            + usage.cache_read_tokens.unwrap_or(0) as f64 * rate.cache_read.unwrap_or(rate.input)
+            + usage.cache_write_tokens.unwrap_or(0) as f64
+                * rate.cache_write.unwrap_or(rate.input))
             / 1_000_000.0;
         Some((usd * 1_000_000.0).round() as i64)
     }
@@ -547,7 +643,9 @@ fn collect_gauge_specs(ir: &IrProgram) -> Vec<GaugeSpec> {
             judge: JudgeSpec::Builtin,
             bar: None,
             inputs: Vec::new(),
-            direction_up: false,
+            // Resource gauges are lower-is-better (spend/latency/tokens);
+            // the cache-hit RATE is higher-is-better.
+            direction_up: *name == "std.cache_hit",
             builtin: true,
         });
     }
@@ -1155,6 +1253,18 @@ fn score_instance(
                 Ok(None) => {}
                 Err(reason) => skipped.push((spec.name.clone(), reason)),
             },
+            "std.cache_hit" => {
+                if let Some(rate) = total_cache_hit_rate(&runs) {
+                    readings.insert(
+                        spec.name.clone(),
+                        GaugeReading {
+                            score: rate,
+                            passed: None,
+                            tags: Vec::new(),
+                        },
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -1309,14 +1419,22 @@ fn total_tokens(runs: &[whipplescript_store::RunView]) -> Option<f64> {
             continue;
         };
         // One usage object per run; prefer the provider's own total, else
-        // input+output — never sum overlapping fields.
+        // the disjoint sum — never sum overlapping fields. The Anthropic
+        // shape has no `total_tokens` and its `input_tokens` EXCLUDES cache
+        // traffic, so the fallback must add the cache fields or cached runs
+        // undercount (spec/inference-cache-note.md G2).
         let usage = metadata.get("usage").or_else(|| metadata.get("usage_json"));
         if let Some(usage) = usage {
             if let Some(count) = usage.get("total_tokens").and_then(Value::as_f64) {
                 total += count;
                 any = true;
             } else {
-                for tokens_key in ["input_tokens", "output_tokens"] {
+                for tokens_key in [
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                ] {
                     if let Some(count) = usage.get(tokens_key).and_then(Value::as_f64) {
                         total += count;
                         any = true;
@@ -1326,6 +1444,40 @@ fn total_tokens(runs: &[whipplescript_store::RunView]) -> Option<f64> {
         }
     }
     any.then_some(total)
+}
+
+/// `std.cache_hit`'s observable: cache-read tokens over all input-side tokens
+/// (uncached + cache read + cache write), across the instance's provider runs.
+/// `None` when NO run reported any cache usage fields at all — an engine that
+/// doesn't report caching yields an honest absence, not a fake 0%.
+fn total_cache_hit_rate(runs: &[whipplescript_store::RunView]) -> Option<f64> {
+    let mut cache_read = 0i64;
+    let mut input_side = 0i64;
+    let mut any_cache_reporting = false;
+    for run in runs {
+        let Ok(metadata) = serde_json::from_str::<Value>(&run.metadata_json) else {
+            continue;
+        };
+        let Some(usage) = metadata
+            .get("usage")
+            .or_else(|| metadata.get("usage_json"))
+            .filter(|usage| !usage.is_null())
+        else {
+            continue;
+        };
+        let model = metadata
+            .get("model")
+            .and_then(Value::as_str)
+            .or_else(|| usage.get("model").and_then(Value::as_str))
+            .unwrap_or("");
+        let turn = TurnUsage::from_usage_json(&run.provider, model, usage);
+        if turn.cache_read_tokens.is_some() || turn.cache_write_tokens.is_some() {
+            any_cache_reporting = true;
+        }
+        cache_read += turn.cache_read_tokens.unwrap_or(0);
+        input_side += turn.input_side_tokens();
+    }
+    (any_cache_reporting && input_side > 0).then(|| cache_read as f64 / input_side as f64)
 }
 
 fn reading_from_judge_output(output: &Value, spec: &GaugeSpec) -> Result<GaugeReading, String> {
@@ -3006,6 +3158,8 @@ impl Proposer for FixtureProposer {
                         model: (*model).to_owned(),
                         input_tokens: input.parse().ok()?,
                         output_tokens: output.parse().ok()?,
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
                         total_tokens: input.parse::<i64>().ok()? + output.parse::<i64>().ok()?,
                     }),
                     _ => None,
@@ -6233,6 +6387,8 @@ mod tests {
             model: "claude-sonnet-5".to_owned(),
             input_tokens: 1_000_000,
             output_tokens: 100_000,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             total_tokens: 1_100_000,
         };
         // 1 Mtok in at $3 + 0.1 Mtok out at $15 = $4.50 = 4_500_000 micros.
@@ -6262,6 +6418,167 @@ mod tests {
     }
 
     #[test]
+    fn usage_normalizes_cache_fields_by_wire_shape_not_provider_name() {
+        // Anthropic shape: `input_tokens` EXCLUDES cache traffic; cache fields
+        // are separate and disjoint. No `total_tokens` on the wire.
+        let anthropic = TurnUsage::from_usage_json(
+            "anthropic",
+            "claude-sonnet-5",
+            &json!({
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": 200,
+            }),
+        );
+        assert_eq!(anthropic.input_tokens, 100);
+        assert_eq!(anthropic.cache_read_tokens, Some(900));
+        assert_eq!(anthropic.cache_write_tokens, Some(200));
+        assert_eq!(anthropic.total_tokens, 1250, "disjoint sum incl. cache");
+        assert_eq!(anthropic.input_side_tokens(), 1200);
+
+        // OpenAI chat shape: `prompt_tokens` INCLUDES the cached subset —
+        // normalize by subtraction so the buckets stay disjoint.
+        let openai_chat = TurnUsage::from_usage_json(
+            "openai-generic",
+            "gpt-4o-mini",
+            &json!({
+                "prompt_tokens": 1000,
+                "completion_tokens": 50,
+                "total_tokens": 1050,
+                "prompt_tokens_details": { "cached_tokens": 900 },
+            }),
+        );
+        assert_eq!(openai_chat.input_tokens, 100, "uncached = prompt - cached");
+        assert_eq!(openai_chat.cache_read_tokens, Some(900));
+        assert_eq!(
+            openai_chat.cache_write_tokens, None,
+            "OpenAI has no write bill"
+        );
+        assert_eq!(openai_chat.total_tokens, 1050, "provider total kept");
+
+        // OpenAI Responses shape: `input_tokens` + `input_tokens_details`.
+        let openai_responses = TurnUsage::from_usage_json(
+            "openai",
+            "gpt-4o",
+            &json!({
+                "input_tokens": 1000,
+                "output_tokens": 20,
+                "input_tokens_details": { "cached_tokens": 600 },
+            }),
+        );
+        assert_eq!(openai_responses.input_tokens, 400);
+        assert_eq!(openai_responses.cache_read_tokens, Some(600));
+
+        // No cache fields at all: an honest None, not a fake zero — and the
+        // legacy plain shape parses exactly as before.
+        let plain = TurnUsage::from_usage_json(
+            "fixture",
+            "",
+            &json!({ "input_tokens": 10, "output_tokens": 5 }),
+        );
+        assert_eq!(plain.cache_read_tokens, None);
+        assert_eq!(plain.cache_write_tokens, None);
+        assert_eq!(plain.total_tokens, 15);
+    }
+
+    #[test]
+    fn cache_rates_price_cache_traffic_and_default_to_the_input_rate() {
+        let dir = std::env::temp_dir().join(format!("whip-cache-prices-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("providers.json");
+        // Entry WITH explicit cache rates (the Anthropic-style discount).
+        std::fs::write(
+            &path,
+            r#"{"prices": [
+                {"provider": "anthropic", "model": "m",
+                 "input_per_mtok_usd": 3.0, "output_per_mtok_usd": 15.0,
+                 "cache_read_per_mtok_usd": 0.3, "cache_write_per_mtok_usd": 3.75}
+            ]}"#,
+        )
+        .expect("write config");
+        let table = PriceTable::load(std::slice::from_ref(&path)).expect("loads");
+        let usage = TurnUsage {
+            provider: "anthropic".to_owned(),
+            model: "m".to_owned(),
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_read_tokens: Some(1_000_000),
+            cache_write_tokens: Some(1_000_000),
+            total_tokens: 3_000_000,
+        };
+        // 1M in at $3 + 1M cache-read at $0.30 + 1M cache-write at $3.75.
+        assert_eq!(table.cost_micros(&usage), Some(7_050_000));
+
+        // Entry WITHOUT cache rates: cache traffic prices at the input rate —
+        // a conservative overestimate (providers discount reads), never $0.
+        std::fs::write(
+            &path,
+            r#"{"prices": [
+                {"provider": "anthropic", "model": "m",
+                 "input_per_mtok_usd": 3.0, "output_per_mtok_usd": 15.0}
+            ]}"#,
+        )
+        .expect("write config");
+        let table = PriceTable::load(std::slice::from_ref(&path)).expect("loads");
+        assert_eq!(table.cost_micros(&usage), Some(9_000_000));
+
+        // Cache-only usage (fully cached prompt) is priceable, not unpriced.
+        let cache_only = TurnUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: Some(500_000),
+            cache_write_tokens: None,
+            ..usage
+        };
+        assert_eq!(table.cost_micros(&cache_only), Some(1_500_000));
+
+        // A malformed cache rate is a hard error like any malformed entry.
+        std::fs::write(
+            &path,
+            r#"{"prices": [
+                {"provider": "anthropic", "model": "m",
+                 "input_per_mtok_usd": 3.0, "output_per_mtok_usd": 15.0,
+                 "cache_read_per_mtok_usd": -1.0}
+            ]}"#,
+        )
+        .expect("write config");
+        assert!(PriceTable::load(&[path]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_hit_rate_reads_out_only_when_a_provider_reports_caching() {
+        let run = |provider: &str, metadata: Value| whipplescript_store::RunView {
+            run_id: "r".to_owned(),
+            effect_id: "e".to_owned(),
+            provider: provider.to_owned(),
+            worker_id: "w".to_owned(),
+            status: "succeeded".to_owned(),
+            started_at: String::new(),
+            completed_at: None,
+            metadata_json: metadata.to_string(),
+            cancel_requested: false,
+        };
+        // 900 cache-read of 1200 input-side across the cached run; the
+        // cache-blind run adds 300 uncached input-side tokens.
+        let cached = run(
+            "anthropic",
+            json!({"usage": {"input_tokens": 100, "output_tokens": 10,
+                              "cache_read_input_tokens": 900,
+                              "cache_creation_input_tokens": 200}}),
+        );
+        let blind = run(
+            "fixture",
+            json!({"usage": {"input_tokens": 300, "output_tokens": 10}}),
+        );
+        let rate = total_cache_hit_rate(&[cached, blind.clone()]).expect("cache reported");
+        assert!((rate - 900.0 / 1500.0).abs() < 1e-9, "rate {rate}");
+        // No run reports cache fields -> honest absence, not a fake 0%.
+        assert_eq!(total_cache_hit_rate(&[blind]), None);
+    }
+
+    #[test]
     fn spend_reading_is_strict_about_unpriced_usage() {
         let run = |provider: &str, metadata: Value| whipplescript_store::RunView {
             run_id: "r".to_owned(),
@@ -6277,7 +6594,12 @@ mod tests {
         let mut table = PriceTable::default();
         table.rates.insert(
             ("anthropic".to_owned(), "claude-sonnet-5".to_owned()),
-            (3.0, 15.0),
+            PriceRate {
+                input: 3.0,
+                output: 15.0,
+                cache_read: None,
+                cache_write: None,
+            },
         );
         let priced = run(
             "anthropic",

@@ -6805,7 +6805,10 @@ pub fn channel_provider_report(provider: &str) -> Option<&'static ChannelProvide
 
 /// The built-in resource gauges: deterministic observables already in the
 /// effect ledger, present without declaration (improve design note §3).
-pub const BUILTIN_GAUGES: &[&str] = &["std.spend", "std.latency", "std.tokens"];
+/// `std.cache_hit` is the provider prompt-cache hit rate (cache-read tokens /
+/// total input-side tokens) — present only when the provider reports cache
+/// usage (spec/inference-cache-note.md G2).
+pub const BUILTIN_GAUGES: &[&str] = &["std.spend", "std.latency", "std.tokens", "std.cache_hit"];
 
 /// The v1 std.files store providers (spec/std-files.md "Providers"): `local`
 /// is the FileStore host-projection seam (native + DO) and the default when a

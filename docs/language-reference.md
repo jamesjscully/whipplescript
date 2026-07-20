@@ -1494,7 +1494,9 @@ gauge extract_quality on summarize.extract {
   ordinary gauges — there is no weighting feature.
 - `std.spend`, `std.latency`, and `std.tokens` are built-in resource
   gauges: deterministic observables from the run ledger, present without
-  declaration, descending-toward-better.
+  declaration, descending-toward-better. `std.cache_hit` (ascending) is the
+  provider prompt-cache hit rate — cache-read tokens over all input-side
+  tokens — present only when the provider reports cache usage.
 
 A `mark` declares a named cut point — *where* the meaningful moments of a
 run are, as program structure:
