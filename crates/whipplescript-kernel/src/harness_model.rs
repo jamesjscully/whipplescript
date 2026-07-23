@@ -223,7 +223,7 @@ impl HttpModelClient for MessagesApiClient {
                 tools,
             );
         }
-        build_request(
+        let mut request = build_request(
             self.provider,
             &self.base_url,
             &self.api_key,
@@ -232,7 +232,19 @@ impl HttpModelClient for MessagesApiClient {
             self.cache_key.as_deref(),
             messages,
             tools,
-        )
+        );
+        // The Durable Object host owns an incremental provider transport. Ask
+        // OpenAI's Responses API for SSE so the host can publish text deltas
+        // while still assembling the terminal response through
+        // `assemble_codex_responses_sse`. The native client uses
+        // `RealHarnessModelClient`, so its synchronous transport is unchanged.
+        if self.provider == CoerceProvider::OpenAi {
+            request.body["stream"] = json!(true);
+            request
+                .headers
+                .push(("accept".to_owned(), "text/event-stream".to_owned()));
+        }
+        request
     }
 
     fn parse_response(
@@ -1361,6 +1373,21 @@ mod tests {
             client.parse_response(Err(CoerceTransportError::Timeout)),
             Err(HarnessModelError::Timeout)
         );
+
+        let openai = MessagesApiClient::new(
+            CoerceProvider::OpenAi,
+            "openai-key",
+            "gpt-test",
+            "https://api.openai.com",
+            4096,
+            None,
+        );
+        let request = openai.build_request(&convo(), &tool_specs());
+        assert_eq!(request.body["stream"], json!(true));
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "accept" && value == "text/event-stream"));
     }
 
     #[test]
